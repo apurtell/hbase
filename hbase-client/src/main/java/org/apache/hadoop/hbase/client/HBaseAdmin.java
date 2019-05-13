@@ -187,6 +187,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsSnapshot
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.IsSnapshotDoneResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ListDecommissionedRegionServersRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ListNamespaceDescriptorsRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ListNamespacesRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ListTableDescriptorsByNamespaceRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ListTableNamesByNamespaceRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.MajorCompactionTimestampForRegionRequest;
@@ -1646,7 +1647,7 @@ public class HBaseAdmin implements Admin {
    * @param nameOfRegionB encoded or full name of region b
    * @param forcible true if do a compulsory merge, otherwise we will only merge
    *          two adjacent regions
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   @VisibleForTesting
   public void mergeRegionsSync(
@@ -1764,7 +1765,7 @@ public class HBaseAdmin implements Admin {
    *   Therefore, this is for internal testing only.
    * @param regionName encoded or full name of region
    * @param splitPoint key where region splits
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   @VisibleForTesting
   public void splitRegionSync(byte[] regionName, byte[] splitPoint) throws IOException {
@@ -1778,7 +1779,7 @@ public class HBaseAdmin implements Admin {
    * @param splitPoint split point
    * @param timeout how long to wait on split
    * @param units time units
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   public void splitRegionSync(byte[] regionName, byte[] splitPoint, final long timeout,
       final TimeUnit units) throws IOException {
@@ -1932,7 +1933,7 @@ public class HBaseAdmin implements Admin {
    *  MetaTableAccessor#getRegionLocation(Connection, byte[])}
    *  else null.
    * Throw IllegalArgumentException if <code>regionName</code> is null.
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   Pair<RegionInfo, ServerName> getRegion(final byte[] regionName) throws IOException {
     if (regionName == null) {
@@ -2207,6 +2208,34 @@ public class HBaseAdmin implements Admin {
     });
   }
 
+  /**
+   * List available namespaces
+   * @return List of namespace names
+   * @throws IOException if a remote or network exception occurs
+   */
+  @Override
+  public String[] listNamespaces() throws IOException {
+    return executeCallable(new MasterCallable<String[]>(getConnection(),
+        getRpcControllerFactory()) {
+      @Override
+      protected String[] rpcCall() throws Exception {
+        List<String> list =
+          master.listNamespaces(getRpcController(),
+            ListNamespacesRequest.newBuilder().build()).getNamespaceNameList();
+        String[] res = new String[list.size()];
+        for(int i = 0; i < list.size(); i++) {
+          res[i] = list.get(i);
+        }
+        return res;
+      }
+    });
+  }
+
+  /**
+   * List available namespace descriptors
+   * @return List of descriptors
+   * @throws IOException if a remote or network exception occurs
+   */
   @Override
   public NamespaceDescriptor[] listNamespaceDescriptors() throws IOException {
     return executeCallable(new MasterCallable<NamespaceDescriptor[]>(getConnection(),
@@ -4013,7 +4042,7 @@ public class HBaseAdmin implements Admin {
    * </ol>
    * @param tableName name of the table to sync to the peer
    * @param splits table split keys
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   private void checkAndSyncTableDescToPeers(final TableName tableName, final byte[][] splits)
       throws IOException {

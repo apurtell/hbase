@@ -1729,9 +1729,18 @@ public interface Admin extends Abortable, Closeable {
       throws NamespaceNotFoundException, IOException;
 
   /**
-   * List available namespace descriptors.
+   * List available namespaces
    *
    * @return List of descriptors
+   * @throws IOException if a remote or network exception occurs
+   */
+  String[] listNamespaces() throws IOException;
+
+  /**
+   * List available namespace descriptors
+   *
+   * @return List of descriptors
+   * @throws IOException if a remote or network exception occurs
    */
   NamespaceDescriptor[] listNamespaceDescriptors()
   throws IOException;
@@ -1741,7 +1750,7 @@ public interface Admin extends Abortable, Closeable {
    *
    * @param name namespace name
    * @return HTD[] the read-only tableDescriptors
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    * @deprecated since 2.0 version and will be removed in 3.0 version.
    *             use {@link #listTableDescriptorsByNamespace(byte[])}
    */
