@@ -139,6 +139,7 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsRestoreSnapshot
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsSnapshotDoneRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsSnapshotDoneResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListNamespaceDescriptorsRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListNamespacesRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListProceduresRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableDescriptorsByNamespaceRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceRequest;
@@ -3131,6 +3132,29 @@ public class HBaseAdmin implements Admin {
                 setNamespaceName(name).build()).getNamespaceDescriptor());
           }
         });
+  }
+
+  /**
+   * List available namespaces
+   * @return List of namespace names
+   * @throws IOException
+   */
+  @Override
+  public String[] listNamespaces() throws IOException {
+    return executeCallable(new MasterCallable<String[]>(getConnection()) {
+      @Override
+      public String[] call(int callTimeout) throws Exception {
+        HBaseRpcController controller = rpcControllerFactory.newController();
+        controller.setCallTimeout(callTimeout);
+        List<String> list = master.listNamespaces(controller,
+          ListNamespacesRequest.newBuilder().build()).getNamespaceNameList();
+        String[] res = new String[list.size()];
+        for(int i = 0; i < list.size(); i++) {
+          res[i] = list.get(i);
+        }
+        return res;
+      }
+    });
   }
 
   /**

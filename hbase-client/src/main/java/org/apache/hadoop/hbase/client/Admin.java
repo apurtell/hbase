@@ -85,7 +85,7 @@ public interface Admin extends Abortable, Closeable {
   /**
    * @param tableName Table to check.
    * @return True if table exists already.
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   boolean tableExists(final TableName tableName) throws IOException;
 
@@ -326,7 +326,7 @@ public interface Admin extends Abortable, Closeable {
    * when table is fully online.  If table is taking too long to online, check server logs.
    *
    * @param tableName
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    * @since 0.90.0
    */
   void enableTableAsync(final TableName tableName) throws IOException;
@@ -337,7 +337,7 @@ public interface Admin extends Abortable, Closeable {
    * #listTables(java.lang.String)} and {@link #enableTable(org.apache.hadoop.hbase.TableName)}
    *
    * @param regex The regular expression to match table names against
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    * @see #enableTables(java.util.regex.Pattern)
    * @see #enableTable(org.apache.hadoop.hbase.TableName)
    */
@@ -350,7 +350,7 @@ public interface Admin extends Abortable, Closeable {
    * {@link #enableTable(org.apache.hadoop.hbase.TableName)}
    *
    * @param pattern The pattern to match table names against
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   HTableDescriptor[] enableTables(Pattern pattern) throws IOException;
 
@@ -402,7 +402,7 @@ public interface Admin extends Abortable, Closeable {
    *
    * @param pattern The pattern to match table names against
    * @return Table descriptors for tables that couldn't be disabled
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   HTableDescriptor[] disableTables(Pattern pattern) throws IOException;
 
@@ -536,7 +536,7 @@ public interface Admin extends Abortable, Closeable {
    *
    * @param sn
    * @param hri
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   void closeRegion(final ServerName sn, final HRegionInfo hri) throws IOException;
 
@@ -792,14 +792,14 @@ public interface Admin extends Abortable, Closeable {
    * Ask for cleaner chore to run
    *
    * @return True if cleaner chore ran, false otherwise
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   public boolean runCleanerChore() throws IOException;
 
   /**
    * Query on the cleaner chore state (Enabled/Disabled?)
    *
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   public boolean isCleanerChoreEnabled() throws IOException;
 
@@ -810,7 +810,7 @@ public interface Admin extends Abortable, Closeable {
    * @param nameOfRegionB encoded or full name of region b
    * @param forcible true if do a compulsory merge, otherwise we will only merge two adjacent
    * regions
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   void mergeRegions(final byte[] nameOfRegionA, final byte[] nameOfRegionB,
       final boolean forcible) throws IOException;
@@ -942,10 +942,18 @@ public interface Admin extends Abortable, Closeable {
       throws NamespaceNotFoundException, IOException;
 
   /**
+   * List available namespaces
+   *
+   * @return List of descriptors
+   * @throws IOException if a remote or network exception occurs
+   */
+  String[] listNamespaces() throws IOException;
+
+  /**
    * List available namespace descriptors
    *
    * @return List of descriptors
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   NamespaceDescriptor[] listNamespaceDescriptors()
     throws IOException;
@@ -955,7 +963,7 @@ public interface Admin extends Abortable, Closeable {
    *
    * @param name namespace name
    * @return A descriptor
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   HTableDescriptor[] listTableDescriptorsByNamespace(final String name)
       throws IOException;
@@ -965,7 +973,7 @@ public interface Admin extends Abortable, Closeable {
    *
    * @param name namespace name
    * @return The list of table names in the namespace
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   TableName[] listTableNamesByNamespace(final String name)
       throws IOException;
@@ -975,7 +983,7 @@ public interface Admin extends Abortable, Closeable {
    *
    * @param tableName the name of the table
    * @return List of {@link HRegionInfo}.
-   * @throws IOException
+   * @throws IOException if a remote or network exception occurs
    */
   List<HRegionInfo> getTableRegions(final TableName tableName)
     throws IOException;
