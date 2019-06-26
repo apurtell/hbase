@@ -31,8 +31,6 @@ import java.util.NavigableSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Cell;
@@ -78,7 +76,6 @@ import com.google.common.collect.ImmutableList;
  * It works with TestRegionObserverInterface to provide the test case.
  */
 public class SimpleRegionObserver extends BaseRegionObserver {
-  private static final Log LOG = LogFactory.getLog(TestRegionObserverInterface.class);
 
   final AtomicInteger ctBeforeDelete = new AtomicInteger(1);
   final AtomicInteger ctPreOpen = new AtomicInteger(0);
@@ -139,6 +136,8 @@ public class SimpleRegionObserver extends BaseRegionObserver {
   final AtomicInteger ctPostBatchMutateIndispensably = new AtomicInteger(0);
   final AtomicInteger ctPostStartRegionOperation = new AtomicInteger(0);
   final AtomicInteger ctPostCloseRegionOperation = new AtomicInteger(0);
+  final AtomicInteger ctPreWALAppend = new AtomicInteger(0);
+  final AtomicInteger ctPostWALAppend = new AtomicInteger(0);
   final AtomicBoolean throwOnPostFlush = new AtomicBoolean(false);
   static final String TABLE_SKIPPED = "SKIPPED_BY_PREWALRESTORE";
 
@@ -718,6 +717,18 @@ public class SimpleRegionObserver extends BaseRegionObserver {
     return reader;
   }
 
+  @Override
+  public void preWALAppend(ObserverContext<RegionCoprocessorEnvironment> ctx, WALKey key,
+      WALEdit edit) throws IOException {
+    ctPreWALAppend.incrementAndGet();
+  }
+
+  @Override
+  public void postWALAppend(ObserverContext<RegionCoprocessorEnvironment> ctx, WALKey key,
+      WALEdit edit, long txid) throws IOException {
+    ctPostWALAppend.incrementAndGet();
+  }
+
   public boolean hadPreGet() {
     return ctPreGet.get() > 0;
   }
@@ -977,6 +988,22 @@ public class SimpleRegionObserver extends BaseRegionObserver {
 
   public boolean wasStoreFileReaderOpenCalled() {
     return ctPreStoreFileReaderOpen.get() > 0 && ctPostStoreFileReaderOpen.get() > 0;
+  }
+
+  public int getCtPreWALAppend() {
+    return ctPreWALAppend.get();
+  }
+
+  public boolean hadPreWALAppend() {
+    return ctPreWALAppend.get() > 0;
+  }
+
+  public int getCtPostWALAppend() {
+    return ctPostWALAppend.get();
+  }
+
+  public boolean hadPostWALAppend() {
+    return ctPostWALAppend.get() > 0;
   }
 
   /**

@@ -1341,4 +1341,33 @@ public interface RegionObserver extends Coprocessor {
   DeleteTracker postInstantiateDeleteTracker(
       final ObserverContext<RegionCoprocessorEnvironment> ctx, DeleteTracker delTracker)
       throws IOException;
+
+  /**
+   * Called just before HRegion calls {@link org.apache.hadoop.hbase.wal.WAL#append}.
+   * <p>
+   * Calling {@link org.apache.hadoop.hbase.coprocessor.ObserverContext#bypass()} has no
+   * effect in this hook.
+   * 
+   * @param ctx the environment provided by the region server
+   * @param key WAL key
+   * @param edit WAL edit
+   * @throws IOException
+   */
+  void preWALAppend(ObserverContext<RegionCoprocessorEnvironment> ctx, WALKey key,
+      WALEdit edit) throws IOException;
+
+  /**
+   * Called immediately after HRegion calls {@link org.apache.hadoop.hbase.wal.WAL#append}.
+   * <p>
+   * Calling {@link org.apache.hadoop.hbase.coprocessor.ObserverContext#bypass()} has no
+   * effect in this hook.
+   * @param ctx the environment provided by the region server
+   * @param key WAL key
+   * @param edit WAL edit
+   * @param txid transaction ID from WAL subsystem
+   * @throws IOException
+   */
+  void postWALAppend(ObserverContext<RegionCoprocessorEnvironment> ctx, WALKey key,
+      WALEdit edit, long txid) throws IOException;
+
 }

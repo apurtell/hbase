@@ -3478,8 +3478,14 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
             walKey = new ReplayHLogKey(this.getRegionInfo().getEncodedNameAsBytes(),
               this.htableDescriptor.getTableName(), now, m.getClusterIds(),
               currentNonceGroup, currentNonce, mvcc);
-            txid = this.wal.append(this.htableDescriptor,  this.getRegionInfo(),  walKey,
+            if (coprocessorHost != null) {
+              coprocessorHost.preWALAppend(walKey, walEdit);
+            }
+            txid = this.wal.append(this.htableDescriptor, this.getRegionInfo(),  walKey,
               walEdit, true);
+            if (coprocessorHost != null) {
+              coprocessorHost.postWALAppend(walKey, walEdit, txid);
+            }
             walEdit = new WALEdit(cellCount, isInReplay);
             walKey = null;
           }
@@ -3509,8 +3515,14 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
         long replaySeqId = batchOp.getReplaySequenceId();
         walKey.setOrigLogSeqNum(replaySeqId);
         if (walEdit.size() > 0) {
-          txid =
-              this.wal.append(this.htableDescriptor, this.getRegionInfo(), walKey, walEdit, true);
+          if (coprocessorHost != null) {
+            coprocessorHost.preWALAppend(walKey, walEdit);
+          }
+          txid = this.wal.append(this.htableDescriptor, this.getRegionInfo(), walKey, walEdit,
+            true);
+          if (coprocessorHost != null) {
+            coprocessorHost.postWALAppend(walKey, walEdit, txid);
+          }
         }
       } else {
         if (walEdit.size() > 0) {
@@ -3518,9 +3530,14 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
           walKey = new HLogKey(this.getRegionInfo().getEncodedNameAsBytes(),
               this.htableDescriptor.getTableName(), WALKey.NO_SEQUENCE_ID, now,
               mutation.getClusterIds(), currentNonceGroup, currentNonce, mvcc);
-          txid = this.wal
-              .append(this.htableDescriptor, this.getRegionInfo(), walKey,
+          if (coprocessorHost != null) {
+            coprocessorHost.preWALAppend(walKey, walEdit);
+          }
+          txid = this.wal.append(this.htableDescriptor, this.getRegionInfo(), walKey,
                   walEdit, true);
+          if (coprocessorHost != null) {
+            coprocessorHost.postWALAppend(walKey, walEdit, txid);
+          }
         } else {
           walKey = appendEmptyEdit(wal);
         }
@@ -7584,10 +7601,16 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
             walKey = new HLogKey(this.getRegionInfo().getEncodedNameAsBytes(),
               this.htableDescriptor.getTableName(), WALKey.NO_SEQUENCE_ID, now,
               processor.getClusterIds(), nonceGroup, nonce, mvcc);
+            if (coprocessorHost != null) {
+              coprocessorHost.preWALAppend(walKey, walEdit);
+            }
             txid = this.wal.append(this.htableDescriptor, this.getRegionInfo(),
                 walKey, walEdit, true);
+            if (coprocessorHost != null) {
+              coprocessorHost.postWALAppend(walKey, walEdit, txid);
+            }
           }
-          if(walKey == null){
+          if (walKey == null){
             // since we use wal sequence Id as mvcc, for SKIP_WAL changes we need a "faked" WALEdit
             // to get a sequence id assigned which is done by FSWALEntry#stampRegionSequenceId
             walKey = this.appendEmptyEdit(this.wal);
@@ -7596,8 +7619,6 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
           // 7. Start mvcc transaction
           writeEntry = walKey.getWriteEntry();
           mvccNum = walKey.getSequenceId();
-
-
 
           // 8. Apply to memstore
           for (Mutation m : mutations) {
@@ -7875,8 +7896,13 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
                   nonceGroup,
                   nonce,
                   mvcc);
-              txid =
-                this.wal.append(this.htableDescriptor, getRegionInfo(), walKey, walEdits, true);
+              if (coprocessorHost != null) {
+                coprocessorHost.preWALAppend(walKey, walEdits);
+              }
+              txid = this.wal.append(this.htableDescriptor, getRegionInfo(), walKey, walEdits, true);
+              if (coprocessorHost != null) {
+                coprocessorHost.postWALAppend(walKey, walEdits, txid);
+              }
             } else {
               recordMutationWithoutWal(mutate.getFamilyCellMap());
             }
@@ -8115,8 +8141,14 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
             walKey = new HLogKey(this.getRegionInfo().getEncodedNameAsBytes(),
               this.htableDescriptor.getTableName(), WALKey.NO_SEQUENCE_ID, nonceGroup, nonce,
               getMVCC());
-            txid =
-              this.wal.append(this.htableDescriptor, this.getRegionInfo(), walKey, walEdits, true);
+            if (coprocessorHost != null) {
+              coprocessorHost.preWALAppend(walKey, walEdits);
+            }
+            txid = this.wal.append(this.htableDescriptor, this.getRegionInfo(), walKey, walEdits,
+              true);
+            if (coprocessorHost != null) {
+              coprocessorHost.postWALAppend(walKey, walEdits, txid);
+            }
           } else {
             // Append a faked WALEdit in order for SKIP_WAL updates to get mvccNum assigned
             walKey = this.appendEmptyEdit(this.wal);
@@ -8985,7 +9017,14 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
     // Call append but with an empty WALEdit.  The returned sequence id will not be associated
     // with any edit and we can be sure it went in after all outstanding appends.
     try {
-      wal.append(getTableDesc(), getRegionInfo(), key, WALEdit.EMPTY_WALEDIT, false);
+      WALEdit empty = WALEdit.EMPTY_WALEDIT;
+      if (coprocessorHost != null) {
+        coprocessorHost.preWALAppend(key, empty);
+      }
+      long txid = wal.append(getTableDesc(), getRegionInfo(), key, empty, false);
+      if (coprocessorHost != null) {
+        coprocessorHost.postWALAppend(key, empty, txid);
+      }
     } catch (Throwable t) {
       // If exception, our mvcc won't get cleaned up by client, so do it here.
       getMVCC().complete(key.getWriteEntry());

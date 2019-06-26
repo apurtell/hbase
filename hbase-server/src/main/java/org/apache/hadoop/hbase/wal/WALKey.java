@@ -29,20 +29,15 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.hbase.regionserver.MultiVersionConcurrencyControl;
-import org.apache.hadoop.hbase.regionserver.MultiVersionConcurrencyControl.WriteEntry;
 import org.apache.hadoop.hbase.util.ByteStringer;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
-import org.apache.hadoop.hbase.exceptions.TimeoutIOException;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
+import org.apache.hadoop.hbase.protobuf.generated.WALProtos;
 import org.apache.hadoop.hbase.protobuf.generated.WALProtos.FamilyScope;
 import org.apache.hadoop.hbase.protobuf.generated.WALProtos.ScopeType;
 import org.apache.hadoop.hbase.regionserver.SequenceId;
@@ -78,7 +73,6 @@ import org.apache.hadoop.hbase.regionserver.wal.WALCellCodec;
 // TODO: Cleanup. We have logSeqNum and then WriteEntry, both are sequence id'ing. Fix.
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.REPLICATION)
 public class WALKey implements SequenceId, Comparable<WALKey> {
-  private static final Log LOG = LogFactory.getLog(WALKey.class);
 
   @InterfaceAudience.Private // For internal use only.
   public MultiVersionConcurrencyControl getMvcc() {
@@ -189,6 +183,8 @@ public class WALKey implements SequenceId, Comparable<WALKey> {
   // visible for deprecated HLogKey
   @InterfaceAudience.Private
   protected CompressionContext compressionContext;
+
+  protected Map<byte[],byte[]> attributes;
 
   public WALKey() {
     init(null, null, 0L, HConstants.LATEST_TIMESTAMP,
@@ -459,6 +455,12 @@ public class WALKey implements SequenceId, Comparable<WALKey> {
     stringMap.put("table", tablename);
     stringMap.put("region", Bytes.toStringBinary(encodedRegionName));
     stringMap.put("sequence", logSeqNum);
+    if (attributes != null) {
+      for (Map.Entry<byte[],byte[]> e: attributes.entrySet()) {
+        stringMap.put(Bytes.toStringBinary(e.getKey()),
+          Bytes.toStringBinary(e.getValue()));
+      }
+    }
     return stringMap;
   }
 
@@ -499,6 +501,7 @@ public class WALKey implements SequenceId, Comparable<WALKey> {
       }
     }
     // why isn't cluster id accounted for?
+    // we are ignoring the attribute set too
     return result;
   }
 
@@ -566,6 +569,14 @@ public class WALKey implements SequenceId, Comparable<WALKey> {
             .setFamily(family).setScopeType(ScopeType.valueOf(e.getValue())));
       }
     }
+    if (attributes != null) {
+      for (Map.Entry<byte[],byte[]> e: attributes.entrySet()) {
+        builder.addAttrs(WALProtos.Attribute.newBuilder()
+          .setName(ByteString.copyFrom(e.getKey()))
+          .setValue(ByteString.copyFrom(e.getValue()))
+          .build());
+      }
+    }
     return builder;
   }
 
@@ -609,8 +620,15 @@ public class WALKey implements SequenceId, Comparable<WALKey> {
     }
     this.logSeqNum = walKey.getLogSequenceNumber();
     this.writeTime = walKey.getWriteTime();
-    if(walKey.hasOrigSequenceNumber()) {
+    if (walKey.hasOrigSequenceNumber()) {
       this.origLogSeqNum = walKey.getOrigSequenceNumber();
+    }
+    List<WALProtos.Attribute> attrs = walKey.getAttrsList();
+    if (!attrs.isEmpty()) {
+      this.attributes = new TreeMap<>(Bytes.BYTES_COMPARATOR);
+      for (WALProtos.Attribute attr: attrs) {
+        this.attributes.put(attr.getName().toByteArray(), attr.getValue().toByteArray());
+      }
     }
   }
 
@@ -637,6 +655,34 @@ public class WALKey implements SequenceId, Comparable<WALKey> {
     if (origLogSeqNum > 0) {
       size += Bytes.SIZEOF_LONG; // original sequence number
     }
+    if (attributes != null) {
+      for (Map.Entry<byte[],byte[]> e: attributes.entrySet()) {
+        size += e.getKey().length;
+        size += e.getValue().length;
+      }
+    }
     return size;
+  }
+
+  /**
+   * @param name attribute name
+   * @return attribute value, or null if unset
+   */
+  public byte[] getAttribute(byte[] name) {
+    if (attributes != null) {
+      return attributes.get(name);
+    }
+    return null;
+  }
+
+  /**
+   * @param name attribute name
+   * @param value attribute value
+   */
+  public void setAttribute(byte[] name, byte[] value) {
+    if (attributes == null) {
+      attributes = new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    }
+    attributes.put(name, value);
   }
 }

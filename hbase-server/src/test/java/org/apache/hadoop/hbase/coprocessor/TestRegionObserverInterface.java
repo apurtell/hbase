@@ -124,8 +124,10 @@ public class TestRegionObserverInterface {
     try {
       verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreGet", "hadPostGet",
           "hadPrePut", "hadPostPut", "hadDelete", "hadPostStartRegionOperation",
-          "hadPostCloseRegionOperation", "hadPostBatchMutateIndispensably" }, tableName,
-        new Boolean[] { false, false, false, false, false, false, false, false });
+          "hadPostCloseRegionOperation", "hadPostBatchMutateIndispensably", "hadPreWALAppend",
+          "hadPostWALAppend" },
+        tableName, new Boolean[] {
+          false, false, false, false, false, false, false, false, false, false });
 
       Put put = new Put(ROW);
       put.add(A, A, A);
@@ -136,8 +138,9 @@ public class TestRegionObserverInterface {
       verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreGet", "hadPostGet",
           "hadPrePut", "hadPostPut", "hadPreBatchMutate", "hadPostBatchMutate", "hadDelete",
           "hadPostStartRegionOperation", "hadPostCloseRegionOperation",
-          "hadPostBatchMutateIndispensably" }, TEST_TABLE, new Boolean[] { false, false, true,
-          true, true, true, false, true, true, true });
+          "hadPostBatchMutateIndispensably", "hadPreWALAppend", "hadPostWALAppend" },
+        TEST_TABLE, new Boolean[] {
+          false, false, true, true, true, true, false, true, true, true, true, true });
 
       verifyMethodResult(SimpleRegionObserver.class,
           new String[] {"getCtPreOpen", "getCtPostOpen", "getCtPreClose", "getCtPostClose"},
@@ -150,12 +153,10 @@ public class TestRegionObserverInterface {
       get.addColumn(C, C);
       table.get(get);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreGet", "hadPostGet", "hadPrePut", "hadPostPut",
-      "hadDelete", "hadPrePreparedDeleteTS"},
-      tableName,
-      new Boolean[] {true, true, true, true, false, false}
-          );
+      verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreGet", "hadPostGet",
+          "hadPrePut", "hadPostPut", "hadDelete", "hadPrePreparedDeleteTS" },
+        tableName, new Boolean[] {
+          true, true, true, true, false, false });
 
       Delete delete = new Delete(ROW);
       delete.deleteColumn(A, A);
@@ -163,12 +164,11 @@ public class TestRegionObserverInterface {
       delete.deleteColumn(C, C);
       table.delete(delete);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreGet", "hadPostGet", "hadPrePut", "hadPostPut",
-        "hadPreBatchMutate", "hadPostBatchMutate", "hadDelete", "hadPrePreparedDeleteTS"},
-        tableName,
-        new Boolean[] {true, true, true, true, true, true, true, true}
-          );
+      verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreGet", "hadPostGet",
+          "hadPrePut", "hadPostPut", "hadPreBatchMutate", "hadPostBatchMutate", "hadDelete",
+          "hadPrePreparedDeleteTS" },
+        tableName, new Boolean[] {
+          true, true, true, true, true, true, true, true });
     } finally {
       util.deleteTable(tableName);
       table.close();
@@ -184,11 +184,10 @@ public class TestRegionObserverInterface {
     TableName tableName = TableName.valueOf(TEST_TABLE.getNameAsString() + ".testRowMutation");
     Table table = util.createTable(tableName, new byte[][] {A, B, C});
     try {
-      verifyMethodResult(SimpleRegionObserver.class,
-        new String[] {"hadPreGet", "hadPostGet", "hadPrePut", "hadPostPut",
-            "hadDeleted"},
-        tableName,
-        new Boolean[] {false, false, false, false, false});
+      verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreGet", "hadPostGet",
+          "hadPrePut", "hadPostPut", "hadDeleted", "hadPreWALAppend", "hadPostWALAppend" },
+        tableName, new Boolean[] {
+          false, false, false, false, false, false, false });
       Put put = new Put(ROW);
       put.add(A, A, A);
       put.add(B, B, B);
@@ -204,12 +203,10 @@ public class TestRegionObserverInterface {
       arm.add(delete);
       table.mutateRow(arm);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreGet", "hadPostGet", "hadPrePut", "hadPostPut",
-      "hadDeleted"},
-      tableName,
-      new Boolean[] {false, false, true, true, true}
-          );
+      verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreGet", "hadPostGet",
+          "hadPrePut", "hadPostPut", "hadDeleted", "hadPreWALAppend", "hadPostWALAppend" },
+        tableName, new Boolean[] {
+          false, false, true, true, true, true, true });
     } finally {
       util.deleteTable(tableName);
       table.close();
@@ -224,19 +221,19 @@ public class TestRegionObserverInterface {
       Increment inc = new Increment(Bytes.toBytes(0));
       inc.addColumn(A, A, 1);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreIncrement", "hadPostIncrement", "hadPreIncrementAfterRowLock"},
-          tableName,
-          new Boolean[] {false, false, false}
-          );
+      verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreIncrement",
+          "hadPostIncrement", "hadPreIncrementAfterRowLock", "hadPreWALAppend",
+          "hadPostWALAppend" },
+        tableName, new Boolean[] {
+            false, false, false, false, false });
 
       table.increment(inc);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreIncrement", "hadPostIncrement", "hadPreIncrementAfterRowLock"},
-          tableName,
-          new Boolean[] {true, true, true}
-          );
+      verifyMethodResult(SimpleRegionObserver.class,new String[] { "hadPreIncrement",
+          "hadPostIncrement", "hadPreIncrementAfterRowLock", "hadPreWALAppend",
+          "hadPostWALAppend" },
+        tableName, new Boolean[] {
+          true, true, true, true, true });
     } finally {
       util.deleteTable(tableName);
       table.close();
@@ -309,19 +306,19 @@ public class TestRegionObserverInterface {
       Append app = new Append(Bytes.toBytes(0));
       app.add(A, A, A);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreAppend", "hadPostAppend", "hadPreAppendAfterRowLock"},
-          tableName,
-          new Boolean[] {false, false, false}
-          );
+      verifyMethodResult(SimpleRegionObserver.class, new String[] { "hadPreAppend",
+          "hadPostAppend", "hadPreAppendAfterRowLock", "hadPreWALAppend",
+          "hadPostWALAppend" },
+        tableName, new Boolean[] {
+          false, false, false, false, false });
 
       table.append(app);
 
-      verifyMethodResult(SimpleRegionObserver.class,
-          new String[] {"hadPreAppend", "hadPostAppend", "hadPreAppendAfterRowLock"},
-          tableName,
-          new Boolean[] {true, true, true}
-          );
+      verifyMethodResult(SimpleRegionObserver.class, new String[] {"hadPreAppend",
+          "hadPostAppend", "hadPreAppendAfterRowLock", "hadPreWALAppend",
+          "hadPostWALAppend" },
+        tableName, new Boolean[] {
+          true, true, true, true, true });
     } finally {
       util.deleteTable(tableName);
       table.close();
