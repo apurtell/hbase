@@ -1267,6 +1267,7 @@
     <commons-codec.version>1.9</commons-codec.version>
     <!-- pretty outdated -->
     <commons-io.version>2.4</commons-io.version>
+    <commons-lang3.version>3.9</commons-lang3.version>
     <commons-lang.version>2.6</commons-lang.version>
     <commons-logging.version>1.2</commons-logging.version>
     <commons-math.version>2.2</commons-math.version>
@@ -1659,6 +1660,11 @@
         <version>${commons-lang.version}</version>
       </dependency>
       <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-lang3</artifactId>
+        <version>${commons-lang3.version}</version>
+      </dependency>
+      <dependency>
         <groupId>commons-logging</groupId>
         <artifactId>commons-logging</artifactId>
         <version>${commons-logging.version}</version>
@@ -2015,6 +2021,9 @@
       <activation>
         <jdk>1.8</jdk>
       </activation>
+      <modules>
+        <module>hbase-hbtop</module>
+      </modules>
       <build>
         <pluginManagement>
           <plugins>

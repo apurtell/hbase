@@ -228,4 +228,21 @@
       <artifactId>jackson-mapper-asl</artifactId>
     </dependency>
   </dependencies>
+
+  <profiles>
+    <profile>
+      <id>build-with-jdk8</id>
+      <activation>
+        <jdk>1.8</jdk>
+      </activation>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.hbase</groupId>
+          <artifactId>hbase-hbtop</artifactId>
+          <version>${project.version}</version>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+
 </project>
