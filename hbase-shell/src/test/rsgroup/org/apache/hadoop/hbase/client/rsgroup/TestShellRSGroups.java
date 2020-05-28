@@ -80,10 +80,10 @@ public class TestShellRSGroups {
     TEST_UTIL.startMiniCluster(1,4);
 
     // Configure jruby runtime
-    List<String> loadPaths = new ArrayList<>();
+    List<String> loadPaths = new ArrayList<>(2);
     loadPaths.add(basePath+"/src/main/ruby");
     loadPaths.add(basePath+"/src/test/ruby");
-    jruby.getProvider().setLoadPaths(loadPaths);
+    jruby.setLoadPaths(loadPaths);
     jruby.put("$TEST_CLUSTER", TEST_UTIL);
     System.setProperty("jruby.jit.logging.verbose", "true");
     System.setProperty("jruby.jit.logging", "true");

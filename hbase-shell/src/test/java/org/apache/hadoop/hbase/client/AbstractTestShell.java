@@ -34,8 +34,7 @@ public abstract class AbstractTestShell {
   protected final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
   protected final static ScriptingContainer jruby = new ScriptingContainer();
 
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
+  protected static void setUpConfig() throws Exception {
     // Start mini cluster
     TEST_UTIL.getConfiguration().setBoolean("hbase.online.schema.update.enable", true);
     TEST_UTIL.getConfiguration().setInt("hbase.regionserver.msginterval", 100);
@@ -51,18 +50,28 @@ public abstract class AbstractTestShell {
     // Security setup configuration
     SecureTestUtil.enableSecurity(TEST_UTIL.getConfiguration());
     VisibilityTestUtil.enableVisiblityLabels(TEST_UTIL.getConfiguration());
+  }
 
-    TEST_UTIL.startMiniCluster();
-
+  protected static void setUpJRubyRuntime() {
     // Configure jruby runtime
-    List<String> loadPaths = new ArrayList();
+    List<String> loadPaths = new ArrayList<>(2);
     loadPaths.add("src/main/ruby");
     loadPaths.add("src/test/ruby");
-    jruby.getProvider().setLoadPaths(loadPaths);
+    jruby.setLoadPaths(loadPaths);
     jruby.put("$TEST_CLUSTER", TEST_UTIL);
     System.setProperty("jruby.jit.logging.verbose", "true");
     System.setProperty("jruby.jit.logging", "true");
     System.setProperty("jruby.native.verbose", "true");
+  }
+
+  @BeforeClass
+  public static void setUpBeforeClass() throws Exception {
+    setUpConfig();
+
+    // Start mini cluster
+    TEST_UTIL.startMiniCluster(1);
+
+    setUpJRubyRuntime();
   }
 
   @AfterClass
