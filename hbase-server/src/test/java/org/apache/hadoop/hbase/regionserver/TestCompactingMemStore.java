@@ -27,8 +27,6 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellComparator;
@@ -120,8 +118,6 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
     this.region = HRegion.createHRegion(info, hbaseUtility.getDataTestDir(), conf,
       tableDescriptor, wal, true);
     this.regionServicesForStores = Mockito.spy(region.getRegionServicesForStores());
-    ThreadPoolExecutor pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(1);
-    Mockito.when(regionServicesForStores.getInMemoryCompactionPool()).thenReturn(pool);
     this.store = new HStore(region, familyDescriptor, conf, false);
 
     long globalMemStoreLimit = (long) (ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()

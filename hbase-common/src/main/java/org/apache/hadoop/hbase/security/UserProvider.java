@@ -21,11 +21,12 @@ import java.io.IOException;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.Callable;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.hbase.BaseConfigurable;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.security.Groups;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.ReflectionUtils;
@@ -35,9 +36,7 @@ import org.apache.hbase.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.hbase.thirdparty.com.google.common.cache.CacheLoader;
 import org.apache.hbase.thirdparty.com.google.common.cache.LoadingCache;
 import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ListenableFuture;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ListeningExecutorService;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.MoreExecutors;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ListeningScheduledExecutorService;
 
 /**
  * Provide an instance of a user. Allows custom {@link User} creation.
@@ -46,10 +45,6 @@ import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFacto
 public class UserProvider extends BaseConfigurable {
 
   private static final String USER_PROVIDER_CONF_KEY = "hbase.client.userprovider.class";
-  private static final ListeningExecutorService executor = MoreExecutors.listeningDecorator(
-      Executors.newScheduledThreadPool(
-          1,
-          new ThreadFactoryBuilder().setDaemon(true).setNameFormat("group-cache-%d").build()));
 
   private LoadingCache<String, String[]> groupCache = null;
 
@@ -109,7 +104,8 @@ public class UserProvider extends BaseConfigurable {
           @Override
           public ListenableFuture<String[]> reload(final String k, String[] oldValue)
               throws Exception {
-
+            ListeningScheduledExecutorService executor = (ListeningScheduledExecutorService)
+                ExecutorPools.getScheduler(PoolType.SECURITY);
             return executor.submit(new Callable<String[]>() {
               @Override
               public String[] call() throws Exception {

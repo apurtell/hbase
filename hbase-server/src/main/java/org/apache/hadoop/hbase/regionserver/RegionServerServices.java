@@ -30,7 +30,6 @@ import org.apache.hadoop.hbase.TableDescriptors;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.locking.EntityLock;
-import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.io.hfile.BlockCache;
 import org.apache.hadoop.hbase.ipc.RpcServerInterface;
 import org.apache.hadoop.hbase.mob.MobFileCache;
@@ -197,11 +196,6 @@ public interface RegionServerServices extends Server, MutableOnlineRegions, Favo
    * @return The RegionServer's "Leases" service
    */
   LeaseManager getLeaseManager();
-
-  /**
-   * @return hbase executor service
-   */
-  ExecutorService getExecutorService();
 
   /**
    * Only required for "old" log replay; if it's removed, remove this.

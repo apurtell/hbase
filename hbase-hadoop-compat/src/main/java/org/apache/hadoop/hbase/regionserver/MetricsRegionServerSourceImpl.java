@@ -532,10 +532,6 @@ public class MetricsRegionServerSourceImpl
                     rsWrap.getSplitQueueSize())
             .addGauge(Interns.info(COMPACTION_QUEUE_LENGTH, COMPACTION_QUEUE_LENGTH_DESC),
                     rsWrap.getCompactionQueueSize())
-            .addGauge(Interns.info(SMALL_COMPACTION_QUEUE_LENGTH,
-                    SMALL_COMPACTION_QUEUE_LENGTH_DESC), rsWrap.getSmallCompactionQueueSize())
-            .addGauge(Interns.info(LARGE_COMPACTION_QUEUE_LENGTH,
-                    LARGE_COMPACTION_QUEUE_LENGTH_DESC), rsWrap.getLargeCompactionQueueSize())
             .addGauge(Interns.info(FLUSH_QUEUE_LENGTH, FLUSH_QUEUE_LENGTH_DESC),
                     rsWrap.getFlushQueueSize())
             .addGauge(Interns.info(BLOCK_CACHE_FREE_SIZE, BLOCK_CACHE_FREE_DESC),

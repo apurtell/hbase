@@ -26,7 +26,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.DelayQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.conf.Configuration;
@@ -35,8 +35,8 @@ import org.apache.hadoop.hbase.procedure2.util.DelayedUtil.DelayedContainerWithT
 import org.apache.hadoop.hbase.procedure2.util.DelayedUtil.DelayedWithTimeout;
 import org.apache.hadoop.hbase.procedure2.util.StringUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
-import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,7 +78,7 @@ public abstract class RemoteProcedureDispatcher<TEnv, TRemote extends Comparable
   private final int corePoolSize;
 
   private TimeoutExecutorThread timeoutExecutor;
-  private ThreadPoolExecutor threadPool;
+  private ExecutorService threadPool;
 
   protected RemoteProcedureDispatcher(Configuration conf) {
     this.corePoolSize = conf.getInt(THREAD_POOL_SIZE_CONF_KEY, DEFAULT_THREAD_POOL_SIZE);
@@ -99,10 +99,8 @@ public abstract class RemoteProcedureDispatcher<TEnv, TRemote extends Comparable
     timeoutExecutor = new TimeoutExecutorThread();
     timeoutExecutor.start();
 
-    // Create the thread pool that will execute RPCs
-    threadPool = Threads.getBoundedCachedThreadPool(corePoolSize, 60L, TimeUnit.SECONDS,
-      new ThreadFactoryBuilder().setNameFormat(this.getClass().getSimpleName() + "-pool-%d")
-        .setDaemon(true).setUncaughtExceptionHandler(getUncaughtExceptionHandler()).build());
+    // Get the thread pool that will execute RPCs
+    threadPool = ExecutorPools.getPool(PoolType.REMOTE_RPC);
     return true;
   }
 

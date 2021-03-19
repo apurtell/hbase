@@ -189,7 +189,7 @@ class AsyncConnectionImpl implements AsyncConnection {
       throw new IllegalStateException("connection is already closed");
     }
     if (choreService == null) {
-      choreService = new ChoreService("AsyncConn Chore Service");
+      choreService = new ChoreService();
     }
     return choreService;
   }

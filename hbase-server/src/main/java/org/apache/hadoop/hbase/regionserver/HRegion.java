@@ -58,6 +58,7 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -157,6 +158,8 @@ import org.apache.hadoop.hbase.util.CancelableProgressable;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HashedBytes;
 import org.apache.hadoop.hbase.util.NonceKey;
@@ -1113,9 +1116,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
 
     if (htableDescriptor.getColumnFamilyCount() != 0) {
       // initialize the thread pool for opening stores in parallel.
-      ThreadPoolExecutor storeOpenerThreadPool =
-        getStoreOpenAndCloseThreadPool("StoreOpener-" + this.getRegionInfo().getShortNameToLog());
-      CompletionService<HStore> completionService = new ExecutorCompletionService<>(storeOpenerThreadPool);
+      CompletionService<HStore> completionService =
+          new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.FILE));
 
       // initialize each store in parallel
       for (final ColumnFamilyDescriptor family : htableDescriptor.getColumnFamilies()) {
@@ -1161,7 +1163,6 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
       } catch (ExecutionException e) {
         throw new IOException(e.getCause());
       } finally {
-        storeOpenerThreadPool.shutdownNow();
         if (!allStoresOpened) {
           // something went wrong, close all opened stores
           LOG.error("Could not initialize all stores for the region=" + this);
@@ -1810,11 +1811,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
       Map<byte[], List<HStoreFile>> result = new TreeMap<>(Bytes.BYTES_COMPARATOR);
       if (!stores.isEmpty()) {
         // initialize the thread pool for closing stores in parallel.
-        ThreadPoolExecutor storeCloserThreadPool =
-          getStoreOpenAndCloseThreadPool("StoreCloser-" +
-            getRegionInfo().getRegionNameAsString());
         CompletionService<Pair<byte[], Collection<HStoreFile>>> completionService =
-          new ExecutorCompletionService<>(storeCloserThreadPool);
+          new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.FILE));
 
         // close each store in parallel
         for (HStore store : stores.values()) {
@@ -1857,7 +1855,6 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
           }
           throw new IOException(cause);
         } finally {
-          storeCloserThreadPool.shutdownNow();
         }
       }
 
@@ -1970,41 +1967,9 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
     }
   }
 
-  private ThreadPoolExecutor getStoreOpenAndCloseThreadPool(
-      final String threadNamePrefix) {
-    int numStores = Math.max(1, this.htableDescriptor.getColumnFamilyCount());
-    int maxThreads = Math.min(numStores,
-        conf.getInt(HConstants.HSTORE_OPEN_AND_CLOSE_THREADS_MAX,
-            HConstants.DEFAULT_HSTORE_OPEN_AND_CLOSE_THREADS_MAX));
-    return getOpenAndCloseThreadPool(maxThreads, threadNamePrefix);
-  }
-
-  ThreadPoolExecutor getStoreFileOpenAndCloseThreadPool(
-      final String threadNamePrefix) {
-    int numStores = Math.max(1, this.htableDescriptor.getColumnFamilyCount());
-    int maxThreads = Math.max(1,
-        conf.getInt(HConstants.HSTORE_OPEN_AND_CLOSE_THREADS_MAX,
-            HConstants.DEFAULT_HSTORE_OPEN_AND_CLOSE_THREADS_MAX)
-            / numStores);
-    return getOpenAndCloseThreadPool(maxThreads, threadNamePrefix);
-  }
-
-  private static ThreadPoolExecutor getOpenAndCloseThreadPool(int maxThreads,
-      final String threadNamePrefix) {
-    return Threads.getBoundedCachedThreadPool(maxThreads, 30L, TimeUnit.SECONDS,
-      new ThreadFactory() {
-        private int count = 1;
-
-        @Override
-        public Thread newThread(Runnable r) {
-          return new Thread(r, threadNamePrefix + "-" + count++);
-        }
-      });
-  }
-
-   /**
-    * @return True if its worth doing a flush before we put up the close flag.
-    */
+  /**
+   * @return True if its worth doing a flush before we put up the close flag.
+   */
   private boolean worthPreFlushing() {
     return this.memStoreSizing.getDataSize() >
       this.conf.getLong("hbase.hregion.preclose.flush.size", 1024 * 1024 * 5);

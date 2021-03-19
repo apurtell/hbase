@@ -24,8 +24,6 @@ import static org.apache.hadoop.hbase.ipc.IPCUtil.wrapException;
 import java.io.IOException;
 import java.net.SocketAddress;
 import java.util.Collection;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,6 +37,8 @@ import org.apache.hadoop.hbase.net.Address;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.PoolMap;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.io.compress.CompressionCodec;
@@ -93,11 +93,6 @@ public abstract class AbstractRpcClient<T extends RpcConnection> implements RpcC
     new ThreadFactoryBuilder().setNameFormat("RpcClient-timer-pool-%d").setDaemon(true)
       .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build(),
     10, TimeUnit.MILLISECONDS);
-
-  private static final ScheduledExecutorService IDLE_CONN_SWEEPER =
-    Executors.newScheduledThreadPool(1,
-      new ThreadFactoryBuilder().setNameFormat("Idle-Rpc-Conn-Sweeper-pool-%d").setDaemon(true)
-        .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
 
   private boolean running = true; // if client runs
 
@@ -177,13 +172,14 @@ public abstract class AbstractRpcClient<T extends RpcConnection> implements RpcC
 
     this.connections = new PoolMap<>(getPoolType(conf), getPoolSize(conf));
 
-    this.cleanupIdleConnectionTask = IDLE_CONN_SWEEPER.scheduleAtFixedRate(new Runnable() {
-
-      @Override
-      public void run() {
-        cleanupIdleConnections();
-      }
-    }, minIdleTimeBeforeClose, minIdleTimeBeforeClose, TimeUnit.MILLISECONDS);
+    this.cleanupIdleConnectionTask = ExecutorPools.getScheduler(PoolType.CLIENT)
+        .scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+              cleanupIdleConnections();
+            }
+          },
+          minIdleTimeBeforeClose, minIdleTimeBeforeClose, TimeUnit.MILLISECONDS);
 
     if (LOG.isDebugEnabled()) {
       LOG.debug("Codec=" + this.codec + ", compressor=" + this.compressor + ", tcpKeepAlive="

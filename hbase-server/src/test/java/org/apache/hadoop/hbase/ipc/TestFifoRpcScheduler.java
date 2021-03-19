@@ -99,9 +99,7 @@ public class TestFifoRpcScheduler {
   @Test
   public void testCallQueueInfo() throws IOException, InterruptedException {
 
-    ThreadPoolExecutor rpcExecutor;
-    RpcScheduler scheduler = new FifoRpcScheduler(
-            conf, 1);
+    RpcScheduler scheduler = new FifoRpcScheduler(conf);
 
     scheduler.init(CONTEXT);
 

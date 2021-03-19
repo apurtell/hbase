@@ -28,11 +28,7 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.RejectedExecutionHandler;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntSupplier;
 import org.apache.hadoop.conf.Configuration;
@@ -48,7 +44,8 @@ import org.apache.hadoop.hbase.regionserver.throttle.ThroughputController;
 import org.apache.hadoop.hbase.security.Superusers;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
-import org.apache.hadoop.hbase.util.StealJobQueue;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -56,7 +53,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Compact region on request and then run split if appropriate
@@ -64,20 +60,6 @@ import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFacto
 @InterfaceAudience.Private
 public class CompactSplit implements CompactionRequester, PropagatingConfigurationObserver {
   private static final Logger LOG = LoggerFactory.getLogger(CompactSplit.class);
-
-  // Configuration key for the large compaction threads.
-  public final static String LARGE_COMPACTION_THREADS =
-      "hbase.regionserver.thread.compaction.large";
-  public final static int LARGE_COMPACTION_THREADS_DEFAULT = 1;
-
-  // Configuration key for the small compaction threads.
-  public final static String SMALL_COMPACTION_THREADS =
-      "hbase.regionserver.thread.compaction.small";
-  public final static int SMALL_COMPACTION_THREADS_DEFAULT = 1;
-
-  // Configuration key for split threads
-  public final static String SPLIT_THREADS = "hbase.regionserver.thread.split";
-  public final static int SPLIT_THREADS_DEFAULT = 1;
 
   public static final String REGION_SERVER_REGION_SPLIT_LIMIT =
       "hbase.regionserver.regionSplitLimit";
@@ -87,9 +69,6 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
 
   private final HRegionServer server;
   private final Configuration conf;
-  private volatile ThreadPoolExecutor longCompactions;
-  private volatile ThreadPoolExecutor shortCompactions;
-  private volatile ThreadPoolExecutor splits;
 
   private volatile ThroughputController compactionThroughputController;
 
@@ -105,79 +84,35 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
     this.server = server;
     this.conf = server.getConfiguration();
     this.compactionsEnabled = this.conf.getBoolean(HBASE_REGION_SERVER_ENABLE_COMPACTION,true);
-    createCompactionExecutors();
-    createSplitExcecutors();
 
     // compaction throughput controller
     this.compactionThroughputController =
         CompactionThroughputControllerFactory.create(server, conf);
   }
 
-  private void createSplitExcecutors() {
-    final String n = Thread.currentThread().getName();
-    int splitThreads = conf.getInt(SPLIT_THREADS, SPLIT_THREADS_DEFAULT);
-    this.splits = (ThreadPoolExecutor) Executors.newFixedThreadPool(splitThreads,
-      new ThreadFactoryBuilder().setNameFormat(n + "-splits-%d").setDaemon(true).build());
-  }
-
-  private void createCompactionExecutors() {
-    this.regionSplitLimit =
-        conf.getInt(REGION_SERVER_REGION_SPLIT_LIMIT, DEFAULT_REGION_SERVER_REGION_SPLIT_LIMIT);
-
-    int largeThreads =
-        Math.max(1, conf.getInt(LARGE_COMPACTION_THREADS, LARGE_COMPACTION_THREADS_DEFAULT));
-    int smallThreads = conf.getInt(SMALL_COMPACTION_THREADS, SMALL_COMPACTION_THREADS_DEFAULT);
-
-    // if we have throttle threads, make sure the user also specified size
-    Preconditions.checkArgument(largeThreads > 0 && smallThreads > 0);
-
-    final String n = Thread.currentThread().getName();
-
-    StealJobQueue<Runnable> stealJobQueue = new StealJobQueue<Runnable>(COMPARATOR);
-    this.longCompactions = new ThreadPoolExecutor(largeThreads, largeThreads, 60, TimeUnit.SECONDS,
-        stealJobQueue, new ThreadFactoryBuilder().setNameFormat(n + "-longCompactions-%d")
-            .setDaemon(true).build());
-    this.longCompactions.setRejectedExecutionHandler(new Rejection());
-    this.longCompactions.prestartAllCoreThreads();
-    this.shortCompactions = new ThreadPoolExecutor(smallThreads, smallThreads, 60, TimeUnit.SECONDS,
-        stealJobQueue.getStealFromQueue(), new ThreadFactoryBuilder()
-            .setNameFormat(n + "-shortCompactions-%d").setDaemon(true).build());
-    this.shortCompactions.setRejectedExecutionHandler(new Rejection());
-  }
-
   @Override
   public String toString() {
-    return "compactionQueue=(longCompactions="
-        + longCompactions.getQueue().size() + ":shortCompactions="
-        + shortCompactions.getQueue().size() + ")"
-        + ", splitQueue=" + splits.getQueue().size();
+    return "compactionQueue=(compactions="
+        + ExecutorPools.getPool(PoolType.COMPACTION).getQueue().size()
+        + ", splits="
+        + ExecutorPools.getPool(PoolType.SPLIT).getQueue().size()
+        + ")";
   }
 
   public String dumpQueue() {
     StringBuilder queueLists = new StringBuilder();
     queueLists.append("Compaction/Split Queue dump:\n");
-    queueLists.append("  LargeCompation Queue:\n");
-    BlockingQueue<Runnable> lq = longCompactions.getQueue();
+    queueLists.append("  Compation Queue:\n");
+    BlockingQueue<Runnable> lq = ExecutorPools.getPool(PoolType.COMPACTION).getQueue();
     Iterator<Runnable> it = lq.iterator();
     while (it.hasNext()) {
       queueLists.append("    " + it.next().toString());
       queueLists.append("\n");
     }
 
-    if (shortCompactions != null) {
-      queueLists.append("\n");
-      queueLists.append("  SmallCompation Queue:\n");
-      lq = shortCompactions.getQueue();
-      it = lq.iterator();
-      while (it.hasNext()) {
-        queueLists.append("    " + it.next().toString());
-        queueLists.append("\n");
-      }
-    }
-
     queueLists.append("\n");
     queueLists.append("  Split Queue:\n");
-    lq = splits.getQueue();
+    lq = ExecutorPools.getPool(PoolType.SPLIT).getQueue();
     it = lq.iterator();
     while (it.hasNext()) {
       queueLists.append("    " + it.next().toString());
@@ -220,7 +155,8 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
       return;
     }
     try {
-      this.splits.execute(new SplitRequest(r, midKey, this.server, user));
+      ExecutorPools.getPool(PoolType.SPLIT)
+        .execute(new SplitRequest(r, midKey, this.server, user));
       if (LOG.isDebugEnabled()) {
         LOG.debug("Splitting " + r + ", " + this);
       }
@@ -230,12 +166,7 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
   }
 
   private void interrupt() {
-    longCompactions.shutdownNow();
-    shortCompactions.shutdownNow();
-  }
-
-  private void reInitializeCompactionsExecutors() {
-    createCompactionExecutors();
+    // TODO
   }
 
   private interface CompactionCompleteTracker {
@@ -293,13 +224,7 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
 
   @Override
   public void switchCompaction(boolean onOrOff) {
-    if (onOrOff) {
-      // re-create executor pool if compactions are disabled.
-      if (!isCompactionsEnabled()) {
-        LOG.info("Re-Initializing compactions because user switched on compactions");
-        reInitializeCompactionsExecutors();
-      }
-    } else {
+    if (!onOrOff) {
       LOG.info("Interrupting running compactions because user switched off compactions");
       interrupt();
     }
@@ -351,23 +276,12 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
       compaction = null;
     }
 
-    ThreadPoolExecutor pool;
-    if (selectNow) {
-      // compaction.get is safe as we will just return if selectNow is true but no compaction is
-      // selected
-      pool = store.throttleCompaction(compaction.getRequest().getSize()) ? longCompactions
-          : shortCompactions;
-    } else {
-      // We assume that most compactions are small. So, put system compactions into small
-      // pool; we will do selection there, and move to large pool if necessary.
-      pool = shortCompactions;
-    }
-    pool.execute(
-      new CompactionRunner(store, region, compaction, tracker, completeTracker, pool, user));
+    store.throttleCompaction(compaction.getRequest().getSize());
+    ExecutorPools.getPool(PoolType.COMPACTION).execute(
+      new CompactionRunner(store, region, compaction, tracker, completeTracker, user));
     region.incrementCompactionsQueuedCount();
     if (LOG.isDebugEnabled()) {
-      String type = (pool == shortCompactions) ? "Small " : "Large ";
-      LOG.debug(type + "Compaction requested: " + (selectNow ? compaction.toString() : "system")
+      LOG.debug("Compaction requested: " + (selectNow ? compaction.toString() : "system")
           + (why != null && !why.isEmpty() ? "; Because: " + why : "") + "; " + this);
     }
   }
@@ -406,31 +320,11 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
    * Only interrupt once it's done with a run through the work loop.
    */
   void interruptIfNecessary() {
-    splits.shutdown();
-    longCompactions.shutdown();
-    shortCompactions.shutdown();
-  }
-
-  private void waitFor(ThreadPoolExecutor t, String name) {
-    boolean done = false;
-    while (!done) {
-      try {
-        done = t.awaitTermination(60, TimeUnit.SECONDS);
-        LOG.info("Waiting for " + name + " to finish...");
-        if (!done) {
-          t.shutdownNow();
-        }
-      } catch (InterruptedException ie) {
-        LOG.warn("Interrupted waiting for " + name + " to finish...");
-        t.shutdownNow();
-      }
-    }
+    // TODO
   }
 
   void join() {
-    waitFor(splits, "Split Thread");
-    waitFor(longCompactions, "Large Compaction Thread");
-    waitFor(shortCompactions, "Small Compaction Thread");
+    // TODO
   }
 
   /**
@@ -440,20 +334,11 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
    * @return The current size of the regions queue.
    */
   public int getCompactionQueueSize() {
-    return longCompactions.getQueue().size() + shortCompactions.getQueue().size();
-  }
-
-  public int getLargeCompactionQueueSize() {
-    return longCompactions.getQueue().size();
-  }
-
-
-  public int getSmallCompactionQueueSize() {
-    return shortCompactions.getQueue().size();
+    return ExecutorPools.getPool(PoolType.COMPACTION).getQueue().size();
   }
 
   public int getSplitQueueSize() {
-    return splits.getQueue().size();
+    return ExecutorPools.getPool(PoolType.SPLIT).getQueue().size();
   }
 
   private boolean shouldSplitRegion() {
@@ -531,13 +416,12 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
     private final CompactionLifeCycleTracker tracker;
     private final CompactionCompleteTracker completeTracker;
     private int queuedPriority;
-    private ThreadPoolExecutor parent;
     private User user;
     private long time;
 
     public CompactionRunner(HStore store, HRegion region, CompactionContext compaction,
         CompactionLifeCycleTracker tracker, CompactionCompleteTracker completeTracker,
-        ThreadPoolExecutor parent, User user) {
+        User user) {
       this.store = store;
       this.region = region;
       this.compaction = compaction;
@@ -545,7 +429,6 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
       this.completeTracker = completeTracker;
       this.queuedPriority =
           compaction != null ? compaction.getRequest().getPriority() : store.getCompactPriority();
-      this.parent = parent;
       this.user = user;
       this.time = EnvironmentEdgeManager.currentTime();
     }
@@ -569,7 +452,7 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
         if (this.queuedPriority > oldPriority) {
           // Store priority decreased while we were in queue (due to some other compaction?),
           // requeue with new priority to avoid blocking potential higher priorities.
-          this.parent.execute(this);
+          ExecutorPools.getPool(PoolType.COMPACTION).execute(this);
           return;
         }
         Optional<CompactionContext> selected;
@@ -591,17 +474,7 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
         // Now see if we are in correct pool for the size; if not, go to the correct one.
         // We might end up waiting for a while, so cancel the selection.
 
-        ThreadPoolExecutor pool =
-            store.throttleCompaction(c.getRequest().getSize()) ? longCompactions : shortCompactions;
-
-        // Long compaction pool can process small job
-        // Short compaction pool should not process large job
-        if (this.parent == shortCompactions && pool == longCompactions) {
-          this.store.cancelRequestedCompaction(c);
-          this.parent = pool;
-          this.parent.execute(this);
-          return;
-        }
+        store.throttleCompaction(c.getRequest().getSize());
       } else {
         c = compaction;
       }
@@ -669,77 +542,10 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
   }
 
   /**
-   * Cleanup class to use when rejecting a compaction request from the queue.
-   */
-  private static class Rejection implements RejectedExecutionHandler {
-    @Override
-    public void rejectedExecution(Runnable runnable, ThreadPoolExecutor pool) {
-      if (runnable instanceof CompactionRunner) {
-        CompactionRunner runner = (CompactionRunner) runnable;
-        LOG.debug("Compaction Rejected: " + runner);
-        if (runner.compaction != null) {
-          runner.store.cancelRequestedCompaction(runner.compaction);
-        }
-      }
-    }
-  }
-
-  /**
    * {@inheritDoc}
    */
   @Override
   public void onConfigurationChange(Configuration newConf) {
-    // Check if number of large / small compaction threads has changed, and then
-    // adjust the core pool size of the thread pools, by using the
-    // setCorePoolSize() method. According to the javadocs, it is safe to
-    // change the core pool size on-the-fly. We need to reset the maximum
-    // pool size, as well.
-    int largeThreads = Math.max(1, newConf.getInt(
-            LARGE_COMPACTION_THREADS,
-            LARGE_COMPACTION_THREADS_DEFAULT));
-    if (this.longCompactions.getCorePoolSize() != largeThreads) {
-      LOG.info("Changing the value of " + LARGE_COMPACTION_THREADS +
-              " from " + this.longCompactions.getCorePoolSize() + " to " +
-              largeThreads);
-      if(this.longCompactions.getCorePoolSize() < largeThreads) {
-        this.longCompactions.setMaximumPoolSize(largeThreads);
-        this.longCompactions.setCorePoolSize(largeThreads);
-      } else {
-        this.longCompactions.setCorePoolSize(largeThreads);
-        this.longCompactions.setMaximumPoolSize(largeThreads);
-      }
-    }
-
-    int smallThreads = newConf.getInt(SMALL_COMPACTION_THREADS,
-            SMALL_COMPACTION_THREADS_DEFAULT);
-    if (this.shortCompactions.getCorePoolSize() != smallThreads) {
-      LOG.info("Changing the value of " + SMALL_COMPACTION_THREADS +
-                " from " + this.shortCompactions.getCorePoolSize() + " to " +
-                smallThreads);
-      if(this.shortCompactions.getCorePoolSize() < smallThreads) {
-        this.shortCompactions.setMaximumPoolSize(smallThreads);
-        this.shortCompactions.setCorePoolSize(smallThreads);
-      } else {
-        this.shortCompactions.setCorePoolSize(smallThreads);
-        this.shortCompactions.setMaximumPoolSize(smallThreads);
-      }
-    }
-
-    int splitThreads = newConf.getInt(SPLIT_THREADS,
-            SPLIT_THREADS_DEFAULT);
-    if (this.splits.getCorePoolSize() != splitThreads) {
-      LOG.info("Changing the value of " + SPLIT_THREADS +
-                " from " + this.splits.getCorePoolSize() + " to " +
-                splitThreads);
-      if(this.splits.getCorePoolSize() < splitThreads) {
-        this.splits.setMaximumPoolSize(splitThreads);
-        this.splits.setCorePoolSize(splitThreads);
-      } else {
-        this.splits.setCorePoolSize(splitThreads);
-        this.splits.setMaximumPoolSize(splitThreads);
-      }
-    }
-
     ThroughputController old = this.compactionThroughputController;
     if (old != null) {
       old.stop("configuration change");
@@ -752,16 +558,12 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
     this.conf.reloadConfiguration();
   }
 
-  protected int getSmallCompactionThreadNum() {
-    return this.shortCompactions.getCorePoolSize();
-  }
-
-  protected int getLargeCompactionThreadNum() {
-    return this.longCompactions.getCorePoolSize();
+  protected int getCompactionThreadNum() {
+    return ExecutorPools.getPool(PoolType.COMPACTION).getCorePoolSize();
   }
 
   protected int getSplitThreadNum() {
-    return this.splits.getCorePoolSize();
+    return ExecutorPools.getPool(PoolType.SPLIT).getCorePoolSize();
   }
 
   /**
@@ -784,23 +586,6 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
     return compactionThroughputController;
   }
 
-  /**
-   * Shutdown the long compaction thread pool.
-   * Should only be used in unit test to prevent long compaction thread pool from stealing job
-   * from short compaction queue
-   */
-  void shutdownLongCompactions(){
-    this.longCompactions.shutdown();
-  }
-
-  public void clearLongCompactionsQueue() {
-    longCompactions.getQueue().clear();
-  }
-
-  public void clearShortCompactionsQueue() {
-    shortCompactions.getQueue().clear();
-  }
-
   public boolean isCompactionsEnabled() {
     return compactionsEnabled;
   }
@@ -809,19 +594,4 @@ public class CompactSplit implements CompactionRequester, PropagatingConfigurati
     this.compactionsEnabled = compactionsEnabled;
     this.conf.set(HBASE_REGION_SERVER_ENABLE_COMPACTION,String.valueOf(compactionsEnabled));
   }
-
-  /**
-   * @return the longCompactions thread pool executor
-   */
-  ThreadPoolExecutor getLongCompactions() {
-    return longCompactions;
-  }
-
-  /**
-   * @return the shortCompactions thread pool executor
-   */
-  ThreadPoolExecutor getShortCompactions() {
-    return shortCompactions;
-  }
-
 }

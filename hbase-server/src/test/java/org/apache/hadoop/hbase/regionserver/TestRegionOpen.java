@@ -43,6 +43,8 @@ import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.testclassification.RegionServerTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
@@ -78,17 +80,11 @@ public class TestRegionOpen {
     HTU.shutdownMiniCluster();
   }
 
-  private static HRegionServer getRS() {
-    return HTU.getHBaseCluster().getLiveRegionServerThreads().get(0).getRegionServer();
-  }
-
   @Test
   public void testPriorityRegionIsOpenedWithSeparateThreadPool() throws Exception {
     final TableName tableName = TableName.valueOf(TestRegionOpen.class.getSimpleName());
-    ThreadPoolExecutor exec = getRS().getExecutorService()
-        .getExecutorThreadPool(ExecutorType.RS_OPEN_PRIORITY_REGION);
+    ThreadPoolExecutor exec = (ThreadPoolExecutor) ExecutorPools.getPool(PoolType.REGION);
     long completed = exec.getCompletedTaskCount();
-
     TableDescriptor tableDescriptor =
       TableDescriptorBuilder.newBuilder(tableName).setPriority(HConstants.HIGH_QOS)
         .setColumnFamily(ColumnFamilyDescriptorBuilder.of(HConstants.CATALOG_FAMILY)).build();
@@ -96,7 +92,6 @@ public class TestRegionOpen {
         Admin admin = connection.getAdmin()) {
       admin.createTable(tableDescriptor);
     }
-
     assertEquals(completed + 1, exec.getCompletedTaskCount());
   }
 

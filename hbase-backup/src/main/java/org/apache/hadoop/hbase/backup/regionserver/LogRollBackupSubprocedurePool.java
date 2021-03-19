@@ -25,15 +25,12 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.errorhandling.ForeignException;
-import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,28 +43,14 @@ import org.slf4j.LoggerFactory;
 public class LogRollBackupSubprocedurePool implements Closeable, Abortable {
   private static final Logger LOG = LoggerFactory.getLogger(LogRollBackupSubprocedurePool.class);
 
-  /** Maximum number of concurrent snapshot region tasks that can run concurrently */
-  private static final String CONCURENT_BACKUP_TASKS_KEY = "hbase.backup.region.concurrentTasks";
-  private static final int DEFAULT_CONCURRENT_BACKUP_TASKS = 3;
-
   private final ExecutorCompletionService<Void> taskPool;
-  private final ThreadPoolExecutor executor;
   private volatile boolean aborted;
   private final List<Future<Void>> futures = new ArrayList<>();
   private final String name;
 
   public LogRollBackupSubprocedurePool(String name, Configuration conf) {
-    // configure the executor service
-    long keepAlive =
-        conf.getLong(LogRollRegionServerProcedureManager.BACKUP_TIMEOUT_MILLIS_KEY,
-          LogRollRegionServerProcedureManager.BACKUP_TIMEOUT_MILLIS_DEFAULT);
-    int threads = conf.getInt(CONCURENT_BACKUP_TASKS_KEY, DEFAULT_CONCURRENT_BACKUP_TASKS);
     this.name = name;
-    executor =
-      new ThreadPoolExecutor(1, threads, keepAlive, TimeUnit.SECONDS, new LinkedBlockingQueue<>(),
-        new ThreadFactoryBuilder().setNameFormat("rs(" + name + ")-backup-pool-%d").setDaemon(true)
-          .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
-    taskPool = new ExecutorCompletionService<>(executor);
+    this.taskPool = new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.PROCEDURE));
   }
 
   /**
@@ -113,13 +96,9 @@ public class LogRollBackupSubprocedurePool implements Closeable, Abortable {
     return false;
   }
 
-  /**
-   * Attempt to cleanly shutdown any running tasks - allows currently running tasks to cleanly
-   * finish
-   */
   @Override
   public void close() {
-    executor.shutdown();
+    // TODO: Wait for all futures registered with taskPool to complete
   }
 
   @Override
@@ -127,10 +106,9 @@ public class LogRollBackupSubprocedurePool implements Closeable, Abortable {
     if (this.aborted) {
       return;
     }
-
+    // TODO: Abort all pending futures registered with taskPool
     this.aborted = true;
     LOG.warn("Aborting because: " + why, e);
-    this.executor.shutdownNow();
   }
 
   @Override

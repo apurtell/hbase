@@ -33,8 +33,6 @@ import java.util.Map.Entry;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
@@ -51,13 +49,12 @@ import org.apache.hadoop.hbase.tool.BulkLoadHFiles.LoadQueueItem;
 import org.apache.hadoop.hbase.tool.BulkLoadHFilesTool;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * It is used for replicating HFile entries. It will first copy parallely all the hfiles to a local
@@ -67,14 +64,6 @@ import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFacto
  */
 @InterfaceAudience.Private
 public class HFileReplicator implements Closeable {
-  /** Maximum number of threads to allow in pool to copy hfiles during replication */
-  public static final String REPLICATION_BULKLOAD_COPY_MAXTHREADS_KEY =
-      "hbase.replication.bulkload.copy.maxthreads";
-  public static final int REPLICATION_BULKLOAD_COPY_MAXTHREADS_DEFAULT = 10;
-  /** Number of hfiles to copy per thread during replication */
-  public static final String REPLICATION_BULKLOAD_COPY_HFILES_PERTHREAD_KEY =
-      "hbase.replication.bulkload.copy.hfiles.perthread";
-  public static final int REPLICATION_BULKLOAD_COPY_HFILES_PERTHREAD_DEFAULT = 10;
 
   private static final Logger LOG = LoggerFactory.getLogger(HFileReplicator.class);
   private static final String UNDERSCORE = "_";
@@ -90,9 +79,6 @@ public class HFileReplicator implements Closeable {
   private Configuration conf;
   private AsyncClusterConnection connection;
   private Path hbaseStagingDir;
-  private ThreadPoolExecutor exec;
-  private int maxCopyThreads;
-  private int copiesPerThread;
   private List<String> sourceClusterIds;
 
   public HFileReplicator(Configuration sourceClusterConf,
@@ -111,25 +97,11 @@ public class HFileReplicator implements Closeable {
     fsDelegationToken = new FsDelegationToken(userProvider, "renewer");
     this.hbaseStagingDir =
       new Path(CommonFSUtils.getRootDir(conf), HConstants.BULKLOAD_STAGING_DIR_NAME);
-    this.maxCopyThreads =
-        this.conf.getInt(REPLICATION_BULKLOAD_COPY_MAXTHREADS_KEY,
-          REPLICATION_BULKLOAD_COPY_MAXTHREADS_DEFAULT);
-    this.exec = Threads.getBoundedCachedThreadPool(maxCopyThreads, 60, TimeUnit.SECONDS,
-        new ThreadFactoryBuilder().setDaemon(true)
-            .setNameFormat("HFileReplicationCopier-%1$d-" + this.sourceBaseNamespaceDirPath).
-          build());
-    this.copiesPerThread =
-        conf.getInt(REPLICATION_BULKLOAD_COPY_HFILES_PERTHREAD_KEY,
-          REPLICATION_BULKLOAD_COPY_HFILES_PERTHREAD_DEFAULT);
-
     sinkFs = FileSystem.get(conf);
   }
 
   @Override
   public void close() throws IOException {
-    if (this.exec != null) {
-      this.exec.shutdown();
-    }
   }
 
   public Void replicate() throws IOException {
@@ -204,7 +176,6 @@ public class HFileReplicator implements Closeable {
     byte[] family;
     Path familyStagingDir;
     int familyHFilePathsPairsListSize;
-    int totalNoOfHFiles;
     List<Pair<byte[], List<String>>> familyHFilePathsPairsList;
     FileSystem sourceFs = null;
 
@@ -244,31 +215,14 @@ public class HFileReplicator implements Closeable {
           hfilePaths = familyHFilePathsPair.getSecond();
 
           familyStagingDir = new Path(stagingDir, Bytes.toString(family));
-          totalNoOfHFiles = hfilePaths.size();
 
           // For each list of hfile paths for the family
           List<Future<Void>> futures = new ArrayList<>();
           Callable<Void> c;
           Future<Void> future;
-          int currentCopied = 0;
-          // Copy the hfiles parallely
-          while (totalNoOfHFiles > currentCopied + this.copiesPerThread) {
-            c =
-                new Copier(sourceFs, familyStagingDir, hfilePaths.subList(currentCopied,
-                  currentCopied + this.copiesPerThread));
-            future = exec.submit(c);
-            futures.add(future);
-            currentCopied += this.copiesPerThread;
-          }
-
-          int remaining = totalNoOfHFiles - currentCopied;
-          if (remaining > 0) {
-            c =
-                new Copier(sourceFs, familyStagingDir, hfilePaths.subList(currentCopied,
-                  currentCopied + remaining));
-            future = exec.submit(c);
-            futures.add(future);
-          }
+          c = new Copier(sourceFs, familyStagingDir, hfilePaths);
+          future = ExecutorPools.getPool(PoolType.FILE).submit(c);
+          futures.add(future);
 
           for (Future<Void> f : futures) {
             try {
@@ -294,9 +248,6 @@ public class HFileReplicator implements Closeable {
     } finally {
       if (sourceFs != null) {
         sourceFs.close();
-      }
-      if(exec != null) {
-        exec.shutdown();
       }
     }
   }

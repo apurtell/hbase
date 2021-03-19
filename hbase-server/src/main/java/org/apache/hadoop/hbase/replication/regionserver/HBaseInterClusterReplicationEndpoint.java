@@ -35,8 +35,6 @@ import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.StringUtils;
@@ -57,15 +55,14 @@ import org.apache.hadoop.hbase.regionserver.wal.WALUtil;
 import org.apache.hadoop.hbase.replication.HBaseReplicationEndpoint;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.hbase.wal.WALEdit;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * A {@link org.apache.hadoop.hbase.replication.ReplicationEndpoint}
@@ -98,15 +95,14 @@ public class HBaseInterClusterReplicationEndpoint extends HBaseReplicationEndpoi
   private int maxRetriesMultiplier;
   // Socket timeouts require even bolder actions since we don't want to DDOS
   private int socketTimeoutMultiplier;
-  // Amount of time for shutdown to wait for all tasks to complete
-  private long maxTerminationWait;
   // Size limit for replication RPCs, in bytes
   private int replicationRpcLimit;
   //Metrics for this source
   private MetricsSource metrics;
   private boolean peersSelected = false;
   private String replicationClusterId = "";
-  private ThreadPoolExecutor exec;
+  private final CompletionService<Integer> rpcExecutor =
+      new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.REMOTE_RPC));
   private int maxThreads;
   private Path baseNamespaceDir;
   private Path hfileArchiveDir;
@@ -130,16 +126,12 @@ public class HBaseInterClusterReplicationEndpoint extends HBaseReplicationEndpoi
     long maxTerminationWaitMultiplier = this.conf.getLong(
         "replication.source.maxterminationmultiplier",
         DEFAULT_MAX_TERMINATION_WAIT_MULTIPLIER);
-    this.maxTerminationWait = maxTerminationWaitMultiplier *
-        this.conf.getLong(HConstants.HBASE_RPC_TIMEOUT_KEY, HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
     this.sleepForRetries =
         this.conf.getLong("replication.source.sleepforretries", 1000);
     this.metrics = context.getMetrics();
     // per sink thread pool
     this.maxThreads = this.conf.getInt(HConstants.REPLICATION_SOURCE_MAXTHREADS_KEY,
       HConstants.REPLICATION_SOURCE_MAXTHREADS_DEFAULT);
-    this.exec = Threads.getBoundedCachedThreadPool(maxThreads, 60, TimeUnit.SECONDS,
-        new ThreadFactoryBuilder().setDaemon(true).setNameFormat("SinkThread-%d").build());
     this.abortable = ctx.getAbortable();
     // Set the size limit for replication RPCs to 95% of the max request size.
     // We could do with less slop if we have an accurate estimate of encoded size. Being
@@ -448,7 +440,6 @@ public class HBaseInterClusterReplicationEndpoint extends HBaseReplicationEndpoi
    */
   @Override
   public boolean replicate(ReplicateContext replicateContext) {
-    CompletionService<Integer> pool = new ExecutorCompletionService<>(this.exec);
     int sleepMultiplier = 1;
 
     if (!peersSelected && this.isRunning()) {
@@ -470,7 +461,7 @@ public class HBaseInterClusterReplicationEndpoint extends HBaseReplicationEndpoi
     }
 
     List<List<Entry>> batches = createBatches(replicateContext.getEntries());
-    while (this.isRunning() && !exec.isShutdown()) {
+    while (this.isRunning()) {
       if (!isPeerEnabled()) {
         if (sleepForRetries("Replication is disabled", sleepMultiplier)) {
           sleepMultiplier++;
@@ -479,7 +470,7 @@ public class HBaseInterClusterReplicationEndpoint extends HBaseReplicationEndpoi
       }
       try {
         // replicate the batches to sink side.
-        parallelReplicate(pool, replicateContext, batches);
+        parallelReplicate(rpcExecutor, replicateContext, batches);
         return true;
       } catch (IOException ioe) {
         if (ioe instanceof RemoteException) {
@@ -534,19 +525,7 @@ public class HBaseInterClusterReplicationEndpoint extends HBaseReplicationEndpoi
   @Override
   protected void doStop() {
     disconnect(); // don't call super.doStop()
-    // Allow currently running replication tasks to finish
-    exec.shutdown();
-    try {
-      exec.awaitTermination(maxTerminationWait, TimeUnit.MILLISECONDS);
-    } catch (InterruptedException e) {
-    }
-    // Abort if the tasks did not terminate in time
-    if (!exec.isTerminated()) {
-      String errMsg = "HBaseInterClusterReplicationEndpoint termination failed. The " +
-          "ThreadPoolExecutor failed to finish all tasks within " + maxTerminationWait + "ms. " +
-          "Aborting to prevent Replication from deadlocking. See HBASE-16081.";
-      abortable.abort(errMsg, new IOException(errMsg));
-    }
+    // TODO use rpcExecutor to wait for pending replication tasks to finish
     notifyStopped();
   }
 

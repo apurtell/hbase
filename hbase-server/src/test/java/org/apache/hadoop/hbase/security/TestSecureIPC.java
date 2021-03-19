@@ -398,7 +398,7 @@ public class TestSecureIPC {
 
     RpcServerInterface rpcServer = RpcServerFactory.createRpcServer(null, "AbstractTestSecureIPC",
         Lists.newArrayList(new RpcServer.BlockingServiceAndInterface((BlockingService) SERVICE, null)), isa,
-        serverConf, new FifoRpcScheduler(serverConf, 1));
+        serverConf, new FifoRpcScheduler(serverConf));
     rpcServer.start();
     try (RpcClient rpcClient = RpcClientFactory.createClient(clientConf,
       HConstants.DEFAULT_CLUSTER_ID.toString())) {

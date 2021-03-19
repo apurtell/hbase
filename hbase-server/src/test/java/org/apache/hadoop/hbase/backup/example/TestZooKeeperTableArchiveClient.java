@@ -43,7 +43,6 @@ import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.DummyConnectionRegistry;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.master.cleaner.BaseHFileCleanerDelegate;
-import org.apache.hadoop.hbase.master.cleaner.DirScanPool;
 import org.apache.hadoop.hbase.master.cleaner.HFileCleaner;
 import org.apache.hadoop.hbase.regionserver.CompactedHFilesDischarger;
 import org.apache.hadoop.hbase.regionserver.HRegion;
@@ -90,7 +89,6 @@ public class TestZooKeeperTableArchiveClient {
   private final List<Path> toCleanup = new ArrayList<>();
   private static Connection CONNECTION;
   private static RegionServerServices rss;
-  private static DirScanPool POOL;
 
   public static final class MockRegistry extends DummyConnectionRegistry {
 
@@ -119,7 +117,6 @@ public class TestZooKeeperTableArchiveClient {
     String archivingZNode = ZKTableArchiveClient.getArchiveZNode(UTIL.getConfiguration(), watcher);
     ZKUtil.createWithParents(watcher, archivingZNode);
     rss = mock(RegionServerServices.class);
-    POOL = new DirScanPool(UTIL.getConfiguration());
   }
 
   private static void setupConf(Configuration conf) {
@@ -151,9 +148,6 @@ public class TestZooKeeperTableArchiveClient {
       CONNECTION.close();
     }
     UTIL.shutdownMiniZKCluster();
-    if (POOL != null) {
-      POOL.shutdownNow();
-    }
   }
 
   /**
@@ -204,8 +198,7 @@ public class TestZooKeeperTableArchiveClient {
     List<HRegion> regions = new ArrayList<>();
     regions.add(region);
     Mockito.doReturn(regions).when(rss).getRegions();
-    final CompactedHFilesDischarger compactionCleaner =
-        new CompactedHFilesDischarger(100, stop, rss, false);
+    final CompactedHFilesDischarger compactionCleaner = new CompactedHFilesDischarger(100, stop, rss);
     loadFlushAndCompact(region, TEST_FAM);
     compactionCleaner.chore();
     // get the current hfiles in the archive directory
@@ -247,7 +240,7 @@ public class TestZooKeeperTableArchiveClient {
     Configuration conf = UTIL.getConfiguration();
     // setup the delegate
     Stoppable stop = new StoppableImplementation();
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     HFileCleaner cleaner = setupAndCreateCleaner(conf, fs, archiveDir, stop);
     List<BaseHFileCleanerDelegate> cleaners = turnOnArchiving(STRING_TABLE_NAME, cleaner);
     final LongTermArchivingHFileCleaner delegate = (LongTermArchivingHFileCleaner) cleaners.get(0);
@@ -257,8 +250,7 @@ public class TestZooKeeperTableArchiveClient {
     List<HRegion> regions = new ArrayList<>();
     regions.add(region);
     Mockito.doReturn(regions).when(rss).getRegions();
-    final CompactedHFilesDischarger compactionCleaner =
-        new CompactedHFilesDischarger(100, stop, rss, false);
+    final CompactedHFilesDischarger compactionCleaner = new CompactedHFilesDischarger(100, stop, rss);
     loadFlushAndCompact(region, TEST_FAM);
     compactionCleaner.chore();
     // create the another table that we don't archive
@@ -268,7 +260,7 @@ public class TestZooKeeperTableArchiveClient {
     regions.add(otherRegion);
     Mockito.doReturn(regions).when(rss).getRegions();
     final CompactedHFilesDischarger compactionCleaner1 = new CompactedHFilesDischarger(100, stop,
-        rss, false);
+        rss);
     loadFlushAndCompact(otherRegion, TEST_FAM);
     compactionCleaner1.chore();
     // get the current hfiles in the archive directory
@@ -346,7 +338,7 @@ public class TestZooKeeperTableArchiveClient {
       Stoppable stop) {
     conf.setStrings(HFileCleaner.MASTER_HFILE_CLEANER_PLUGINS,
       LongTermArchivingHFileCleaner.class.getCanonicalName());
-    return new HFileCleaner(1000, stop, conf, fs, archiveDir, POOL);
+    return new HFileCleaner(1000, stop, conf, fs, archiveDir);
   }
 
   /**
@@ -471,7 +463,7 @@ public class TestZooKeeperTableArchiveClient {
    */
   private void runCleaner(HFileCleaner cleaner, CountDownLatch finished, Stoppable stop)
       throws InterruptedException {
-    final ChoreService choreService = new ChoreService("CLEANER_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     // run the cleaner
     choreService.scheduleChore(cleaner);
     // wait for the cleaner to check all the files

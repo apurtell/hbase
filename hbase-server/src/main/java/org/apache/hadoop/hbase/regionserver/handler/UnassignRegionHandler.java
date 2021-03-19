@@ -30,8 +30,10 @@ import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices.RegionStateTransitionContext;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -88,7 +90,9 @@ public class UnassignRegionHandler extends EventHandler {
         long backoff = retryCounter.getBackoffTimeAndIncrementAttempts();
         LOG.warn("Received CLOSE for {} which we are already " +
           "trying to OPEN; try again after {}ms", encodedName, backoff);
-        rs.getExecutorService().delayedSubmit(this, backoff, TimeUnit.MILLISECONDS);
+        ExecutorPools.getScheduler(PoolType.REGION).schedule(
+          create(rs, encodedName, closeProcId, abort, destination),
+            backoff, TimeUnit.MILLISECONDS);
       } else {
         LOG.info("Received CLOSE for {} which we are already trying to CLOSE," +
           " but not completed yet", encodedName);

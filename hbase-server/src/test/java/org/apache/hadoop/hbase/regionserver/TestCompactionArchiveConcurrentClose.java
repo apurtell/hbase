@@ -103,8 +103,7 @@ public class TestCompactionArchiveConcurrentClose {
     Mockito.doReturn(regions).when(rss).getRegions();
 
     // Create the cleaner object
-    CompactedHFilesDischarger cleaner =
-        new CompactedHFilesDischarger(1000, (Stoppable) null, rss, false);
+    CompactedHFilesDischarger cleaner = new CompactedHFilesDischarger(1000, (Stoppable) null, rss);
     // Add some data to the region and do some flushes
     int batchSize = 10;
     int fileCount = 10;

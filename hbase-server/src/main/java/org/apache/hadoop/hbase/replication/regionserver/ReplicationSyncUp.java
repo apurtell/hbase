@@ -87,7 +87,7 @@ public class ReplicationSyncUp extends Configured implements Tool {
         new WALFactory(conf, "test", null, false));
       ReplicationSourceManager manager = replication.getReplicationManager();
       manager.init().get();
-      while (manager.activeFailoverTaskCount() > 0) {
+      while (manager.getActiveTaskCount() > 0) {
         Thread.sleep(SLEEP_TIME);
       }
       while (manager.getOldSources().size() > 0) {

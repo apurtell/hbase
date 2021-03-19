@@ -27,11 +27,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
-import java.util.concurrent.ThreadPoolExecutor;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.errorhandling.ForeignException;
 import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;
@@ -92,9 +90,7 @@ public class TestProcedureMember {
    * @return member to use for tests
    */
   private ProcedureMember buildCohortMember() {
-    String name = "node";
-    ThreadPoolExecutor pool = ProcedureMember.defaultPool(name, 1, POOL_KEEP_ALIVE);
-    return new ProcedureMember(mockMemberComms, pool, mockBuilder);
+    return new ProcedureMember(mockMemberComms, mockBuilder);
   }
 
   /**
@@ -102,9 +98,7 @@ public class TestProcedureMember {
    */
   private void buildCohortMemberPair() throws IOException {
     dispatcher = new ForeignExceptionDispatcher();
-    String name = "node";
-    ThreadPoolExecutor pool = ProcedureMember.defaultPool(name, 1, POOL_KEEP_ALIVE);
-    member = new ProcedureMember(mockMemberComms, pool, mockBuilder);
+    member = new ProcedureMember(mockMemberComms, mockBuilder);
     when(mockMemberComms.getMemberName()).thenReturn("membername"); // needed for generating exception
     Subprocedure subproc = new EmptySubprocedure(member, dispatcher);
     spySub = spy(subproc);
@@ -406,10 +400,9 @@ public class TestProcedureMember {
    */
   @Test
   public void testNoTaskToBeRunFromRequest() throws Exception {
-    ThreadPoolExecutor pool = mock(ThreadPoolExecutor.class);
     when(mockBuilder.buildSubprocedure(op, data)).thenReturn(null)
       .thenThrow(new IllegalStateException("Wrong state!"), new IllegalArgumentException("can't understand the args"));
-    member = new ProcedureMember(mockMemberComms, pool, mockBuilder);
+    member = new ProcedureMember(mockMemberComms, mockBuilder);
     // builder returns null
     // build a new operation
     Subprocedure subproc = member.createSubprocedure(op, data);
@@ -428,9 +421,6 @@ public class TestProcedureMember {
       member.submitSubprocedure(subproc3);
     } catch (IllegalArgumentException iae) {
     }
-
-    // no request should reach the pool
-    verifyZeroInteractions(pool);
     // get two abort requests
     // TODO Need to do another refactor to get this to propagate to the coordinator.
     // verify(mockMemberComms, times(2)).sendMemberAborted(any(), any());

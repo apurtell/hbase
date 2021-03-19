@@ -221,10 +221,6 @@ public interface MetricsRegionServerWrapper {
    */
   int getCompactionQueueSize();
 
-  int getSmallCompactionQueueSize();
-
-  int getLargeCompactionQueueSize();
-
   /**
    * Get the size of the flush queue.
    */

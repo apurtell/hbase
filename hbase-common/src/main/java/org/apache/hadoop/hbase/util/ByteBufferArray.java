@@ -24,11 +24,11 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.function.BiConsumer;
 
 import org.apache.hadoop.hbase.nio.ByteBuff;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -70,37 +70,33 @@ public class ByteBufferArray {
   }
 
   private void createBuffers(int threadCount, ByteBufferAllocator alloc) throws IOException {
-    ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+    ExecutorService pool = ExecutorPools.getPool(PoolType.IO);
     int perThreadCount = bufferCount / threadCount;
     int reminder = bufferCount % threadCount;
-    try {
-      List<Future<ByteBuffer[]>> futures = new ArrayList<>(threadCount);
-      // Dispatch the creation task to each thread.
-      for (int i = 0; i < threadCount; i++) {
-        final int chunkSize = perThreadCount + ((i == threadCount - 1) ? reminder : 0);
-        futures.add(pool.submit(() -> {
-          ByteBuffer[] chunk = new ByteBuffer[chunkSize];
-          for (int k = 0; k < chunkSize; k++) {
-            chunk[k] = alloc.allocate(bufferSize);
-          }
-          return chunk;
-        }));
-      }
-      // Append the buffers created by each thread.
-      int bufferIndex = 0;
-      try {
-        for (Future<ByteBuffer[]> f : futures) {
-          for (ByteBuffer b : f.get()) {
-            this.buffers[bufferIndex++] = b;
-          }
+    List<Future<ByteBuffer[]>> futures = new ArrayList<>(threadCount);
+    // Dispatch the creation task to each thread.
+    for (int i = 0; i < threadCount; i++) {
+      final int chunkSize = perThreadCount + ((i == threadCount - 1) ? reminder : 0);
+      futures.add(pool.submit(() -> {
+        ByteBuffer[] chunk = new ByteBuffer[chunkSize];
+        for (int k = 0; k < chunkSize; k++) {
+          chunk[k] = alloc.allocate(bufferSize);
         }
-        assert bufferIndex == bufferCount;
-      } catch (Exception e) {
-        LOG.error("Buffer creation interrupted", e);
-        throw new IOException(e);
+        return chunk;
+      }));
+    }
+    // Append the buffers created by each thread.
+    int bufferIndex = 0;
+    try {
+      for (Future<ByteBuffer[]> f : futures) {
+        for (ByteBuffer b : f.get()) {
+          this.buffers[bufferIndex++] = b;
+        }
       }
-    } finally {
-      pool.shutdownNow();
+      assert bufferIndex == bufferCount;
+    } catch (Exception e) {
+      LOG.error("Buffer creation interrupted", e);
+      throw new IOException(e);
     }
   }
 

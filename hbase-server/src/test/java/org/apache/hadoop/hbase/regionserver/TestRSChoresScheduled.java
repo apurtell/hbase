@@ -20,7 +20,6 @@ package org.apache.hadoop.hbase.regionserver;
 
 import java.lang.reflect.Field;
 
-import org.apache.hadoop.hbase.ExecutorStatusChore;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.ScheduledChore;
@@ -103,14 +102,6 @@ public class TestRSChoresScheduled {
     ScheduledChore nonceManagerChore =
       nonceManagerTestChoreField.getChoreObj("nonceManagerChore");
     nonceManagerTestChoreField.testIfChoreScheduled(nonceManagerChore);
-
-    // test if executorStatusChore chore is scheduled by default in HRegionServer init
-    TestChoreField<ExecutorStatusChore> executorStatusChoreTestChoreField =
-      new TestChoreField<>();
-    ExecutorStatusChore executorStatusChore =
-      executorStatusChoreTestChoreField.getChoreObj("executorStatusChore");
-    executorStatusChoreTestChoreField.testIfChoreScheduled(executorStatusChore);
-
   }
 
 }

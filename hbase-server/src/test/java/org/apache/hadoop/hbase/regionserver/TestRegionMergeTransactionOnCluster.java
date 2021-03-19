@@ -265,7 +265,7 @@ public class TestRegionMergeTransactionOnCluster {
           .getRegionServerThreads();
       for (RegionServerThread rs : regionServerThreads) {
         CompactedHFilesDischarger cleaner = new CompactedHFilesDischarger(100, null,
-            rs.getRegionServer(), false);
+            rs.getRegionServer());
         cleaner.chore();
         Thread.sleep(1000);
       }

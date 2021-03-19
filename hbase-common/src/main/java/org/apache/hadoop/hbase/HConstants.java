@@ -1236,10 +1236,6 @@ public final class HConstants {
       "hbase.node.health.failure.threshold";
   public static final int DEFAULT_HEALTH_FAILURE_THRESHOLD = 3;
 
-  public static final String EXECUTOR_STATUS_COLLECT_ENABLED =
-      "hbase.executors.status.collect.enabled";
-  public static final boolean DEFAULT_EXECUTOR_STATUS_COLLECT_ENABLED = true;
-
   /**
    * Setting to activate, or not, the publication of the status by the master. Default
    *  notification is by a multicast message.
@@ -1544,36 +1540,6 @@ public final class HConstants {
     "hbase.master.regions.recovery.check.interval";
 
   public static final int DEFAULT_REGIONS_RECOVERY_INTERVAL = 1200 * 1000; // Default 20 min
-
-  /**
-   * Configurations for master executor services.
-   */
-  public static final String MASTER_OPEN_REGION_THREADS =
-      "hbase.master.executor.openregion.threads";
-  public static final int MASTER_OPEN_REGION_THREADS_DEFAULT = 5;
-
-  public static final String MASTER_CLOSE_REGION_THREADS =
-      "hbase.master.executor.closeregion.threads";
-  public static final int MASTER_CLOSE_REGION_THREADS_DEFAULT = 5;
-
-  public static final String MASTER_SERVER_OPERATIONS_THREADS =
-      "hbase.master.executor.serverops.threads";
-  public static final int MASTER_SERVER_OPERATIONS_THREADS_DEFAULT = 5;
-
-  /**
-   * Number of threads used to dispatch merge operations to the regionservers.
-   */
-  public static final String MASTER_MERGE_DISPATCH_THREADS =
-      "hbase.master.executor.merge.dispatch.threads";
-  public static final int MASTER_MERGE_DISPATCH_THREADS_DEFAULT = 2;
-
-  public static final String MASTER_META_SERVER_OPERATIONS_THREADS =
-      "hbase.master.executor.meta.serverops.threads";
-  public static final int MASTER_META_SERVER_OPERATIONS_THREADS_DEFAULT = 5;
-
-  public static final String MASTER_LOG_REPLAY_OPS_THREADS =
-      "hbase.master.executor.logreplayops.threads";
-  public static final int MASTER_LOG_REPLAY_OPS_THREADS_DEFAULT = 10;
 
   public static final int DEFAULT_SLOW_LOG_RING_BUFFER_SIZE = 256;
 

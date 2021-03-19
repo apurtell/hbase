@@ -21,7 +21,6 @@ package org.apache.hadoop.hbase.regionserver;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hadoop.conf.Configuration;
@@ -33,6 +32,8 @@ import org.apache.hadoop.hbase.exceptions.IllegalArgumentIOException;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.wal.WAL;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -434,7 +435,7 @@ public class CompactingMemStore extends AbstractMemStore {
             LOG.trace("Dispatching the MemStore in-memory flush for store " + store
                 .getColumnFamilyName());
           }
-          getPool().execute(runnable);
+          ExecutorPools.getPool(PoolType.IO).execute(runnable);
         }
       }
       return false;
@@ -486,10 +487,6 @@ public class CompactingMemStore extends AbstractMemStore {
 
   private byte[] getFamilyNameInBytes() {
     return store.getColumnFamilyDescriptor().getName();
-  }
-
-  private ThreadPoolExecutor getPool() {
-    return getRegionServices().getInMemoryCompactionPool();
   }
 
   protected boolean shouldFlushInMemory(MutableSegment currActive, Cell cellToAdd,

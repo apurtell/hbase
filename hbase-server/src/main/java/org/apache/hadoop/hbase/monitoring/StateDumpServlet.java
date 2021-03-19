@@ -20,16 +20,15 @@ package org.apache.hadoop.hbase.monitoring;
 
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.util.Map;
 
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.executor.ExecutorService;
-import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorStatus;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.VersionInfo;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 
 @InterfaceAudience.Private
 public abstract class StateDumpServlet extends HttpServlet {
@@ -58,16 +57,10 @@ public abstract class StateDumpServlet extends HttpServlet {
     return Long.parseLong(param);
   }
 
-  protected void dumpExecutors(ExecutorService service, PrintWriter out)
-      throws IOException {
-    if (service == null) {
-      out.println("ExecutorService is not initialized");
-      return;
-    }
-
-    Map<String, ExecutorStatus> statuses = service.getAllExecutorStatuses();
-    for (ExecutorStatus status : statuses.values()) {
-      status.dumpTo(out, "  ");
+  protected void dumpExecutors(PrintWriter out) throws IOException {
+    for (PoolType pt: PoolType.values()) {
+      ExecutorPools.dumpPool(pt, out);
+      ExecutorPools.dumpScheduler(pt, out);
     }
   }
 }

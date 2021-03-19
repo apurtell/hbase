@@ -484,8 +484,7 @@ public class TestRegionReplicas {
           break;
         }
       }
-      CompactedHFilesDischarger cleaner =
-          new CompactedHFilesDischarger(100, null, hrs, false);
+      CompactedHFilesDischarger cleaner = new CompactedHFilesDischarger(100, null, hrs);
       cleaner.chore();
       // scan all the hfiles on the secondary.
       // since there are no read on the secondary when we ask locations to

@@ -38,7 +38,6 @@ import static org.mockito.Mockito.when;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;
@@ -93,8 +92,7 @@ public class TestProcedureCoordinator {
   }
 
   private ProcedureCoordinator buildNewCoordinator() {
-    ThreadPoolExecutor pool = ProcedureCoordinator.defaultPool(nodeName, 1, POOL_KEEP_ALIVE);
-    return spy(new ProcedureCoordinator(controller, pool));
+    return spy(new ProcedureCoordinator(controller));
   }
 
   /**

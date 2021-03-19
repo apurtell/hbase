@@ -138,7 +138,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), regionServerAccounting);
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     memStoreFlusher.flushType = FlushType.ABOVE_ONHEAP_HIGHER_MARK;
     memStoreFlusher.requestFlush(null, FlushLifeCycleTracker.DUMMY);
@@ -176,7 +176,7 @@ public class TestHeapMemoryManager {
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
     float maxStepValue = DefaultHeapMemoryTuner.DEFAULT_MIN_STEP_VALUE;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     blockCache.evictBlock(null);
     blockCache.evictBlock(null);
@@ -224,7 +224,7 @@ public class TestHeapMemoryManager {
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
     float maxStepValue = DefaultHeapMemoryTuner.DEFAULT_MIN_STEP_VALUE;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     blockCache.evictBlock(null);
     blockCache.evictBlock(null);
@@ -278,7 +278,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), regionServerAccounting);
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     blockCache.evictBlock(null);
     blockCache.evictBlock(null);
@@ -311,7 +311,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), regionServerAccounting);
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     memStoreFlusher.flushType = FlushType.ABOVE_ONHEAP_LOWER_MARK;
     memStoreFlusher.requestFlush(null, FlushLifeCycleTracker.DUMMY);
@@ -359,7 +359,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), regionServerAccounting);
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     // this should not change anything with onheap memstore
     memStoreFlusher.flushType = FlushType.ABOVE_OFFHEAP_HIGHER_MARK;
@@ -401,7 +401,7 @@ public class TestHeapMemoryManager {
     float maxStepValue = (maxTuneSize * 1.0f) / oldMemstoreHeapSize;
     maxStepValue = maxStepValue > DefaultHeapMemoryTuner.DEFAULT_MAX_STEP_VALUE ?
         DefaultHeapMemoryTuner.DEFAULT_MAX_STEP_VALUE:maxStepValue;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     blockCache.evictBlock(null);
     blockCache.evictBlock(null);
@@ -447,7 +447,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), regionServerAccounting);
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     memStoreFlusher.flushType = FlushType.ABOVE_ONHEAP_LOWER_MARK;
     memStoreFlusher.requestFlush(null, FlushLifeCycleTracker.DUMMY);
@@ -493,7 +493,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), regionServerAccounting);
     long oldMemstoreHeapSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     memStoreFlusher.flushType = FlushType.ABOVE_ONHEAP_LOWER_MARK;
     memStoreFlusher.requestFlush(null, FlushLifeCycleTracker.DUMMY);
@@ -537,7 +537,7 @@ public class TestHeapMemoryManager {
     // Let the system start with default values for memstore heap and block cache size.
     HeapMemoryManager heapMemoryManager = new HeapMemoryManager(blockCache, memStoreFlusher,
         new RegionServerStub(conf), new RegionServerAccountingStub(conf));
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     // Now we wants to be in write mode. Set bigger memstore size from CustomHeapMemoryTuner
     CustomHeapMemoryTuner.memstoreSize = 0.78f;
@@ -570,7 +570,7 @@ public class TestHeapMemoryManager {
         HeapMemoryTuner.class);
     HeapMemoryManager heapMemoryManager = new HeapMemoryManager(blockCache, memStoreFlusher,
         new RegionServerStub(conf), new RegionServerAccountingStub(conf));
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     CustomHeapMemoryTuner.memstoreSize = 0.78f;
     CustomHeapMemoryTuner.blockCacheSize = 0.02f;
@@ -598,7 +598,7 @@ public class TestHeapMemoryManager {
         new RegionServerStub(conf), new RegionServerAccountingStub(conf));
     long oldMemstoreSize = memStoreFlusher.memstoreSize;
     long oldBlockCacheSize = blockCache.maxSize;
-    final ChoreService choreService = new ChoreService("TEST_SERVER_NAME");
+    final ChoreService choreService = new ChoreService();
     heapMemoryManager.start(choreService);
     CustomHeapMemoryTuner.memstoreSize = 0.7f;
     CustomHeapMemoryTuner.blockCacheSize = 0.3f;

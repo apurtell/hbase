@@ -627,9 +627,7 @@ public class TestSplitTransactionOnCluster {
       // file discharger process. It runs infrequently. Make it run so CatalogJanitor
       // doens't find any references.
       for (RegionServerThread rst : cluster.getRegionServerThreads()) {
-        boolean oldSetting = rst.getRegionServer().compactedFileDischarger.setUseExecutor(false);
         rst.getRegionServer().compactedFileDischarger.run();
-        rst.getRegionServer().compactedFileDischarger.setUseExecutor(oldSetting);
       }
       cluster.getMaster().setCatalogJanitorEnabled(true);
       ProcedureTestingUtility.waitAllProcedures(cluster.getMaster().getMasterProcedureExecutor());

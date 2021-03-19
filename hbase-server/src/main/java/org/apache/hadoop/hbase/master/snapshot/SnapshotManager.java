@@ -28,10 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -48,7 +45,6 @@ import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.client.TableState;
 import org.apache.hadoop.hbase.errorhandling.ForeignException;
-import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.ipc.RpcServer;
 import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
 import org.apache.hadoop.hbase.master.MasterFileSystem;
@@ -84,6 +80,8 @@ import org.apache.hadoop.hbase.snapshot.TablePartiallyOpenException;
 import org.apache.hadoop.hbase.snapshot.UnknownSnapshotException;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.NonceKey;
 import org.apache.hadoop.hbase.util.TableDescriptorChecker;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -91,8 +89,6 @@ import org.apache.yetus.audience.InterfaceStability;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.NameStringPair;
@@ -166,9 +162,7 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
   // snapshotTable() will insert an Handler in the table.
   // isSnapshotDone() will remove the handler requested if the operation is finished.
   private final Map<TableName, SnapshotSentinel> snapshotHandlers = new ConcurrentHashMap<>();
-  private final ScheduledExecutorService scheduleThreadPool =
-      Executors.newScheduledThreadPool(1, new ThreadFactoryBuilder()
-          .setNameFormat("SnapshotHandlerChoreCleaner").setDaemon(true).build());
+
   private ScheduledFuture<?> snapshotHandlerChoreCleanerTask;
 
   // Restore map, with table name as key, procedure ID as value.
@@ -181,7 +175,6 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
   private Map<TableName, Long> restoreTableToProcIdMap = new HashMap<>();
 
   private Path rootDir;
-  private ExecutorService executorService;
 
   /**
    * Read write lock between taking snapshot and snapshot HFile cleaner. The cleaner should skip to
@@ -201,7 +194,7 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
    */
   @InterfaceAudience.Private
   SnapshotManager(final MasterServices master, ProcedureCoordinator coordinator,
-      ExecutorService pool, int sentinelCleanInterval)
+      int sentinelCleanInterval)
       throws IOException, UnsupportedOperationException {
     this.master = master;
 
@@ -210,9 +203,8 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
     checkSnapshotSupport(conf, master.getMasterFileSystem());
 
     this.coordinator = coordinator;
-    this.executorService = pool;
     resetTempDir();
-    snapshotHandlerChoreCleanerTask = this.scheduleThreadPool.scheduleAtFixedRate(
+    snapshotHandlerChoreCleanerTask = ExecutorPools.getScheduler(PoolType.SNAPSHOT).scheduleAtFixedRate(
       this::cleanupSentinels, sentinelCleanInterval, sentinelCleanInterval, TimeUnit.SECONDS);
   }
 
@@ -547,7 +539,7 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
       final TakeSnapshotHandler handler) throws IOException {
     try {
       handler.prepare();
-      this.executorService.submit(handler);
+      ExecutorPools.getPool(PoolType.SNAPSHOT).submit(handler);
       this.snapshotHandlers.put(TableName.valueOf(snapshot.getTable()), handler);
     } catch (Exception e) {
       // cleanup the working directory by trying to delete it from the fs.
@@ -1197,19 +1189,15 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
                     SnapshotDescriptionUtils.DEFAULT_MAX_WAIT_TIME),
             conf.getLong(SnapshotDescriptionUtils.MASTER_SNAPSHOT_TIMEOUT_MILLIS,
                     SnapshotDescriptionUtils.DEFAULT_MAX_WAIT_TIME));
-    int opThreads = conf.getInt(SNAPSHOT_POOL_THREADS_KEY, SNAPSHOT_POOL_THREADS_DEFAULT);
 
     // setup the default procedure coordinator
     String name = master.getServerName().toString();
-    ThreadPoolExecutor tpool = ProcedureCoordinator.defaultPool(name, opThreads);
     ProcedureCoordinatorRpcs comms = new ZKProcedureCoordinator(
         master.getZooKeeper(), SnapshotManager.ONLINE_SNAPSHOT_CONTROLLER_DESCRIPTION, name);
-
-    this.coordinator = new ProcedureCoordinator(comms, tpool, timeoutMillis, wakeFrequency);
-    this.executorService = master.getExecutorService();
+    this.coordinator = new ProcedureCoordinator(comms, timeoutMillis, wakeFrequency);
     resetTempDir();
-    snapshotHandlerChoreCleanerTask =
-        scheduleThreadPool.scheduleAtFixedRate(this::cleanupSentinels, 10, 10, TimeUnit.SECONDS);
+    snapshotHandlerChoreCleanerTask = ExecutorPools.getScheduler(PoolType.SNAPSHOT)
+        .scheduleAtFixedRate(this::cleanupSentinels, 10, 10, TimeUnit.SECONDS);
   }
 
   @Override

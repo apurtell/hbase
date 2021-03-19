@@ -26,10 +26,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -44,9 +40,10 @@ import org.apache.hadoop.hbase.regionserver.HStoreFile;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HFileArchiveUtil;
-import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.io.MultipleIOException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -74,8 +71,6 @@ public class HFileArchiver {
           return file == null ? null : file.getPath();
         }
       };
-
-  private static ThreadPoolExecutor archiveExecutor;
 
   private HFileArchiver() {
     // hidden ctor since this is just a util
@@ -187,7 +182,7 @@ public class HFileArchiver {
     List<Path> regionDirList) throws IOException {
     List<Future<Void>> futures = new ArrayList<>(regionDirList.size());
     for (Path regionDir: regionDirList) {
-      Future<Void> future = getArchiveExecutor(conf).submit(() -> {
+      Future<Void> future = ExecutorPools.getPool(PoolType.FILE).submit(() -> {
         archiveRegion(fs, rootDir, tableDir, regionDir);
         return null;
       });
@@ -202,36 +197,6 @@ public class HFileArchiver {
     } catch (ExecutionException e) {
       throw new IOException(e.getCause());
     }
-  }
-
-  private static synchronized ThreadPoolExecutor getArchiveExecutor(final Configuration conf) {
-    if (archiveExecutor == null) {
-      int maxThreads = conf.getInt("hbase.hfilearchiver.thread.pool.max", 8);
-      archiveExecutor = Threads.getBoundedCachedThreadPool(maxThreads, 30L, TimeUnit.SECONDS,
-        getThreadFactory());
-
-      // Shutdown this ThreadPool in a shutdown hook
-      Runtime.getRuntime().addShutdownHook(new Thread(() -> archiveExecutor.shutdown()));
-    }
-    return archiveExecutor;
-  }
-
-  // We need this method instead of Threads.getNamedThreadFactory() to pass some tests.
-  // The difference from Threads.getNamedThreadFactory() is that it doesn't fix ThreadGroup for
-  // new threads. If we use Threads.getNamedThreadFactory(), we will face ThreadGroup related
-  // issues in some tests.
-  private static ThreadFactory getThreadFactory() {
-    return new ThreadFactory() {
-      final AtomicInteger threadNumber = new AtomicInteger(1);
-
-      @Override
-      public Thread newThread(Runnable r) {
-        final String name = "HFileArchiver-" + threadNumber.getAndIncrement();
-        Thread t = new Thread(r, name);
-        t.setDaemon(true);
-        return t;
-      }
-    };
   }
 
   /**

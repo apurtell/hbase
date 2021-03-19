@@ -102,8 +102,7 @@ public class TestCompactedHFilesDischarger {
   @Test
   public void testCompactedHFilesCleaner() throws Exception {
     // Create the cleaner object
-    CompactedHFilesDischarger cleaner =
-        new CompactedHFilesDischarger(1000, (Stoppable) null, rss, false);
+    CompactedHFilesDischarger cleaner = new CompactedHFilesDischarger(1000, (Stoppable) null, rss);
     // Add some data to the region and do some flushes
     for (int i = 1; i < 10; i++) {
       Put p = new Put(Bytes.toBytes("row" + i));
@@ -169,7 +168,7 @@ public class TestCompactedHFilesDischarger {
   public void testCleanerWithParallelScannersAfterCompaction() throws Exception {
     // Create the cleaner object
     CompactedHFilesDischarger cleaner =
-        new CompactedHFilesDischarger(1000, (Stoppable) null, rss, false);
+        new CompactedHFilesDischarger(1000, (Stoppable) null, rss);
     // Add some data to the region and do some flushes
     for (int i = 1; i < 10; i++) {
       Put p = new Put(Bytes.toBytes("row" + i));
@@ -240,7 +239,7 @@ public class TestCompactedHFilesDischarger {
   public void testCleanerWithParallelScanners() throws Exception {
     // Create the cleaner object
     CompactedHFilesDischarger cleaner =
-        new CompactedHFilesDischarger(1000, (Stoppable) null, rss, false);
+        new CompactedHFilesDischarger(1000, (Stoppable) null, rss);
     // Add some data to the region and do some flushes
     for (int i = 1; i < 10; i++) {
       Put p = new Put(Bytes.toBytes("row" + i));
@@ -370,7 +369,7 @@ public class TestCompactedHFilesDischarger {
 
     // Create the cleaner object
     CompactedHFilesDischarger cleaner =
-        new CompactedHFilesDischarger(1000, (Stoppable) null, rss, false);
+        new CompactedHFilesDischarger(1000, (Stoppable) null, rss);
     cleaner.chore();
     // This issues scan next
     scanner.next(res);

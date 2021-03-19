@@ -35,8 +35,10 @@ import org.apache.hadoop.hbase.regionserver.handler.OpenRegionHandler;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.testclassification.RegionServerTests;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.JVMClusterUtil.RegionServerThread;
 import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.zookeeper.MetaTableLocator;
 import org.apache.hadoop.hbase.zookeeper.ZKWatcher;
 import org.junit.AfterClass;
@@ -270,7 +272,7 @@ public class TestRegionServerNoMaster {
     // Let's start the open handler
     TableDescriptor htd = getRS().tableDescriptors.get(hri.getTable());
 
-    getRS().executorService.submit(new OpenRegionHandler(getRS(), getRS(), hri, htd, -1));
+    ExecutorPools.getPool(PoolType.REGION).submit(new OpenRegionHandler(getRS(), getRS(), hri, htd, -1));
 
     // The open handler should have removed the region from RIT but kept the region closed
     checkRegionIsClosed(HTU, getRS(), hri);

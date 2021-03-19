@@ -146,7 +146,7 @@ public abstract class IntegrationTestBase extends AbstractHBaseTool {
     // for more details.
     final ScheduledChore authChore = AuthUtil.getAuthChore(conf);
     if (authChore != null) {
-      choreService = new ChoreService("INTEGRATION_TEST");
+      choreService = new ChoreService();
       choreService.scheduleChore(authChore);
     }
 

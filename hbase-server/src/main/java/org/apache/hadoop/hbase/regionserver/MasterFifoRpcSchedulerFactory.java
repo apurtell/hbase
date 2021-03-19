@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase.regionserver;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
-import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.ipc.MasterFifoRpcScheduler;
 import org.apache.hadoop.hbase.ipc.PriorityFunction;
 import org.apache.hadoop.hbase.ipc.RpcScheduler;
@@ -34,11 +33,6 @@ import org.apache.yetus.audience.InterfaceStability;
 public class MasterFifoRpcSchedulerFactory extends FifoRpcSchedulerFactory {
   @Override
   public RpcScheduler create(Configuration conf, PriorityFunction priority, Abortable server) {
-    int totalHandlerCount = conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT,
-      HConstants.DEFAULT_REGION_SERVER_HANDLER_COUNT);
-    int rsReportHandlerCount = Math.max(1, conf
-        .getInt(MasterFifoRpcScheduler.MASTER_SERVER_REPORT_HANDLER_COUNT, totalHandlerCount / 2));
-    int callHandlerCount = Math.max(1, totalHandlerCount - rsReportHandlerCount);
-    return new MasterFifoRpcScheduler(conf, callHandlerCount, rsReportHandlerCount);
+    return new MasterFifoRpcScheduler(conf);
   }
 }

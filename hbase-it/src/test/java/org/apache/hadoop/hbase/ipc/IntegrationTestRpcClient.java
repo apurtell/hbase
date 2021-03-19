@@ -111,7 +111,7 @@ public class IntegrationTestRpcClient {
             "testRpcServer", Lists
                 .newArrayList(new BlockingServiceAndInterface(SERVICE, null)),
             new InetSocketAddress("localhost", 0), conf, new FifoRpcScheduler(
-                conf, 1));
+                conf));
         rpcServer.start();
         InetSocketAddress address = rpcServer.getListenerAddress();
         if (address == null) {

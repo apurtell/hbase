@@ -24,7 +24,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorCompletionService;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
@@ -36,6 +35,8 @@ import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -137,7 +138,7 @@ public final class SnapshotManifestV2 {
   }
 
   static List<SnapshotRegionManifest> loadRegionManifests(final Configuration conf,
-      final Executor executor, final FileSystem fs, final Path snapshotDir,
+      final FileSystem fs, final Path snapshotDir,
       final SnapshotDescription desc, final int manifestSizeLimit) throws IOException {
     FileStatus[] manifestFiles = CommonFSUtils.listStatus(fs, snapshotDir, new PathFilter() {
       @Override
@@ -149,7 +150,7 @@ public final class SnapshotManifestV2 {
     if (manifestFiles == null || manifestFiles.length == 0) return null;
 
     final ExecutorCompletionService<SnapshotRegionManifest> completionService =
-      new ExecutorCompletionService<>(executor);
+      new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.SNAPSHOT));
     for (final FileStatus st: manifestFiles) {
       completionService.submit(new Callable<SnapshotRegionManifest>() {
         @Override

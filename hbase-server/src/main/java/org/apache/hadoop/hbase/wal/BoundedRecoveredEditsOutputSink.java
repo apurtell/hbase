@@ -121,8 +121,6 @@ class BoundedRecoveredEditsOutputSink extends AbstractRecoveredEditsOutputSink {
       throw iie;
     } catch (ExecutionException e) {
       throw new IOException(e.getCause());
-    } finally {
-      closeThreadPool.shutdownNow();
     }
     return !progressFailed;
   }

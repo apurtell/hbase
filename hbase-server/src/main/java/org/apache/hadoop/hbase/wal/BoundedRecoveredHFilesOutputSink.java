@@ -161,8 +161,6 @@ public class BoundedRecoveredHFilesOutputSink extends OutputSink {
       throw iie;
     } catch (ExecutionException e) {
       throw new IOException(e.getCause());
-    } finally {
-      closeThreadPool.shutdownNow();
     }
     return !progressFailed;
   }

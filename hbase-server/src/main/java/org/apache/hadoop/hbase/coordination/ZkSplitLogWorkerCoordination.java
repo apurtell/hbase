@@ -44,6 +44,8 @@ import org.apache.hadoop.hbase.regionserver.SplitLogWorker.TaskExecutor;
 import org.apache.hadoop.hbase.regionserver.handler.WALSplitterHandler;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
 import org.apache.hadoop.hbase.zookeeper.ZKListener;
 import org.apache.hadoop.hbase.zookeeper.ZKMetadata;
@@ -320,7 +322,7 @@ public class ZkSplitLogWorkerCoordination extends ZKListener implements
     WALSplitterHandler hsh =
         new WALSplitterHandler(server, this, splitTaskDetails, reporter,
             this.tasksInProgress, splitTaskExecutor);
-    server.getExecutorService().submit(hsh);
+    ExecutorPools.getPool(PoolType.WAL).submit(hsh);
   }
 
   /**

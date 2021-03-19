@@ -19,10 +19,9 @@
 package org.apache.hadoop.metrics2.lib;
 
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.metrics2.MetricsExecutor;
 import org.apache.yetus.audience.InterfaceAudience;
 
@@ -48,23 +47,7 @@ public class MetricsExecutorImpl implements MetricsExecutor {
 
   private enum ExecutorSingleton {
     INSTANCE;
-    private final transient ScheduledExecutorService scheduler = new ScheduledThreadPoolExecutor(1,
-        new ThreadPoolExecutorThreadFactory("HBase-Metrics2-"));
-  }
-
-  private final static class ThreadPoolExecutorThreadFactory implements ThreadFactory {
-    private final String name;
-    private final AtomicInteger threadNumber = new AtomicInteger(1);
-
-    private ThreadPoolExecutorThreadFactory(String name) {
-      this.name = name;
-    }
-
-    @Override
-    public Thread newThread(Runnable runnable) {
-      Thread t = new Thread(runnable, name + threadNumber.getAndIncrement());
-      t.setDaemon(true);
-      return t;
-    }
+    private final transient ScheduledExecutorService scheduler = 
+        ExecutorPools.getScheduler(PoolType.METRICS);
   }
 }

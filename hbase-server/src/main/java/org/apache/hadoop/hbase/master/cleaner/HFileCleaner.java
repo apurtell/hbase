@@ -50,8 +50,8 @@ public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate>
   public static final String MASTER_HFILE_CLEANER_PLUGINS = "hbase.master.hfilecleaner.plugins";
 
   public HFileCleaner(final int period, final Stoppable stopper, Configuration conf, FileSystem fs,
-    Path directory, DirScanPool pool) {
-    this(period, stopper, conf, fs, directory, pool, null);
+    Path directory) {
+    this(period, stopper, conf, fs, directory, null);
   }
 
   // Configuration key for large/small throttle point
@@ -114,9 +114,8 @@ public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate>
    * @param params params could be used in subclass of BaseHFileCleanerDelegate
    */
   public HFileCleaner(final int period, final Stoppable stopper, Configuration conf, FileSystem fs,
-    Path directory, DirScanPool pool, Map<String, Object> params) {
-    this("HFileCleaner", period, stopper, conf, fs, directory, MASTER_HFILE_CLEANER_PLUGINS, pool,
-      params);
+    Path directory, Map<String, Object> params) {
+    this("HFileCleaner", period, stopper, conf, fs, directory, MASTER_HFILE_CLEANER_PLUGINS, params);
 
   }
 
@@ -133,8 +132,8 @@ public class HFileCleaner extends CleanerChore<BaseHFileCleanerDelegate>
    * @param params params could be used in subclass of BaseHFileCleanerDelegate
    */
   public HFileCleaner(String name, int period, Stoppable stopper, Configuration conf, FileSystem fs,
-    Path directory, String confKey, DirScanPool pool, Map<String, Object> params) {
-    super(name, period, stopper, conf, fs, directory, confKey, pool, params);
+    Path directory, String confKey, Map<String, Object> params) {
+    super(name, period, stopper, conf, fs, directory, confKey, params);
     throttlePoint =
       conf.getInt(HFILE_DELETE_THROTTLE_THRESHOLD, DEFAULT_HFILE_DELETE_THROTTLE_THRESHOLD);
     largeQueueInitSize =

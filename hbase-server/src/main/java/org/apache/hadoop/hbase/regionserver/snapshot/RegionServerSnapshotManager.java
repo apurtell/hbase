@@ -26,17 +26,15 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.TableName;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.zookeeper.ZKWatcher;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 import org.apache.hadoop.hbase.client.RegionReplicaUtil;
@@ -76,10 +74,6 @@ import org.slf4j.LoggerFactory;
 @InterfaceStability.Unstable
 public class RegionServerSnapshotManager extends RegionServerProcedureManager {
   private static final Logger LOG = LoggerFactory.getLogger(RegionServerSnapshotManager.class);
-
-  /** Maximum number of snapshot region tasks that can run concurrently */
-  private static final String CONCURENT_SNAPSHOT_TASKS_KEY = "hbase.snapshot.region.concurrentTasks";
-  private static final int DEFAULT_CONCURRENT_SNAPSHOT_TASKS = 3;
 
   /** Conf key for number of request threads to start snapshots on regionservers */
   public static final String SNAPSHOT_REQUEST_THREADS_KEY = "hbase.snapshot.region.pool.threads";
@@ -270,23 +264,14 @@ public class RegionServerSnapshotManager extends RegionServerProcedureManager {
   static class SnapshotSubprocedurePool {
     private final Abortable abortable;
     private final ExecutorCompletionService<Void> taskPool;
-    private final ThreadPoolExecutor executor;
     private volatile boolean stopped;
     private final List<Future<Void>> futures = new ArrayList<>();
     private final String name;
 
     SnapshotSubprocedurePool(String name, Configuration conf, Abortable abortable) {
       this.abortable = abortable;
-      // configure the executor service
-      long keepAlive = conf.getLong(
-        RegionServerSnapshotManager.SNAPSHOT_TIMEOUT_MILLIS_KEY,
-        RegionServerSnapshotManager.SNAPSHOT_TIMEOUT_MILLIS_DEFAULT);
-      int threads = conf.getInt(CONCURENT_SNAPSHOT_TASKS_KEY, DEFAULT_CONCURRENT_SNAPSHOT_TASKS);
       this.name = name;
-      executor = Threads.getBoundedCachedThreadPool(threads, keepAlive, TimeUnit.MILLISECONDS,
-        new ThreadFactoryBuilder().setNameFormat("rs(" + name + ")-snapshot-pool-%d")
-          .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
-      taskPool = new ExecutorCompletionService<>(executor);
+      taskPool = new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.PROCEDURE));
     }
 
     boolean hasTasks() {
@@ -378,9 +363,7 @@ public class RegionServerSnapshotManager extends RegionServerProcedureManager {
      */
     void stop() {
       if (this.stopped) return;
-
       this.stopped = true;
-      this.executor.shutdown();
     }
   }
 
@@ -395,16 +378,7 @@ public class RegionServerSnapshotManager extends RegionServerProcedureManager {
     ZKWatcher zkw = rss.getZooKeeper();
     this.memberRpcs = new ZKProcedureMemberRpcs(zkw,
         SnapshotManager.ONLINE_SNAPSHOT_CONTROLLER_DESCRIPTION);
-
-    // read in the snapshot request configuration properties
-    Configuration conf = rss.getConfiguration();
-    long keepAlive = conf.getLong(SNAPSHOT_TIMEOUT_MILLIS_KEY, SNAPSHOT_TIMEOUT_MILLIS_DEFAULT);
-    int opThreads = conf.getInt(SNAPSHOT_REQUEST_THREADS_KEY, SNAPSHOT_REQUEST_THREADS_DEFAULT);
-
-    // create the actual snapshot procedure member
-    ThreadPoolExecutor pool = ProcedureMember.defaultPool(rss.getServerName().toString(),
-      opThreads, keepAlive);
-    this.member = new ProcedureMember(memberRpcs, pool, new SnapshotSubprocedureBuilder());
+    this.member = new ProcedureMember(memberRpcs, new SnapshotSubprocedureBuilder());
   }
 
   @Override

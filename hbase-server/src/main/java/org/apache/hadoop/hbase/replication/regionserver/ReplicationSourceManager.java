@@ -35,11 +35,8 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -66,7 +63,9 @@ import org.apache.hadoop.hbase.replication.ReplicationQueueStorage;
 import org.apache.hadoop.hbase.replication.ReplicationTracker;
 import org.apache.hadoop.hbase.replication.ReplicationUtils;
 import org.apache.hadoop.hbase.replication.SyncReplicationState;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
 import org.apache.hadoop.hbase.wal.SyncReplicationWALProvider;
 import org.apache.hadoop.hbase.wal.WAL;
@@ -78,7 +77,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.hbase.thirdparty.com.google.common.collect.Sets;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * This class is responsible to manage all the replication sources. There are two classes of
@@ -171,8 +169,6 @@ public class ReplicationSourceManager implements ReplicationListener {
   private final WALFactory walFactory;
   // The number of ms that we wait before moving znodes, HBASE-3596
   private final long sleepBeforeFailover;
-  // Homemade executer service for replication
-  private final ThreadPoolExecutor executor;
 
   private final boolean replicationForBulkLoadDataEnabled;
 
@@ -231,17 +227,6 @@ public class ReplicationSourceManager implements ReplicationListener {
     this.walFactory = walFactory;
     this.syncReplicationPeerMappingManager = syncReplicationPeerMappingManager;
     this.replicationTracker.registerListener(this);
-    // It's preferable to failover 1 RS at a time, but with good zk servers
-    // more could be processed at the same time.
-    int nbWorkers = conf.getInt("replication.executor.workers", 1);
-    // use a short 100ms sleep since this could be done inline with a RS startup
-    // even if we fail, other region servers can take care of it
-    this.executor = new ThreadPoolExecutor(nbWorkers, nbWorkers, 100,
-        TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
-    ThreadFactoryBuilder tfb = new ThreadFactoryBuilder();
-    tfb.setNameFormat("ReplicationExecutor-%d");
-    tfb.setDaemon(true);
-    this.executor.setThreadFactory(tfb.build());
     this.latestPaths = new HashMap<>();
     this.replicationForBulkLoadDataEnabled = conf.getBoolean(
       HConstants.REPLICATION_BULKLOAD_ENABLE_KEY, HConstants.REPLICATION_BULKLOAD_ENABLE_DEFAULT);
@@ -268,7 +253,7 @@ public class ReplicationSourceManager implements ReplicationListener {
         throwIOExceptionWhenFail(() -> this.queueStorage.addPeerToHFileRefs(id));
       }
     }
-    return this.executor.submit(this::adoptAbandonedQueues);
+    return ExecutorPools.getPool(PoolType.REPLICATION).submit(this::adoptAbandonedQueues);
   }
 
   private void adoptAbandonedQueues() {
@@ -848,7 +833,7 @@ public class ReplicationSourceManager implements ReplicationListener {
     }
     NodeFailoverWorker transfer = new NodeFailoverWorker(deadRS);
     try {
-      this.executor.execute(transfer);
+      ExecutorPools.getPool(PoolType.REPLICATION).execute(transfer);
     } catch (RejectedExecutionException ex) {
       CompatibilitySingletonFactory.getInstance(MetricsReplicationSourceFactory.class)
           .getGlobalSource().incrFailedRecoveryQueue();
@@ -1016,7 +1001,7 @@ public class ReplicationSourceManager implements ReplicationListener {
    * Terminate the replication on this region server
    */
   public void join() {
-    this.executor.shutdown();
+    // TODO: Track replication pool task futures and wait
     for (ReplicationSourceInterface source : this.sources.values()) {
       source.terminate("Region server is closing");
     }
@@ -1162,8 +1147,8 @@ public class ReplicationSourceManager implements ReplicationListener {
     interruptOrAbortWhenFail(() -> this.queueStorage.removeHFileRefs(peerId, files));
   }
 
-  int activeFailoverTaskCount() {
-    return executor.getActiveCount();
+  int getActiveTaskCount() {
+    return ExecutorPools.getPool(PoolType.REPLICATION).getActiveCount();
   }
 
   MetricsReplicationGlobalSourceSource getGlobalMetrics() {

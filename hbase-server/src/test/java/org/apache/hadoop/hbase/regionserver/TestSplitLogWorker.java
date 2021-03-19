@@ -75,7 +75,6 @@ public class TestSplitLogWorker {
   private DummyServer ds;
   private ZKWatcher zkw;
   private SplitLogWorker slw;
-  private ExecutorService executorService;
 
   static class DummyServer extends MockServer {
     private ZKWatcher zkw;
@@ -153,16 +152,10 @@ public class TestSplitLogWorker {
     assertThat(ZKUtil.checkExists(zkw, zkw.getZNodePaths().rsZNode), not(is(-1)));
 
     SplitLogCounters.resetCounters();
-    executorService = new ExecutorService("TestSplitLogWorker");
-    executorService.startExecutorService(executorService.new ExecutorConfig().setExecutorType(
-        ExecutorType.RS_LOG_REPLAY_OPS).setCorePoolSize(10));
   }
 
   @After
   public void teardown() throws Exception {
-    if (executorService != null) {
-      executorService.shutdown();
-    }
     TEST_UTIL.shutdownMiniZKCluster();
   }
 
@@ -425,7 +418,6 @@ public class TestSplitLogWorker {
     when(mockedServer.getServerName()).thenReturn(name);
     when(mockedServer.getZooKeeper()).thenReturn(zkw);
     when(mockedServer.isStopped()).thenReturn(false);
-    when(mockedServer.getExecutorService()).thenReturn(executorService);
 
     return mockedServer;
   }

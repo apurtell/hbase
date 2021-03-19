@@ -114,7 +114,7 @@ public class ChaosService {
 
     try {
       if (authChore != null) {
-        choreChaosService = new ChoreService(ChaosConstants.CHORE_SERVICE_PREFIX);
+        choreChaosService = new ChoreService();
         choreChaosService.scheduleChore(authChore);
       }
 

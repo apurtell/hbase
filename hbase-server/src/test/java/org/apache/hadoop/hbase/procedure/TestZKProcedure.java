@@ -32,7 +32,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
@@ -73,8 +72,6 @@ public class TestZKProcedure {
   private static final Logger LOG = LoggerFactory.getLogger(TestZKProcedure.class);
   private static HBaseTestingUtility UTIL = new HBaseTestingUtility();
   private static final String COORDINATOR_NODE_NAME = "coordinator";
-  private static final long KEEP_ALIVE = 100; // seconds
-  private static final int POOL_SIZE = 1;
   private static final long TIMEOUT = 10000; // when debugging make this larger for debugging
   private static final long WAKE_FREQUENCY = 500;
   private static final String opName = "op";
@@ -135,8 +132,7 @@ public class TestZKProcedure {
     // start running the controller
     ZKProcedureCoordinator coordinatorComms = new ZKProcedureCoordinator(
         coordZkw, opDescription, COORDINATOR_NODE_NAME);
-    ThreadPoolExecutor pool = ProcedureCoordinator.defaultPool(COORDINATOR_NODE_NAME, POOL_SIZE, KEEP_ALIVE);
-    ProcedureCoordinator coordinator = new ProcedureCoordinator(coordinatorComms, pool) {
+    ProcedureCoordinator coordinator = new ProcedureCoordinator(coordinatorComms) {
       @Override
       public Procedure createProcedure(ForeignExceptionDispatcher fed, String procName, byte[] procArgs,
           List<String> expectedMembers) {
@@ -152,8 +148,7 @@ public class TestZKProcedure {
     for (String member : members) {
       ZKWatcher watcher = newZooKeeperWatcher();
       ZKProcedureMemberRpcs comms = new ZKProcedureMemberRpcs(watcher, opDescription);
-      ThreadPoolExecutor pool2 = ProcedureMember.defaultPool(member, 1, KEEP_ALIVE);
-      ProcedureMember procMember = new ProcedureMember(comms, pool2, subprocFactory);
+      ProcedureMember procMember = new ProcedureMember(comms, subprocFactory);
       procMembers.add(new Pair<>(procMember, comms));
       comms.start(member, procMember);
     }
@@ -216,8 +211,7 @@ public class TestZKProcedure {
     ZKWatcher coordinatorWatcher = newZooKeeperWatcher();
     ZKProcedureCoordinator coordinatorController = new ZKProcedureCoordinator(
         coordinatorWatcher, opDescription, COORDINATOR_NODE_NAME);
-    ThreadPoolExecutor pool = ProcedureCoordinator.defaultPool(COORDINATOR_NODE_NAME, POOL_SIZE, KEEP_ALIVE);
-    ProcedureCoordinator coordinator = spy(new ProcedureCoordinator(coordinatorController, pool));
+    ProcedureCoordinator coordinator = spy(new ProcedureCoordinator(coordinatorController));
 
     // start a member for each node
     SubprocedureFactory subprocFactory = Mockito.mock(SubprocedureFactory.class);
@@ -225,8 +219,7 @@ public class TestZKProcedure {
     for (String member : expected) {
       ZKWatcher watcher = newZooKeeperWatcher();
       ZKProcedureMemberRpcs controller = new ZKProcedureMemberRpcs(watcher, opDescription);
-      ThreadPoolExecutor pool2 = ProcedureMember.defaultPool(member, 1, KEEP_ALIVE);
-      ProcedureMember mem = new ProcedureMember(controller, pool2, subprocFactory);
+      ProcedureMember mem = new ProcedureMember(controller, subprocFactory);
       members.add(new Pair<>(mem, controller));
       controller.start(member, mem);
     }

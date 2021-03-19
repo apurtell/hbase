@@ -36,7 +36,6 @@ import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.PrivateConstants;
 import org.apache.hadoop.hbase.client.IsolationLevel;
 import org.apache.hadoop.hbase.client.Scan;
-import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.regionserver.ScannerContext.LimitScope;
 import org.apache.hadoop.hbase.regionserver.ScannerContext.NextState;
@@ -45,6 +44,8 @@ import org.apache.hadoop.hbase.regionserver.querymatcher.CompactionScanQueryMatc
 import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher;
 import org.apache.hadoop.hbase.regionserver.querymatcher.UserScanQueryMatcher;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -84,7 +85,6 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
    * A flag that enables StoreFileScanner parallel-seeking
    */
   private boolean parallelSeekEnabled = false;
-  private ExecutorService executor;
   private final Scan scan;
   private final long oldestUnexpiredTS;
   private final long now;
@@ -214,7 +214,6 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       RegionServerServices rsService = store.getHRegion().getRegionServerServices();
       if (rsService != null && scanInfo.isParallelSeekEnabled()) {
         this.parallelSeekEnabled = true;
-        this.executor = rsService.getExecutorService();
       }
     }
   }
@@ -1177,7 +1176,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       if (scanner instanceof StoreFileScanner) {
         ParallelSeekHandler seekHandler = new ParallelSeekHandler(scanner, kv,
           this.readPt, latch);
-        executor.submit(seekHandler);
+        ExecutorPools.getPool(PoolType.IO).submit(seekHandler);
         handlers.add(seekHandler);
       } else {
         scanner.seek(kv);

@@ -89,7 +89,7 @@ public class TestProtoBufRpc {
     // Get RPC server for server side implementation
     this.server = RpcServerFactory.createRpcServer(null, "testrpc",
         Lists.newArrayList(new RpcServer.BlockingServiceAndInterface(SERVICE, null)),
-        new InetSocketAddress(ADDRESS, PORT), conf, new FifoRpcScheduler(conf, 10));
+        new InetSocketAddress(ADDRESS, PORT), conf, new FifoRpcScheduler(conf));
     InetSocketAddress address = server.getListenerAddress();
     if (address == null) {
       throw new IOException("Listener channel is closed");

@@ -18,18 +18,10 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.client.RegionInfo;
-import org.apache.hadoop.hbase.executor.ExecutorService;
-import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorConfig;
-import org.apache.hadoop.hbase.executor.ExecutorType;
 import org.apache.hadoop.hbase.io.ByteBuffAllocator;
 import org.apache.hadoop.hbase.wal.WAL;
 import org.apache.yetus.audience.InterfaceAudience;
-
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Services a Store needs from a Region.
@@ -43,16 +35,10 @@ public class RegionServicesForStores {
 
   private final HRegion region;
   private final RegionServerServices rsServices;
-  private int inMemoryPoolSize;
 
   public RegionServicesForStores(HRegion region, RegionServerServices rsServices) {
     this.region = region;
     this.rsServices = rsServices;
-    if (this.rsServices != null) {
-      this.inMemoryPoolSize = rsServices.getConfiguration().getInt(
-        CompactingMemStore.IN_MEMORY_CONPACTION_POOL_SIZE_KEY,
-        CompactingMemStore.IN_MEMORY_CONPACTION_POOL_SIZE_DEFAULT);
-    }
   }
 
   public void addMemStoreSize(long dataSizeDelta, long heapSizeDelta, long offHeapSizeDelta,
@@ -82,29 +68,6 @@ public class RegionServicesForStores {
       return rsServices.getRpcServer().getByteBuffAllocator();
     } else {
       return getAllocatorForTest();
-    }
-  }
-
-  private static ThreadPoolExecutor INMEMORY_COMPACTION_POOL_FOR_TEST;
-
-  private static synchronized ThreadPoolExecutor getInMemoryCompactionPoolForTest() {
-    if (INMEMORY_COMPACTION_POOL_FOR_TEST == null) {
-      INMEMORY_COMPACTION_POOL_FOR_TEST = new ThreadPoolExecutor(10, 10, 60, TimeUnit.SECONDS,
-        new LinkedBlockingQueue<>(), new ThreadFactoryBuilder().setDaemon(true)
-          .setNameFormat("InMemoryCompactionsForTest-%d").build());
-    }
-    return INMEMORY_COMPACTION_POOL_FOR_TEST;
-  }
-
-  ThreadPoolExecutor getInMemoryCompactionPool() {
-    if (rsServices != null) {
-      ExecutorService executorService = rsServices.getExecutorService();
-      ExecutorConfig config = executorService.new ExecutorConfig().setExecutorType(
-          ExecutorType.RS_IN_MEMORY_COMPACTION).setCorePoolSize(inMemoryPoolSize);
-      return executorService.getExecutorLazily(config);
-    } else {
-      // this could only happen in tests
-      return getInMemoryCompactionPoolForTest();
     }
   }
 

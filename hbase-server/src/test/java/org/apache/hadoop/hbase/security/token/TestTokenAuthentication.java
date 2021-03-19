@@ -194,7 +194,7 @@ public class TestTokenAuthentication {
       sai.add(new BlockingServiceAndInterface(proxy,
         AuthenticationProtos.AuthenticationService.BlockingInterface.class));
       this.rpcServer = RpcServerFactory.createRpcServer(this, "tokenServer", sai, initialIsa, conf,
-          new FifoRpcScheduler(conf, 1));
+          new FifoRpcScheduler(conf));
       InetSocketAddress address = rpcServer.getListenerAddress();
       if (address == null) {
         throw new IOException("Listener channel is closed");

@@ -42,6 +42,8 @@ import org.apache.hadoop.hbase.io.HFileLink;
 import org.apache.hadoop.hbase.io.WALLink;
 import org.apache.hadoop.hbase.util.AbstractHBaseTool;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -682,28 +684,16 @@ public final class SnapshotInfo extends AbstractHBaseTool {
       AtomicLong uniqueHFilesArchiveSize, AtomicLong uniqueHFilesSize,
       AtomicLong uniqueHFilesMobSize) throws IOException {
     List<SnapshotDescription> snapshotList = getSnapshotList(conf);
-
-
     if (snapshotList.isEmpty()) {
       return Collections.emptyMap();
     }
-
     ConcurrentHashMap<Path, Integer> fileMap = new ConcurrentHashMap<>();
-
-    ExecutorService exec = SnapshotManifest.createExecutor(conf, "SnapshotsFilesMapping");
-
-    try {
-      for (final SnapshotDescription snapshot : snapshotList) {
-        getSnapshotFilesMap(conf, snapshot, exec, fileMap, uniqueHFilesArchiveSize,
-            uniqueHFilesSize, uniqueHFilesMobSize);
-      }
-    } finally {
-      exec.shutdown();
+    for (final SnapshotDescription snapshot : snapshotList) {
+      getSnapshotFilesMap(conf, snapshot, ExecutorPools.getPool(PoolType.SNAPSHOT), fileMap,
+        uniqueHFilesArchiveSize, uniqueHFilesSize, uniqueHFilesMobSize);
     }
-
     return fileMap;
   }
-
 
   public static void main(String[] args) {
     new SnapshotInfo().doStaticMain(args);

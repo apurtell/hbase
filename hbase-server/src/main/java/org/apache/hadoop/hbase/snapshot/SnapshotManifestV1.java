@@ -25,7 +25,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorCompletionService;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -36,7 +35,9 @@ import org.apache.hadoop.hbase.regionserver.HRegionFileSystem;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -123,7 +124,7 @@ public final class SnapshotManifestV1 {
   }
 
   static List<SnapshotRegionManifest> loadRegionManifests(final Configuration conf,
-      final Executor executor,final FileSystem fs, final Path snapshotDir,
+      final FileSystem fs, final Path snapshotDir,
       final SnapshotDescription desc) throws IOException {
     FileStatus[] regions =
       CommonFSUtils.listStatus(fs, snapshotDir, new FSUtils.RegionDirFilter(fs));
@@ -133,7 +134,7 @@ public final class SnapshotManifestV1 {
     }
 
     final ExecutorCompletionService<SnapshotRegionManifest> completionService =
-      new ExecutorCompletionService<>(executor);
+      new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.SNAPSHOT));
     for (final FileStatus region: regions) {
       completionService.submit(new Callable<SnapshotRegionManifest>() {
         @Override

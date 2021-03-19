@@ -42,7 +42,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -100,6 +99,8 @@ import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
@@ -530,12 +531,9 @@ public class HStore implements Store, HeapSize, StoreConfigInformation,
     if (CollectionUtils.isEmpty(files)) {
       return Collections.emptyList();
     }
-    // initialize the thread pool for opening store files in parallel..
-    ThreadPoolExecutor storeFileOpenerThreadPool =
-      this.region.getStoreFileOpenAndCloseThreadPool("StoreFileOpener-"
-        + this.region.getRegionInfo().getEncodedName() + "-" + this.getColumnFamilyName());
+
     CompletionService<HStoreFile> completionService =
-      new ExecutorCompletionService<>(storeFileOpenerThreadPool);
+      new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.FILE));
 
     int totalValidStoreFile = 0;
     for (StoreFileInfo storeFileInfo : files) {
@@ -547,27 +545,23 @@ public class HStore implements Store, HeapSize, StoreConfigInformation,
     Set<String> compactedStoreFiles = new HashSet<>();
     ArrayList<HStoreFile> results = new ArrayList<>(files.size());
     IOException ioe = null;
-    try {
-      for (int i = 0; i < totalValidStoreFile; i++) {
-        try {
-          HStoreFile storeFile = completionService.take().get();
-          if (storeFile != null) {
-            LOG.debug("loaded {}", storeFile);
-            results.add(storeFile);
-            compactedStoreFiles.addAll(storeFile.getCompactedStoreFiles());
-          }
-        } catch (InterruptedException e) {
-          if (ioe == null) {
-            ioe = new InterruptedIOException(e.getMessage());
-          }
-        } catch (ExecutionException e) {
-          if (ioe == null) {
-            ioe = new IOException(e.getCause());
-          }
+    for (int i = 0; i < totalValidStoreFile; i++) {
+      try {
+        HStoreFile storeFile = completionService.take().get();
+        if (storeFile != null) {
+          LOG.debug("loaded {}", storeFile);
+          results.add(storeFile);
+          compactedStoreFiles.addAll(storeFile.getCompactedStoreFiles());
+        }
+      } catch (InterruptedException e) {
+        if (ioe == null) {
+          ioe = new InterruptedIOException(e.getMessage());
+        }
+      } catch (ExecutionException e) {
+        if (ioe == null) {
+          ioe = new IOException(e.getCause());
         }
       }
-    } finally {
-      storeFileOpenerThreadPool.shutdownNow();
     }
     if (ioe != null) {
       // close StoreFile readers
@@ -932,14 +926,9 @@ public class HStore implements Store, HeapSize, StoreConfigInformation,
             getCacheConfig().shouldEvictOnClose() : true);
       }
       if (!result.isEmpty()) {
-        // initialize the thread pool for closing store files in parallel.
-        ThreadPoolExecutor storeFileCloserThreadPool = this.region
-            .getStoreFileOpenAndCloseThreadPool("StoreFileCloser-"
-              + this.region.getRegionInfo().getEncodedName() + "-" + this.getColumnFamilyName());
-
         // close each store file in parallel
         CompletionService<Void> completionService =
-          new ExecutorCompletionService<>(storeFileCloserThreadPool);
+          new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.FILE));
         for (HStoreFile f : result) {
           completionService.submit(new Callable<Void>() {
             @Override
@@ -951,26 +940,21 @@ public class HStore implements Store, HeapSize, StoreConfigInformation,
             }
           });
         }
-
         IOException ioe = null;
-        try {
-          for (int i = 0; i < result.size(); i++) {
-            try {
-              Future<Void> future = completionService.take();
-              future.get();
-            } catch (InterruptedException e) {
-              if (ioe == null) {
-                ioe = new InterruptedIOException();
-                ioe.initCause(e);
-              }
-            } catch (ExecutionException e) {
-              if (ioe == null) {
-                ioe = new IOException(e.getCause());
-              }
+        for (int i = 0; i < result.size(); i++) {
+          try {
+            Future<Void> future = completionService.take();
+            future.get();
+          } catch (InterruptedException e) {
+            if (ioe == null) {
+              ioe = new InterruptedIOException();
+              ioe.initCause(e);
+            }
+          } catch (ExecutionException e) {
+            if (ioe == null) {
+              ioe = new IOException(e.getCause());
             }
           }
-        } finally {
-          storeFileCloserThreadPool.shutdownNow();
         }
         if (ioe != null) {
           throw ioe;

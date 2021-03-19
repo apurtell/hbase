@@ -125,8 +125,7 @@ public class SplitLogManager {
     // splitting. It is null if we are configured to use procedure-based distributed WAL
     // splitting.
     if (server.getCoordinatedStateManager() != null) {
-      this.choreService =
-        new ChoreService(master.getServerName().toShortString() + ".splitLogManager.");
+      this.choreService = new ChoreService();
       SplitLogManagerCoordination coordination = getSplitLogManagerCoordination();
       Set<String> failedDeletions = Collections.synchronizedSet(new HashSet<String>());
       SplitLogManagerDetails details = new SplitLogManagerDetails(tasks, master, failedDeletions);

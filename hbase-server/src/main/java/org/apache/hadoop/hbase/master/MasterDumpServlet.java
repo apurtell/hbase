@@ -75,7 +75,7 @@ public class MasterDumpServlet extends StateDumpServlet {
 
       out.println("\n\nExecutors:");
       out.println(LINE);
-      dumpExecutors(master.getExecutorService(), out);
+      dumpExecutors(out);
 
       out.println("\n\nStacks:");
       out.println(LINE);

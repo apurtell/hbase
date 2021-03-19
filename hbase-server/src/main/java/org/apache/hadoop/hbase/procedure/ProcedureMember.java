@@ -20,15 +20,11 @@ package org.apache.hadoop.hbase.procedure;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.hbase.errorhandling.ForeignException;
-import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,7 +47,6 @@ public class ProcedureMember implements Closeable {
 
   private final ConcurrentMap<String,Subprocedure> subprocs =
       new MapMaker().concurrencyLevel(4).weakValues().makeMap();
-  private final ExecutorService pool;
 
   /**
    * Instantiate a new ProcedureMember.  This is a slave that executes subprocedures.
@@ -60,36 +55,9 @@ public class ProcedureMember implements Closeable {
    * @param pool thread pool to submit subprocedures
    * @param factory class that creates instances of a subprocedure.
    */
-  public ProcedureMember(ProcedureMemberRpcs rpcs, ThreadPoolExecutor pool,
-      SubprocedureFactory factory) {
-    this.pool = pool;
+  public ProcedureMember(ProcedureMemberRpcs rpcs, SubprocedureFactory factory) {
     this.rpcs = rpcs;
     this.builder = factory;
-  }
-
-  /**
-   * Default thread pool for the procedure
-   *
-   * @param memberName
-   * @param procThreads the maximum number of threads to allow in the pool
-   */
-  public static ThreadPoolExecutor defaultPool(String memberName, int procThreads) {
-    return defaultPool(memberName, procThreads, KEEP_ALIVE_MILLIS_DEFAULT);
-  }
-
-  /**
-   * Default thread pool for the procedure
-   *
-   * @param memberName
-   * @param procThreads the maximum number of threads to allow in the pool
-   * @param keepAliveMillis the maximum time (ms) that excess idle threads will wait for new tasks
-   */
-  public static ThreadPoolExecutor defaultPool(String memberName, int procThreads,
-      long keepAliveMillis) {
-    return new ThreadPoolExecutor(1, procThreads, keepAliveMillis, TimeUnit.MILLISECONDS,
-      new SynchronousQueue<>(),
-      new ThreadFactoryBuilder().setNameFormat("member: '" + memberName + "' subprocedure-pool-%d")
-        .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
   }
 
   /**
@@ -100,7 +68,6 @@ public class ProcedureMember implements Closeable {
   ProcedureMemberRpcs getRpcs() {
     return rpcs;
   }
-
 
   /**
    * This is separated from execution so that we can detect and handle the case where the
@@ -154,7 +121,7 @@ public class ProcedureMember implements Closeable {
     // kick off the subprocedure
     try {
       if (subprocs.putIfAbsent(procName, subproc) == null) {
-        this.pool.submit(subproc);
+        ExecutorPools.getPool(PoolType.PROCEDURE).submit(subproc);
         return true;
       } else {
         LOG.error("Another thread has submitted subproc '" + procName + "'. Bailing out");
@@ -193,8 +160,7 @@ public class ProcedureMember implements Closeable {
    */
   @Override
   public void close() throws IOException {
-    // have to use shutdown now to break any latch waiting
-    pool.shutdownNow();
+    // TODO: Track procedure task futures and interrupt/cancel
   }
 
   /**
@@ -204,8 +170,8 @@ public class ProcedureMember implements Closeable {
    * @throws InterruptedException
    */
   boolean closeAndWait(long timeoutMs) throws InterruptedException {
-    pool.shutdown();
-    return pool.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS);
+    // TODO: Track procedure task futures and interrupt/cancel with wait
+    return true;
   }
 
   /**

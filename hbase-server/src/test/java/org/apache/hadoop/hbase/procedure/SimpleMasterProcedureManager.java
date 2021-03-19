@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.errorhandling.ForeignException;
@@ -65,11 +64,9 @@ public class SimpleMasterProcedureManager extends MasterProcedureManager {
 
     // setup the default procedure coordinator
     String name = master.getServerName().toString();
-    ThreadPoolExecutor tpool = ProcedureCoordinator.defaultPool(name, 1);
     ProcedureCoordinatorRpcs comms = new ZKProcedureCoordinator(
         master.getZooKeeper(), getProcedureSignature(), name);
-
-    this.coordinator = new ProcedureCoordinator(comms, tpool);
+    this.coordinator = new ProcedureCoordinator(comms);
   }
 
   @Override

@@ -22,17 +22,16 @@ import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ClientMetaService;
 
@@ -54,15 +53,15 @@ public class MasterAddressRefresher implements Closeable {
       "hbase.client.master_registry.min_secs_between_refreshes";
   private static final int MIN_SECS_BETWEEN_REFRESHES_DEFAULT = 60;
 
-  private final ExecutorService pool;
   private final MasterRegistry registry;
   private final long periodicRefreshMs;
   private final long timeBetweenRefreshesMs;
   private final Object refreshMasters = new Object();
+  private final RefreshThread refresher;
 
   @Override
   public void close() {
-    pool.shutdownNow();
+    refresher.interrupt();
   }
 
   /**
@@ -70,8 +69,15 @@ public class MasterAddressRefresher implements Closeable {
    * Multiple callers attempting to refresh at the same time synchronize on {@link #refreshMasters}.
    */
   private class RefreshThread implements Runnable {
+    private Thread myThread;
+
+    private void interrupt() { 
+      myThread.interrupt();
+    }
+
     @Override
     public void run() {
+      myThread = Thread.currentThread();
       long lastRpcTs = 0;
       while (!Thread.interrupted()) {
         try {
@@ -102,8 +108,6 @@ public class MasterAddressRefresher implements Closeable {
   }
 
   MasterAddressRefresher(Configuration conf, MasterRegistry registry) {
-    pool = Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
-        .setNameFormat("master-registry-refresh-end-points").setDaemon(true).build());
     periodicRefreshMs = TimeUnit.SECONDS.toMillis(conf.getLong(PERIODIC_REFRESH_INTERVAL_SECS,
         PERIODIC_REFRESH_INTERVAL_SECS_DEFAULT));
     timeBetweenRefreshesMs = TimeUnit.SECONDS.toMillis(conf.getLong(MIN_SECS_BETWEEN_REFRESHES,
@@ -111,7 +115,8 @@ public class MasterAddressRefresher implements Closeable {
     Preconditions.checkArgument(periodicRefreshMs > 0);
     Preconditions.checkArgument(timeBetweenRefreshesMs < periodicRefreshMs);
     this.registry = registry;
-    pool.submit(new RefreshThread());
+    this.refresher = new RefreshThread();
+    ExecutorPools.getPool(PoolType.CLIENT).submit(refresher);
   }
 
   /**

@@ -441,7 +441,7 @@ public class TestSnapshotFromMaster {
         break;
       }
     }
-    CompactedHFilesDischarger cleaner = new CompactedHFilesDischarger(100, null, hrs, false);
+    CompactedHFilesDischarger cleaner = new CompactedHFilesDischarger(100, null, hrs);
     cleaner.chore();
     LOG.info("After compaction File-System state");
     CommonFSUtils.logFileSystemState(fs, rootDir, LOG);

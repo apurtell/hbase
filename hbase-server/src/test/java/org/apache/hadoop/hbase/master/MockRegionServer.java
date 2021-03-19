@@ -48,7 +48,6 @@ import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.locking.EntityLock;
-import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.io.hfile.BlockCache;
 import org.apache.hadoop.hbase.ipc.HBaseRpcController;
 import org.apache.hadoop.hbase.ipc.RpcServerInterface;
@@ -543,11 +542,6 @@ class MockRegionServer implements AdminProtos.AdminService.BlockingInterface,
 
   @Override
   public WAL getWAL(RegionInfo regionInfo) throws IOException {
-    return null;
-  }
-
-  @Override
-  public ExecutorService getExecutorService() {
     return null;
   }
 

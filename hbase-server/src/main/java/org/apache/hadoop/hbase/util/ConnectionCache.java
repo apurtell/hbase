@@ -74,7 +74,7 @@ public class ConnectionCache {
       @Override public void stop(String why) { isStopped = true;}
       @Override public boolean isStopped() {return isStopped;}
     };
-    this.choreService = new ChoreService("ConnectionCache");
+    this.choreService = new ChoreService();
     ScheduledChore cleaner = new ScheduledChore("ConnectionCleaner", stoppable, cleanInterval) {
       @Override
       protected void chore() {

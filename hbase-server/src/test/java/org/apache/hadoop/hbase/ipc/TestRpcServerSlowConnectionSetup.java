@@ -85,7 +85,7 @@ public class TestRpcServerSlowConnectionSetup {
     conf.set(RpcServerFactory.CUSTOM_RPC_SERVER_IMPL_CONF_KEY, rpcServerImpl.getName());
     server = RpcServerFactory.createRpcServer(null, "testRpcServer",
       Lists.newArrayList(new BlockingServiceAndInterface(SERVICE, null)),
-      new InetSocketAddress("localhost", 0), conf, new FifoRpcScheduler(conf, 1));
+      new InetSocketAddress("localhost", 0), conf, new FifoRpcScheduler(conf));
     server.start();
     socket = new Socket("localhost", server.getListenerAddress().getPort());
   }

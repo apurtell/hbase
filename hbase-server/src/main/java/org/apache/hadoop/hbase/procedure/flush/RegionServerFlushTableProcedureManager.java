@@ -25,8 +25,6 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
@@ -44,9 +42,9 @@ import org.apache.hadoop.hbase.procedure.ZKProcedureMemberRpcs;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.zookeeper.ZKWatcher;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.zookeeper.KeeperException;
 
 import org.apache.yetus.audience.InterfaceAudience;
@@ -61,10 +59,6 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;
 public class RegionServerFlushTableProcedureManager extends RegionServerProcedureManager {
   private static final Logger LOG =
       LoggerFactory.getLogger(RegionServerFlushTableProcedureManager.class);
-
-  private static final String CONCURENT_FLUSH_TASKS_KEY =
-      "hbase.flush.procedure.region.concurrentTasks";
-  private static final int DEFAULT_CONCURRENT_FLUSH_TASKS = 3;
 
   public static final String FLUSH_REQUEST_THREADS_KEY =
       "hbase.flush.procedure.region.pool.threads";
@@ -214,23 +208,14 @@ public class RegionServerFlushTableProcedureManager extends RegionServerProcedur
   static class FlushTableSubprocedurePool {
     private final Abortable abortable;
     private final ExecutorCompletionService<Void> taskPool;
-    private final ThreadPoolExecutor executor;
     private volatile boolean stopped;
     private final List<Future<Void>> futures = new ArrayList<>();
     private final String name;
 
     FlushTableSubprocedurePool(String name, Configuration conf, Abortable abortable) {
       this.abortable = abortable;
-      // configure the executor service
-      long keepAlive = conf.getLong(
-        RegionServerFlushTableProcedureManager.FLUSH_TIMEOUT_MILLIS_KEY,
-        RegionServerFlushTableProcedureManager.FLUSH_TIMEOUT_MILLIS_DEFAULT);
-      int threads = conf.getInt(CONCURENT_FLUSH_TASKS_KEY, DEFAULT_CONCURRENT_FLUSH_TASKS);
       this.name = name;
-      executor = Threads.getBoundedCachedThreadPool(threads, keepAlive, TimeUnit.MILLISECONDS,
-        new ThreadFactoryBuilder().setNameFormat("rs(" + name + ")-flush-proc-pool-%d")
-          .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
-      taskPool = new ExecutorCompletionService<>(executor);
+      this.taskPool = new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.PROCEDURE));
     }
 
     boolean hasTasks() {
@@ -318,9 +303,8 @@ public class RegionServerFlushTableProcedureManager extends RegionServerProcedur
      */
     void stop() {
       if (this.stopped) return;
-
       this.stopped = true;
-      this.executor.shutdown();
+      // TODO: Use taskPool to get and finish any pending futures
     }
   }
 
@@ -336,15 +320,8 @@ public class RegionServerFlushTableProcedureManager extends RegionServerProcedur
     ZKWatcher zkw = rss.getZooKeeper();
     this.memberRpcs = new ZKProcedureMemberRpcs(zkw,
       MasterFlushTableProcedureManager.FLUSH_TABLE_PROCEDURE_SIGNATURE);
-
-    Configuration conf = rss.getConfiguration();
-    long keepAlive = conf.getLong(FLUSH_TIMEOUT_MILLIS_KEY, FLUSH_TIMEOUT_MILLIS_DEFAULT);
-    int opThreads = conf.getInt(FLUSH_REQUEST_THREADS_KEY, FLUSH_REQUEST_THREADS_DEFAULT);
-
     // create the actual flush table procedure member
-    ThreadPoolExecutor pool = ProcedureMember.defaultPool(rss.getServerName().toString(),
-      opThreads, keepAlive);
-    this.member = new ProcedureMember(memberRpcs, pool, new FlushTableSubprocedureBuilder());
+    this.member = new ProcedureMember(memberRpcs, new FlushTableSubprocedureBuilder());
   }
 
   @Override

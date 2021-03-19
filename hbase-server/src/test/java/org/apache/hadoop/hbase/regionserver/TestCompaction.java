@@ -72,7 +72,9 @@ import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.testclassification.RegionServerTests;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.wal.WAL;
 import org.junit.After;
 import org.junit.Assume;
@@ -462,28 +464,24 @@ public class TestCompaction {
     thread.requestCompaction(r, store, "test", Store.PRIORITY_USER,
       CompactionLifeCycleTracker.DUMMY, null);
     assertFalse(thread.isCompactionsEnabled());
-    int longCompactions = thread.getLongCompactions().getActiveCount();
-    int shortCompactions = thread.getShortCompactions().getActiveCount();
-    assertEquals("longCompactions=" + longCompactions + "," +
-        "shortCompactions=" + shortCompactions, 0, longCompactions + shortCompactions);
+    int compactions = ExecutorPools.getPool(PoolType.COMPACTION).getActiveCount();
+    assertEquals("compactions=" + compactions, 0, compactions);
     thread.switchCompaction(true);
     assertTrue(thread.isCompactionsEnabled());
     // Make sure no compactions have run.
-    assertEquals(0, thread.getLongCompactions().getCompletedTaskCount() +
-        thread.getShortCompactions().getCompletedTaskCount());
+    assertEquals(0, ExecutorPools.getPool(PoolType.COMPACTION).getCompletedTaskCount());
     // Request a compaction and make sure it is submitted successfully.
     thread.requestCompaction(r, store, "test", Store.PRIORITY_USER,
         CompactionLifeCycleTracker.DUMMY, null);
     // Wait until the compaction finishes.
-    Waiter.waitFor(UTIL.getConfiguration(), 5000,
-        (Waiter.Predicate<Exception>) () -> thread.getLongCompactions().getCompletedTaskCount() +
-        thread.getShortCompactions().getCompletedTaskCount() == 1);
+    Waiter.waitFor(UTIL.getConfiguration(), 5000, (Waiter.Predicate<Exception>) ()
+      -> ExecutorPools.getPool(PoolType.COMPACTION).getCompletedTaskCount() == 1);
     // Make sure there are no compactions running.
-    assertEquals(0, thread.getLongCompactions().getActiveCount()
-        + thread.getShortCompactions().getActiveCount());
+    assertEquals(0, ExecutorPools.getPool(PoolType.COMPACTION).getActiveCount());
   }
 
-  @Test public void testInterruptingRunningCompactions() throws Exception {
+  @Test
+  public void testInterruptingRunningCompactions() throws Exception {
     // setup a compact/split thread on a mock server
     conf.set(CompactionThroughputControllerFactory.HBASE_THROUGHPUT_CONTROLLER_KEY,
         WaitThroughPutController.class.getName());
@@ -714,11 +712,9 @@ public class TestCompaction {
     HRegionServer mockServer = mock(HRegionServer.class);
     when(mockServer.isStopped()).thenReturn(false);
     when(mockServer.getConfiguration()).thenReturn(conf);
-    when(mockServer.getChoreService()).thenReturn(new ChoreService("test"));
+    when(mockServer.getChoreService()).thenReturn(new ChoreService());
     CompactSplit cst = new CompactSplit(mockServer);
     when(mockServer.getCompactSplitThread()).thenReturn(cst);
-    //prevent large compaction thread pool stealing job from small compaction queue.
-    cst.shutdownLongCompactions();
     // Set up the region mock that redirects compactions.
     HRegion r = mock(HRegion.class);
     when(

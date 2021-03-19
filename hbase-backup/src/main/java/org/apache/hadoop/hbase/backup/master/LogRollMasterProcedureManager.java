@@ -21,7 +21,6 @@ package org.apache.hadoop.hbase.backup.master;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ServerName;
@@ -88,21 +87,16 @@ public class LogRollMasterProcedureManager extends MasterProcedureManager {
 
     // setup the default procedure coordinator
     String name = master.getServerName().toString();
-
-
     // get the configuration for the coordinator
     Configuration conf = master.getConfiguration();
     long wakeFrequency = conf.getInt(BACKUP_WAKE_MILLIS_KEY, BACKUP_WAKE_MILLIS_DEFAULT);
     long timeoutMillis = conf.getLong(BACKUP_TIMEOUT_MILLIS_KEY,BACKUP_TIMEOUT_MILLIS_DEFAULT);
-    int opThreads = conf.getInt(BACKUP_POOL_THREAD_NUMBER_KEY,
-                                    BACKUP_POOL_THREAD_NUMBER_DEFAULT);
 
     // setup the default procedure coordinator
-    ThreadPoolExecutor tpool = ProcedureCoordinator.defaultPool(name, opThreads);
     ProcedureCoordinationManager coordManager = new ZKProcedureCoordinationManager(master);
     ProcedureCoordinatorRpcs comms =
         coordManager.getProcedureCoordinatorRpcs(getProcedureSignature(), name);
-    this.coordinator = new ProcedureCoordinator(comms, tpool, timeoutMillis, wakeFrequency);
+    this.coordinator = new ProcedureCoordinator(comms, timeoutMillis, wakeFrequency);
 
   }
 

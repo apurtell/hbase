@@ -19,14 +19,12 @@ package org.apache.hadoop.hbase.ipc;
 
 import java.io.IOException;
 import java.util.HashMap;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,15 +39,12 @@ import org.apache.hbase.thirdparty.io.netty.util.internal.StringUtil;
 @InterfaceAudience.Private
 public class FifoRpcScheduler extends RpcScheduler {
   private static final Logger LOG = LoggerFactory.getLogger(FifoRpcScheduler.class);
-  protected final int handlerCount;
   protected final int maxQueueLength;
   protected final AtomicInteger queueSize = new AtomicInteger(0);
-  protected ThreadPoolExecutor executor;
 
-  public FifoRpcScheduler(Configuration conf, int handlerCount) {
-    this.handlerCount = handlerCount;
+  public FifoRpcScheduler(Configuration conf) {
     this.maxQueueLength = conf.getInt(RpcScheduler.IPC_SERVER_MAX_CALLQUEUE_LENGTH,
-        handlerCount * RpcServer.DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER);
+        Runtime.getRuntime().availableProcessors() * RpcServer.DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER);
   }
 
   @Override
@@ -59,18 +54,12 @@ public class FifoRpcScheduler extends RpcScheduler {
 
   @Override
   public void start() {
-    LOG.info("Using {} as user call queue; handlerCount={}; maxQueueLength={}",
-      this.getClass().getSimpleName(), handlerCount, maxQueueLength);
-    this.executor = new ThreadPoolExecutor(handlerCount, handlerCount, 60, TimeUnit.SECONDS,
-      new ArrayBlockingQueue<>(maxQueueLength),
-      new ThreadFactoryBuilder().setNameFormat("FifoRpcScheduler.handler-pool-%d").setDaemon(true)
-        .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build(),
-      new ThreadPoolExecutor.CallerRunsPolicy());
+    LOG.info("Using {} as user call queue; maxQueueLength={}",
+      this.getClass().getSimpleName(), maxQueueLength);
   }
 
   @Override
   public void stop() {
-    this.executor.shutdown();
   }
 
   private static class FifoCallRunner implements Runnable {
@@ -93,10 +82,10 @@ public class FifoRpcScheduler extends RpcScheduler {
 
   @Override
   public boolean dispatch(final CallRunner task) throws IOException, InterruptedException {
-    return executeRpcCall(executor, queueSize, task);
+    return executeRpcCall(ExecutorPools.getPool(PoolType.HANDLER), queueSize, task);
   }
 
-  protected boolean executeRpcCall(final ThreadPoolExecutor executor, final AtomicInteger queueSize,
+  protected boolean executeRpcCall(final ExecutorService executor, final AtomicInteger queueSize,
       final CallRunner task) {
     // Executors provide no offer, so make our own.
     int queued = queueSize.getAndIncrement();
@@ -119,7 +108,7 @@ public class FifoRpcScheduler extends RpcScheduler {
 
   @Override
   public int getGeneralQueueLength() {
-    return executor.getQueue().size();
+    return ExecutorPools.getPool(PoolType.HANDLER).getQueue().size();
   }
 
   @Override
@@ -134,7 +123,7 @@ public class FifoRpcScheduler extends RpcScheduler {
 
   @Override
   public int getActiveRpcHandlerCount() {
-    return executor.getActiveCount();
+    return ExecutorPools.getPool(PoolType.HANDLER).getActiveCount();
   }
 
   @Override
@@ -213,7 +202,8 @@ public class FifoRpcScheduler extends RpcScheduler {
     callQueueInfo.setCallMethodCount(queueName, methodCount);
     callQueueInfo.setCallMethodSize(queueName, methodSize);
 
-    updateMethodCountAndSizeByQueue(executor.getQueue(), methodCount, methodSize);
+    updateMethodCountAndSizeByQueue(ExecutorPools.getPool(PoolType.HANDLER).getQueue(),
+      methodCount, methodSize);
 
     return callQueueInfo;
   }

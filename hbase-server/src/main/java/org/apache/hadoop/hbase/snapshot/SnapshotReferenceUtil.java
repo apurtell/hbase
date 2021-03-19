@@ -38,7 +38,9 @@ import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.io.HFileLink;
 import org.apache.hadoop.hbase.mob.MobUtils;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.HFileArchiveUtil;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -188,14 +190,8 @@ public final class SnapshotReferenceUtil {
       LOG.debug("No manifest files present: " + snapshotDir);
       return;
     }
-
-    ExecutorService exec = SnapshotManifest.createExecutor(conf, desc);
-
-    try {
-      concurrentVisitReferencedFiles(conf, fs, manifest, exec, visitor);
-    } finally {
-      exec.shutdown();
-    }
+    concurrentVisitReferencedFiles(conf, fs, manifest, ExecutorPools.getPool(PoolType.SNAPSHOT),
+      visitor);
   }
 
   public static void concurrentVisitReferencedFiles(final Configuration conf, final FileSystem fs,

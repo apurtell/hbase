@@ -23,6 +23,8 @@ import org.apache.hadoop.hbase.ScheduledChore;
 import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.executor.EventType;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,8 +38,6 @@ import org.slf4j.LoggerFactory;
 public class CompactedHFilesDischarger extends ScheduledChore {
   private static final Logger LOG = LoggerFactory.getLogger(CompactedHFilesDischarger.class);
   private RegionServerServices regionServerServices;
-  // Default is to use executor
-  private boolean useExecutor = true;
 
   /**
    * @param period the period of time to sleep between each run
@@ -49,31 +49,6 @@ public class CompactedHFilesDischarger extends ScheduledChore {
     // Need to add the config classes
     super("CompactedHFilesCleaner", stopper, period);
     this.regionServerServices = regionServerServices;
-  }
-
-  /**
-   * @param period the period of time to sleep between each run
-   * @param stopper the stopper
-   * @param regionServerServices the region server that starts this chore
-   * @param useExecutor true if to use the region server's executor service, false otherwise
-   */
-  public CompactedHFilesDischarger(final int period, final Stoppable stopper,
-      final RegionServerServices regionServerServices, boolean useExecutor) {
-    // Need to add the config classes
-    this(period, stopper, regionServerServices);
-    this.useExecutor = useExecutor;
-  }
-
-  /**
-   * CompactedHFilesDischarger runs asynchronously by default using the hosting
-   * RegionServer's Executor. In tests it can be useful to force a synchronous
-   * cleanup. Use this method to set no-executor before you call run.
-   * @return The old setting for <code>useExecutor</code>
-   */
-  boolean setUseExecutor(final boolean useExecutor) {
-    boolean oldSetting = this.useExecutor;
-    this.useExecutor = useExecutor;
-    return oldSetting;
   }
 
   @Override
@@ -89,10 +64,10 @@ public class CompactedHFilesDischarger extends ScheduledChore {
       }
       for (HStore store : region.getStores()) {
         try {
-          if (useExecutor && regionServerServices != null) {
+          if (regionServerServices != null) {
             CompactedHFilesDischargeHandler handler = new CompactedHFilesDischargeHandler(
                 (Server) regionServerServices, EventType.RS_COMPACTED_FILES_DISCHARGER, store);
-            regionServerServices.getExecutorService().submit(handler);
+            ExecutorPools.getPool(PoolType.FILE).submit(handler);
           } else {
             // call synchronously if the RegionServerServices are not
             // available

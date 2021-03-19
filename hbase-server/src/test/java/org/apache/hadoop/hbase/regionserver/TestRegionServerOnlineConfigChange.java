@@ -101,30 +101,6 @@ public class TestRegionServerOnlineConfigChange {
   }
 
   /**
-   * Check if the number of compaction threads changes online
-   * @throws IOException
-   */
-  @Test
-  public void testNumCompactionThreadsOnlineChange() throws IOException {
-    assertTrue(rs1.compactSplitThread != null);
-    int newNumSmallThreads =
-            rs1.compactSplitThread.getSmallCompactionThreadNum() + 1;
-    int newNumLargeThreads =
-            rs1.compactSplitThread.getLargeCompactionThreadNum() + 1;
-
-    conf.setInt("hbase.regionserver.thread.compaction.small",
-            newNumSmallThreads);
-    conf.setInt("hbase.regionserver.thread.compaction.large",
-            newNumLargeThreads);
-    rs1.getConfigurationManager().notifyAllObservers(conf);
-
-    assertEquals(newNumSmallThreads,
-                  rs1.compactSplitThread.getSmallCompactionThreadNum());
-    assertEquals(newNumLargeThreads,
-                  rs1.compactSplitThread.getLargeCompactionThreadNum());
-  }
-
-  /**
    * Test that the configurations in the CompactionConfiguration class change
    * properly.
    *

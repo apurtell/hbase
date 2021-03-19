@@ -21,8 +21,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
@@ -93,8 +91,6 @@ public class TestWalAndCompactingMemStoreFlush {
     HRegion region =
       HBaseTestingUtility.createRegionAndWAL(info, path, conf, builder.build(), false);
     region.regionServicesForStores = Mockito.spy(region.regionServicesForStores);
-    ThreadPoolExecutor pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(1);
-    Mockito.when(region.regionServicesForStores.getInMemoryCompactionPool()).thenReturn(pool);
     region.initialize(null);
     return region;
   }

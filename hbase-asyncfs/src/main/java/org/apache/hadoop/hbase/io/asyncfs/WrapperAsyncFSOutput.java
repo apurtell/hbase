@@ -20,18 +20,17 @@ package org.apache.hadoop.hbase.io.asyncfs;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.io.ByteArrayOutputStream;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * An {@link AsyncFSOutput} wraps a {@link FSDataOutputStream}.
@@ -43,14 +42,10 @@ public class WrapperAsyncFSOutput implements AsyncFSOutput {
 
   private ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 
-  private final ExecutorService executor;
-
   private volatile long syncedLength = 0;
 
   public WrapperAsyncFSOutput(Path file, FSDataOutputStream out) {
     this.out = out;
-    this.executor = Executors.newSingleThreadExecutor(new ThreadFactoryBuilder().setDaemon(true)
-        .setNameFormat("AsyncFSOutputFlusher-" + file.toString().replace("%", "%%")).build());
   }
 
   @Override
@@ -111,20 +106,18 @@ public class WrapperAsyncFSOutput implements AsyncFSOutput {
     CompletableFuture<Long> future = new CompletableFuture<>();
     ByteArrayOutputStream buffer = this.buffer;
     this.buffer = new ByteArrayOutputStream();
-    executor.execute(() -> flush0(future, buffer, sync));
+    ExecutorPools.getPool(PoolType.IO).execute(() -> flush0(future, buffer, sync));
     return future;
   }
 
   @Override
   public void recoverAndClose(CancelableProgressable reporter) throws IOException {
-    executor.shutdown();
     out.close();
   }
 
   @Override
   public void close() throws IOException {
     Preconditions.checkState(buffer.size() == 0, "should call flush first before calling close");
-    executor.shutdown();
     out.close();
   }
 

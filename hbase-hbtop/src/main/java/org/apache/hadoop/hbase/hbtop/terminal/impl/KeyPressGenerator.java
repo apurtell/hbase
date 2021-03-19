@@ -24,19 +24,15 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.hbase.hbtop.terminal.KeyPress;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
-
 
 /**
  * This generates {@link KeyPress} objects from the given input stream and offers them to the
@@ -56,7 +52,6 @@ public class KeyPressGenerator {
   private final Reader input;
   private final InputStream inputStream;
   private final AtomicBoolean stopThreads = new AtomicBoolean();
-  private final ExecutorService executorService;
 
   private ParseState parseState;
   private int param1;
@@ -66,17 +61,12 @@ public class KeyPressGenerator {
     this.inputStream = inputStream;
     input = new InputStreamReader(inputStream, StandardCharsets.UTF_8);
     this.keyPressQueue = keyPressQueue;
-
-    executorService = Executors.newFixedThreadPool(2, new ThreadFactoryBuilder()
-      .setNameFormat("KeyPressGenerator-%d").setDaemon(true)
-      .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
-
     initState();
   }
 
   public void start() {
-    executorService.execute(this::readerThread);
-    executorService.execute(this::generatorThread);
+    ExecutorPools.getPool(PoolType.IO).execute(this::readerThread);
+    ExecutorPools.getPool(PoolType.IO).execute(this::generatorThread);
   }
 
   private void initState() {
@@ -479,14 +469,5 @@ public class KeyPressGenerator {
 
   public void stop() {
     stopThreads.set(true);
-
-    executorService.shutdown();
-    try {
-      while (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
-        LOGGER.warn("Waiting for thread-pool to terminate");
-      }
-    } catch (InterruptedException e) {
-      LOGGER.warn("Interrupted while waiting for thread-pool termination", e);
-    }
   }
 }

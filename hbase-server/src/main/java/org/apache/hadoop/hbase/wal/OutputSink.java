@@ -24,15 +24,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutorCompletionService;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
-import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,7 +66,6 @@ abstract class OutputSink {
   /**
    * Used when close this output sink.
    */
-  protected final ThreadPoolExecutor closeThreadPool;
   protected final CompletionService<Void> closeCompletionService;
 
   public OutputSink(WALSplitter.PipelineController controller, EntryBuffers entryBuffers,
@@ -76,10 +73,7 @@ abstract class OutputSink {
     this.numThreads = numWriters;
     this.controller = controller;
     this.entryBuffers = entryBuffers;
-    this.closeThreadPool = Threads.getBoundedCachedThreadPool(numThreads, 30L, TimeUnit.SECONDS,
-      new ThreadFactoryBuilder().setNameFormat("split-log-closeStream-pool-%d").setDaemon(true)
-        .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
-    this.closeCompletionService = new ExecutorCompletionService<>(closeThreadPool);
+    this.closeCompletionService = new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.WAL));
   }
 
   void setReporter(CancelableProgressable reporter) {

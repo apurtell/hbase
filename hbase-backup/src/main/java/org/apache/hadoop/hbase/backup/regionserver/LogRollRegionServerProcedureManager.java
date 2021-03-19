@@ -19,7 +19,6 @@
 package org.apache.hadoop.hbase.backup.regionserver;
 
 import java.io.IOException;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.backup.BackupRestoreConstants;
@@ -159,15 +158,7 @@ public class LogRollRegionServerProcedureManager extends RegionServerProcedureMa
     ProcedureCoordinationManager coordManager = new ZKProcedureCoordinationManager(rss);
     this.memberRpcs = coordManager
             .getProcedureMemberRpcs(LogRollMasterProcedureManager.ROLLLOG_PROCEDURE_SIGNATURE);
-
-    // read in the backup handler configuration properties
-    Configuration conf = rss.getConfiguration();
-    long keepAlive = conf.getLong(BACKUP_TIMEOUT_MILLIS_KEY, BACKUP_TIMEOUT_MILLIS_DEFAULT);
-    int opThreads = conf.getInt(BACKUP_REQUEST_THREADS_KEY, BACKUP_REQUEST_THREADS_DEFAULT);
-    // create the actual cohort member
-    ThreadPoolExecutor pool =
-        ProcedureMember.defaultPool(rss.getServerName().toString(), opThreads, keepAlive);
-    this.member = new ProcedureMember(memberRpcs, pool, new BackupSubprocedureBuilder());
+    this.member = new ProcedureMember(memberRpcs, new BackupSubprocedureBuilder());
   }
 
   @Override

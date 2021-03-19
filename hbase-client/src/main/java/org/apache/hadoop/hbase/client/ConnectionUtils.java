@@ -24,14 +24,11 @@ import static org.apache.hadoop.hbase.util.FutureUtils.addListener;
 
 import java.io.IOException;
 import java.lang.reflect.UndeclaredThrowableException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -635,17 +632,6 @@ public final class ConnectionUtils {
       future.completeExceptionally(e);
     }
     return future;
-  }
-
-  static void shutdownPool(ExecutorService pool) {
-    pool.shutdown();
-    try {
-      if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
-        pool.shutdownNow();
-      }
-    } catch (InterruptedException e) {
-      pool.shutdownNow();
-    }
   }
 
   static void setCoprocessorError(RpcController controller, Throwable error) {

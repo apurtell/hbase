@@ -32,7 +32,6 @@ import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
-import org.apache.hadoop.hbase.master.cleaner.DirScanPool;
 import org.apache.hadoop.hbase.regionserver.MemStoreLAB;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
@@ -46,8 +45,6 @@ public class MasterRegionTestBase {
   protected MasterRegion region;
 
   protected ChoreService choreService;
-
-  protected DirScanPool cleanerPool;
 
   protected static byte[] CF1 = Bytes.toBytes("f1");
 
@@ -78,8 +75,7 @@ public class MasterRegionTestBase {
     // Runs on local filesystem. Test does not need sync. Turn off checks.
     htu.getConfiguration().setBoolean(CommonFSUtils.UNSAFE_STREAM_CAPABILITY_ENFORCE, false);
     configure(htu.getConfiguration());
-    choreService = new ChoreService(getClass().getSimpleName());
-    cleanerPool = new DirScanPool(htu.getConfiguration());
+    choreService = new ChoreService();
     Server server = mock(Server.class);
     when(server.getConfiguration()).thenReturn(htu.getConfiguration());
     when(server.getServerName())
@@ -102,7 +98,6 @@ public class MasterRegionTestBase {
   @After
   public void tearDown() throws IOException {
     region.close(true);
-    cleanerPool.shutdownNow();
     choreService.shutdown();
     htu.cleanupTestDir();
   }

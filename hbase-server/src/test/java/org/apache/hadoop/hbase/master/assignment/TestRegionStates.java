@@ -24,7 +24,6 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.TableName;
@@ -34,8 +33,8 @@ import org.apache.hadoop.hbase.procedure2.util.StringUtils;
 import org.apache.hadoop.hbase.testclassification.MasterTests;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -57,21 +56,16 @@ public class TestRegionStates {
 
   protected static final HBaseTestingUtility UTIL = new HBaseTestingUtility();
 
-  private static ThreadPoolExecutor threadPool;
   private static ExecutorCompletionService<Object> executorService;
 
   @BeforeClass
   public static void setUp() throws Exception {
-    threadPool = Threads.getBoundedCachedThreadPool(32, 60L, TimeUnit.SECONDS,
-      new ThreadFactoryBuilder().setNameFormat("ProcedureDispatcher-pool-%d").setDaemon(true)
-        .setUncaughtExceptionHandler((t, e) -> LOG.warn("Failed thread " + t.getName(), e))
-        .build());
-    executorService = new ExecutorCompletionService<>(threadPool);
+    executorService = new ExecutorCompletionService<>(ExecutorPools.getPool(PoolType.REGION));
   }
 
   @AfterClass
   public static void tearDown() throws Exception {
-    threadPool.shutdown();
+    ExecutorPools.shutdownPools();
   }
 
   @Before

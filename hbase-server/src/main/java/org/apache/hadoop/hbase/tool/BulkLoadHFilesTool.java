@@ -44,9 +44,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -89,6 +86,8 @@ import org.apache.hadoop.hbase.regionserver.StoreUtils;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.security.token.FsDelegationToken;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.FSVisitor;
 import org.apache.hadoop.hbase.util.FutureUtils;
 import org.apache.hadoop.hbase.util.Pair;
@@ -99,7 +98,6 @@ import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
 import org.apache.hbase.thirdparty.com.google.common.collect.Maps;
 import org.apache.hbase.thirdparty.com.google.common.collect.Multimap;
 import org.apache.hbase.thirdparty.com.google.common.collect.Multimaps;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -135,7 +133,6 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
   // Source delegation token
   private FsDelegationToken fsDelegationToken;
   private UserProvider userProvider;
-  private int nrThreads;
   private final AtomicInteger numRetries = new AtomicInteger(0);
   private String bulkToken;
 
@@ -156,18 +153,7 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
     fsDelegationToken = new FsDelegationToken(userProvider, "renewer");
     assignSeqIds = conf.getBoolean(ASSIGN_SEQ_IDS, true);
     maxFilesPerRegionPerFamily = conf.getInt(MAX_FILES_PER_REGION_PER_FAMILY, 32);
-    nrThreads = conf.getInt("hbase.loadincremental.threads.max",
-      Runtime.getRuntime().availableProcessors());
     bulkLoadByFamily = conf.getBoolean(BULK_LOAD_HFILES_BY_FAMILY, false);
-  }
-
-  // Initialize a thread pool
-  private ExecutorService createExecutorService() {
-    ThreadPoolExecutor pool = new ThreadPoolExecutor(nrThreads, nrThreads, 60, TimeUnit.SECONDS,
-      new LinkedBlockingQueue<>(),
-      new ThreadFactoryBuilder().setNameFormat("BulkLoadHFilesTool-%1$d").setDaemon(true).build());
-    pool.allowCoreThreadTimeOut(true);
-    return pool;
   }
 
   private boolean isCreateTable() {
@@ -363,14 +349,9 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
    */
   public void loadHFileQueue(AsyncClusterConnection conn, TableName tableName,
       Deque<LoadQueueItem> queue, boolean copyFiles) throws IOException {
-    ExecutorService pool = createExecutorService();
-    try {
-      Multimap<ByteBuffer, LoadQueueItem> regionGroups = groupOrSplitPhase(conn, tableName, pool,
-        queue, FutureUtils.get(conn.getRegionLocator(tableName).getStartEndKeys())).getFirst();
-      bulkLoadPhase(conn, tableName, queue, regionGroups, copyFiles, null);
-    } finally {
-      pool.shutdown();
-    }
+    Multimap<ByteBuffer, LoadQueueItem> regionGroups = groupOrSplitPhase(conn, tableName,
+      queue, FutureUtils.get(conn.getRegionLocator(tableName).getStartEndKeys())).getFirst();
+    bulkLoadPhase(conn, tableName, queue, regionGroups, copyFiles, null);
   }
 
   /**
@@ -513,13 +494,12 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
   /**
    * @param conn the HBase cluster connection
    * @param tableName the table name of the table to load into
-   * @param pool the ExecutorService
    * @param queue the queue for LoadQueueItem
    * @param startEndKeys start and end keys
    * @return A map that groups LQI by likely bulk load region targets and Set of missing hfiles.
    */
   private Pair<Multimap<ByteBuffer, LoadQueueItem>, Set<String>> groupOrSplitPhase(
-      AsyncClusterConnection conn, TableName tableName, ExecutorService pool,
+      AsyncClusterConnection conn, TableName tableName,
       Deque<LoadQueueItem> queue, List<Pair<byte[], byte[]>> startEndKeys) throws IOException {
     // <region start key, LQI> need synchronized only within this scope of this
     // phase because of the puts that happen in futures.
@@ -536,7 +516,7 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
 
       final Callable<Pair<List<LoadQueueItem>, String>> call =
         () -> groupOrSplit(conn, tableName, regionGroups, item, startEndKeys);
-      splittingFutures.add(pool.submit(call));
+      splittingFutures.add(ExecutorPools.getPool(PoolType.FILE).submit(call));
     }
     // get all the results. All grouping and splitting must finish before
     // we can attempt the atomic loads.
@@ -881,7 +861,7 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
   }
 
   private Map<LoadQueueItem, ByteBuffer> performBulkLoad(AsyncClusterConnection conn,
-      TableName tableName, Deque<LoadQueueItem> queue, ExecutorService pool, boolean copyFile)
+      TableName tableName, Deque<LoadQueueItem> queue, boolean copyFile)
       throws IOException {
     int count = 0;
 
@@ -909,7 +889,7 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
       count++;
 
       // Using ByteBuffer for byte[] equality semantics
-      pair = groupOrSplitPhase(conn, tableName, pool, queue, startEndKeys);
+      pair = groupOrSplitPhase(conn, tableName, queue, startEndKeys);
       Multimap<ByteBuffer, LoadQueueItem> regionGroups = pair.getFirst();
 
       if (!checkHFilesCountPerRegionPerFamily(regionGroups)) {
@@ -971,8 +951,7 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
         LOG.warn("Bulk load operation did not get any files to load");
         return Collections.emptyMap();
       }
-      pool = createExecutorService();
-      return performBulkLoad(conn, tableName, queue, pool, copyFile);
+      return performBulkLoad(conn, tableName, queue, copyFile);
     } finally {
       cleanup(conn, tableName, queue, pool);
     }
@@ -1017,8 +996,7 @@ public class BulkLoadHFilesTool extends Configured implements BulkLoadHFiles, To
           (hfofDir != null ? hfofDir.toUri().toString() : ""));
         return Collections.emptyMap();
       }
-      pool = createExecutorService();
-      return performBulkLoad(conn, tableName, queue, pool, copyFile);
+      return performBulkLoad(conn, tableName, queue, copyFile);
     } finally {
       cleanup(conn, tableName, queue, pool);
     }

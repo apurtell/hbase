@@ -74,7 +74,7 @@ public class RSDumpServlet extends StateDumpServlet {
 
       out.println("\n\nExecutors:");
       out.println(LINE);
-      dumpExecutors(hrs.getExecutorService(), out);
+      dumpExecutors(out);
 
       out.println("\n\nStacks:");
       out.println(LINE);

@@ -23,7 +23,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ThreadPoolExecutor;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
@@ -65,10 +64,6 @@ public class MasterFlushTableProcedureManager extends MasterProcedureManager {
   private static final String FLUSH_WAKE_MILLIS_KEY = "hbase.flush.master.wakeMillis";
   private static final int FLUSH_WAKE_MILLIS_DEFAULT = 500;
 
-  private static final String FLUSH_PROC_POOL_THREADS_KEY =
-      "hbase.flush.procedure.master.threads";
-  private static final int FLUSH_PROC_POOL_THREADS_DEFAULT = 1;
-
   private static final Logger LOG = LoggerFactory.getLogger(MasterFlushTableProcedureManager.class);
 
   private MasterServices master;
@@ -98,15 +93,12 @@ public class MasterFlushTableProcedureManager extends MasterProcedureManager {
     Configuration conf = master.getConfiguration();
     long wakeFrequency = conf.getInt(FLUSH_WAKE_MILLIS_KEY, FLUSH_WAKE_MILLIS_DEFAULT);
     long timeoutMillis = conf.getLong(FLUSH_TIMEOUT_MILLIS_KEY, FLUSH_TIMEOUT_MILLIS_DEFAULT);
-    int threads = conf.getInt(FLUSH_PROC_POOL_THREADS_KEY, FLUSH_PROC_POOL_THREADS_DEFAULT);
 
     // setup the procedure coordinator
     String name = master.getServerName().toString();
-    ThreadPoolExecutor tpool = ProcedureCoordinator.defaultPool(name, threads);
     ProcedureCoordinatorRpcs comms = new ZKProcedureCoordinator(
         master.getZooKeeper(), getProcedureSignature(), name);
-
-    this.coordinator = new ProcedureCoordinator(comms, tpool, timeoutMillis, wakeFrequency);
+    this.coordinator = new ProcedureCoordinator(comms, timeoutMillis, wakeFrequency);
   }
 
   @Override

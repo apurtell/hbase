@@ -23,19 +23,15 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.errorhandling.ForeignException;
 import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hbase.thirdparty.com.google.common.collect.MapMaker;
 
 /**
@@ -53,7 +49,6 @@ public class ProcedureCoordinator {
   final static long WAKE_MILLIS_DEFAULT = 500;
 
   private final ProcedureCoordinatorRpcs rpcs;
-  private final ExecutorService pool;
   private final long wakeTimeMillis;
   private final long timeoutMillis;
 
@@ -70,8 +65,8 @@ public class ProcedureCoordinator {
    * @param pool Used for executing procedures.
    */
   // Only used in tests. SimpleMasterProcedureManager is a test class.
-  public ProcedureCoordinator(ProcedureCoordinatorRpcs rpcs, ThreadPoolExecutor pool) {
-    this(rpcs, pool, TIMEOUT_MILLIS_DEFAULT, WAKE_MILLIS_DEFAULT);
+  public ProcedureCoordinator(ProcedureCoordinatorRpcs rpcs) {
+    this(rpcs, TIMEOUT_MILLIS_DEFAULT, WAKE_MILLIS_DEFAULT);
   }
 
   /**
@@ -82,38 +77,11 @@ public class ProcedureCoordinator {
    *
    * @param pool Used for executing procedures.
    */
-  public ProcedureCoordinator(ProcedureCoordinatorRpcs rpcs, ThreadPoolExecutor pool,
-      long timeoutMillis, long wakeTimeMillis) {
+  public ProcedureCoordinator(ProcedureCoordinatorRpcs rpcs, long timeoutMillis, long wakeTimeMillis) {
     this.timeoutMillis = timeoutMillis;
     this.wakeTimeMillis = wakeTimeMillis;
     this.rpcs = rpcs;
-    this.pool = pool;
     this.rpcs.start(this);
-  }
-
-  /**
-   * Default thread pool for the procedure
-   *
-   * @param coordName
-   * @param opThreads the maximum number of threads to allow in the pool
-   */
-  public static ThreadPoolExecutor defaultPool(String coordName, int opThreads) {
-    return defaultPool(coordName, opThreads, KEEP_ALIVE_MILLIS_DEFAULT);
-  }
-
-  /**
-   * Default thread pool for the procedure
-   *
-   * @param coordName
-   * @param opThreads the maximum number of threads to allow in the pool
-   * @param keepAliveMillis the maximum time (ms) that excess idle threads will wait for new tasks
-   */
-  public static ThreadPoolExecutor defaultPool(String coordName, int opThreads,
-      long keepAliveMillis) {
-    return new ThreadPoolExecutor(1, opThreads, keepAliveMillis, TimeUnit.MILLISECONDS,
-      new SynchronousQueue<>(),
-      new ThreadFactoryBuilder().setNameFormat("(" + coordName + ")-proc-coordinator-pool-%d")
-        .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
   }
 
   /**
@@ -121,8 +89,6 @@ public class ProcedureCoordinator {
    * @throws IOException
    */
   public void close() throws IOException {
-    // have to use shutdown now to break any latch waiting
-    pool.shutdownNow();
     rpcs.close();
   }
 
@@ -175,7 +141,7 @@ public class ProcedureCoordinator {
     try {
       if (this.procedures.putIfAbsent(procName, proc) == null) {
         LOG.debug("Submitting procedure " + procName);
-        this.pool.submit(proc);
+        ExecutorPools.getPool(PoolType.PROCEDURE).submit(proc);
         return true;
       } else {
         LOG.error("Another thread has submitted procedure '" + procName + "'. Ignoring this attempt.");

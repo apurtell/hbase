@@ -30,7 +30,6 @@ import org.apache.hadoop.hbase.client.MasterSwitchType;
 import org.apache.hadoop.hbase.client.NormalizeTableFilterParams;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.TableDescriptor;
-import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.favored.FavoredNodesManager;
 import org.apache.hadoop.hbase.master.assignment.AssignmentManager;
 import org.apache.hadoop.hbase.master.janitor.CatalogJanitor;
@@ -101,11 +100,6 @@ public interface MasterServices extends Server {
    * @return Master's {@link ServerManager} instance.
    */
   ServerManager getServerManager();
-
-  /**
-   * @return Master's instance of {@link ExecutorService}
-   */
-  ExecutorService getExecutorService();
 
   /**
    * @return Master's instance of {@link TableStateManager}

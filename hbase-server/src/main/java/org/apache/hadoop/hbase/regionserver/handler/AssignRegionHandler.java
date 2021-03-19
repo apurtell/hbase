@@ -33,8 +33,10 @@ import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices.PostOpenDeployContext;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices.RegionStateTransitionContext;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -119,7 +121,9 @@ public class AssignRegionHandler extends EventHandler {
         LOG.info(
           "Receiving OPEN for {} which we are trying to close, try again after {}ms",
           regionName, backoff);
-        rs.getExecutorService().delayedSubmit(this, backoff, TimeUnit.MILLISECONDS);
+        ExecutorPools.getScheduler(PoolType.REGION).schedule(
+          create(rs, regionInfo, openProcId, tableDesc, masterSystemTime),
+            backoff, TimeUnit.MILLISECONDS);
       }
       return;
     }

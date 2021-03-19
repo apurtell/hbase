@@ -28,8 +28,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -38,7 +37,7 @@ import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.regionserver.HRegion;
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -109,14 +108,8 @@ public abstract class ModifyRegionUtils {
       final TableDescriptor tableDescriptor, final RegionInfo[] newRegions,
       final RegionFillTask task) throws IOException {
     if (newRegions == null) return null;
-    int regionNumber = newRegions.length;
-    ThreadPoolExecutor exec = getRegionOpenAndInitThreadPool(conf,
-        "RegionOpenAndInit-" + tableDescriptor.getTableName(), regionNumber);
-    try {
-      return createRegions(exec, conf, rootDir, tableDescriptor, newRegions, task);
-    } finally {
-      exec.shutdownNow();
-    }
+    return createRegions(ExecutorPools.getPool(PoolType.REGION), conf, rootDir, tableDescriptor,
+      newRegions, task);
   }
 
   /**
@@ -131,7 +124,7 @@ public abstract class ModifyRegionUtils {
    * @param task {@link RegionFillTask} custom code to populate region after creation
    * @throws IOException
    */
-  public static List<RegionInfo> createRegions(final ThreadPoolExecutor exec,
+  public static List<RegionInfo> createRegions(final ExecutorService exec,
                                                 final Configuration conf, final Path rootDir,
                                                 final TableDescriptor tableDescriptor, final RegionInfo[] newRegions,
                                                 final RegionFillTask task) throws IOException {
@@ -199,7 +192,7 @@ public abstract class ModifyRegionUtils {
    * @param task {@link RegionFillTask} custom code to edit the region
    * @throws IOException
    */
-  public static void editRegions(final ThreadPoolExecutor exec,
+  public static void editRegions(final ExecutorService exec,
       final Collection<RegionInfo> regions, final RegionEditTask task) throws IOException {
     final ExecutorCompletionService<Void> completionService = new ExecutorCompletionService<>(exec);
     for (final RegionInfo hri: regions) {
@@ -221,19 +214,5 @@ public abstract class ModifyRegionUtils {
     } catch (ExecutionException e) {
       throw new IOException(e.getCause());
     }
-  }
-
-  /*
-   * used by createRegions() to get the thread pool executor based on the
-   * "hbase.hregion.open.and.init.threads.max" property.
-   */
-  static ThreadPoolExecutor getRegionOpenAndInitThreadPool(final Configuration conf,
-    final String threadNamePrefix, int regionNumber) {
-    int maxThreads =
-      Math.min(regionNumber, conf.getInt("hbase.hregion.open.and.init.threads.max", 16));
-    ThreadPoolExecutor regionOpenAndInitThreadPool = Threads.getBoundedCachedThreadPool(maxThreads,
-      30L, TimeUnit.SECONDS, new ThreadFactoryBuilder().setNameFormat(threadNamePrefix + "-pool-%d")
-        .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
-    return regionOpenAndInitThreadPool;
   }
 }

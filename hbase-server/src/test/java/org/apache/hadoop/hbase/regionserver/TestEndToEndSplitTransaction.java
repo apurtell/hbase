@@ -180,7 +180,7 @@ public class TestEndToEndSplitTransaction {
     Stoppable stopper = new StoppableImplementation();
     RegionSplitter regionSplitter = new RegionSplitter(table);
     RegionChecker regionChecker = new RegionChecker(CONF, stopper, tableName);
-    final ChoreService choreService = new ChoreService("TEST_SERVER");
+    final ChoreService choreService = new ChoreService();
 
     choreService.scheduleChore(regionChecker);
     regionSplitter.start();

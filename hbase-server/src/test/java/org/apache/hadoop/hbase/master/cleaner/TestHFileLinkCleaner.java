@@ -40,8 +40,6 @@ import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.HFileArchiveUtil;
 import org.apache.hadoop.hbase.util.MockServer;
 import org.apache.hadoop.hbase.zookeeper.ZKWatcher;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
@@ -60,20 +58,8 @@ public class TestHFileLinkCleaner {
 
   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
 
-  private static DirScanPool POOL;
-
   @Rule
   public TestName name = new TestName();
-
-  @BeforeClass
-  public static void setUp() {
-    POOL = new DirScanPool(TEST_UTIL.getConfiguration());
-  }
-
-  @AfterClass
-  public static void tearDown() {
-    POOL.shutdownNow();
-  }
 
   @Test
   public void testHFileLinkCleaning() throws Exception {
@@ -116,7 +102,7 @@ public class TestHFileLinkCleaner {
     final long ttl = 1000;
     conf.setLong(TimeToLiveHFileCleaner.TTL_CONF_KEY, ttl);
     Server server = new DummyServer();
-    HFileCleaner cleaner = new HFileCleaner(1000, server, conf, fs, archiveDir, POOL);
+    HFileCleaner cleaner = new HFileCleaner(1000, server, conf, fs, archiveDir);
 
     // Link backref cannot be removed
     cleaner.chore();

@@ -27,7 +27,6 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
@@ -55,10 +54,7 @@ public class SimpleRSProcedureManager extends RegionServerProcedureManager {
     this.rss = rss;
     ZKWatcher zkw = rss.getZooKeeper();
     this.memberRpcs = new ZKProcedureMemberRpcs(zkw, getProcedureSignature());
-
-    ThreadPoolExecutor pool =
-        ProcedureMember.defaultPool(rss.getServerName().toString(), 1);
-    this.member = new ProcedureMember(memberRpcs, pool, new SimleSubprocedureBuilder());
+    this.member = new ProcedureMember(memberRpcs, new SimleSubprocedureBuilder());
     LOG.info("Initialized: " + rss.getServerName().toString());
   }
 

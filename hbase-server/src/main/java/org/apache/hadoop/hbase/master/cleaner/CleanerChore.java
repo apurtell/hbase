@@ -35,13 +35,14 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathIsNotEmptyDirectoryException;
 import org.apache.hadoop.hbase.ScheduledChore;
 import org.apache.hadoop.hbase.Stoppable;
+import org.apache.hadoop.hbase.util.ExecutorPools;
 import org.apache.hadoop.hbase.util.FutureUtils;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
 import org.apache.hbase.thirdparty.com.google.common.collect.ImmutableSet;
 import org.apache.hbase.thirdparty.com.google.common.collect.Iterables;
 import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
@@ -54,18 +55,6 @@ import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
 public abstract class CleanerChore<T extends FileCleanerDelegate> extends ScheduledChore {
 
   private static final Logger LOG = LoggerFactory.getLogger(CleanerChore.class);
-  private static final int AVAIL_PROCESSORS = Runtime.getRuntime().availableProcessors();
-
-  /**
-   * If it is an integer and >= 1, it would be the size;
-   * if 0.0 < size <= 1.0, size would be available processors * size.
-   * Pay attention that 1.0 is different from 1, former indicates it will use 100% of cores,
-   * while latter will use only 1 thread for chore to scan dir.
-   */
-  public static final String CHORE_POOL_SIZE = "hbase.cleaner.scan.dir.concurrent.size";
-  static final String DEFAULT_CHORE_POOL_SIZE = "0.25";
-
-  private final DirScanPool pool;
 
   protected final FileSystem fs;
   private final Path oldFileDir;
@@ -75,8 +64,8 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
   protected List<T> cleanersChain;
 
   public CleanerChore(String name, final int sleepPeriod, final Stoppable s, Configuration conf,
-    FileSystem fs, Path oldFileDir, String confKey, DirScanPool pool) {
-    this(name, sleepPeriod, s, conf, fs, oldFileDir, confKey, pool, null);
+    FileSystem fs, Path oldFileDir, String confKey) {
+    this(name, sleepPeriod, s, conf, fs, oldFileDir, confKey, null);
   }
 
   /**
@@ -87,50 +76,16 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
    * @param fs handle to the FS
    * @param oldFileDir the path to the archived files
    * @param confKey configuration key for the classes to instantiate
-   * @param pool the thread pool used to scan directories
    * @param params members could be used in cleaner
    */
   public CleanerChore(String name, final int sleepPeriod, final Stoppable s, Configuration conf,
-    FileSystem fs, Path oldFileDir, String confKey, DirScanPool pool, Map<String, Object> params) {
+    FileSystem fs, Path oldFileDir, String confKey, Map<String, Object> params) {
     super(name, s, sleepPeriod);
-
-    Preconditions.checkNotNull(pool, "Chore's pool can not be null");
-    this.pool = pool;
     this.fs = fs;
     this.oldFileDir = oldFileDir;
     this.conf = conf;
     this.params = params;
     initCleanerChain(confKey);
-  }
-
-  /**
-   * Calculate size for cleaner pool.
-   * @param poolSize size from configuration
-   * @return size of pool after calculation
-   */
-  static int calculatePoolSize(String poolSize) {
-    if (poolSize.matches("[1-9][0-9]*")) {
-      // If poolSize is an integer, return it directly,
-      // but upmost to the number of available processors.
-      int size = Math.min(Integer.parseInt(poolSize), AVAIL_PROCESSORS);
-      if (size == AVAIL_PROCESSORS) {
-        LOG.warn("Use full core processors to scan dir, size={}", size);
-      }
-      return size;
-    } else if (poolSize.matches("0.[0-9]+|1.0")) {
-      // if poolSize is a double, return poolSize * availableProcessors;
-      // Ensure that we always return at least one.
-      int computedThreads = (int) (AVAIL_PROCESSORS * Double.parseDouble(poolSize));
-      if (computedThreads < 1) {
-        LOG.debug("Computed {} threads for CleanerChore, using 1 instead", computedThreads);
-        return 1;
-      }
-      return computedThreads;
-    } else {
-      LOG.error("Unrecognized value: " + poolSize + " for " + CHORE_POOL_SIZE +
-          ", use default config: " + DEFAULT_CHORE_POOL_SIZE + " instead.");
-      return calculatePoolSize(DEFAULT_CHORE_POOL_SIZE);
-    }
   }
 
   /**
@@ -189,21 +144,11 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
   @Override
   protected void chore() {
     if (getEnabled()) {
-      try {
-        pool.latchCountUp();
-        if (runCleaner()) {
-          LOG.trace("Cleaned all WALs under {}", oldFileDir);
-        } else {
-          LOG.trace("WALs outstanding under {}", oldFileDir);
-        }
-      } finally {
-        pool.latchCountDown();
+      if (runCleaner()) {
+        LOG.trace("Cleaned all WALs under {}", oldFileDir);
+      } else {
+        LOG.trace("WALs outstanding under {}", oldFileDir);
       }
-      // After each cleaner chore, checks if received reconfigure notification while cleaning.
-      // First in cleaner turns off notification, to avoid another cleaner updating pool again.
-      // This cleaner is waiting for other cleaners finishing their jobs.
-      // To avoid missing next chore, only wait 0.8 * period, then shutdown.
-      pool.tryUpdatePoolSize((long) (0.8 * getTimeUnit().toMillis(getPeriod())));
     } else {
       LOG.trace("Cleaner chore disabled! Not cleaning.");
     }
@@ -217,7 +162,7 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
     preRunCleaner();
     try {
       CompletableFuture<Boolean> future = new CompletableFuture<>();
-      pool.execute(() -> traverseAndDelete(oldFileDir, true, future));
+      ExecutorPools.getPool(PoolType.FILE).execute(() -> traverseAndDelete(oldFileDir, true, future));
       return future.get();
     } catch (Exception e) {
       LOG.info("Failed to traverse and delete the dir: {}", oldFileDir, e);
@@ -371,10 +316,6 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
     }
   }
 
-  int getChorePoolSize() {
-    return pool.getSize();
-  }
-
   /**
    * @param enabled
    */
@@ -390,8 +331,8 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
   }
 
   /**
-   * Attempts to clean up a directory(its subdirectories, and files) in a
-   * {@link java.util.concurrent.ThreadPoolExecutor} concurrently. We can get the final result by
+   * Attempts to clean up a directory(its subdirectories, and files) concurrently. 
+   * We can get the final result by
    * calling result.get().
    */
   private void traverseAndDelete(Path dir, boolean root, CompletableFuture<Boolean> result) {
@@ -414,7 +355,7 @@ public abstract class CleanerChore<T extends FileCleanerDelegate> extends Schedu
         // Submit the request of sub-directory deletion.
         subDirs.forEach(subDir -> {
           CompletableFuture<Boolean> subFuture = new CompletableFuture<>();
-          pool.execute(() -> traverseAndDelete(subDir.getPath(), false, subFuture));
+          ExecutorPools.getPool(PoolType.FILE).execute(() -> traverseAndDelete(subDir.getPath(), false, subFuture));
           futures.add(subFuture);
         });
       }

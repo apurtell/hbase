@@ -1000,7 +1000,7 @@ public class CanaryTool implements Tool, Canary {
     // for more details.
     final ScheduledChore authChore = AuthUtil.getAuthChore(conf);
     if (authChore != null) {
-      choreService = new ChoreService("CANARY_TOOL");
+      choreService = new ChoreService();
       choreService.scheduleChore(authChore);
     }
 

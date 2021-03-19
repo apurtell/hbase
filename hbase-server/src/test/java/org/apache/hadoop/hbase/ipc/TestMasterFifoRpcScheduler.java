@@ -29,7 +29,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
-import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.master.MasterRpcServices;
 import org.apache.hadoop.hbase.regionserver.RSRpcServices;
@@ -66,8 +65,6 @@ public class TestMasterFifoRpcScheduler {
     Configuration conf = TEST_UTIL.getConfiguration();
     conf.set(RSRpcServices.MASTER_RPC_SCHEDULER_FACTORY_CLASS,
       "org.apache.hadoop.hbase.regionserver.MasterFifoRpcSchedulerFactory");
-    conf.setInt(HConstants.REGION_SERVER_HANDLER_COUNT, 5);
-    conf.setInt(MasterFifoRpcScheduler.MASTER_SERVER_REPORT_HANDLER_COUNT, 2);
     TEST_UTIL.startMiniCluster();
   }
 
@@ -89,7 +86,7 @@ public class TestMasterFifoRpcScheduler {
     Configuration conf = HBaseConfiguration.create();
     AtomicInteger callExecutionCount = new AtomicInteger(0);
 
-    RpcScheduler scheduler = new MockMasterFifoRpcScheduler(conf, 2, 1);
+    RpcScheduler scheduler = new MockMasterFifoRpcScheduler(conf);
     scheduler.start();
 
     int totalCallMethods = 30;
@@ -148,9 +145,8 @@ public class TestMasterFifoRpcScheduler {
 
   private static class MockMasterFifoRpcScheduler extends MasterFifoRpcScheduler {
 
-    public MockMasterFifoRpcScheduler(Configuration conf, int callHandlerCount,
-        int rsReportHandlerCount) {
-      super(conf, callHandlerCount, rsReportHandlerCount);
+    public MockMasterFifoRpcScheduler(Configuration conf) {
+      super(conf);
     }
 
     /**

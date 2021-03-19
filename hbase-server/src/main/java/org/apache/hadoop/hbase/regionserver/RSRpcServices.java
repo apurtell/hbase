@@ -144,6 +144,8 @@ import org.apache.hadoop.hbase.security.access.ZKPermissionWatcher;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.ExecutorPools;
+import org.apache.hadoop.hbase.util.ExecutorPools.PoolType;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;
 import org.apache.hadoop.hbase.wal.WAL;
@@ -1879,33 +1881,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
         + RpcServer.getRemoteAddress().orElse(null) + " clear compactions queue");
     ClearCompactionQueuesResponse.Builder respBuilder = ClearCompactionQueuesResponse.newBuilder();
     requestCount.increment();
-    if (clearCompactionQueues.compareAndSet(false,true)) {
-      try {
-        checkOpen();
-        regionServer.getRegionServerCoprocessorHost().preClearCompactionQueues();
-        for (String queueName : request.getQueueNameList()) {
-          LOG.debug("clear " + queueName + " compaction queue");
-          switch (queueName) {
-            case "long":
-              regionServer.compactSplitThread.clearLongCompactionsQueue();
-              break;
-            case "short":
-              regionServer.compactSplitThread.clearShortCompactionsQueue();
-              break;
-            default:
-              LOG.warn("Unknown queue name " + queueName);
-              throw new IOException("Unknown queue name " + queueName);
-          }
-        }
-        regionServer.getRegionServerCoprocessorHost().postClearCompactionQueues();
-      } catch (IOException ie) {
-        throw new ServiceException(ie);
-      } finally {
-        clearCompactionQueues.set(false);
-      }
-    } else {
-      LOG.warn("Clear compactions queue is executing by other admin.");
-    }
+    // TODO
     return respBuilder.build();
   }
 
@@ -2120,24 +2096,20 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
           }
           // If there is no action in progress, we can submit a specific handler.
           // Need to pass the expected version in the constructor.
-          if (regionServer.executorService == null) {
-            LOG.info("No executor executorService; skipping open request");
-          } else {
-            if (region.isMetaRegion()) {
-              regionServer.executorService.submit(new OpenMetaHandler(
+          if (region.isMetaRegion()) {
+            ExecutorPools.getPool(PoolType.REGION).submit(new OpenMetaHandler(
               regionServer, regionServer, region, htd, masterSystemTime));
-            } else {
-              if (regionOpenInfo.getFavoredNodesCount() > 0) {
-                regionServer.updateRegionFavoredNodesMapping(region.getEncodedName(),
+          } else {
+            if (regionOpenInfo.getFavoredNodesCount() > 0) {
+              regionServer.updateRegionFavoredNodesMapping(region.getEncodedName(),
                 regionOpenInfo.getFavoredNodesList());
-              }
-              if (htd.getPriority() >= HConstants.ADMIN_QOS || region.getTable().isSystemTable()) {
-                regionServer.executorService.submit(new OpenPriorityRegionHandler(
+            }
+            if (htd.getPriority() >= HConstants.ADMIN_QOS || region.getTable().isSystemTable()) {
+              ExecutorPools.getPool(PoolType.REGION).submit(new OpenPriorityRegionHandler(
                 regionServer, regionServer, region, htd, masterSystemTime));
-              } else {
-                regionServer.executorService.submit(new OpenRegionHandler(
+            } else {
+              ExecutorPools.getPool(PoolType.REGION).submit(new OpenRegionHandler(
                 regionServer, regionServer, region, htd, masterSystemTime));
-              }
             }
           }
         }
@@ -3904,7 +3876,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
       }
       long procId = regionOpenInfo.getOpenProcId();
       if (regionServer.submitRegionProcedure(procId)) {
-        regionServer.executorService.submit(AssignRegionHandler
+        ExecutorPools.getPool(PoolType.REGION).submit(AssignRegionHandler
             .create(regionServer, regionInfo, procId, tableDesc,
                 masterSystemTime));
       }
@@ -3923,7 +3895,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
         null;
     long procId = request.getCloseProcId();
     if (regionServer.submitRegionProcedure(procId)) {
-      regionServer.executorService.submit(UnassignRegionHandler
+      ExecutorPools.getPool(PoolType.REGION).submit(UnassignRegionHandler
           .create(regionServer, encodedName, procId, false, destination));
     }
   }

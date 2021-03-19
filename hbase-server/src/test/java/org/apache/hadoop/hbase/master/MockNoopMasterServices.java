@@ -34,7 +34,6 @@ import org.apache.hadoop.hbase.client.MasterSwitchType;
 import org.apache.hadoop.hbase.client.NormalizeTableFilterParams;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.TableDescriptor;
-import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.favored.FavoredNodesManager;
 import org.apache.hadoop.hbase.master.assignment.AssignmentManager;
 import org.apache.hadoop.hbase.master.janitor.CatalogJanitor;
@@ -96,11 +95,6 @@ public class MockNoopMasterServices implements MasterServices {
 
   @Override
   public AssignmentManager getAssignmentManager() {
-    return null;
-  }
-
-  @Override
-  public ExecutorService getExecutorService() {
     return null;
   }
 
