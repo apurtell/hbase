@@ -665,7 +665,11 @@ public class FSHLog extends AbstractFSWAL<Writer> {
             //TODO handle htrace API change, see HBASE-18895
             // takeSyncFuture.setSpan(scope.getSpan());
             // First release what we 'took' from the queue.
-            syncCount += releaseSyncFuture(takeSyncFuture, currentSequence, lastException);
+            int released = releaseSyncFuture(takeSyncFuture, currentSequence, lastException);
+            if (released > 0) {
+              takeSyncFuture = null;
+              syncCount += released;
+            }
             // Can we release other syncs?
             syncCount += releaseSyncFutures(currentSequence, lastException);
             if (lastException != null) {
@@ -676,7 +680,19 @@ public class FSHLog extends AbstractFSWAL<Writer> {
           }
           postSync(System.nanoTime() - start, syncCount);
         } catch (InterruptedException e) {
-          // Presume legit interrupt.
+          // Presume legit interrupt. Cancel all remaining futures, if any, that will
+          // never be processed.
+          if (takeSyncFuture != null) {
+            takeSyncFuture.cancel(true);
+          }
+          while (!syncFutures.isEmpty()) {
+            takeSyncFuture = syncFutures.poll();
+            if (takeSyncFuture != null) {
+              takeSyncFuture.cancel(true);
+            }
+          }
+          takeSyncFuture = null;
+          // Reassert interrupt status on thread so it will propagate
           Thread.currentThread().interrupt();
         } catch (Throwable t) {
           LOG.warn("UNEXPECTED, continuing", t);
