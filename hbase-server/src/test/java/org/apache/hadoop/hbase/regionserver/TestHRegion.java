@@ -65,6 +65,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
+import org.apache.commons.math3.stat.descriptive.SynchronizedDescriptiveStatistics;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
@@ -8207,6 +8209,118 @@ public class TestHRegion {
 
   public static class NoOpRegionCoprocessor implements RegionCoprocessor, RegionObserver {
     // a empty region coprocessor class
+  }
+
+  @Test
+  public void testBenchmarkRowCommitSequencer() throws Exception {
+    final int ITERATIONS = 100;
+    final boolean[] ENABLED = { false, true };
+    final boolean[] CONTENDED = { false, true };
+    final int[] NUM_ROWS = { 1, 10, 100, 1000 };
+    final int[] NUM_THREADS = { 1, 2, 4, 8, 16, 32 };
+
+    // Warmup
+    doBenchmarkRowCommitSequencer(1, 1, ITERATIONS, true, false);
+    doBenchmarkRowCommitSequencer(1, 1, ITERATIONS, true, true);
+
+    List<String> results = new ArrayList<>();
+
+    // Real
+    for (boolean enabled: ENABLED) {
+      for (boolean conflict: CONTENDED) {
+        for (int numRows: NUM_ROWS) {
+          for (int numThreads: NUM_THREADS) {
+            DescriptiveStatistics stats =
+              doBenchmarkRowCommitSequencer(numRows, numThreads, ITERATIONS, enabled, conflict);
+            String s = String.format("%s %s %3d iterations %2d threads %4d rows ms/op:" +
+              " p50=%.4f p99=%.4f, p999=%.4f max=%.4f",
+                enabled ? "active  " : "baseline",
+                conflict ? "conflict  " : "noconflict",
+                ITERATIONS,
+                numThreads,
+                numRows,
+                stats.getPercentile(0.5)/1000.0/1000.0,
+                stats.getPercentile(0.99)/1000.0/1000.0,
+                stats.getPercentile(0.999)/1000.0/1000.0,
+                stats.getMax()/1000.0/1000.0);
+            results.add(s);
+            LOG.info(s);
+          }
+        }
+      }
+    }
+    for (String s: results) {
+      System.out.println(s);
+    }
+  }
+
+  private DescriptiveStatistics doBenchmarkRowCommitSequencer(final int numRows,
+      final int numThreads, final int iterations, final boolean enabled,
+      final boolean contended) throws Exception {
+    final SynchronizedDescriptiveStatistics stats = new SynchronizedDescriptiveStatistics();
+    final byte[] cf1 = Bytes.toBytes("CF1");
+    final byte[][] families = { cf1 };
+
+    Configuration thisConf = new Configuration(CONF);
+    thisConf.setBoolean(HRegion.COMMIT_SEQUENCER_ENABLED_KEY, enabled);
+    //final HRegion region = initHRegion(tableName, method, thisConf, families);
+    final HRegion region = initHRegion(tableName, null, null, CONF, false, Durability.USE_DEFAULT,
+      new NullWAL(CONF), families);
+
+    LOG.info("Enabled is {}", enabled);
+    LOG.info("Contended is {}", contended);
+    LOG.info("Mutation batch size is {} rows", numRows);
+    final Put[][] threadPuts = new Put[numThreads][];
+    int r = 0;
+    for (int t = 0; t < numThreads; t++) {
+      threadPuts[t] = new Put[numRows];
+      for (int i = 0; i < numRows; i++) {
+        threadPuts[t][i] = new Put(Bytes.toBytes("row" + r++)).addColumn(cf1,
+          HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY);
+      }
+      if (contended) {
+        r = 0;
+      }
+    }
+    LOG.info("Starting {} threads", numThreads);
+    final Thread[] threads = new Thread[numThreads];
+    final CountDownLatch latch = new CountDownLatch(1);
+    for (int t = 0; t < numThreads; t++) {
+      final int tid = t;
+      threads[t] = new Thread(() -> {
+        try {
+          latch.await();
+        } catch (InterruptedException e) {
+          LOG.error("Interrupted while waiting to start", e);
+          return;
+        }
+        for (int i = 0; i < iterations; i++) {
+          try {
+            final long start = System.nanoTime();
+            region.batchMutate(threadPuts[tid]);
+            final long end = System.nanoTime();
+            stats.addValue(end - start);
+          } catch (IOException e) {
+            LOG.error("Unexpected exception", e);
+          }
+        }
+      });
+      threads[t].start();
+    }
+    LOG.info("Releasing latch");
+    latch.countDown();
+    for (int i = 0; i < numThreads; i++) {
+      threads[i].join();
+    }
+    LOG.info("All threads finished");
+
+    try {
+      region.close();
+    } catch (Exception e) {
+      LOG.warn("Exception closing region", e);
+    }
+
+    return stats;
   }
 
 }
