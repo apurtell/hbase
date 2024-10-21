@@ -29,11 +29,13 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseIOException;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotDisabledException;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.RegionInfo;
+import org.apache.hadoop.hbase.client.SnapshotDescription;
 import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.master.MasterFileSystem;
@@ -370,5 +372,103 @@ public class TestTruncateTableProcedure extends TestTableDDLProcedureBase {
     // confirm that we have the correct number of regions
     assertEquals((regions.length + 1) * regionReplication,
       UTIL.getAdmin().getRegions(tableName).size());
+  }
+
+  @Test
+  public void testRecoverySnapshotRollback() throws Exception {
+    final TableName tableName = TableName.valueOf(name.getMethodName());
+    final String[] families = new String[] { "f1", "f2" };
+
+    // Enable recovery snapshots
+    UTIL.getConfiguration().setBoolean(HConstants.SNAPSHOT_BEFORE_DELETE_ENABLED_KEY, true);
+
+    try {
+      // Create table with data
+      MasterProcedureTestingUtility.createTable(getMasterProcedureExecutor(), tableName, null,
+        families);
+      MasterProcedureTestingUtility.loadData(UTIL.getConnection(), tableName, 100, null, families);
+      assertEquals(100, UTIL.countRows(tableName));
+
+      // Disable the table
+      UTIL.getAdmin().disableTable(tableName);
+
+      // Create a procedure that will fail after snapshot creation
+      final ProcedureExecutor<MasterProcedureEnv> procExec = getMasterProcedureExecutor();
+      long procId = procExec.submitProcedure(
+        new TruncateTableProcedureOnHDFSFailure(procExec.getEnvironment(), tableName, false));
+
+      // Wait for procedure to fail
+      ProcedureTestingUtility.waitProcedure(procExec, procId);
+      Procedure<?> result = procExec.getResult(procId);
+      assertTrue("Procedure should have failed", result.isFailed());
+
+      // Verify no recovery snapshots remain after rollback
+      boolean snapshotFound = false;
+      for (SnapshotDescription snapshot : UTIL.getAdmin().listSnapshots()) {
+        if (snapshot.getName().startsWith("auto_" + tableName.getNameAsString())) {
+          snapshotFound = true;
+          break;
+        }
+      }
+      assertTrue("Recovery snapshot should have been cleaned up during rollback", !snapshotFound);
+    } finally {
+      // Clean up - disable recovery snapshots
+      UTIL.getConfiguration().setBoolean(HConstants.SNAPSHOT_BEFORE_DELETE_ENABLED_KEY, false);
+    }
+  }
+
+  @Test
+  public void testRecoverySnapshotAndRestore() throws Exception {
+    final TableName tableName = TableName.valueOf(name.getMethodName());
+    final TableName restoredTableName = TableName.valueOf(name.getMethodName() + "_restored");
+    final String[] families = new String[] { "f1", "f2" };
+
+    // Enable recovery snapshots
+    UTIL.getConfiguration().setBoolean(HConstants.SNAPSHOT_BEFORE_DELETE_ENABLED_KEY, true);
+
+    try {
+      // Create table with data
+      MasterProcedureTestingUtility.createTable(getMasterProcedureExecutor(), tableName, null,
+        families);
+      MasterProcedureTestingUtility.loadData(UTIL.getConnection(), tableName, 100, null, families);
+      assertEquals(100, UTIL.countRows(tableName));
+
+      // Disable the table
+      UTIL.getAdmin().disableTable(tableName);
+
+      // Truncate the table (this should create a recovery snapshot)
+      final ProcedureExecutor<MasterProcedureEnv> procExec = getMasterProcedureExecutor();
+      long procId = ProcedureTestingUtility.submitAndWait(procExec,
+        new TruncateTableProcedure(procExec.getEnvironment(), tableName, false));
+      ProcedureTestingUtility.assertProcNotFailed(procExec, procId);
+
+      // Verify table is truncated
+      UTIL.waitUntilAllRegionsAssigned(tableName);
+      assertEquals(0, UTIL.countRows(tableName));
+
+      // Find the recovery snapshot
+      String recoverySnapshotName = null;
+      for (SnapshotDescription snapshot : UTIL.getAdmin().listSnapshots()) {
+        if (snapshot.getName().startsWith("auto_" + tableName.getNameAsString())) {
+          recoverySnapshotName = snapshot.getName();
+          break;
+        }
+      }
+      assertTrue("Recovery snapshot should exist", recoverySnapshotName != null);
+
+      // Restore from snapshot by cloning to a new table
+      UTIL.getAdmin().cloneSnapshot(recoverySnapshotName, restoredTableName);
+      UTIL.waitUntilAllRegionsAssigned(restoredTableName);
+
+      // Verify restored table has original data
+      assertEquals(100, UTIL.countRows(restoredTableName));
+
+      // Clean up the cloned table
+      UTIL.getAdmin().disableTable(restoredTableName);
+      UTIL.getAdmin().deleteTable(restoredTableName);
+    } finally {
+      // Clean up - disable recovery snapshots
+      UTIL.getConfiguration().setBoolean(HConstants.SNAPSHOT_BEFORE_DELETE_ENABLED_KEY, false);
+    }
   }
 }

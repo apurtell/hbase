@@ -1532,6 +1532,14 @@ public final class HConstants {
   // User defined Default TTL config key
   public static final String DEFAULT_SNAPSHOT_TTL_CONFIG_KEY = "hbase.master.snapshot.ttl";
 
+  // Soft drop for destructive table actions configuration
+  public static final String SNAPSHOT_BEFORE_DELETE_ENABLED_KEY =
+    "hbase.snapshot.before.delete.enabled";
+  public static final boolean DEFAULT_SNAPSHOT_BEFORE_DELETE_ENABLED = false;
+
+  public static final String SNAPSHOT_BEFORE_DELETE_TTL_KEY = "hbase.snapshot.before.delete.ttl";
+  public static final long DEFAULT_SNAPSHOT_BEFORE_DELETE_TTL = 86400; // 1 day in seconds
+
   // Regions Recovery based on high storeFileRefCount threshold value
   public static final String STORE_FILE_REF_COUNT_THRESHOLD =
     "hbase.regions.recovery.store.file.ref.count";
