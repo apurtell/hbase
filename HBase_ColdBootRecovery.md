@@ -280,8 +280,8 @@ The new procedure BulkAssignProcedure is designed for assigning a large set of o
 
 1. **BULK_ASSIGN_PREPARE:** Initial sanity checks. Transition to BULK_ASSIGN_CREATE_PLAN.
 2. **BULK_ASSIGN_CREATE_PLAN:** Call the LoadBalancer with the full list of regions to get an efficient, balanced assignment plan. This is more efficient than assigning regions one by one. Transition to BULK_ASSIGN_DISPATCH_BATCH.
-3. **BULK_ASSIGN_DISPATCH_BATCH:** Take the next batch of regions from the plan. For each region in the batch, create a simple assign TRSP, and submit the TRSPs as child procedures. Transition to BULK_ASSIGN_CONFIRM_BATCH_ASSIGNED.
-4. **BULK_ASSIGN_CONFIRM_BATCH_ASSIGNED:** Wait for all child procedures in the batch to complete. Check if there are more regions in the plan. If so, transition back to the BULK_ASSIGN_DISPATCH_BATCH state. If not, transition to BULK_ASSIGN_POST_OPERATION.
+3. **BULK_ASSIGN_DISPATCH_BATCH:** Take the next batch of regions from the plan. For each region in the batch, create a simple assign TRSP, and submit the TRSPs as child procedures. Transition to BULK_ASSIGN_CONFIRM_BATCH.
+4. **BULK_ASSIGN_CONFIRM_BATCH:** Wait for all child procedures in the batch to complete. Check if there are more regions in the plan. If so, transition back to the BULK_ASSIGN_DISPATCH_BATCH state. If not, transition to BULK_ASSIGN_POST_OPERATION.
 5. **BULK_ASSIGN_POST_OPERATION:** Perform any cleanup and finish.
 
 This new procedure would be clean, semantically correct, and would reuse the best patterns from RTRP without inheriting its unsuitable assumptions.
@@ -362,15 +362,19 @@ We would handle pathological WAL splitting issues with a two pronged approach.
 
 ### WAL Split Quarantine
 
-We would modify the SplitWALProcedure to take automated action after repeated failures. After a configurable number of failed attempts on different workers, the procedure would enter a new QUARANTINE_WAL state. In this state, it would move the problematic WAL file to a dedicated quarantine directory in HDFS (e.g., `/hbase/WALs/quarantine/`). After the move, the procedure would terminate with a SUCCESS status.
+We would modify the SplitWALProcedure to take automated action after repeated failures. After a configurable number of failed attempts on different workers, the procedure would enter a new QUARANTINE_WAL state. In this state, it would move the problematic WAL file to the existing corrupt directory in HDFS (`/hbase/corrupt/<server-name>/`), reusing infrastructure already in place for WALs that fail during parsing. After the move, the procedure would terminate with a SUCCESS status.
 
 The default configuration can be set to very conservative values.
 
-This unblocks recovery and allows the BRP to proceed, enabling the rest of the cluster to come online, while preserving data. The problematic WAL is not deleted. It is safely isolated for later offline analysis and manual data recovery by way of tools like WALPlayer. This is a default-safe, automated behavior that prioritizes cluster availability without discarding potentially valuable data. However, this does introduce a new operational concept (quarantine and its associated directory) that operators must monitor. The presence of any file in the quarantine directory should trigger a high priority alert.
+This unblocks recovery and allows the BRP to proceed, enabling the rest of the cluster to come online, while preserving data. The problematic WAL is not deleted. It is safely isolated for later offline analysis and manual data recovery by way of tools like WALPlayer. This is a default-safe, automated behavior that prioritizes cluster availability without discarding potentially valuable data. Operators must monitor the corrupt directory (`/hbase/corrupt/`) for quarantined WALs. The presence of any file in this directory should trigger a high priority alert, as it indicates potential data loss requiring manual recovery.
 
 ### New HBCK2 `quarantine_wal` Command
 
-We would introduce a new HBCK2 command, `quarantine_wal <proc_id>`, that an operator can use to target a stuck SplitWALProcedure. This command would immediately force transition the stuck WAL split procedure into the QUARANTINE_WAL state, and from there it would terminate with SUCCESS as described above. The parent SCP would then consider the child complete and proceed.
+We would introduce a new HBCK2 command with two modes:
+
+- `hbck2 quarantine_wal --proc-id <id>` - Forces a stuck SplitWALProcedure to immediately transition to the QUARANTINE_WAL state. The procedure will move its WAL to the corrupt directory and terminate with SUCCESS. The parent SCP will then consider the child complete and proceed.
+
+- `hbck2 quarantine_wal --wal-path <hdfs-path>` - Directly quarantines a WAL file by path, without requiring an active procedure. This is useful when the SplitWALProcedure has already been bypassed or does not exist, but the WAL file still needs to be moved out of the way.
 
 This provides ultimate control to an operator in an emergency. Perhaps the default configuration of the QUARANTINE_WAL capability is set to very conservative values yet the operator makes the executive decision that cluster availability should be immediately prioritized.
 
@@ -384,7 +388,7 @@ The SplitWALManager dispatches WAL splitting tasks to the available RegionServer
 
 The BulkAssignProcedure is designed to efficiently assign a large number of offline regions and provides a very substantial reduction in fan-out. For a 10-minute recovery, this procedure needs to optimally batch with minimal overhead, considering the potential for many thousands of regions requiring assignment. The Master must not become a bottleneck due to procedure scheduling, locking, or execution overhead.
 
-We introduce WAL quarantine to prevent a single stuck SplitWALProcedure from blocking the entire recovery. For a 10-minute recovery, this automated quarantine mechanism must be enabled, effective, and timely.
+We introduce WAL quarantine to prevent a single stuck SplitWALProcedure from blocking the entire recovery. For a 10-minute recovery, this automated quarantine mechanism must be enabled, effective, and timely. The `HBaseColdStartTool` should configure the cluster with `hbase.splitwal.quarantine.enabled=true` and an aggressive failure threshold (e.g., `hbase.splitwal.quarantine.failure.threshold=3`).
 
 ### Recovery Time Objective (RTO)
 
@@ -544,12 +548,15 @@ This task will add a quarantine mechanism for problematic WAL files. This will p
 
 **Implementation Details:**
 - Modify the SplitWALProcedure to include a QUARANTINE_WAL state.
-- Implement the logic to move problematic WALs to a quarantine directory.
-- Create the new HBCK2 `quarantine_wal` command.
+- Implement the logic to move problematic WALs to the existing corrupt directory (`/hbase/corrupt/<server-name>/`).
+- Create the new HBCK2 `quarantine_wal` command with two modes: by procedure ID and by WAL path.
+- Add JMX metrics for monitoring quarantined WAL count.
 
 **Acceptance Criteria:**
 - Unit tests for the WAL quarantine logic.
 - Integration tests simulating a failed WAL split and verifying that the cluster can still recover.
+
+**Detailed Design:** [HBase_ColdBootRecovery_Task_4_Design.md](HBase_ColdBootRecovery_Task_4_Design.md)
 
 ---
 
