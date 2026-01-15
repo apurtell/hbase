@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -59,6 +60,7 @@ import org.apache.hadoop.hbase.master.assignment.RegionStates;
 import org.apache.hadoop.hbase.master.procedure.ServerCrashProcedure;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.procedure2.Procedure;
+import org.apache.hadoop.hbase.procedure2.ProcedureExecutor;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
@@ -443,9 +445,31 @@ public class ServerManager implements ConfigurationObserver {
    */
   void findDeadServersAndProcess(Map<ServerName, Long> deadServersWithDeathTimeFromPE,
     Set<ServerName> liveServersFromWALDir) {
+
     deadServersWithDeathTimeFromPE.forEach(deadservers::putIfAbsent);
-    liveServersFromWALDir.stream().filter(sn -> !onlineServers.containsKey(sn))
-      .forEach(this::expireServer);
+
+    // Check for servers that need new SCP scheduled.
+    Set<ServerName> candidateDeadServers = liveServersFromWALDir.stream()
+      .filter(sn -> !onlineServers.containsKey(sn)).collect(Collectors.toSet());
+    if (candidateDeadServers.isEmpty()) {
+      LOG.debug("No candidate dead servers found during startup");
+      return;
+    }
+    // Exclude servers which already have SCPs scheduled, active, or recently completed.
+    ProcedureExecutor<?> procExec = master.getMasterProcedureExecutor();
+    Set<ServerName> serversWithRecovery =
+      procExec.getProcedures().stream().filter(p -> p instanceof ServerCrashProcedure)
+        .map(p -> ((ServerCrashProcedure) p).getServerName()).collect(Collectors.toSet());
+    // Schedule SCPs for servers that need them.
+    Set<ServerName> serversToProcess = candidateDeadServers.stream()
+      .filter(server -> !serversWithRecovery.contains(server)).collect(Collectors.toSet());
+    if (!serversToProcess.isEmpty()) {
+      LOG.info("Scheduling SCPs for {} dead servers discovered during startup: {}",
+        serversToProcess.size(), serversToProcess);
+      serversToProcess.forEach(this::expireServer);
+    } else {
+      LOG.info("No dead servers to process found during startup");
+    }
   }
 
   /**
