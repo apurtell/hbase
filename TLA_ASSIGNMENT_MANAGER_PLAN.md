@@ -235,9 +235,39 @@ genuinely independent state that composes cleanly, but is not planned at
 this time.
 
 ```
-AssignmentManager.tla   (monolithic spec, iteratively built)
-AssignmentManager.cfg   (TLC model configuration)
+AssignmentManager.tla        (monolithic spec, iteratively built)
+AssignmentManager.cfg        (primary TLC config — fast, for development)
+AssignmentManager-full.cfg   (extended TLC config — thorough, periodic)
+AssignmentManager-sim.cfg    (simulation TLC config — deep random traces)
 ```
+
+Three TLC configurations are maintained to balance speed and coverage:
+
+| Config | Model | Mode | State space | Time |
+|--------|-------|------|-------------|------|
+| `AssignmentManager.cfg` | 2r/2s, procId≤5, crash≤1 | Exhaustive | ~36K distinct | <1s |
+| `AssignmentManager-full.cfg` | 3r/3s, procId≤7, crash≤1 | Exhaustive | ~15M distinct | ~5min |
+| `AssignmentManager-sim.cfg` | 3r/3s, procId≤7, no crash limit | Simulation | random traces, depth ~766 | 3s default |
+
+- **Primary** (`AssignmentManager.cfg`): **Run at every iteration.**
+  Fast exhaustive check (2r/2s) for development iteration feedback.
+  Exercises all pairwise interactions.  `StateConstraintSmall` bounds
+  `nextProcId ≤ 5`.  `CrashConstraint` ensures at least one server
+  remains online.  **Deadlock checking is ON** — any deadlock found is
+  a genuine protocol bug, not a false positive from all servers crashing.
+- **Simulation** (`AssignmentManager-sim.cfg`): **Run at every iteration.**
+  Random deep traces at full model size (3r/3s) with no crash limit.
+  Explores cascading crash scenarios probabilistically.  Run via
+  `tlaplus_mcp_tlc_smoke` (default 3s) or command line with
+  `-Dtlc2.TLC.stopAfter=N` for longer runs.  **Deadlock checking is OFF**
+  (`-deadlock`) because cascading crashes can legitimately exhaust all
+  servers.
+- **Full** (`AssignmentManager-full.cfg`): **Run only when explicitly
+  requested by the user.**  Thorough exhaustive check (3r/3s) that
+  catches three-way interactions.  `CrashConstraint` ensures at least
+  one server remains online.  **Deadlock checking is ON** — any deadlock
+  found is a genuine protocol bug.  Cascading crash scenarios are
+  covered by the simulation config.  Takes ~5 minutes.
 
 ### 5.2 Abstraction Decisions
 
@@ -288,7 +318,7 @@ VARIABLES
                       \*          region: Regions,
                       \*          targetServer: Servers ∪ {None}]]
     nextProcId,       \* Nat (monotonically increasing)               ✅ (Iter 4)
-    serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ⏳ (Iter 10)
+    serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ✅ (Iter 10)
     procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 18)
 
     \* --- Communication ---
@@ -302,8 +332,8 @@ VARIABLES
                       \* RS→master report channel.
 
     \* --- RegionServer-side state ---
-    rsOnlineRegions,  \* [Servers → SUBSET Regions]                   ⏳ (Iter 8)
-    rsTransitions,    \* [Servers → [Regions → {"Opening",            ⏳ (Iter 8)
+    rsOnlineRegions,  \* [Servers → SUBSET Regions]                   ✅ (Iter 8)
+    rsTransitions,    \* [Servers → [Regions → {"Opening",            ✅ (Iter 8)
                       \*   "Closing", None}]]
 
     \* --- Failure model ---
@@ -349,7 +379,7 @@ requires Java 11+).
 | `tlaplus_mcp_tlc_explore` | Generate and print a random behavior of a given length. Useful for understanding the spec. |
 | `tlaplus_mcp_tlc_trace` | Replay a previously generated TLC counterexample trace file. |
 
-**Exhaustive check** (standard iteration verification):
+**Primary — fast, for development**:
 
 ```
 CallMcpTool:
@@ -359,6 +389,18 @@ CallMcpTool:
     fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
     cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.cfg
     extraOpts: ["-workers", "auto", "-cleanup"]
+```
+
+**Simulation — deep random traces at full model size**:
+
+```
+CallMcpTool:
+  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
+  toolName: tlaplus_mcp_tlc_smoke
+  arguments:
+    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
+    cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager-sim.cfg
+    extraOpts: ["-deadlock"]
 ```
 
 **Parse check only** (verify syntax before running TLC):
@@ -373,35 +415,36 @@ CallMcpTool:
 
 ### Running TLC via Command Line (Large Models)
 
-For state spaces that take more than ~30 seconds, the MCP tool may time
-out. Run TLC directly for full control over heap, workers, and timeout:
+The MCP `tlaplus_mcp_tlc_check` tool may time out for state spaces
+that take more than ~30 seconds.  The full config (~5 min) should be
+run via command line.  Both primary and full configs use
+`CrashConstraint` and keep deadlock checking ON.  The sim config
+disables deadlock checking (`-deadlock`) because cascading crashes
+can legitimately exhaust all servers.
+
+**Exhaustive check** (3r/3s, periodic or before committing):
 
 ```bash
 cd /Users/apurtell/src/hbase/src/main/spec
 JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
 $JAVA_HOME/bin/java -XX:+UseParallelGC -Xmx8g \
   -cp "$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager-full.cfg -workers auto -cleanup
+```
+
+**Extended simulation** (longer than the 3s MCP default):
+
+```bash
+cd /Users/apurtell/src/hbase/src/main/spec
+JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
+$JAVA_HOME/bin/java -XX:+UseParallelGC -Dtlc2.TLC.stopAfter=300 \
+  -cp "$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate -workers auto -deadlock
 ```
 
 Run in background (Shell `block_until_ms: 0`) and monitor the terminal
 file for progress. Use `-Dtlc2.TLC.stopAfter=N` (seconds) to set a
 hard time limit.
-
-### State Space Management
-
-The spec uses symmetry reduction (added in Iteration 7) to keep the
-state space tractable. The `Symmetry` operator is defined using
-`Permutations(Regions) \union Permutations(Servers)` from the `TLC`
-module. This provides up to `|Regions|! × |Servers|!` reduction (36×
-for 3r/3s) with zero semantic cost.
-
-If the state space grows too large in future iterations, additional
-strategies include:
-- Reducing model size (2r/2s instead of 3r/3s)
-- Lowering `StateConstraint` bound on `nextProcId`
-- Adding state constraints on channel sizes
-- Using simulation mode (`tlaplus_mcp_tlc_smoke`) for quick checks
 
 ---
 
@@ -474,28 +517,19 @@ TLC: 5,622,240 distinct, ~67s. Git: `f01818db30`.
 
 #### Iteration 9 — Master dispatches close command and RS close handler ✅ COMPLETE
 
-`TRSPClose` renamed to `TRSPDispatchClose` (dispatches CLOSE command,
-accepts OPEN/CLOSING for retry). `TRSPConfirmClosed` now requires
-CLOSED report. `DispatchFailClose` (close RPC retry). RS-side:
-`RSReceiveClose`, `RSCompleteClose`. `RSMasterAgreement` invariant
-(stably OPEN region is in `rsOnlineRegions`). Both ASSIGN and UNASSIGN
-round-trips now complete end-to-end through RS.
-TLC: 6,322,817 distinct, depth 43, ~79s. Git: `0a21cdb883`.
+`TRSPDispatchClose` (renamed), `TRSPConfirmClosed` (requires CLOSED
+report), `DispatchFailClose`, `RSReceiveClose`, `RSCompleteClose`.
+`RSMasterAgreement` invariant. Both round-trips end-to-end through RS.
+TLC: 6,322,817 distinct, ~79s. Git: `3e92a15830`.
 
-#### Iteration 10 — Master report processing with validation
+#### Iteration 10 — Server liveness, per-server crash, FAILED_OPEN handling ✅ COMPLETE
 
-**What to add**: Explicit `MasterReceiveReport(rpt)` action that:
-- Dequeues a report from `pendingReports`.
-- Validates the reporting server is ONLINE (pre: `serverState[s] # "CRASHED"`).
-- Matches `procId` against the region's attached procedure.
-- Updates the procedure state based on `TransitionCode`.
-Previously `TRSPConfirmOpened`/`TRSPConfirmClosed` consumed reports
-directly; now they are triggered by `MasterReceiveReport`.
-**What to add**: `serverState` variable: `[Servers → {"ONLINE", "CRASHED"}]`.
-Initially all ONLINE. Reject reports from CRASHED servers.
-**Verify**: All invariants hold. Report from unknown/crashed server is
-silently dropped.
-**Source**: `AssignmentManager.reportRegionStateTransition()` L1256-1299.
+`serverState` (`ONLINE`/`CRASHED`), `ServerCrashAll(s)` (atomic per-server
+crash + RS cleanup), `TRSPHandleFailedOpen`, `DropStaleReport`, `ONLINE`
+guards on report-consuming and RS actions. `NoSplitBrain`,
+`RSMasterAgreementConverse` invariants. Three-tier TLC config (2r/2s
+fast, 3r/3s full + `CrashConstraint`, 3r/3s simulation).
+TLC primary: 35,856 distinct, <1s. Git: `0000000000`.
 
 ---
 
@@ -513,19 +547,20 @@ Reuses existing `TRSPDispatchClose`, `TRSPConfirmClosed`,
 — they are parameterized by procedure, not transition type.
 **Verify**: Region is OPEN on new server after MOVE completes.
 All invariants hold.
-**New invariant**: `NoSplitBrain` — a region is never in `rsOnlineRegions`
-of two different servers simultaneously.
+**Note**: `NoSplitBrain` invariant (a region is never in `rsOnlineRegions`
+of two different servers simultaneously) was pulled forward to Iteration 10
+and is already checked in all configurations.
 **Source**: `TransitRegionStateProcedure.java` `TransitionType.MOVE` L160-162.
 
-#### Iteration 12 — Open failures and retry
+#### Iteration 12 — Open failures: max-attempts give-up path
 
-**What to add**: When `MasterReceiveReport` processes a `FAILED_OPEN`
-report:
-- Increment retry counter on the procedure.
-- If retries < `MaxRetries`: set `forceNewPlan = true`, go back to
-  `GET_ASSIGN_CANDIDATE`.
-- If retries >= `MaxRetries`: set `regionState = FAILED_OPEN`, update
-  meta, detach procedure (give up).
+**Note**: The basic retry-after-FAILED_OPEN path was implemented early
+in Iteration 10 as `TRSPHandleFailedOpen(pid)`, which consumes the
+`FAILED_OPEN` report and resets the procedure to `GET_ASSIGN_CANDIDATE`.
+What remains for this iteration is the give-up path.
+**What to add**: Retry counter on procedure records and `MaxRetries`
+constant.  When retries >= `MaxRetries`: set `regionState = FAILED_OPEN`,
+update meta, detach procedure (give up).
 **New constant**: `MaxRetries` (recommend 1-2 for TLC).
 **Verify**: Region can reach `FAILED_OPEN` after enough failures.
 `TypeOK` updated. All safety invariants hold.
@@ -1028,13 +1063,17 @@ Each iteration follows a fixed loop:
 1. **WRITE / EDIT** — Add or modify spec per the iteration's scope
    (see Section 7 for iteration descriptions).
 2. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
-3. **RUN TLC** — Model-check with the documented configuration
-   (constants, constraints, symmetry sets — see 12.4).
+3. **RUN TLC** — Run both mandatory configurations:
+   - `AssignmentManager.cfg` (primary, exhaustive 2r/2s) — must pass.
+   - `AssignmentManager-sim.cfg` (simulation, 3r/3s) — must pass.
+   - `AssignmentManager-full.cfg` (full exhaustive 3r/3s) — run **only
+     when the user explicitly requests it**.
 4. **TRIAGE** — If TLC reports violations, classify each one (see 12.3).
    Repeat from step 1 or 3 as needed.
 5. **REGRESSION CHECK** — Re-verify all invariants and properties from
    prior iterations. A fix in iteration N must not break any invariant
-   proven in iterations 1 through N-1.
+   proven in iterations 1 through N-1. The primary and simulation
+   configs provide this coverage automatically at every iteration.
 6. **RECORD** — Document the TLC result, configuration, state count,
    and any findings (see 12.4 and 12.5).
 7. **UPDATE PLAN** — Mark the iteration complete in this plan document
