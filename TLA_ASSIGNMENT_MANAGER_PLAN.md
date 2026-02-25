@@ -566,20 +566,50 @@ action constraint pass. ~56 seconds on 1 worker (16 cores).
 State count unchanged from Iteration 5 (dispatchedOps and pendingReports
 are constant empty — dependent variables with no new state).
 
-#### Iteration 7 — Master dispatches open command via RPC
+#### Iteration 7 — Master dispatches open command via RPC ✅ COMPLETE
 
-**What to change**: Split `TRSPOpen(p)` into two actions:
-- `TRSPDispatchOpen(p)`: Sets `regionState = OPENING`, updates meta,
-  adds an open command to `dispatchedOps[targetServer]`, advances TRSP
-  to `CONFIRM_OPENED`. The procedure now **waits** for a report.
-- The old `TRSPConfirmOpened(p)` now requires consuming a matching
-  `OPENED` report from `pendingReports` (added in Iteration 8).
-**What to add**: Non-deterministic `DispatchFail(p)` action — the
-command is removed from `dispatchedOps` without delivery, TRSP goes
-back to `GET_ASSIGN_CANDIDATE` with `forceNewPlan`.
-**Verify**: Type invariant. The open path is now incomplete (no RS side
-yet), so reachable states include OPENING with no way to advance — this
-is expected and will be resolved in the next iteration.
+**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
+**What was changed**:
+- Renamed `TRSPOpen(pid)` to `TRSPDispatchOpen(pid)`: same logic (set
+  `regionState = OPENING`, update meta, advance TRSP to `CONFIRM_OPENED`)
+  **plus** adds an `[type |-> "OPEN", region |-> r, procId |-> pid]`
+  command record to `dispatchedOps[targetServer]`.
+- `TRSPConfirmOpened(pid)` now requires consuming a matching `OPENED`
+  report from `pendingReports` (existential quantification over reports
+  with matching region, code, and procId). The consumed report is removed
+  from `pendingReports`. Until RS-side actions are added (Iteration 8),
+  no reports are produced, so this action is never enabled — regions may
+  reach OPENING but cannot advance to OPEN (expected, resolved next
+  iteration).
+**What was added**:
+- `DispatchFail(pid)`: Non-deterministic RPC failure. Pre: ASSIGN
+  procedure in `CONFIRM_OPENED` state, matching open command exists in
+  `dispatchedOps[targetServer]`. Post: command removed, TRSP reset to
+  `GET_ASSIGN_CANDIDATE`, `targetServer` cleared (`forceNewPlan`).
+  Region remains OPENING with current location; the next
+  `TRSPDispatchOpen` will update location to the new server.
+  Source: `RSProcedureDispatcher.java` `remoteCallFailed()` L325-340.
+- `Next` relation updated: `TRSPOpen` replaced with `TRSPDispatchOpen`,
+  `DispatchFail` added.
+**State space management**: The `DispatchFail` retry loop (dispatch →
+fail → get_candidate(3 choices) → dispatch → ...) and orphaned commands
+from `FailOpen` caused state space explosion (~1.1B states at 3r/3s).
+Two mitigations applied:
+1. **Symmetry reduction**: Added `TLC` to `EXTENDS`, defined
+   `Symmetry == Permutations(Regions) \union Permutations(Servers)`,
+   added `SYMMETRY Symmetry` to cfg. Up to 36× reduction for 3r/3s,
+   semantically lossless.
+2. **FailOpen cleanup**: `FailOpen` now removes the dispatched command
+   from `dispatchedOps` (guarded with `IF s \in Servers` for the case
+   where `DispatchFail` already cleared `targetServer` to `None`).
+   Previously it used `UNCHANGED rpcVars`, leaving orphaned commands.
+**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 →
+39,250 distinct states (247,466 total), depth 28, all 7 invariants
+(TypeOK, OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
+MetaConsistency, LockExclusivity, ProcedureConsistency) + TransitionValid
+action constraint pass. No errors, no warnings. ~1 second on 16 workers.
+State count decreased from 1,441,599 (Iteration 6) due to symmetry
+reduction, despite the new dispatch/fail branching.
 
 #### Iteration 8 — RS-side open handler and report
 
@@ -595,24 +625,37 @@ RS-side actions:
   to `pendingReports`.
 - `RSFailOpen(s, r)`: Pre: `rsTransitions[s][r] = "Opening"`. Clear
   transition, add `FAILED_OPEN` report to `pendingReports`.
+**What to change**: The non-deterministic `FailOpen(r)` action from
+earlier iterations should be removed or disabled once `RSFailOpen`
+provides the proper RS-side failure path. `FailOpen` currently handles
+dispatched command cleanup (added in Iteration 7); `RSFailOpen` produces
+a `FAILED_OPEN` report instead, which the master will process in a
+later iteration.
 **Verify**: The ASSIGN round-trip now completes:
 dispatch → RS receive → RS complete → report → master confirm.
-All invariants should hold.
+All invariants should hold. Symmetry reduction (added in Iteration 7)
+keeps state space tractable with the additional RS-side branching.
 **Source**: `AssignRegionHandler.java` `process()` L98-164.
 
 #### Iteration 9 — Master dispatches close command and RS close handler
 
 **What to change**: Split `TRSPClose(p)` into dispatch + confirm, same
-pattern as open:
+pattern established in Iteration 7 for the open path:
 - `TRSPDispatchClose(p)`: Sets `regionState = CLOSING`, updates meta,
   adds close command to `dispatchedOps[targetServer]`.
+- Add `DispatchFailClose(p)` following the same pattern as `DispatchFail`
+  for the open path — remove command, reset TRSP to retry. (Note:
+  `DispatchFail` from Iteration 7 only handles ASSIGN/open commands;
+  close dispatch failure needs its own action or a generalization of
+  the existing one.)
 RS-side actions:
 - `RSReceiveClose(s, r)`: Dequeue close command, set
   `rsTransitions[s][r] = "Closing"`.
 - `RSCompleteClose(s, r)`: Close region, remove from `rsOnlineRegions[s]`,
   clear transition, add `CLOSED` report to `pendingReports`.
 **What to change**: `TRSPConfirmClosed(p)` now requires consuming a
-matching `CLOSED` report from `pendingReports`.
+matching `CLOSED` report from `pendingReports` (same pattern as
+`TRSPConfirmOpened` from Iteration 7).
 **Verify**: UNASSIGN round-trip now completes. All invariants hold.
 **New invariant**: `RSMasterAgreement` — if a region is OPEN in
 `regionState` and the procedure is `None` (i.e., stable), then the RS
@@ -668,13 +711,13 @@ report:
 `TypeOK` updated. All safety invariants hold.
 **Source**: `TransitRegionStateProcedure.java` `confirmOpened()` L345-374.
 
-#### Iteration 13 — Dispatch failure
+#### Iteration 13 — Dispatch failure (close path and ambiguous delivery)
 
-**What to add**: Refine `DispatchFail` from Iteration 7 to also apply
-to close dispatches. On dispatch failure:
-- Remove command from `dispatchedOps` (never delivered).
-- For open: go back to `GET_ASSIGN_CANDIDATE` with `forceNewPlan`.
-- For close: go back to `CLOSE` (retry same server or abort).
+**Already done** (from Iteration 7): `DispatchFail(pid)` handles open
+dispatch failure — removes command from `dispatchedOps`, resets TRSP to
+`GET_ASSIGN_CANDIDATE` with `forceNewPlan`.
+**Already done** (from Iteration 9): Close dispatch failure should be
+handled by `DispatchFailClose` or a generalized `DispatchFail` action.
 **What to add**: `DispatchMaybeDelivered(p)` — models the ambiguous case
 where the command might or might not have been delivered (the connection
 error on retry case from Appendix B.2). In this case the procedure must
