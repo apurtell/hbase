@@ -2,7 +2,7 @@
 
 ## Quick Navigation
 
-**Current state**: Iterations 1–2 complete, Iteration 3 next.
+**Current state**: Iterations 1–4 complete, Iteration 5 next.
 
 ### Iteration Plan (read status, update on completion)
 
@@ -414,25 +414,56 @@ depth 13, all 6 invariants + TransitionValid action constraint pass.
 State count unchanged from Iteration 2 (procedure field is a dependent
 variable — deterministically derived from state transitions).
 
-#### Iteration 4 — TRSP state machine for ASSIGN (master-side only)
+#### Iteration 4 — TRSP state machine for ASSIGN (master-side only) ✅ COMPLETE
 
-**What to add**: A `procedures` variable mapping procedure IDs to records
-with `[type, trspState, region, targetServer]`. The ASSIGN procedure has
-states `GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED → DONE`. Replace
-the monolithic `BeginOpen`/`ConfirmOpened` actions with TRSP-step actions:
-- `TRSPCreate(r)`: Create ASSIGN procedure, attach to region, initial
-  state `GET_ASSIGN_CANDIDATE`.
-- `TRSPGetCandidate(p)`: Non-deterministically choose server, set
-  `targetServer`, advance to `OPEN`.
-- `TRSPOpen(p)`: Set `regionState = OPENING`, `location = targetServer`,
-  update meta, advance to `CONFIRM_OPENED`.
-- `TRSPConfirmOpened(p)`: Set `regionState = OPEN`, update meta, advance
-  to `DONE`, detach procedure.
+**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
+**What was added**:
+- `procedures` variable: function from procedure IDs (Nat) to records
+  `[type, trspState, region, targetServer]`. The ASSIGN procedure has
+  states `GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED → (removed)`.
+- `nextProcId` variable: monotonically increasing counter for procedure
+  ID allocation, starting at 1.
+- `regionState[r].procedure` field changed from `{None, TRUE}` to
+  `{None} ∪ Nat` — now holds the actual procedure ID instead of a
+  boolean sentinel.
+- Replaced the monolithic `BeginOpen`/`ConfirmOpened` actions with four
+  TRSP-step actions:
+  - `TRSPCreate(r)`: Create ASSIGN procedure, attach to region, initial
+    state `GET_ASSIGN_CANDIDATE`. Region state is NOT changed yet.
+  - `TRSPGetCandidate(pid, s)`: Non-deterministically choose server, set
+    `targetServer`, advance to `OPEN`.
+  - `TRSPOpen(pid)`: Set `regionState = OPENING`, `location = targetServer`,
+    update meta, advance to `CONFIRM_OPENED`.
+  - `TRSPConfirmOpened(pid)`: Set `regionState = OPEN`, update meta,
+    remove procedure and detach from region.
+- `BeginClose` and `ConfirmClosed` adapted to create/remove procedure
+  records (type `"UNASSIGN"`, trspState `"CLOSE"` placeholder) so the
+  procedure representation is uniform across assign and unassign paths.
+- `FailOpen` adapted to remove the procedure on failure.
+- `GoOffline` now guards on `procedure = None` to respect the RSN lock.
+- `LockExclusivity` updated: procedure may be attached during
+  pre-transitional states (OFFLINE, CLOSED, ABNORMALLY_CLOSED,
+  FAILED_OPEN) in addition to transitional states (OPENING, CLOSING),
+  reflecting that the TRSP attaches before driving state transitions.
+- New invariant: `ProcedureConsistency` — bidirectional consistency
+  between `regionState[r].procedure` and `procedures[pid].region`.
+- `TypeOK` extended with `procedures`, `nextProcId`, and updated
+  procedure field type.
+- `vars` tuple updated to `<<regionState, metaTable, procedures, nextProcId>>`.
+- `StateConstraint` added: `nextProcId <= 7` to bound TLC state space.
+- Helper operators `AddProc`/`RemoveProc` for function domain manipulation.
+- `TRSPState` defined: `{"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED", "CLOSE"}`.
 **No RS side yet** — the TRSP drives the state machine directly. This is
 the master's view in isolation.
-**Verify**: All existing invariants still hold.
 **Source**: `TransitRegionStateProcedure.java` `executeFromState()` L483-531,
 `queueAssign()` L246-278, `openRegion()` L293-311, `confirmOpened()` L320-374.
+**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 → 829,329 distinct
+states (3,845,782 total), depth 26, all 7 invariants (TypeOK,
+OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
+MetaConsistency, LockExclusivity, ProcedureConsistency) +
+TransitionValid action constraint pass. ~3 seconds on 16 workers.
+State count increased from 2,197 (Iteration 3) due to TRSP intermediate
+states and procedure ID allocation.
 
 #### Iteration 5 — TRSP state machine for UNASSIGN
 
