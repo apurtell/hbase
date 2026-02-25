@@ -20,9 +20,13 @@
  * (a natural number) when a TRSP is attached, or None when idle.
  *
  * Procedures are modeled as records in the `procedures` variable, indexed
- * by procedure ID.  Both ASSIGN and UNASSIGN follow TRSP state machines:
+ * by procedure ID.  ASSIGN, UNASSIGN, and MOVE follow TRSP state machines:
  *   ASSIGN:   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
  *   UNASSIGN: CLOSE -> CONFIRM_CLOSED -> (removed)
+ *   MOVE:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
+ *                -> CONFIRM_OPENED -> (removed)
+ * MOVE is an UNASSIGN (close on current server) followed by an ASSIGN
+ * (open on a new server), all within a single procedure.
  * If a procedure's region becomes ABNORMALLY_CLOSED (server crash), the
  * procedure converts to ASSIGN/GET_ASSIGN_CANDIDATE via the
  * serverCrashed() callback, modeling the TRSP's self-recovery path.
@@ -123,6 +127,8 @@ ValidTransition ==
 \* TRSP internal states used in the procedures variable.
 \* ASSIGN path:   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
 \* UNASSIGN path: CLOSE -> CONFIRM_CLOSED -> (removed)
+\* MOVE path:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
+\*                   -> CONFIRM_OPENED -> (removed)
 TRSPState == {"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED",
               "CLOSE", "CONFIRM_CLOSED"}
 
@@ -164,7 +170,7 @@ VARIABLE metaTable
 VARIABLE procedures
     \* procedures is a function from a subset of Nat to procedure records.
     \* Each record is:
-    \*   [type : {"ASSIGN", "UNASSIGN"},
+    \*   [type : {"ASSIGN", "UNASSIGN", "MOVE"},
     \*    trspState : TRSPState,
     \*    region : Regions,
     \*    targetServer : Servers \cup {None}]
@@ -273,8 +279,8 @@ TypeOK ==
     /\ DOMAIN procedures \subseteq 1..(nextProcId - 1)
     \* For every active procedure, check all four fields of its record.
     /\ \A pid \in DOMAIN procedures :
-         \* Procedure type is either ASSIGN or UNASSIGN.
-         /\ procedures[pid].type \in {"ASSIGN", "UNASSIGN"}
+         \* Procedure type is ASSIGN, UNASSIGN, or MOVE.
+         /\ procedures[pid].type \in {"ASSIGN", "UNASSIGN", "MOVE"}
          \* Procedure step is one of the defined transition-procedure states.
          /\ procedures[pid].trspState \in TRSPState
          \* Procedure's target region is a valid region.
@@ -326,15 +332,16 @@ MetaConsistency ==
         /\ metaTable[r].state = regionState[r].state
         /\ metaTable[r].location = regionState[r].location
 
-\* No split brain: a region is never simultaneously in the online set
-\* of two different servers.  This is the foundational safety property
-\* that prevents dual assignment.  It is non-trivial because the master
-\* and RS views of region state evolve asynchronously, and server
-\* crashes create interleavings where stale RS state could persist.
+\* No double assignment: a region is never simultaneously deployed on
+\* two (or more) RegionServers.  This is the foundational safety
+\* property of the assignment manager.  It is non-trivial because the
+\* master and RS views of region state evolve asynchronously, and
+\* server crashes create interleavings where stale RS state could
+\* persist.
 \*
 \* Source: The "at most one server per region" invariant from the
 \*         HBase region assignment design.
-NoSplitBrain ==
+NoDoubleAssignment ==
     \A r \in Regions :
         Cardinality({s \in Servers : r \in rsOnlineRegions[s]}) <= 1
 
@@ -348,7 +355,12 @@ NoSplitBrain ==
 \*   removed at OPEN.
 \* UNASSIGN attaches during OPEN and the region transitions through CLOSING
 \*   before the procedure is removed at CLOSED.
-\* Either type may be found on an ABNORMALLY_CLOSED region if a server
+\* MOVE attaches during OPEN and drives the region through CLOSING, CLOSED,
+\*   OPENING before being removed at OPEN.  It spans the full close+assign
+\*   lifecycle, so its valid states are the union of UNASSIGN and ASSIGN
+\*   states plus CLOSED (where the procedure transitions from the close
+\*   phase to the assign phase).
+\* Any type may be found on an ABNORMALLY_CLOSED region if a server
 \*   crash occurs while the procedure is in flight (crash recovery is
 \*   modeled in later iterations).
 \*
@@ -366,6 +378,10 @@ LockExclusivity ==
                \/ /\ procedures[pid].type = "UNASSIGN"
                   /\ regionState[r].state \in {"OPEN", "CLOSING",
                                                 "ABNORMALLY_CLOSED"}
+               \/ /\ procedures[pid].type = "MOVE"
+                  /\ regionState[r].state \in {"OPEN", "CLOSING", "CLOSED",
+                                                "ABNORMALLY_CLOSED",
+                                                "FAILED_OPEN", "OPENING"}
 
 \* Bidirectional consistency between region->procedure and procedure->region.
 \* Every attached procedure ID refers to an active procedure whose region
@@ -418,9 +434,9 @@ StateConstraintSmall == nextProcId <= 5
 \* full assign/unassign/crash/reassign cycles.
 StateConstraintDeep == nextProcId <= 15
 
-\* Limit the number of simultaneously crashed servers.  Used by the
-\* full (3r/3s) configuration to prevent cascading-crash state
-\* explosion while still exercising single-server crash paths.
+\* Limit the number of simultaneously crashed servers.  Used to
+\* prevent cascading-crash state space explosion while still
+\* exercising single-server crash paths.
 CrashConstraint ==
     Cardinality({s \in Servers : serverState[s] = "CRASHED"}) <= 1
 
@@ -492,10 +508,10 @@ TRSPCreate(r) ==
 \* Source: TransitRegionStateProcedure.java executeFromState() L483-496,
 \*         queueAssign() L246-278 (getDestinationServer).
 TRSPGetCandidate(pid, s) ==
-    \* Guards: procedure exists, is ASSIGN, is in GET_ASSIGN_CANDIDATE step,
-    \* and the chosen server is ONLINE.
+    \* Guards: procedure exists, is ASSIGN or MOVE, is in
+    \* GET_ASSIGN_CANDIDATE step, and the chosen server is ONLINE.
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "GET_ASSIGN_CANDIDATE"
     /\ serverState[s] = "ONLINE"
     \* Record the chosen server and advance the procedure to the OPEN step.
@@ -515,9 +531,10 @@ TRSPGetCandidate(pid, s) ==
 \* Source: TransitRegionStateProcedure.java openRegion() L293-311,
 \*         RSProcedureDispatcher.java L200-367.
 TRSPDispatchOpen(pid) ==
-    \* Guards: procedure exists, is ASSIGN, is in OPEN step, and has a target server.
+    \* Guards: procedure exists, is ASSIGN or MOVE, is in OPEN step,
+    \* and has a target server.
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "OPEN"
     /\ procedures[pid].targetServer # None
     \* Bind the procedure's region and target server for readability.
@@ -553,11 +570,11 @@ TRSPDispatchOpen(pid) ==
 \*
 \* Source: TransitRegionStateProcedure.java confirmOpened() L320-374.
 TRSPConfirmOpened(pid) ==
-    \* Guards: procedure exists, is ASSIGN, is in CONFIRM_OPENED step,
-    \* region is OPENING, and a matching OPENED report exists for this
-    \* procedure from an ONLINE server.
+    \* Guards: procedure exists, is ASSIGN or MOVE, is in CONFIRM_OPENED
+    \* step, region is OPENING, and a matching OPENED report exists for
+    \* this procedure from an ONLINE server.
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CONFIRM_OPENED"
     /\ LET r == procedures[pid].region IN
        /\ regionState[r].state = "OPENING"
@@ -600,10 +617,11 @@ TRSPConfirmOpened(pid) ==
 \*
 \* Source: RSProcedureDispatcher.java remoteCallFailed() L325-340.
 DispatchFail(pid) ==
-    \* Guards: procedure exists, is ASSIGN, is in CONFIRM_OPENED step,
-    \* has a target server, and the OPEN command is still in dispatchedOps.
+    \* Guards: procedure exists, is ASSIGN or MOVE, is in CONFIRM_OPENED
+    \* step, has a target server, and the OPEN command is still in
+    \* dispatchedOps.
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CONFIRM_OPENED"
     /\ LET s == procedures[pid].targetServer
            r == procedures[pid].region IN
@@ -628,14 +646,14 @@ DispatchFail(pid) ==
 \* path (DispatchFail), the targetServer is NOT cleared because the
 \* close must still target the server hosting the region.
 \*
-\* Pre: UNASSIGN procedure in CONFIRM_CLOSED state and the matching
-\*      close command still exists in dispatchedOps.
+\* Pre: UNASSIGN or MOVE procedure in CONFIRM_CLOSED state and the
+\*      matching close command still exists in dispatchedOps.
 \* Post: command removed, TRSP reset to CLOSE.
 \*
 \* Source: RSProcedureDispatcher.java remoteCallFailed() L325-340.
 DispatchFailClose(pid) ==
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "UNASSIGN"
+    /\ procedures[pid].type \in {"UNASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CONFIRM_CLOSED"
     /\ LET s == procedures[pid].targetServer
            r == procedures[pid].region IN
@@ -664,11 +682,11 @@ DispatchFailClose(pid) ==
 \*
 \* Source: TransitRegionStateProcedure.java confirmOpened() L345-374.
 TRSPHandleFailedOpen(pid) ==
-    \* Guards: procedure exists, is ASSIGN, is in CONFIRM_OPENED step,
-    \* region is OPENING, and a matching FAILED_OPEN report exists from
-    \* an ONLINE server.
+    \* Guards: procedure exists, is ASSIGN or MOVE, is in CONFIRM_OPENED
+    \* step, region is OPENING, and a matching FAILED_OPEN report exists
+    \* from an ONLINE server.
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CONFIRM_OPENED"
     /\ LET r == procedures[pid].region IN
        /\ regionState[r].state = "OPENING"
@@ -718,8 +736,36 @@ TRSPCreateUnassign(r) ==
     \* META table, RPC channels, RS-side state, and server state unchanged.
     /\ UNCHANGED <<metaTable, rpcVars, rsVars, serverState>>
 
+\* Create a TRSP MOVE procedure for an OPEN region.
+\* A MOVE is an UNASSIGN (close on the current server) followed by an
+\* ASSIGN (open on a new server), all within a single procedure.  The
+\* procedure starts in the CLOSE phase with targetServer set to the
+\* region's current location.  After the close completes, targetServer
+\* is cleared and TRSPGetCandidate picks a new destination.
+\*
+\* Pre: region is OPEN with a location AND no procedure is attached.
+\* Post: MOVE procedure created in CLOSE state, attached to region.
+\*       Region state is NOT changed yet -- the TRSP will drive the
+\*       OPEN -> CLOSING transition via TRSPDispatchClose.
+\*
+\* Source: TransitRegionStateProcedure.java TransitionType.MOVE L160-162,
+\*         queueAssign() L246-278 (MOVE path).
+TRSPCreateMove(r) ==
+    LET pid == nextProcId IN
+    /\ regionState[r].state = "OPEN"
+    /\ regionState[r].location # None
+    /\ regionState[r].procedure = None
+    /\ regionState' = [regionState EXCEPT ![r].procedure = pid]
+    /\ procedures' = AddProc(procedures, pid,
+                            [type |-> "MOVE",
+                             trspState |-> "CLOSE",
+                             region |-> r,
+                             targetServer |-> regionState[r].location])
+    /\ nextProcId' = nextProcId + 1
+    /\ UNCHANGED <<metaTable, rpcVars, rsVars, serverState>>
+
 \* Dispatch the close command to the target server via RPC.
-\* Pre: UNASSIGN procedure in CLOSE state, region is OPEN or CLOSING
+\* Pre: UNASSIGN or MOVE procedure in CLOSE state, region is OPEN or CLOSING
 \*      (CLOSING on retry after DispatchFailClose).
 \* Post: region transitions to CLOSING (no-op if already CLOSING),
 \*       meta updated, close command added to dispatchedOps[targetServer],
@@ -728,10 +774,10 @@ TRSPCreateUnassign(r) ==
 \* Source: TransitRegionStateProcedure.java closeRegion() L389-407,
 \*         RSProcedureDispatcher.java L200-367.
 TRSPDispatchClose(pid) ==
-    \* Guards: procedure exists, is UNASSIGN, is in CLOSE step, has a target
-    \* server, and the region is OPEN or CLOSING (CLOSING on retry).
+    \* Guards: procedure exists, is UNASSIGN or MOVE, is in CLOSE step,
+    \* has a target server, and the region is OPEN or CLOSING (CLOSING on retry).
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "UNASSIGN"
+    /\ procedures[pid].type \in {"UNASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CLOSE"
     /\ procedures[pid].targetServer # None
     \* Bind the procedure's region and target server for readability.
@@ -757,22 +803,26 @@ TRSPDispatchClose(pid) ==
 
 \* Confirm that the region closed successfully by consuming a CLOSED
 \* report from pendingReports.
-\* Pre: UNASSIGN procedure in CONFIRM_CLOSED state, region is CLOSING,
-\*      and a matching CLOSED report exists in pendingReports from an
-\*      ONLINE server.
-\* Post: region transitions to CLOSED, location cleared, procedure
-\*       removed and detached, report consumed from pendingReports.
+\* Pre: UNASSIGN or MOVE procedure in CONFIRM_CLOSED state, region is
+\*      CLOSING, and a matching CLOSED report exists in pendingReports
+\*      from an ONLINE server.
+\* Post: region transitions to CLOSED, location cleared.
+\*       For UNASSIGN: procedure removed and detached.
+\*       For MOVE: procedure kept, advanced to GET_ASSIGN_CANDIDATE
+\*       with targetServer cleared so a new destination can be chosen.
+\*       Report consumed from pendingReports.
 \*
 \* RS-side actions (RSReceiveClose, RSCompleteClose) produce the CLOSED
-\* reports consumed here, completing the UNASSIGN round-trip.
+\* reports consumed here.  For UNASSIGN this completes the round-trip;
+\* for MOVE the procedure continues into the assign phase.
 \*
 \* Source: TransitRegionStateProcedure.java confirmClosed() L409-446.
 TRSPConfirmClosed(pid) ==
-    \* Guards: procedure exists, is UNASSIGN, is in CONFIRM_CLOSED step,
-    \* region is CLOSING, and a matching CLOSED report exists for this
-    \* procedure from an ONLINE server.
+    \* Guards: procedure exists, is UNASSIGN or MOVE, is in
+    \* CONFIRM_CLOSED step, region is CLOSING, and a matching CLOSED
+    \* report exists for this procedure from an ONLINE server.
     /\ pid \in DOMAIN procedures
-    /\ procedures[pid].type = "UNASSIGN"
+    /\ procedures[pid].type \in {"UNASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CONFIRM_CLOSED"
     /\ LET r == procedures[pid].region IN
        /\ regionState[r].state = "CLOSING"
@@ -781,15 +831,24 @@ TRSPConfirmClosed(pid) ==
             /\ rpt.code = "CLOSED"
             /\ rpt.procId = pid
             /\ serverState[rpt.server] = "ONLINE"
-            \* Finalize the region as CLOSED, clear location, detach procedure.
+            \* Region becomes CLOSED with location cleared.
+            \* UNASSIGN: detach procedure.  MOVE: keep procedure attached.
             /\ regionState' = [regionState EXCEPT
                  ![r] = [state |-> "CLOSED", location |-> None,
-                         procedure |-> None]]
+                         procedure |->
+                           IF procedures[pid].type = "UNASSIGN"
+                           THEN None ELSE pid]]
             \* Persist the CLOSED state and cleared location in META.
             /\ metaTable' = [metaTable EXCEPT
                  ![r] = [state |-> "CLOSED", location |-> None]]
-            \* Remove the completed procedure from the active set.
-            /\ procedures' = RemoveProc(procedures, pid)
+            \* UNASSIGN: remove completed procedure.
+            \* MOVE: advance to GET_ASSIGN_CANDIDATE, clear targetServer.
+            /\ procedures' =
+                 IF procedures[pid].type = "UNASSIGN"
+                 THEN RemoveProc(procedures, pid)
+                 ELSE [procedures EXCEPT
+                         ![pid].trspState = "GET_ASSIGN_CANDIDATE",
+                         ![pid].targetServer = None]
             \* Consume the matched report from the pending set.
             /\ pendingReports' = pendingReports \ {rpt}
             \* Proc id counter, dispatched ops, RS-side state, and server
@@ -1060,6 +1119,9 @@ Next ==
     \* -- UNASSIGN path --
     \* Start an UNASSIGN procedure for an OPEN region.
     \/ \E r \in Regions : TRSPCreateUnassign(r)
+    \* -- MOVE path --
+    \* Start a MOVE procedure for an OPEN region.
+    \/ \E r \in Regions : TRSPCreateMove(r)
     \* Dispatch a CLOSE command to the target server.
     \/ \E pid \in DOMAIN procedures : TRSPDispatchClose(pid)
     \* Confirm a successful close via a CLOSED report.
@@ -1101,6 +1163,7 @@ Next ==
 Fairness ==
     /\ \A r \in Regions : WF_vars(TRSPCreate(r))
     /\ \A r \in Regions : WF_vars(TRSPCreateUnassign(r))
+    /\ \A r \in Regions : WF_vars(TRSPCreateMove(r))
 
 ---------------------------------------------------------------------------
 (* Specification *)
@@ -1119,8 +1182,8 @@ THEOREM Spec => []OpenImpliesLocation
 \* Safety: offline-like regions never have a location.
 THEOREM Spec => []OfflineImpliesNoLocation
 
-\* Safety: no split brain (region in at most one server's online set).
-THEOREM Spec => []NoSplitBrain
+\* Safety: no double assignment (region deployed on at most one server).
+THEOREM Spec => []NoDoubleAssignment
 
 \* Safety: persistent meta state matches in-memory state.
 THEOREM Spec => []MetaConsistency
