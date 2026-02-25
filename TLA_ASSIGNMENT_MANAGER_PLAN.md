@@ -1,5 +1,47 @@
 # TLA+ Model of the HBase AssignmentManager
 
+## Quick Navigation
+
+**Current state**: Iterations 1–2 complete, Iteration 3 next.
+
+### Iteration Plan (read status, update on completion)
+
+| Section | What to do there |
+|---------|-----------------|
+| [Phase 1: Master-Side Foundation](#phase-1-master-side-foundation) | Iterations 1–5. |
+| [Phase 2: RPC Channels and RegionServer Side](#phase-2-rpc-channels-and-regionserver-side) | Iterations 6–10. |
+| [Phase 3: MOVE and Failures](#phase-3-move-and-failures) | Iterations 11–13. |
+| [Phase 4: RegionServer Crash and Recovery](#phase-4-regionserver-crash-and-recovery) | Iterations 14–17. |
+| [Phase 5: Procedure Persistence and Master Recovery](#phase-5-procedure-persistence-and-master-recovery) | Iterations 18–19. |
+| [Phase 6: Split and Merge](#phase-6-split-and-merge-deferred) | Iterations 20–26. |
+| [Phase 7: Liveness and Refinement](#phase-7-liveness-and-refinement-deferred) | Iterations 27–29. |
+
+### Process and Results (read methodology, record outcomes)
+
+| Section | Purpose |
+|---------|---------|
+| [12.2 Per-Iteration Workflow](#122-per-iteration-workflow) | The 8-step loop to follow for every iteration. |
+| [12.3 Finding Classification](#123-finding-classification-triage) | How to triage TLC violations (spec error / abstraction gap / legitimate finding). |
+| [12.4 TLC Configuration Documentation](#124-tlc-configuration-documentation) | Template for recording each iteration's TLC config and results. |
+| [12.5 Finding Documentation](#125-finding-documentation) | Template for documenting legitimate findings (F-001, etc.). |
+| [12.6 Regression Policy](#126-regression-policy) | Rules for backward compatibility across iterations. |
+| [12.7 Completion Criteria](#127-completion-criteria-for-the-full-specification) | When the overall effort is done. |
+
+### Reference (context for writing specs)
+
+| Section | Content |
+|---------|---------|
+| [4. Key Invariants and Properties](#4-key-invariants-and-properties-to-verify) | Safety and liveness properties to verify. |
+| [5. TLA+ Model Design](#5-tla-model-design) | Module hierarchy, abstraction decisions, variables. |
+| [7. Code → TLA+ Action Mapping](#7-mapping-from-code-to-tla-actions) | Maps Java code paths to TLA+ actions. |
+| [8. Source Code Reference Map](#8-source-code-reference-map) | Key files and line ranges in the HBase codebase. |
+| [11. Getting Started](#11-getting-started) | TLC invocation commands. |
+| [Appendix A: Locking](#appendix-a-locking-discipline-analysis) | Locking discipline analysis. |
+| [Appendix B: RPC Model](#appendix-b-rpc-model-analysis) | RPC round-trip analysis. |
+| [Appendix C: Split/Merge](#appendix-c-split-and-merge-operations-analysis) | Split and merge operations analysis. |
+
+---
+
 ## 1. Executive Summary
 
 This document presents a detailed analysis of the HBase AssignmentManager system and a
@@ -340,22 +382,37 @@ survives but in-memory state is lost — this distinction will matter.
 depth 13, all 5 invariants + TransitionValid action constraint pass.
 State count unchanged from Iteration 1 (metaTable is a dependent variable).
 
-#### Iteration 3 — Procedure attachment (per-region mutex)
+#### Iteration 3 — Procedure attachment (per-region mutex) ✅ COMPLETE
 
-**What to add**: A `procedure` field on each region's state record.
-Each action that begins a transition (BeginOpen, BeginClose) must find
-`procedure = None` and sets it to a procedure identifier. Each action
-that finishes a transition (ConfirmOpened, ConfirmClosed, FailOpen)
-clears `procedure` back to `None`. GoOffline and ServerCrash are
-external actions that do not involve a procedure.
-**New invariant**: `LockExclusivity` — at most one procedure is attached
-to a region at any time (trivially true by construction, but stated
-for later phases where SCP and TRSP interact).
+**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
+**What was added**:
+- `procedure` field on each region's `regionState` record: `None` when
+  no procedure is attached, `TRUE` when some procedure holds the lock.
+  (Actual procedure identity deferred to Iteration 4.)
+- `BeginOpen` and `BeginClose` now guard on `procedure = None` and set
+  it to `TRUE` (lock acquire).
+- `ConfirmOpened`, `ConfirmClosed`, and `FailOpen` now clear `procedure`
+  back to `None` (lock release).
+- `GoOffline` and `ServerCrash` are external actions that preserve the
+  `procedure` field as-is (they do not acquire or release a lock).
+- `MetaConsistency` updated to compare `state` and `location` fields
+  individually (metaTable records do not carry the `procedure` field,
+  since procedures are master in-memory state, not persisted to meta).
+- New invariant: `LockExclusivity` — a procedure is attached only during
+  transitional states (OPENING or CLOSING). The "at most one procedure
+  per region" aspect is trivially true by construction (scalar field),
+  but the state correlation is a non-trivial check that acquire/release
+  is correctly paired with state transitions.
+- `TypeOK` extended with `procedure : {None, TRUE}` on regionState.
 **Why separate**: Establishes the mutual exclusion discipline before the
 procedure itself has any internal state. The `procedure` field is the
 TLA+ analog of `RegionStateNodeLock` + `holdLock() == true`.
 **Source**: `RegionStateNode.java` `setProcedure()` L213-218,
 `unsetProcedure()` L220-224.
+**TLC result**: 3 regions, 3 servers → 2,197 distinct states (14,197 total),
+depth 13, all 6 invariants + TransitionValid action constraint pass.
+State count unchanged from Iteration 2 (procedure field is a dependent
+variable — deterministically derived from state transitions).
 
 #### Iteration 4 — TRSP state machine for ASSIGN (master-side only)
 
@@ -1001,10 +1058,26 @@ Each iteration follows a fixed loop:
    proven in iterations 1 through N-1.
 6. **RECORD** — Document the TLC result, configuration, state count,
    and any findings (see 12.4 and 12.5).
+7. **UPDATE PLAN** — Mark the iteration complete in this plan document
+   (Section 6). Append `✅ COMPLETE` to the iteration heading, convert
+   the "What to add" description to past tense ("What was added"), and
+   add a `**TLC result**` line summarizing the final model-checking
+   outcome (constants, state count, invariants checked, pass/fail).
+   If the iteration produced a legitimate finding, note it here with
+   its Finding ID (see 12.5). This keeps the plan document as the
+   single source of truth for iteration status.
+8. **GIT COMMIT** — Commit the successful spec files, configuration,
+   updated plan document, and iteration record to version control. The
+   commit message must identify the iteration number and summarize the
+   outcome (clean pass or legitimate finding). This ensures every
+   completed iteration has a recoverable checkpoint and provides an
+   auditable history of the specification's evolution.
 
 Steps 1–4 repeat until TLC either passes cleanly or produces a confirmed
 legitimate finding. Step 5 is mandatory — no iteration is complete without
-a regression check against all prior invariants.
+a regression check against all prior invariants. Steps 7–8 are the
+terminal actions — an iteration is not considered done until the plan
+document is updated and the results are committed.
 
 ### 12.3 Finding Classification (Triage)
 
