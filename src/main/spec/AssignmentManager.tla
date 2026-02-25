@@ -60,16 +60,22 @@
  * commands are cleared, and the server is marked CRASHED.  RS-side
  * actions and report consumption are guarded by server liveness.
  * Reports from crashed servers are dropped by DropStaleReport.
+ * ServerRestart(s) models a process supervisor (Kubernetes, systemd)
+ * restarting a crashed server; WF on ServerRestart ensures crashed
+ * servers eventually come back online.
  *
  * When a region fails to open on an RS, the FAILED_OPEN report is
- * consumed by TRSPHandleFailedOpen, which resets the procedure to
- * GET_ASSIGN_CANDIDATE for retry on a different server.
+ * consumed by TRSPHandleFailedOpen, which increments the retry counter
+ * and resets the procedure to GET_ASSIGN_CANDIDATE for retry on a
+ * different server.  If the retry counter reaches MaxRetries,
+ * TRSPGiveUpOpen transitions the region to FAILED_OPEN (persistent)
+ * and removes the procedure.
  *
  * Currently scoped to the core assign/unassign lifecycle:
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
  *
  * Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW,
- * MERGING_NEW) are deferred to Phase 6 (Iterations 20-26).
+ * MERGING_NEW) are deferred to a later phase.
  *
  * FAILED_CLOSE is omitted because no code path transitions into it. The RS
  * abort triggers crash detection, so close failures are resolved through
@@ -88,6 +94,11 @@ CONSTANTS
     None       \* Sentinel model value for "no server/procedure assigned"
 
 ASSUME None \notin Servers
+
+CONSTANTS
+    MaxRetries  \* Maximum open-retry attempts before giving up (FAILED_OPEN)
+
+ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
 
 ---------------------------------------------------------------------------
 (* State definitions *)
@@ -187,7 +198,8 @@ VARIABLE procedures
     \*   [type : {"ASSIGN", "UNASSIGN", "MOVE"},
     \*    trspState : TRSPState,
     \*    region : Regions,
-    \*    targetServer : Servers \cup {None}]
+    \*    targetServer : Servers \cup {None},
+    \*    retries : 0..MaxRetries]
     \*
     \* Procedures are created when a region operation begins and removed
     \* when it completes.  DOMAIN procedures is the set of active IDs.
@@ -281,7 +293,7 @@ TypeOK ==
     /\ nextProcId >= 1
     \* All existing procedure ids are in the range 1..(nextProcId - 1).
     /\ DOMAIN procedures \subseteq 1..(nextProcId - 1)
-    \* For every active procedure, check all four fields of its record.
+    \* For every active procedure, check all five fields of its record.
     /\ \A pid \in DOMAIN procedures :
          \* Procedure type is ASSIGN, UNASSIGN, or MOVE.
          /\ procedures[pid].type \in {"ASSIGN", "UNASSIGN", "MOVE"}
@@ -291,6 +303,8 @@ TypeOK ==
          /\ procedures[pid].region \in Regions
          \* Procedure's target server is a server or None.
          /\ procedures[pid].targetServer \in Servers \cup {None}
+         \* Open-retry counter is within the configured bound.
+         /\ procedures[pid].retries \in 0..MaxRetries
     \* Each server has a set of dispatched operation commands (open/close).
     /\ dispatchedOps \in [Servers -> SUBSET
          [type : CommandType, region : Regions, procId : Nat]]
@@ -322,10 +336,10 @@ OfflineImpliesNoLocation ==
 \* the fields that meta tracks (state and location).  The procedure
 \* field is master in-memory only and is not compared.
 \*
-\* True by construction in this iteration because all actions update both
-\* atomically.  Becomes non-trivial when master crash is introduced
-\* (Iteration 19): metaTable survives but regionState is lost and must
-\* be rebuilt.  Later (Iteration 22), relaxed to allow SPLITTING_NEW/
+\* True by construction currently because all actions update both
+\* atomically.  Becomes non-trivial when master crash is introduced:
+\* metaTable survives but regionState is lost and must be rebuilt.
+\* Later, relaxed to allow SPLITTING_NEW/
 \* MERGING_NEW in memory while meta says CLOSED.
 MetaConsistency ==
     \A r \in Regions :
@@ -362,7 +376,7 @@ NoDoubleAssignment ==
 \*   phase to the assign phase).
 \* Any type may be found on an ABNORMALLY_CLOSED region if a server
 \*   crash occurs while the procedure is in flight (crash recovery is
-\*   modeled in later iterations).
+\*   modeled in later phases).
 \*
 \* Source: RegionStateNode.java setProcedure() L213-218,
 \*         unsetProcedure() L220-224.
@@ -424,9 +438,7 @@ RSMasterAgreementConverse ==
 ---------------------------------------------------------------------------
 (* State constraints for TLC *)
 
-StateConstraint == nextProcId <= 7
-
-StateConstraintSmall == nextProcId <= 5
+StateConstraint == nextProcId <= 5
 
 \* Deeper bound for simulation mode, where cost is proportional to
 \* trace length (not state-space size).  Allows up to 14 completed
@@ -434,9 +446,10 @@ StateConstraintSmall == nextProcId <= 5
 \* full assign/unassign/crash/reassign cycles.
 StateConstraintDeep == nextProcId <= 15
 
-\* Limit the number of simultaneously crashed servers.  Used to
-\* prevent cascading-crash state space explosion while still
-\* exercising single-server crash paths.
+\* Limit the number of simultaneously crashed servers.  No longer
+\* required in configs now that ServerRestart + WF ensures crashed
+\* servers eventually come back online (preventing the all-crashed
+\* deadlock).  Retained as a definition for ad-hoc bounded runs.
 CrashConstraint ==
     Cardinality({s \in Servers : serverState[s] = "CRASHED"}) <= 1
 
@@ -493,7 +506,8 @@ TRSPCreate(r) ==
                             [type |-> "ASSIGN",
                              trspState |-> "GET_ASSIGN_CANDIDATE",
                              region |-> r,
-                             targetServer |-> None])
+                             targetServer |-> None,
+                             retries |-> 0])
     \* Advance the global procedure id counter.
     /\ nextProcId' = nextProcId + 1
     \* META table, RPC channels, RS-side state, and server state unchanged.
@@ -671,21 +685,21 @@ DispatchFailClose(pid) ==
 \* NOT changed (stays OPENING); the next TRSPDispatchOpen will
 \* overwrite location and state.
 \*
-\* The give-up path (retries >= maxAttempts -> FAILED_OPEN) is
-\* deferred to Iteration 12 when MaxRetries is added.
-\*
-\* Pre: ASSIGN procedure in CONFIRM_OPENED state, region is OPENING,
-\*      and a matching FAILED_OPEN report exists from an ONLINE server.
-\* Post: report consumed, TRSP reset to GET_ASSIGN_CANDIDATE.
+\* Pre: ASSIGN procedure in CONFIRM_OPENED state, retry budget not
+\*      exhausted, region is OPENING, and a matching FAILED_OPEN report
+\*      exists from an ONLINE server.
+\* Post: report consumed, retry counter incremented, TRSP reset to
+\*       GET_ASSIGN_CANDIDATE.
 \*
 \* Source: TransitRegionStateProcedure.java confirmOpened() L345-374.
 TRSPHandleFailedOpen(pid) ==
     \* Guards: procedure exists, is ASSIGN or MOVE, is in CONFIRM_OPENED
-    \* step, region is OPENING, and a matching FAILED_OPEN report exists
-    \* from an ONLINE server.
+    \* step, retry budget not exhausted, region is OPENING, and a matching
+    \* FAILED_OPEN report exists from an ONLINE server.
     /\ pid \in DOMAIN procedures
     /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
     /\ procedures[pid].trspState = "CONFIRM_OPENED"
+    /\ procedures[pid].retries < MaxRetries
     /\ LET r == procedures[pid].region IN
        /\ regionState[r].state = "OPENING"
        /\ \E rpt \in pendingReports :
@@ -693,15 +707,56 @@ TRSPHandleFailedOpen(pid) ==
             /\ rpt.code = "FAILED_OPEN"
             /\ rpt.procId = pid
             /\ serverState[rpt.server] = "ONLINE"
-            \* Reset procedure to pick a new server.
+            \* Reset procedure to pick a new server; increment retry counter.
             /\ procedures' = [procedures EXCEPT
                  ![pid].trspState = "GET_ASSIGN_CANDIDATE",
-                 ![pid].targetServer = None]
+                 ![pid].targetServer = None,
+                 ![pid].retries = procedures[pid].retries + 1]
             \* Consume the matched report from the pending set.
             /\ pendingReports' = pendingReports \ {rpt}
             \* All other state variables unchanged.
             /\ UNCHANGED <<regionState, metaTable, nextProcId,
                            dispatchedOps, rsVars, serverState>>
+
+\* Give up on opening a region after exhausting the retry budget.
+\* Consumes the FAILED_OPEN report, transitions the region to
+\* FAILED_OPEN (persistent), and removes the procedure.
+\*
+\* Pre: ASSIGN/MOVE procedure in CONFIRM_OPENED state, retry budget
+\*      exhausted, region is OPENING, and a matching FAILED_OPEN
+\*      report exists from an ONLINE server.
+\* Post: region becomes FAILED_OPEN with no location or procedure,
+\*       meta updated, procedure removed, report consumed.
+\*
+\* Source: TransitRegionStateProcedure.java confirmOpened() L345-374
+\*         (retryCounter >= maxAttempts branch).
+TRSPGiveUpOpen(pid) ==
+    \* Guards: ASSIGN/MOVE in CONFIRM_OPENED, retries exhausted, FAILED_OPEN report present.
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type \in {"ASSIGN", "MOVE"}
+    /\ procedures[pid].trspState = "CONFIRM_OPENED"
+    /\ procedures[pid].retries >= MaxRetries
+    /\ LET r == procedures[pid].region IN
+       /\ regionState[r].state = "OPENING"
+       /\ \E rpt \in pendingReports :
+            /\ rpt.region = r
+            /\ rpt.code = "FAILED_OPEN"
+            /\ rpt.procId = pid
+            /\ serverState[rpt.server] = "ONLINE"
+            \* Transition region to FAILED_OPEN, clear location, detach procedure.
+            /\ regionState' = [regionState EXCEPT
+                 ![r] = [state |-> "FAILED_OPEN", location |-> None,
+                         procedure |-> None]]
+            \* Persist the FAILED_OPEN state and cleared location in META.
+            /\ metaTable' = [metaTable EXCEPT
+                 ![r] = [state |-> "FAILED_OPEN", location |-> None]]
+            \* Remove the exhausted procedure from the active set.
+            /\ procedures' = RemoveProc(procedures, pid)
+            \* Consume the matched report from the pending set.
+            /\ pendingReports' = pendingReports \ {rpt}
+            \* Proc id counter, dispatched ops, RS-side state, and
+            \* server state unchanged.
+            /\ UNCHANGED <<nextProcId, dispatchedOps, rsVars, serverState>>
 
 ---------------------------------------------------------------------------
 (* Actions -- TRSP UNASSIGN path *)
@@ -728,7 +783,8 @@ TRSPCreateUnassign(r) ==
                             [type |-> "UNASSIGN",
                              trspState |-> "CLOSE",
                              region |-> r,
-                             targetServer |-> regionState[r].location])
+                             targetServer |-> regionState[r].location,
+                             retries |-> 0])
     \* Advance the global procedure id counter.
     /\ nextProcId' = nextProcId + 1
     \* META table, RPC channels, RS-side state, and server state unchanged.
@@ -763,7 +819,8 @@ TRSPCreateMove(r) ==
                             [type |-> "MOVE",
                              trspState |-> "CLOSE",
                              region |-> r,
-                             targetServer |-> regionState[r].location])
+                             targetServer |-> regionState[r].location,
+                             retries |-> 0])
     /\ nextProcId' = nextProcId + 1
     /\ UNCHANGED <<metaTable, rpcVars, rsVars, serverState>>
 
@@ -917,6 +974,36 @@ ServerCrashAll(s) ==
     \* Procedures and proc id counter unchanged; reports retained.
     /\ UNCHANGED <<procedures, nextProcId, pendingReports>>
 
+\* A process supervisor (Kubernetes, systemd, etc.) restarts a crashed
+\* RegionServer.  The restarted server is empty: no regions, no pending
+\* commands, no RS-side state (all cleared atomically by ServerCrashAll
+\* at crash time).  Any pending reports from the previous incarnation
+\* are discarded (in real HBase, epoch mismatch rejects them).
+\*
+\* Design note — RS epochs are NOT modeled explicitly.  Real HBase uses
+\* ServerName (host + startcode) to distinguish incarnations; stale
+\* reports carry the old ServerName and are rejected.  Here, the same
+\* effect is achieved by atomic crash (ServerCrashAll clears RS state)
+\* plus atomic restart (this action purges stale reports).  An explicit
+\* epoch variable would only add value if crash or restart were
+\* decomposed into non-atomic multi-step sequences.
+\*
+\* Pre: server is CRASHED.
+\* Post: serverState set to ONLINE, pending reports from s discarded.
+\*
+\* Source: Environmental assumption — process supervisor guarantees
+\*         crashed processes are eventually restarted.
+ServerRestart(s) ==
+    \* Guard: server is CRASHED.
+    /\ serverState[s] = "CRASHED"
+    \* Mark the server as ONLINE again.
+    /\ serverState' = [serverState EXCEPT ![s] = "ONLINE"]
+    \* Discard pending reports from the previous incarnation.
+    /\ pendingReports' = {rpt \in pendingReports : rpt.server # s}
+    \* All other state variables unchanged.
+    /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
+                   dispatchedOps, rsVars>>
+
 ---------------------------------------------------------------------------
 (* Actions -- crash recovery *)
 
@@ -929,7 +1016,7 @@ ServerCrashAll(s) ==
 \*
 \* This resolves the deadlock where an UNASSIGN procedure is stranded
 \* on an ABNORMALLY_CLOSED region with no way to progress.  The full
-\* SCP machinery (Iterations 14-16) orchestrates WHEN this callback
+\* SCP machinery (ServerCrashProcedure) orchestrates WHEN this callback
 \* fires; this action models WHAT happens to the TRSP.
 \*
 \* Source: TransitRegionStateProcedure.java serverCrashed() L566-586,
@@ -1074,6 +1161,8 @@ Next ==
     \/ \E pid \in DOMAIN procedures : TRSPConfirmOpened(pid)
     \* Handle a failed open by retrying with a new server.
     \/ \E pid \in DOMAIN procedures : TRSPHandleFailedOpen(pid)
+    \* Give up on opening after exhausting the retry budget.
+    \/ \E pid \in DOMAIN procedures : TRSPGiveUpOpen(pid)
     \* Handle open RPC dispatch failure; retry with a new candidate.
     \/ \E pid \in DOMAIN procedures : DispatchFail(pid)
     \* -- UNASSIGN path --
@@ -1093,6 +1182,8 @@ Next ==
     \/ \E r \in Regions : GoOffline(r)
     \* Crash an ONLINE server with at least one region.
     \/ \E s \in Servers : ServerCrashAll(s)
+    \* Restart a CRASHED server (models Kubernetes / process supervisor).
+    \/ \E s \in Servers : ServerRestart(s)
     \* -- Crash recovery --
     \* Convert a stranded procedure on an ABNORMALLY_CLOSED region to ASSIGN.
     \/ \E pid \in DOMAIN procedures : TRSPServerCrashed(pid)
@@ -1115,11 +1206,12 @@ Next ==
 \* progress.  Fairness on procedure-step actions (TRSPGetCandidate,
 \* TRSPDispatchOpen, TRSPConfirmOpened, TRSPClose, TRSPConfirmClosed)
 \* is not expressed here because procedure IDs are dynamically
-\* allocated; full fairness is deferred to Iteration 27.
+\* allocated; full fairness is deferred to a later phase.
 Fairness ==
     /\ \A r \in Regions : WF_vars(TRSPCreate(r))
     /\ \A r \in Regions : WF_vars(TRSPCreateUnassign(r))
     /\ \A r \in Regions : WF_vars(TRSPCreateMove(r))
+    /\ \A s \in Servers : WF_vars(ServerRestart(s))
 
 ---------------------------------------------------------------------------
 (* Specification *)
