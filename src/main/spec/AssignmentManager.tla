@@ -20,10 +20,12 @@
  * (a natural number) when a TRSP is attached, or None when idle.
  *
  * Procedures are modeled as records in the `procedures` variable, indexed
- * by procedure ID.  The ASSIGN procedure follows the TRSP state machine:
- *   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
- * The UNASSIGN path creates a placeholder procedure (type "UNASSIGN",
- * trspState "CLOSE") that is expanded into a full TRSP in Iteration 5.
+ * by procedure ID.  Both ASSIGN and UNASSIGN follow TRSP state machines:
+ *   ASSIGN:   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
+ *   UNASSIGN: CLOSE -> CONFIRM_CLOSED -> (removed)
+ * If a procedure's region becomes ABNORMALLY_CLOSED (server crash), the
+ * procedure converts to ASSIGN/GET_ASSIGN_CANDIDATE via the
+ * serverCrashed() callback, modeling the TRSP's self-recovery path.
  *
  * Currently scoped to the core assign/unassign lifecycle:
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
@@ -91,9 +93,10 @@ ValidTransition ==
       <<"FAILED_OPEN",        "OPENING">> }
 
 \* TRSP internal states used in the procedures variable.
-\* ASSIGN path: GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
-\* UNASSIGN placeholder: CLOSE (expanded in Iteration 5)
-TRSPState == {"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED", "CLOSE"}
+\* ASSIGN path:   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
+\* UNASSIGN path: CLOSE -> CONFIRM_CLOSED -> (removed)
+TRSPState == {"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED",
+              "CLOSE", "CONFIRM_CLOSED"}
 
 ---------------------------------------------------------------------------
 (* Variables *)
@@ -209,22 +212,34 @@ SingleAssignment ==
     \A r \in Regions :
         regionState[r].state = "OPEN" => regionState[r].location # None
 
-\* A procedure is attached only during pre-transitional or transitional
-\* states, never during the stable OPEN state.
+\* Correlates procedure type with the set of region states in which that
+\* procedure may be attached.  Each TRSP type attaches before its first
+\* state transition (setProcedure precedes regionOpening/regionClosing),
+\* so the procedure may be present in the pre-transitional state.
 \*
-\* Updated from Iteration 3: the TRSP ASSIGN procedure attaches to a
-\* region before transitioning it to OPENING (during GET_ASSIGN_CANDIDATE
-\* and OPEN TRSP states), so the procedure may be attached while the
-\* region is still in OFFLINE, CLOSED, ABNORMALLY_CLOSED, or FAILED_OPEN.
+\* ASSIGN attaches during {OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN}
+\*   and the region transitions through OPENING before the procedure is
+\*   removed at OPEN.
+\* UNASSIGN attaches during OPEN and the region transitions through CLOSING
+\*   before the procedure is removed at CLOSED.
+\* Either type may be found on an ABNORMALLY_CLOSED region if a server
+\*   crash occurs while the procedure is in flight (crash recovery is
+\*   modeled in later iterations).
 \*
 \* Source: RegionStateNode.java setProcedure() L213-218,
 \*         unsetProcedure() L220-224.
 LockExclusivity ==
     \A r \in Regions :
-        regionState[r].procedure # None =>
-            regionState[r].state \in {"OFFLINE", "CLOSED",
-                                      "ABNORMALLY_CLOSED", "FAILED_OPEN",
-                                      "OPENING", "CLOSING"}
+        LET pid == regionState[r].procedure IN
+        pid # None =>
+            /\ pid \in DOMAIN procedures
+            /\ \/ /\ procedures[pid].type = "ASSIGN"
+                  /\ regionState[r].state \in {"OFFLINE", "CLOSED",
+                                                "ABNORMALLY_CLOSED",
+                                                "FAILED_OPEN", "OPENING"}
+               \/ /\ procedures[pid].type = "UNASSIGN"
+                  /\ regionState[r].state \in {"OPEN", "CLOSING",
+                                                "ABNORMALLY_CLOSED"}
 
 \* Bidirectional consistency between region->procedure and procedure->region.
 \* Every attached procedure ID refers to an active procedure whose region
@@ -361,45 +376,74 @@ FailOpen(r) ==
     /\ UNCHANGED nextProcId
 
 ---------------------------------------------------------------------------
-(* Actions -- Unassign path (placeholder, expanded in Iteration 5) *)
+(* Actions -- TRSP UNASSIGN path *)
 
-\* Begin closing a region.
-\* Pre: region is OPEN AND no procedure is currently attached.
-\* Post: region transitions to CLOSING (location retained during close);
-\*       a procedure is created and attached.
-BeginClose(r) ==
+\* Create a TRSP UNASSIGN procedure for an OPEN region.
+\* Pre: region is OPEN with a location AND no procedure is attached.
+\* Post: procedure created in CLOSE state, attached to region.
+\*       Region state is NOT changed yet -- the TRSP will drive the
+\*       OPEN -> CLOSING transition in the next step.
+\*
+\* Source: TransitRegionStateProcedure.java queueAssign() L246-278
+\*         (UNASSIGN path), setProcedure() before closeRegion().
+TRSPCreateUnassign(r) ==
     LET pid == nextProcId IN
     /\ regionState[r].state = "OPEN"
     /\ regionState[r].location # None
     /\ regionState[r].procedure = None
-    /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "CLOSING",
-                 location |-> regionState[r].location,
-                 procedure |-> pid]]
-    /\ metaTable' = [metaTable EXCEPT
-         ![r] = [state |-> "CLOSING",
-                 location |-> metaTable[r].location]]
+    /\ regionState' = [regionState EXCEPT ![r].procedure = pid]
     /\ procedures' = AddProc(procedures, pid,
                             [type |-> "UNASSIGN",
                              trspState |-> "CLOSE",
                              region |-> r,
                              targetServer |-> regionState[r].location])
     /\ nextProcId' = nextProcId + 1
+    /\ UNCHANGED metaTable
 
-\* Region successfully closed.
-\* Pre: region is CLOSING with a procedure attached.
-\* Post: region transitions to CLOSED, location cleared;
-\*       procedure removed and detached.
-ConfirmClosed(r) ==
-    LET pid == regionState[r].procedure IN
-    /\ regionState[r].state = "CLOSING"
-    /\ pid # None
-    /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "CLOSED", location |-> None, procedure |-> None]]
-    /\ metaTable' = [metaTable EXCEPT
-         ![r] = [state |-> "CLOSED", location |-> None]]
-    /\ procedures' = RemoveProc(procedures, pid)
-    /\ UNCHANGED nextProcId
+\* Execute the close step: transition region to CLOSING.
+\* Pre: UNASSIGN procedure in CLOSE state, region is OPEN.
+\* Post: region transitions to CLOSING (location retained during close),
+\*       meta updated, TRSP advances to CONFIRM_CLOSED.
+\*
+\* Source: TransitRegionStateProcedure.java closeRegion() L389-407.
+TRSPClose(pid) ==
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type = "UNASSIGN"
+    /\ procedures[pid].trspState = "CLOSE"
+    /\ LET r == procedures[pid].region IN
+       /\ regionState[r].state = "OPEN"
+       /\ regionState' = [regionState EXCEPT
+            ![r].state = "CLOSING"]
+       /\ metaTable' = [metaTable EXCEPT
+            ![r] = [state |-> "CLOSING",
+                    location |-> metaTable[r].location]]
+       /\ procedures' = [procedures EXCEPT
+            ![pid].trspState = "CONFIRM_CLOSED"]
+       /\ UNCHANGED nextProcId
+
+\* Confirm that the region closed successfully.
+\* Pre: UNASSIGN procedure in CONFIRM_CLOSED state, region is CLOSING.
+\* Post: region transitions to CLOSED, location cleared, procedure
+\*       removed and detached.
+\*
+\* In this iteration (no RS side), this models the master confirming
+\* the close directly. In later iterations, this will require consuming
+\* a CLOSED report from the RS.
+\*
+\* Source: TransitRegionStateProcedure.java confirmClosed() L409-446.
+TRSPConfirmClosed(pid) ==
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type = "UNASSIGN"
+    /\ procedures[pid].trspState = "CONFIRM_CLOSED"
+    /\ LET r == procedures[pid].region IN
+       /\ regionState[r].state = "CLOSING"
+       /\ regionState' = [regionState EXCEPT
+            ![r] = [state |-> "CLOSED", location |-> None,
+                    procedure |-> None]]
+       /\ metaTable' = [metaTable EXCEPT
+            ![r] = [state |-> "CLOSED", location |-> None]]
+       /\ procedures' = RemoveProc(procedures, pid)
+       /\ UNCHANGED nextProcId
 
 ---------------------------------------------------------------------------
 (* Actions -- external events *)
@@ -434,6 +478,33 @@ ServerCrash(r) ==
     /\ UNCHANGED <<procedures, nextProcId>>
 
 ---------------------------------------------------------------------------
+(* Actions -- crash recovery *)
+
+\* A procedure's region has been crashed (ABNORMALLY_CLOSED).  The
+\* procedure converts itself to an ASSIGN at GET_ASSIGN_CANDIDATE,
+\* modeling the TRSP serverCrashed() callback plus the closeRegion()
+\* recovery branch: when closeRegion() finds the region is not in a
+\* closeable state, it sets forceNewPlan=true, clears the location,
+\* and jumps to GET_ASSIGN_CANDIDATE.
+\*
+\* This resolves the deadlock where an UNASSIGN procedure is stranded
+\* on an ABNORMALLY_CLOSED region with no way to progress.  The full
+\* SCP machinery (Iterations 14-16) orchestrates WHEN this callback
+\* fires; this action models WHAT happens to the TRSP.
+\*
+\* Source: TransitRegionStateProcedure.java serverCrashed() L566-586,
+\*         closeRegion() L389-407 (else branch).
+TRSPServerCrashed(pid) ==
+    /\ pid \in DOMAIN procedures
+    /\ LET r == procedures[pid].region IN
+       /\ regionState[r].state = "ABNORMALLY_CLOSED"
+       /\ procedures' = [procedures EXCEPT
+            ![pid].type = "ASSIGN",
+            ![pid].trspState = "GET_ASSIGN_CANDIDATE",
+            ![pid].targetServer = None]
+       /\ UNCHANGED <<regionState, metaTable, nextProcId>>
+
+---------------------------------------------------------------------------
 (* Next-state relation *)
 
 Next ==
@@ -443,22 +514,24 @@ Next ==
     \/ \E pid \in DOMAIN procedures : TRSPOpen(pid)
     \/ \E pid \in DOMAIN procedures : TRSPConfirmOpened(pid)
     \/ \E r \in Regions : FailOpen(r)
-    \/ \E r \in Regions : BeginClose(r)
-    \/ \E r \in Regions : ConfirmClosed(r)
+    \/ \E r \in Regions : TRSPCreateUnassign(r)
+    \/ \E pid \in DOMAIN procedures : TRSPClose(pid)
+    \/ \E pid \in DOMAIN procedures : TRSPConfirmClosed(pid)
     \/ \E r \in Regions : GoOffline(r)
     \/ \E r \in Regions : ServerCrash(r)
+    \/ \E pid \in DOMAIN procedures : TRSPServerCrashed(pid)
 
 ---------------------------------------------------------------------------
 (* Fairness *)
 
-\* Weak fairness on region-level actions ensures forward progress.
-\* Fairness on procedure-step actions (TRSPGetCandidate, TRSPOpen,
-\* TRSPConfirmOpened) is not expressed here because procedure IDs are
-\* dynamically allocated; full fairness is deferred to Iteration 27.
+\* Weak fairness on region-level creation actions ensures forward
+\* progress.  Fairness on procedure-step actions (TRSPGetCandidate,
+\* TRSPOpen, TRSPConfirmOpened, TRSPClose, TRSPConfirmClosed) is not
+\* expressed here because procedure IDs are dynamically allocated;
+\* full fairness is deferred to Iteration 27.
 Fairness ==
     /\ \A r \in Regions : WF_vars(TRSPCreate(r))
-    /\ \A r \in Regions : WF_vars(BeginClose(r))
-    /\ \A r \in Regions : WF_vars(ConfirmClosed(r))
+    /\ \A r \in Regions : WF_vars(TRSPCreateUnassign(r))
 
 ---------------------------------------------------------------------------
 (* Specification *)
