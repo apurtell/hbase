@@ -412,6 +412,12 @@ StateConstraint == nextProcId <= 7
 
 StateConstraintSmall == nextProcId <= 5
 
+\* Deeper bound for simulation mode, where cost is proportional to
+\* trace length (not state-space size).  Allows up to 14 completed
+\* procedures (~5 per region with 3 regions): enough for multiple
+\* full assign/unassign/crash/reassign cycles.
+StateConstraintDeep == nextProcId <= 15
+
 \* Limit the number of simultaneously crashed servers.  Used by the
 \* full (3r/3s) configuration to prevent cascading-crash state
 \* explosion while still exercising single-server crash paths.
@@ -579,42 +585,6 @@ TRSPConfirmOpened(pid) ==
 
 ---------------------------------------------------------------------------
 (* Actions -- failure path *)
-
-\* Region failed to open (non-deterministic master-side failure).
-\* SUPERSEDED in Iteration 8 by RSFailOpen, which models the proper
-\* RS-side failure path and produces a FAILED_OPEN report.  Retained
-\* for reference; not included in the Next relation.
-\* Full retry logic deferred to Iteration 12.
-\* Pre: region is OPENING with a procedure attached.
-\* Post: region transitions to FAILED_OPEN, location cleared,
-\*       procedure removed and detached, dispatched command cleaned up.
-\*       If targetServer is None (DispatchFail already removed the
-\*       command), dispatchedOps is left unchanged.
-FailOpen(r) ==
-    \* Bind the owning procedure id from the region's in-memory state.
-    LET pid == regionState[r].procedure IN
-    \* Guards: region is OPENING and has an attached procedure.
-    /\ regionState[r].state = "OPENING"
-    /\ pid # None
-    \* Bind the target server and the corresponding dispatched command.
-    /\ LET s == procedures[pid].targetServer
-           cmd == [type |-> "OPEN", region |-> r, procId |-> pid] IN
-       \* Move region to FAILED_OPEN, clear location, detach procedure.
-       /\ regionState' = [regionState EXCEPT
-            ![r] = [state |-> "FAILED_OPEN", location |-> None,
-                    procedure |-> None]]
-       \* Persist the FAILED_OPEN state and cleared location in META.
-       /\ metaTable' = [metaTable EXCEPT
-            ![r] = [state |-> "FAILED_OPEN", location |-> None]]
-       \* Remove the failed procedure from the active set.
-       /\ procedures' = RemoveProc(procedures, pid)
-       \* Clean up the dispatched command if a target server was set.
-       /\ dispatchedOps' = IF s \in Servers
-                           THEN [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
-                           ELSE dispatchedOps
-       \* Procedure id counter, pending reports, RS-side state, and
-       \* server state unchanged.
-       /\ UNCHANGED <<nextProcId, pendingReports, rsVars, serverState>>
 
 \* Open command dispatch failed (non-deterministic RPC failure).
 \* The command is removed from dispatchedOps without delivery and
