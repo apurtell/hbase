@@ -546,21 +546,17 @@ TLC primary: 35,856 distinct, <1s. Git: `cc9a28a29f`.
 reused via relaxed type guards; `TRSPConfirmClosed` branches (UNASSIGN
 removes, MOVE advances). Renamed `NoSplitBrain` → `NoDoubleAssignment`.
 TLC primary: 61,151 distinct, ~4s. Full: 85M distinct, ~28min.
-Git: `840c084e18`.
+Git: `732d3aa9b9`.
 
-#### Iteration 12 — Open failures: max-attempts give-up path
+#### Iteration 12 — Open failures give-up path and server restart ✅ COMPLETE
 
-**Note**: The basic retry-after-FAILED_OPEN path was implemented early
-in Iteration 10 as `TRSPHandleFailedOpen(pid)`, which consumes the
-`FAILED_OPEN` report and resets the procedure to `GET_ASSIGN_CANDIDATE`.
-What remains for this iteration is the give-up path.
-**What to add**: Retry counter on procedure records and `MaxRetries`
-constant.  When retries >= `MaxRetries`: set `regionState = FAILED_OPEN`,
-update meta, detach procedure (give up).
-**New constant**: `MaxRetries` (recommend 1-2 for TLC).
-**Verify**: Region can reach `FAILED_OPEN` after enough failures.
-`TypeOK` updated. All safety invariants hold.
-**Source**: `TransitRegionStateProcedure.java` `confirmOpened()` L345-374.
+`retries` field + `MaxRetries` constant; `TRSPGiveUpOpen` transitions to
+FAILED_OPEN when limit reached, `TRSPHandleFailedOpen` increments counter
+below limit. `ServerRestart(s)` models process-supervisor restart of
+CRASHED servers (WF guarantees liveness); stale pending reports discarded
+(epoch-based rejection). `CrashConstraint` removed (restart prevents
+all-crashed deadlock). TLC primary: 307,449 distinct, ~16s.
+Git: `0000000000`.
 
 #### Iteration 13 — Dispatch failure (close path and ambiguous delivery)
 
@@ -867,6 +863,8 @@ is shown.
 | `UnassignRegionHandler.process()` receive | `RSReceiveClose(s, r)` | 9 | ✅ |
 | `UnassignRegionHandler.process()` complete | `RSCompleteClose(s, r)` | 9 | ✅ |
 | `AM.balance()` / `createMoveRegionProcedure()` | `TRSPCreateMove(r)` | 11 | ✅ |
+| `TRSP.confirmOpened()` maxAttempts give-up | `TRSPGiveUpOpen(pid)` | 12 | ✅ |
+| Kubernetes / process supervisor restart | `ServerRestart(s)` | 12 | ✅ |
 | `SCP.assignRegions()` | `SCPAssign(scp)` | 15 | ⏳ |
 | `SCP` + `TRSP.serverCrashed()` interaction | `SCPInterruptTRSP(scp, p)` | 16 | ⏳ |
 | Master crash | `MasterCrash` | 19 | ⏳ |
@@ -950,7 +948,7 @@ For each module, the primary source files and their key line ranges:
 |-------|-----------|---------------------|---------------|
 | Phase 1: Master-Side Foundation | 1-5 | ~500 (actual) | State machine + procedures in isolation |
 | Phase 2: RPC and RegionServer | 6-10 | +200 (~680 at Iter 7) | Two-channel RPC, RS-side state, report validation |
-| Phase 3: MOVE and Failures | 11-13 | +100 | Move lifecycle, retry logic, dispatch ambiguity |
+| Phase 3: MOVE and Failures | 11-13 | +100 | Move lifecycle, retry logic, server restart, dispatch ambiguity |
 | Phase 4: RS Crash and Recovery | 14-17 | +200 | SCP, TRSP interaction, double crash |
 | Phase 5: Procedure Store + Master Recovery | 18-19 | +150 | Persistence, crash+rebuild |
 | Phase 6: Split and Merge | 20-26 | +350 | Region pool, multi-region locking, PONR, rollback |
