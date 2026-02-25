@@ -1,47 +1,5 @@
 # TLA+ Model of the HBase AssignmentManager
 
-## Quick Navigation
-
-**Current state**: Iterations 1–4 complete, Iteration 5 next.
-
-### Iteration Plan (read status, update on completion)
-
-| Section | What to do there |
-|---------|-----------------|
-| [Phase 1: Master-Side Foundation](#phase-1-master-side-foundation) | Iterations 1–5. |
-| [Phase 2: RPC Channels and RegionServer Side](#phase-2-rpc-channels-and-regionserver-side) | Iterations 6–10. |
-| [Phase 3: MOVE and Failures](#phase-3-move-and-failures) | Iterations 11–13. |
-| [Phase 4: RegionServer Crash and Recovery](#phase-4-regionserver-crash-and-recovery) | Iterations 14–17. |
-| [Phase 5: Procedure Persistence and Master Recovery](#phase-5-procedure-persistence-and-master-recovery) | Iterations 18–19. |
-| [Phase 6: Split and Merge](#phase-6-split-and-merge-deferred) | Iterations 20–26. |
-| [Phase 7: Liveness and Refinement](#phase-7-liveness-and-refinement-deferred) | Iterations 27–29. |
-
-### Process and Results (read methodology, record outcomes)
-
-| Section | Purpose |
-|---------|---------|
-| [12.2 Per-Iteration Workflow](#122-per-iteration-workflow) | The 8-step loop to follow for every iteration. |
-| [12.3 Finding Classification](#123-finding-classification-triage) | How to triage TLC violations (spec error / abstraction gap / legitimate finding). |
-| [12.4 TLC Configuration Documentation](#124-tlc-configuration-documentation) | Template for recording each iteration's TLC config and results. |
-| [12.5 Finding Documentation](#125-finding-documentation) | Template for documenting legitimate findings (F-001, etc.). |
-| [12.6 Regression Policy](#126-regression-policy) | Rules for backward compatibility across iterations. |
-| [12.7 Completion Criteria](#127-completion-criteria-for-the-full-specification) | When the overall effort is done. |
-
-### Reference (context for writing specs)
-
-| Section | Content |
-|---------|---------|
-| [4. Key Invariants and Properties](#4-key-invariants-and-properties-to-verify) | Safety and liveness properties to verify. |
-| [5. TLA+ Model Design](#5-tla-model-design) | Module hierarchy, abstraction decisions, variables. |
-| [7. Code → TLA+ Action Mapping](#7-mapping-from-code-to-tla-actions) | Maps Java code paths to TLA+ actions. |
-| [8. Source Code Reference Map](#8-source-code-reference-map) | Key files and line ranges in the HBase codebase. |
-| [11. Getting Started](#11-getting-started) | TLC invocation commands. |
-| [Appendix A: Locking](#appendix-a-locking-discipline-analysis) | Locking discipline analysis. |
-| [Appendix B: RPC Model](#appendix-b-rpc-model-analysis) | RPC round-trip analysis. |
-| [Appendix C: Split/Merge](#appendix-c-split-and-merge-operations-analysis) | Split and merge operations analysis. |
-
----
-
 ## 1. Executive Summary
 
 This document presents a detailed analysis of the HBase AssignmentManager system and a
@@ -266,17 +224,19 @@ Combined with `onlineRegions` membership, the RS-side region lifecycle is:
 
 ## 5. TLA+ Model Design
 
-### 5.1 Module Hierarchy
+### 5.1 Module Structure
+
+The specification is built as a single monolithic file, `AssignmentManager.tla`,
+iteratively extended per the iteration plan below. All TRSP, crash recovery,
+and (future) RPC/RS-side logic lives in this one module. Decomposition into
+separate modules (e.g., TRSP.tla, ServerCrash.tla, Network.tla) may be
+considered if the file grows unwieldy (1500+ lines) or a component has
+genuinely independent state that composes cleanly, but is not planned at
+this time.
 
 ```
-HBaseAssignment.tla          (top-level specification, composes all modules)
-  ├── AssignmentManager.tla  (top-level monolithic spec, iteratively built)
-  ├── TRSP.tla               (TransitRegionStateProcedure state machine)
-  ├── RegionServer.tla        (RS-side open/close behavior)
-  ├── ProcedureExecutor.tla   (procedure lifecycle: execute, suspend, crash-recover)
-  ├── ServerCrash.tla         (ServerCrashProcedure state machine)
-  ├── Network.tla             (message passing model for RPCs)
-  └── MetaTable.tla           (simplified hbase:meta persistence)
+AssignmentManager.tla   (monolithic spec, iteratively built)
+AssignmentManager.cfg   (TLC model configuration)
 ```
 
 ### 5.2 Abstraction Decisions
@@ -340,7 +300,49 @@ VARIABLES
 
 ---
 
-## 6. Iterative Development Plan
+## 6. Getting Started
+
+### Prerequisites
+
+- TLA+ Toolbox or VS Code TLA+ extension
+- TLC model checker (bundled with Toolbox)
+- Java 11+ (the TLA+ tools jar requires class file version 55.0+)
+- Familiarity with PlusCal (optional, for algorithmic notation before translating to TLA+)
+
+### Running TLC from the Command Line
+
+The TLA+ extension for Cursor/VS Code bundles `tla2tools.jar` and
+`CommunityModules-deps.jar`. TLC can be invoked directly:
+
+```bash
+cd src/main/spec
+
+/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
+  -XX:+UseParallelGC \
+  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+```
+
+**Key flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `-XX:+UseParallelGC` | Throughput-optimized GC (recommended by TLC) |
+| `-workers auto` | Use all available cores |
+| `-cleanup` | Remove generated state files after run |
+| `-config <file>` | Specify the `.cfg` file with constants, invariants, and constraints |
+
+**SANY-only parse check** (no model checking):
+
+```bash
+/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
+  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar" \
+  tla2sany.SANY AssignmentManager.tla
+```
+
+---
+
+## 7. Iterative Development Plan
 
 Each iteration introduces exactly one new concept, produces a spec that
 TLC can verify, and is small enough to review and debug in isolation.
@@ -465,19 +467,43 @@ TransitionValid action constraint pass. ~3 seconds on 16 workers.
 State count increased from 2,197 (Iteration 3) due to TRSP intermediate
 states and procedure ID allocation.
 
-#### Iteration 5 — TRSP state machine for UNASSIGN
+#### Iteration 5 — TRSP state machine for UNASSIGN ✅ COMPLETE
 
-**What to add**: The UNASSIGN procedure with states
-`CLOSE → CONFIRM_CLOSED → DONE`.
-- `TRSPCreateUnassign(r)`: Pre: region is OPEN. Create procedure,
-  attach, initial state `CLOSE`.
-- `TRSPClose(p)`: Set `regionState = CLOSING`, update meta, advance to
-  `CONFIRM_CLOSED`.
-- `TRSPConfirmClosed(p)`: Set `regionState = CLOSED`, clear location,
-  update meta, advance to `DONE`, detach procedure.
-**Verify**: All existing invariants still hold.
+**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (unchanged)
+**What was added**:
+- Replaced the placeholder `BeginClose`/`ConfirmClosed` actions with
+  three TRSP-step actions for the UNASSIGN path:
+  - `TRSPCreateUnassign(r)`: Pre: region is OPEN, no procedure. Create
+    UNASSIGN procedure in CLOSE state, attach to region. Region stays
+    OPEN (state change deferred to TRSPClose).
+  - `TRSPClose(pid)`: Pre: UNASSIGN procedure in CLOSE state, region
+    OPEN. Transition to CLOSING, update meta, advance to CONFIRM_CLOSED.
+  - `TRSPConfirmClosed(pid)`: Pre: UNASSIGN in CONFIRM_CLOSED, region
+    CLOSING. Transition to CLOSED, clear location, update meta, remove
+    procedure.
+- Added `"CONFIRM_CLOSED"` to `TRSPState`.
+- `LockExclusivity` strengthened: now correlates procedure type with
+  valid region states (ASSIGN may be attached during {OFFLINE, CLOSED,
+  ABNORMALLY_CLOSED, FAILED_OPEN, OPENING}; UNASSIGN during {OPEN,
+  CLOSING, ABNORMALLY_CLOSED}). Previously a flat set that would have
+  become vacuous with OPEN added.
+- Deadlock initially detected when ServerCrash strands UNASSIGN
+  procedures on ABNORMALLY_CLOSED regions (TRSPClose requires OPEN).
+  Resolved by adding `TRSPServerCrashed(pid)` action: when a procedure's
+  region is ABNORMALLY_CLOSED, the procedure converts to ASSIGN at
+  GET_ASSIGN_CANDIDATE (models the `serverCrashed()` callback plus
+  the `closeRegion()` recovery branch where forceNewPlan is set).
+  This is the TRSP's self-recovery logic — the full SCP orchestration
+  of WHEN this fires remains in Iterations 14-16.
 **Source**: `TransitRegionStateProcedure.java` `closeRegion()` L389-407,
-`confirmClosed()` L409-446.
+`confirmClosed()` L409-446, `serverCrashed()` L566-586.
+**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 →
+1,441,599 distinct states (7,142,467 total), depth 27, all 7 invariants
+(TypeOK, OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
+MetaConsistency, LockExclusivity, ProcedureConsistency) + TransitionValid
+action constraint pass. No deadlock. ~6 seconds on 16 workers. State
+count increased from 829,329 (Iteration 4) due to UNASSIGN TRSP
+intermediate states and crash recovery paths.
 
 ---
 
@@ -645,6 +671,10 @@ completes, no region is stuck in ABNORMALLY_CLOSED with no procedure.
 
 #### Iteration 16 — SCP interaction with in-flight TRSPs
 
+**Note**: The TRSP's `serverCrashed()` self-recovery logic (procedure
+converts to ASSIGN/GET_ASSIGN_CANDIDATE when region is ABNORMALLY_CLOSED)
+is already modeled by `TRSPServerCrashed` from Iteration 5.  This
+iteration adds the SCP's orchestration of WHEN that callback is invoked.
 **What to add**: When SCP encounters a region that already has a TRSP
 attached (e.g., an ASSIGN or MOVE was in progress when the server
 crashed):
@@ -865,7 +895,7 @@ GoOffline meta divergence (in-memory OFFLINE while meta shows CLOSED).
 
 ---
 
-## 7. Mapping from Code to TLA+ Actions
+## 8. Mapping from Code to TLA+ Actions
 
 This table maps each significant code path to its corresponding TLA+ action.
 
@@ -911,7 +941,7 @@ This table maps each significant code path to its corresponding TLA+ action.
 
 ---
 
-## 8. Source Code Reference Map
+## 9. Source Code Reference Map
 
 For each module, the primary source files and their key line ranges:
 
@@ -966,7 +996,7 @@ For each module, the primary source files and their key line ranges:
 
 ---
 
-## 9. Estimated Scope and Complexity
+## 10. Estimated Scope and Complexity
 
 | Phase | Iterations | Estimated TLA+ Lines | Key Challenge |
 |-------|-----------|---------------------|---------------|
@@ -996,7 +1026,7 @@ proof-based verification of inductive invariants.
 
 ---
 
-## 10. Open Questions and Risks
+## 11. Open Questions and Risks
 
 1. ~~**Meta table modeling granularity**~~: **RESOLVED** — Meta (and all region
    writes) are modeled as immediately consistent and atomic. When the RPC
@@ -1026,48 +1056,6 @@ proof-based verification of inductive invariants.
    regions (replicaId=0) only. Read replicas have relaxed constraints (no
    exclusive assignment, staleness tolerated, different lifecycle) and can
    be layered on as an extension without altering the core model.
-
----
-
-## 11. Getting Started
-
-### Prerequisites
-
-- TLA+ Toolbox or VS Code TLA+ extension
-- TLC model checker (bundled with Toolbox)
-- Java 11+ (the TLA+ tools jar requires class file version 55.0+)
-- Familiarity with PlusCal (optional, for algorithmic notation before translating to TLA+)
-
-### Running TLC from the Command Line
-
-The TLA+ extension for Cursor/VS Code bundles `tla2tools.jar` and
-`CommunityModules-deps.jar`. TLC can be invoked directly:
-
-```bash
-cd src/main/spec
-
-/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
-  -XX:+UseParallelGC \
-  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
-```
-
-**Key flags:**
-
-| Flag | Purpose |
-|------|---------|
-| `-XX:+UseParallelGC` | Throughput-optimized GC (recommended by TLC) |
-| `-workers auto` | Use all available cores |
-| `-cleanup` | Remove generated state files after run |
-| `-config <file>` | Specify the `.cfg` file with constants, invariants, and constraints |
-
-**SANY-only parse check** (no model checking):
-
-```bash
-/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
-  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar" \
-  tla2sany.SANY AssignmentManager.tla
-```
 
 ---
 
@@ -1101,7 +1089,7 @@ iteration is considered complete.
 Each iteration follows a fixed loop:
 
 1. **WRITE / EDIT** — Add or modify spec per the iteration's scope
-   (see Section 6 for iteration descriptions).
+   (see Section 7 for iteration descriptions).
 2. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
 3. **RUN TLC** — Model-check with the documented configuration
    (constants, constraints, symmetry sets — see 12.4).
@@ -1113,7 +1101,7 @@ Each iteration follows a fixed loop:
 6. **RECORD** — Document the TLC result, configuration, state count,
    and any findings (see 12.4 and 12.5).
 7. **UPDATE PLAN** — Mark the iteration complete in this plan document
-   (Section 6). Append `✅ COMPLETE` to the iteration heading, convert
+   (Section 7). Append `✅ COMPLETE` to the iteration heading, convert
    the "What to add" description to past tense ("What was added"), and
    add a `**TLC result**` line summarizing the final model-checking
    outcome (constants, state count, invariants checked, pass/fail).
@@ -1148,7 +1136,7 @@ into exactly one of three categories:
 
 1. Read the full TLC error trace, noting every state transition.
 2. For each transition in the trace, identify the corresponding code path
-   using the mapping in Section 7.
+   using the mapping in Section 8.
 3. Ask: "Can this exact sequence of events occur in the real system?"
    - If NO → Spec error or abstraction gap. Identify the constraint or
      mechanism that prevents it.
@@ -1210,7 +1198,7 @@ Each legitimate finding must be documented with full traceability:
 | **Iteration** | The iteration in which it was discovered |
 | **Violated invariant/property** | The name and definition of the violated property |
 | **TLC trace summary** | The sequence of actions leading to the violation, in plain language |
-| **Code path** | The corresponding Java code path(s) from Section 7/8 |
+| **Code path** | The corresponding Java code path(s) from Section 8/9 |
 | **Root cause** | Why the implementation permits this behavior |
 | **Severity** | Critical (data loss / split-brain) / High (stuck region / lost region) / Medium (transient inconsistency, self-healing) / Low (cosmetic or unlikely) |
 | **Recommended fix** | Suggested code or design change |
@@ -1249,7 +1237,7 @@ The following rules govern backward compatibility across iterations:
 The overall TLA+ specification effort is complete when ALL of the following
 hold:
 
-1. **All planned iterations are done**: Every iteration in Section 6
+1. **All planned iterations are done**: Every iteration in Section 7
    (Phases 1–7, Iterations 1–29) has been completed per the workflow in
    12.2, or explicitly deferred with justification.
 
