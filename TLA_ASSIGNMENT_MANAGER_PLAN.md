@@ -672,6 +672,19 @@ matching entry in `procStore`.
   3. Re-attach procedures to regions.
   4. Set `serverState` for all servers to ONLINE (RS will re-register).
   5. Resumed procedures pick up from their last persisted state.
+**Pattern C inconsistency window**: This iteration must model the
+two-step persistence pattern for OPENING→OPEN and CLOSING→CLOSED
+transitions (see Appendix D.4). In-memory state is updated first
+(`regionOpenedWithoutPersistingToMeta`), then meta is updated
+separately (`persistToMeta`). If the master crashes between these
+steps, meta retains the old value (OPENING or CLOSING) while the
+procedure state in `procStore` is REPORT_SUCCEED. On recovery, the
+procedure replays `persistToMeta` to resolve the inconsistency.
+The OPENING→OPEN and CLOSING→CLOSED actions should be split into
+separate in-memory and meta-persist steps, with `MasterCrash`
+possible between them. `MetaConsistency` must be relaxed to allow
+divergence when a procedure's persisted state is REPORT_SUCCEED
+(indicating the in-memory update completed but meta has not caught up).
 **Verify**: After `MasterRecover`, the system eventually reaches a
 consistent state. `MetaConsistency` holds after recovery. No lost
 regions. No stuck procedures.
@@ -808,6 +821,16 @@ crash frequency. Measure state space reduction.
 **What to verify**: Cascade crashes, master failover during SCP,
 concurrent split and move on the same region, split during merge of
 adjacent regions. Document all counterexamples or confirmed invariants.
+**Optional: meta write failure modeling**: Model non-deterministic meta
+write failure for all meta-writing actions (see Appendix D). This would
+split each meta-writing action into attempt + succeed/fail sub-actions,
+add a `metaWritePending` variable, and verify that the three revert
+patterns (state-only revert, full revert, no revert) correctly restore
+invariants under all crash and concurrency scenarios. Key properties to
+check: revert correctness after Pattern A failure (asymmetric revert —
+state reverted but location not), interaction between meta write retry
+and server crash (SCP blocked by procedure lock during retry), and
+GoOffline meta divergence (in-memory OFFLINE while meta shows CLOSED).
 
 ---
 
@@ -2195,3 +2218,153 @@ NoOrphanedDaughters ==
         regionState[r].state = "SPLITTING_NEW"
             => \E p \in SplitProcs : r \in {daughters[p].dA, daughters[p].dB}
 ```
+
+---
+
+## Appendix D: Meta Write Failure Patterns
+
+This appendix documents the three distinct meta-write persistence patterns in the
+implementation and their failure/revert behavior, explaining why the TLA+ model
+treats meta writes as atomic (always-succeeding) and identifying the iteration
+where this abstraction is refined.
+
+### D.1 Overview
+
+The model treats every action as an atomic update of both `regionState` (in-memory)
+and `metaTable` (persistent). In the implementation, meta writes can fail,
+triggering revert logic that restores the in-memory state to its pre-transition
+value while leaving meta unchanged. The procedure lock is held throughout, so the
+transient inconsistency is never observable by other procedures.
+
+Three distinct patterns are used:
+
+| Pattern | Used by | Revert on failure |
+|---------|---------|-------------------|
+| **A: `transitStateAndUpdate()`** | `regionOpening()`, `regionClosing()` | State only (location NOT reverted) |
+| **B: Direct setState + meta write** | `regionFailedOpen()`, `regionClosedAbnormally()` | State AND location |
+| **C: Two-step persistence** | `regionOpened...()` + `persistToMeta()`, `regionClosed...()` + `persistToMeta()` | No revert; retry until success |
+
+### D.2 Pattern A: `transitStateAndUpdate()` — State-Only Revert
+
+Used by `regionOpening()` (→OPENING) and `regionClosing()` (→CLOSING).
+
+```
+1.  transitionState(newState)       — in-memory state changes
+2.  regionStateStore.update(...)    — meta write attempted
+3.  IF meta write fails:
+      regionNode.setState(oldState) — revert STATE only, NOT location
+```
+
+**Source**: `AssignmentManager.java` `transitStateAndUpdate()` L2190-2208.
+
+**Asymmetric revert observation**: For `regionOpening()`, the TRSP sets
+`regionNode.setRegionLocation(targetServer)` in `queueAssign()` (TRSP.java
+L249-260) BEFORE calling `regionOpening()`. If the meta write fails, the state
+reverts (e.g., OPENING back to OFFLINE) but the location remains set to the
+target server. This creates a transient state `(state=OFFLINE, location=server)`
+that would violate the model's `OfflineImpliesNoLocation` invariant.
+
+By contrast, `regionClosing()` does not change the location (it retains the
+existing server), so the revert is clean — the state goes back to OPEN with
+the original location, which is a valid consistent state.
+
+The asymmetry between Pattern A (state-only revert) and Pattern B (full revert)
+is not a bug because the RegionStateNode lock prevents any concurrent procedure
+from observing the transient state. The TRSP retries the same step on the next
+execution cycle.
+
+### D.3 Pattern B: Full Revert (State + Location)
+
+Used by `regionFailedOpen()` (→FAILED_OPEN, when `giveUp=true`) and
+`regionClosedAbnormally()` (→ABNORMALLY_CLOSED).
+
+```
+1.  setState(newState)                      — in-memory state changes
+2.  setRegionLocation(null)                 — in-memory location cleared
+3.  regionStateStore.update(...)            — meta write attempted
+4.  IF meta write fails:
+      regionNode.setState(oldState)         — revert state
+      regionNode.setRegionLocation(oldLoc)  — revert location
+```
+
+**Source**: `AssignmentManager.java` `regionFailedOpen()` L2236-2261,
+`regionClosedAbnormally()` L2320-2340.
+
+Both state and location are reverted, restoring the region to its pre-transition
+state. The procedure retries on the next execution cycle.
+
+### D.4 Pattern C: Two-Step Persistence (No Revert)
+
+Used for the OPENING→OPEN and CLOSING→CLOSED transitions, which are reported
+by the RegionServer via `ReportRegionStateTransition`.
+
+```
+Step 1 (in RegionRemoteProcedureBase.reportTransition):
+  regionOpenedWithoutPersistingToMeta()   — in-memory: OPENING → OPEN
+  OR regionClosedWithoutPersistingToMeta() — in-memory: CLOSING → CLOSED
+  persist procedure state to ProcedureStore (WAL)
+  wake procedure
+
+Step 2 (in RegionRemoteProcedureBase.execute, REPORT_SUCCEED state):
+  persistToMeta(regionNode)               — meta write attempted
+  IF meta write fails:
+    procedure suspended, retried          — NO revert of in-memory state
+  IF meta write succeeds:
+    unattach procedure from region
+```
+
+**Source**: `AssignmentManager.java` `regionOpenedWithoutPersistingToMeta()` L2283-2289,
+`regionClosedWithoutPersistingToMeta()` L2292-2301, `persistToMeta()` L2304-2316;
+`RegionRemoteProcedureBase.java` `execute()` L352-361.
+
+There is an intentional inconsistency window between steps 1 and 2: in-memory
+state says OPEN (or CLOSED) while meta still says OPENING (or CLOSING). No revert
+is performed because the region IS genuinely open/closed on the RegionServer — the
+in-memory state reflects reality, and meta will catch up on retry.
+
+**Master crash during this window**: If the master crashes after step 1 but before
+step 2 succeeds, meta retains the old value (OPENING or CLOSING). The procedure
+state REPORT_SUCCEED is persisted to the ProcedureStore (WAL). On master recovery,
+the procedure is reloaded and replays step 2, retrying `persistToMeta()`. This is
+the core scenario for Iteration 19 (master crash and recovery).
+
+### D.5 GoOffline: No Meta Write
+
+`RegionStateNode.offline()` (RSN.java L132-134) calls `setState(State.OFFLINE)`
+and `setRegionLocation(null)` but does NOT write to meta. After `offline()`, the
+in-memory state is OFFLINE while meta retains the last persisted value (typically
+CLOSED). This divergence is resolved on master restart when in-memory state is
+rebuilt from meta.
+
+The TLA+ model currently updates both `regionState` and `metaTable` atomically in
+the `GoOffline` action. This is an over-simplification: in the implementation, meta
+would retain CLOSED. The discrepancy is harmless for the assignment model because
+OFFLINE and CLOSED are both "unassigned" states from the assignment perspective.
+
+### D.6 Implications for TLA+ Modeling
+
+The meta write failure patterns are deliberately not modeled in the TLA+
+specification. The justification:
+
+1. **Lock discipline masks intermediate states**: The RegionStateNode lock
+   (`holdLock() == true`) is held across all steps, including retries. No
+   concurrent procedure can observe the transient inconsistency between
+   in-memory and meta state. The procedure retries on the next execution cycle.
+
+2. **Retry is captured by TLA+ non-determinism**: An action in TLA+ either fires
+   or doesn't. If it doesn't fire in a given step, it may fire in a later step.
+   This naturally models the retry semantics without explicit failure/revert logic.
+
+3. **Pattern C is refined in Iteration 19**: The two-step persistence window
+   (in-memory updated, meta not yet) becomes non-trivial when master crash is
+   introduced. At that point, the model must split the OPENING→OPEN and
+   CLOSING→CLOSED transitions into separate in-memory and meta steps, with
+   master crash possible between them. The recovery action rebuilds in-memory
+   state from meta (which still says OPENING/CLOSING) and replays the procedure.
+
+4. **Meta write failure as an advanced scenario**: Full meta write failure
+   modeling (splitting every meta-writing action, adding a `metaWritePending`
+   variable, weakening 4 invariants) is a candidate for Iteration 29 (advanced
+   scenarios). It would roughly double the action count and significantly
+   increase the state space, but could validate the revert correctness and
+   the interaction between meta write failure and crash recovery.
