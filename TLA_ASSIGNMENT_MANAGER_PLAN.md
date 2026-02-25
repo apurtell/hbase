@@ -265,37 +265,50 @@ The following table documents what is modeled concretely vs. abstracted:
 
 ### 5.3 Model Constants and Variables
 
+The following shows the full planned variable set. Variables marked with
+✅ are implemented in the current spec; those marked with ⏳ are planned
+for future iterations. Names reflect the actual spec where implemented.
+
 ```tla
 CONSTANTS
-    Regions,          \* Set of region identifiers
-    Servers,          \* Set of regionserver identifiers
-    MaxRetries        \* Maximum open/close retries before FAILED_OPEN/FAILED_CLOSE
+    Regions,          \* Set of region identifiers                     ✅ (Iter 1)
+    Servers,          \* Set of regionserver identifiers               ✅ (Iter 1)
+    None              \* Sentinel for "no server/procedure assigned"   ✅ (Iter 1)
+    MaxRetries        \* Maximum open/close retries                    ⏳ (Iter 12)
 
 VARIABLES
     \* --- Master-side state ---
-    regionState,      \* [Regions → RegionStateRecord]
-                      \*   where RegionStateRecord = [state: State, location: Server ∪ {None},
-                      \*                              procedure: ProcId ∪ {None}]
-    serverState,      \* [Servers → {ONLINE, CRASHED, OFFLINE}]
-    procedures,       \* [ProcId → ProcedureRecord]
-                      \*   where ProcedureRecord = [type: ProcType, state: ProcState,
-                      \*                            region: Region, targetServer: Server, ...]
-    procStore,        \* Set of ProcedureRecord (persisted to WAL)
-    metaTable,        \* [Regions → MetaRecord]  (persistent state in hbase:meta)
-                      \*   where MetaRecord = [state: State, server: Server ∪ {None}]
-    nextProcId,       \* Nat (monotonically increasing procedure ID)
-
-    \* --- RegionServer-side state ---
-    rsOnlineRegions,  \* [Servers → SUBSET Regions]
-    rsTransitions,    \* [Servers → [Regions → {Opening, Closing, None}]]
+    regionState,      \* [Regions → [state: State,                    ✅ (Iter 1)
+                      \*              location: Servers ∪ {None},      ✅ (Iter 1)
+                      \*              procedure: Nat ∪ {None}]]        ✅ (Iter 4)
+    metaTable,        \* [Regions → [state: State,                    ✅ (Iter 2)
+                      \*              location: Servers ∪ {None}]]
+    procedures,       \* [Nat → [type: {"ASSIGN","UNASSIGN"},         ✅ (Iter 4)
+                      \*          trspState: TRSPState,
+                      \*          region: Regions,
+                      \*          targetServer: Servers ∪ {None}]]
+    nextProcId,       \* Nat (monotonically increasing)               ✅ (Iter 4)
+    serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ⏳ (Iter 10)
+    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 18)
 
     \* --- Communication ---
-    masterToRS,       \* Set of Message  (master → RS commands)
-    rsToMaster,       \* Set of Message  (RS → master reports)
+    dispatchedOps,    \* [Servers → SUBSET [type: CommandType,        ✅ (Iter 6)
+                      \*   region: Regions, procId: Nat]]
+                      \* Master→RS command channel (per server).
+                      \* Commands dispatched by TRSP actions (Iter 7+),
+                      \* consumed by RS-side actions (Iter 8+).
+    pendingReports,   \* SUBSET [server: Servers, region: Regions,    ✅ (Iter 6)
+                      \*   code: ReportCode, procId: Nat]
+                      \* RS→master report channel.
+
+    \* --- RegionServer-side state ---
+    rsOnlineRegions,  \* [Servers → SUBSET Regions]                   ⏳ (Iter 8)
+    rsTransitions,    \* [Servers → [Regions → {"Opening",            ⏳ (Iter 8)
+                      \*   "Closing", None}]]
 
     \* --- Failure model ---
-    masterAlive,      \* BOOLEAN
-    serverAlive       \* [Servers → BOOLEAN]
+    masterAlive,      \* BOOLEAN                                      ⏳ (Iter 19)
+    serverAlive       \* [Servers → BOOLEAN]                          ⏳ (Iter 14)
 ```
 
 ---
@@ -358,6 +371,38 @@ CallMcpTool:
     fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
 ```
 
+### Running TLC via Command Line (Large Models)
+
+For state spaces that take more than ~30 seconds, the MCP tool may time
+out. Run TLC directly for full control over heap, workers, and timeout:
+
+```bash
+cd /Users/apurtell/src/hbase/src/main/spec
+JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
+$JAVA_HOME/bin/java -XX:+UseParallelGC -Xmx8g \
+  -cp "$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+```
+
+Run in background (Shell `block_until_ms: 0`) and monitor the terminal
+file for progress. Use `-Dtlc2.TLC.stopAfter=N` (seconds) to set a
+hard time limit.
+
+### State Space Management
+
+The spec uses symmetry reduction (added in Iteration 7) to keep the
+state space tractable. The `Symmetry` operator is defined using
+`Permutations(Regions) \union Permutations(Servers)` from the `TLC`
+module. This provides up to `|Regions|! × |Servers|!` reduction (36×
+for 3r/3s) with zero semantic cost.
+
+If the state space grows too large in future iterations, additional
+strategies include:
+- Reducing model size (2r/2s instead of 3r/3s)
+- Lowering `StateConstraint` bound on `nextProcId`
+- Adding state constraints on channel sizes
+- Using simulation mode (`tlaplus_mcp_tlc_smoke`) for quick checks
+
 ---
 
 ## 7. Iterative Development Plan
@@ -371,157 +416,36 @@ is the individual iteration.
 
 #### Iteration 1 — Region states and valid transitions ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (originally `RegionStates.tla`, renamed at Iteration 2)
-**What was added**:
-- `State` type: 7 core states (OFFLINE through ABNORMALLY_CLOSED)
-- `ValidTransition` relation (10 valid transitions)
-- Per-region record: `[state, location]`
-- 7 actions: `BeginOpen`, `ConfirmOpened`, `FailOpen`, `BeginClose`,
-  `ConfirmClosed`, `GoOffline`, `ServerCrash`
-- Invariants: `TypeOK`, `OpenImpliesLocation`, `OfflineImpliesNoLocation`,
-  `SingleAssignment`, `TransitionValid` (action constraint)
-**TLC result**: 3 regions, 3 servers → 2,197 states, all pass.
+`State` (7 states), `ValidTransition` (10 transitions), per-region
+`[state, location]` records, 7 actions, 4 invariants + `TransitionValid`.
+TLC: 2,197 states. Git: `1e09615768` (detail in commit message).
 
 #### Iteration 2 — Meta table as persistent state ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
-**What was added**:
-- `metaTable` variable: `[Regions → [state: State, location: Servers ∪ {None}]]`
-- Every action atomically updates both `regionState` and `metaTable`
-  (per Appendix A, Section A.8, item 2: the RegionStateNode lock is held
-  across both in-memory and meta writes, so they are a single atomic step)
-- `TypeOK` extended with `metaTable` type constraint
-- New invariant: `MetaConsistency` — `metaTable[r] = regionState[r]` for
-  all regions at all times (trivially true by construction in this iteration;
-  becomes non-trivial when master crash breaks the symmetry in Iteration 19)
-- `vars` tuple updated from `<<regionState>>` to `<<regionState, metaTable>>`
-**Why separate**: Introduces the concept of persistent vs. in-memory state
-before any procedures exist. When master crash is added later, meta
-survives but in-memory state is lost — this distinction will matter.
-**TLC result**: 3 regions, 3 servers → 2,197 distinct states (14,197 total),
-depth 13, all 5 invariants + TransitionValid action constraint pass.
-State count unchanged from Iteration 1 (metaTable is a dependent variable).
+Added `metaTable` (persistent `[state, location]` per region), atomic
+dual update with `regionState`, `MetaConsistency` invariant. TLC: 2,197
+distinct (metaTable is dependent). Git: `1e09615768`.
 
 #### Iteration 3 — Procedure attachment (per-region mutex) ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
-**What was added**:
-- `procedure` field on each region's `regionState` record: `None` when
-  no procedure is attached, `TRUE` when some procedure holds the lock.
-  (Actual procedure identity deferred to Iteration 4.)
-- `BeginOpen` and `BeginClose` now guard on `procedure = None` and set
-  it to `TRUE` (lock acquire).
-- `ConfirmOpened`, `ConfirmClosed`, and `FailOpen` now clear `procedure`
-  back to `None` (lock release).
-- `GoOffline` and `ServerCrash` are external actions that preserve the
-  `procedure` field as-is (they do not acquire or release a lock).
-- `MetaConsistency` updated to compare `state` and `location` fields
-  individually (metaTable records do not carry the `procedure` field,
-  since procedures are master in-memory state, not persisted to meta).
-- New invariant: `LockExclusivity` — a procedure is attached only during
-  transitional states (OPENING or CLOSING). The "at most one procedure
-  per region" aspect is trivially true by construction (scalar field),
-  but the state correlation is a non-trivial check that acquire/release
-  is correctly paired with state transitions.
-- `TypeOK` extended with `procedure : {None, TRUE}` on regionState.
-**Why separate**: Establishes the mutual exclusion discipline before the
-procedure itself has any internal state. The `procedure` field is the
-TLA+ analog of `RegionStateNodeLock` + `holdLock() == true`.
-**Source**: `RegionStateNode.java` `setProcedure()` L213-218,
-`unsetProcedure()` L220-224.
-**TLC result**: 3 regions, 3 servers → 2,197 distinct states (14,197 total),
-depth 13, all 6 invariants + TransitionValid action constraint pass.
-State count unchanged from Iteration 2 (procedure field is a dependent
-variable — deterministically derived from state transitions).
+Added `procedure` field (`None`/`TRUE`) to `regionState`, lock
+acquire/release guards, `LockExclusivity` invariant. TLC: 2,197
+distinct. Git: `5f21f83d37`.
 
 #### Iteration 4 — TRSP state machine for ASSIGN (master-side only) ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
-**What was added**:
-- `procedures` variable: function from procedure IDs (Nat) to records
-  `[type, trspState, region, targetServer]`. The ASSIGN procedure has
-  states `GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED → (removed)`.
-- `nextProcId` variable: monotonically increasing counter for procedure
-  ID allocation, starting at 1.
-- `regionState[r].procedure` field changed from `{None, TRUE}` to
-  `{None} ∪ Nat` — now holds the actual procedure ID instead of a
-  boolean sentinel.
-- Replaced the monolithic `BeginOpen`/`ConfirmOpened` actions with four
-  TRSP-step actions:
-  - `TRSPCreate(r)`: Create ASSIGN procedure, attach to region, initial
-    state `GET_ASSIGN_CANDIDATE`. Region state is NOT changed yet.
-  - `TRSPGetCandidate(pid, s)`: Non-deterministically choose server, set
-    `targetServer`, advance to `OPEN`.
-  - `TRSPOpen(pid)`: Set `regionState = OPENING`, `location = targetServer`,
-    update meta, advance to `CONFIRM_OPENED`.
-  - `TRSPConfirmOpened(pid)`: Set `regionState = OPEN`, update meta,
-    remove procedure and detach from region.
-- `BeginClose` and `ConfirmClosed` adapted to create/remove procedure
-  records (type `"UNASSIGN"`, trspState `"CLOSE"` placeholder) so the
-  procedure representation is uniform across assign and unassign paths.
-- `FailOpen` adapted to remove the procedure on failure.
-- `GoOffline` now guards on `procedure = None` to respect the RSN lock.
-- `LockExclusivity` updated: procedure may be attached during
-  pre-transitional states (OFFLINE, CLOSED, ABNORMALLY_CLOSED,
-  FAILED_OPEN) in addition to transitional states (OPENING, CLOSING),
-  reflecting that the TRSP attaches before driving state transitions.
-- New invariant: `ProcedureConsistency` — bidirectional consistency
-  between `regionState[r].procedure` and `procedures[pid].region`.
-- `TypeOK` extended with `procedures`, `nextProcId`, and updated
-  procedure field type.
-- `vars` tuple updated to `<<regionState, metaTable, procedures, nextProcId>>`.
-- `StateConstraint` added: `nextProcId <= 7` to bound TLC state space.
-- Helper operators `AddProc`/`RemoveProc` for function domain manipulation.
-- `TRSPState` defined: `{"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED", "CLOSE"}`.
-**No RS side yet** — the TRSP drives the state machine directly. This is
-the master's view in isolation.
-**Source**: `TransitRegionStateProcedure.java` `executeFromState()` L483-531,
-`queueAssign()` L246-278, `openRegion()` L293-311, `confirmOpened()` L320-374.
-**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 → 829,329 distinct
-states (3,845,782 total), depth 26, all 7 invariants (TypeOK,
-OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
-MetaConsistency, LockExclusivity, ProcedureConsistency) +
-TransitionValid action constraint pass. ~3 seconds on 16 workers.
-State count increased from 2,197 (Iteration 3) due to TRSP intermediate
-states and procedure ID allocation.
+`procedures` variable (function from Nat to records), `nextProcId`,
+procedure field changed to Nat. Actions: `TRSPCreate`, `TRSPGetCandidate`,
+`TRSPOpen`, `TRSPConfirmOpened`. `ProcedureConsistency` invariant.
+`StateConstraint`, `AddProc`/`RemoveProc` helpers. TLC: 829,329 distinct,
+~3s. Git: `ad76a4d4db`.
 
 #### Iteration 5 — TRSP state machine for UNASSIGN ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (unchanged)
-**What was added**:
-- Replaced the placeholder `BeginClose`/`ConfirmClosed` actions with
-  three TRSP-step actions for the UNASSIGN path:
-  - `TRSPCreateUnassign(r)`: Pre: region is OPEN, no procedure. Create
-    UNASSIGN procedure in CLOSE state, attach to region. Region stays
-    OPEN (state change deferred to TRSPClose).
-  - `TRSPClose(pid)`: Pre: UNASSIGN procedure in CLOSE state, region
-    OPEN. Transition to CLOSING, update meta, advance to CONFIRM_CLOSED.
-  - `TRSPConfirmClosed(pid)`: Pre: UNASSIGN in CONFIRM_CLOSED, region
-    CLOSING. Transition to CLOSED, clear location, update meta, remove
-    procedure.
-- Added `"CONFIRM_CLOSED"` to `TRSPState`.
-- `LockExclusivity` strengthened: now correlates procedure type with
-  valid region states (ASSIGN may be attached during {OFFLINE, CLOSED,
-  ABNORMALLY_CLOSED, FAILED_OPEN, OPENING}; UNASSIGN during {OPEN,
-  CLOSING, ABNORMALLY_CLOSED}). Previously a flat set that would have
-  become vacuous with OPEN added.
-- Deadlock initially detected when ServerCrash strands UNASSIGN
-  procedures on ABNORMALLY_CLOSED regions (TRSPClose requires OPEN).
-  Resolved by adding `TRSPServerCrashed(pid)` action: when a procedure's
-  region is ABNORMALLY_CLOSED, the procedure converts to ASSIGN at
-  GET_ASSIGN_CANDIDATE (models the `serverCrashed()` callback plus
-  the `closeRegion()` recovery branch where forceNewPlan is set).
-  This is the TRSP's self-recovery logic — the full SCP orchestration
-  of WHEN this fires remains in Iterations 14-16.
-**Source**: `TransitRegionStateProcedure.java` `closeRegion()` L389-407,
-`confirmClosed()` L409-446, `serverCrashed()` L566-586.
-**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 →
-1,441,599 distinct states (7,142,467 total), depth 27, all 7 invariants
-(TypeOK, OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
-MetaConsistency, LockExclusivity, ProcedureConsistency) + TransitionValid
-action constraint pass. No deadlock. ~6 seconds on 16 workers. State
-count increased from 829,329 (Iteration 4) due to UNASSIGN TRSP
-intermediate states and crash recovery paths.
+Actions: `TRSPCreateUnassign`, `TRSPClose`, `TRSPConfirmClosed`.
+`LockExclusivity` strengthened (type-correlated). Deadlock from
+`ServerCrash` stranding UNASSIGN resolved by `TRSPServerCrashed`.
+TLC: 1,441,599 distinct, ~6s. Git: `ec0b870b5c`.
 
 ---
 
@@ -529,87 +453,22 @@ intermediate states and crash recovery paths.
 
 #### Iteration 6 — RPC channels (data structures only) ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
-**What was added**:
-- `CommandType` set: `{"OPEN", "CLOSE"}` — RPC command types from master
-  to RS (RSProcedureDispatcher dispatches OpenRegionProcedure /
-  CloseRegionProcedure).
-- `ReportCode` set: `{"OPENED", "FAILED_OPEN", "CLOSED"}` — transition
-  codes reported from RS back to master.
-- `dispatchedOps` variable: `[Servers → SUBSET [type : CommandType,
-  region : Regions, procId : Nat]]` — master→RS command channel, per
-  server. Commands remain until consumed by RS-side actions or discarded
-  on dispatch failure / server crash.
-- `pendingReports` variable: subset of `[server : Servers, region :
-  Regions, code : ReportCode, procId : Nat]` — RS→master report channel.
-  Reports remain until consumed by master-side actions.
-- `rpcVars` shorthand: `<<dispatchedOps, pendingReports>>` used in
-  UNCHANGED clauses throughout.
-- `vars` tuple extended to 6 elements:
-  `<<regionState, metaTable, procedures, nextProcId, dispatchedOps,
-  pendingReports>>`.
-- `TypeOK` extended with type constraints for both new variables.
-- `Init` extended: `dispatchedOps = [s ∈ Servers ↦ {}]`,
-  `pendingReports = {}`.
-- All 11 existing actions updated with `UNCHANGED rpcVars` (or
-  `UNCHANGED <<..., rpcVars>>`).
-- No actions produce or consume messages yet — channels remain empty
-  throughout. This is expected and resolved in Iterations 7-9.
-**Why separate**: Establishes the channel data structures before any
-actions produce or consume messages. Ensures the type invariant is
-correct before building on it.
-**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 →
-1,441,599 distinct states (7,142,467 total), depth 27, all 7 invariants
-(TypeOK, OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
-MetaConsistency, LockExclusivity, ProcedureConsistency) + TransitionValid
-action constraint pass. ~56 seconds on 1 worker (16 cores).
-State count unchanged from Iteration 5 (dispatchedOps and pendingReports
-are constant empty — dependent variables with no new state).
+`dispatchedOps` (per-server command set), `pendingReports` (report set),
+`CommandType`, `ReportCode`, `rpcVars` shorthand. Channels empty
+throughout — no actions produce/consume yet. TLC: 1,441,599 distinct
+(channels are dependent). Git: `dd4c127fff`.
 
 #### Iteration 7 — Master dispatches open command via RPC ✅ COMPLETE
 
-**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
-**What was changed**:
-- Renamed `TRSPOpen(pid)` to `TRSPDispatchOpen(pid)`: same logic (set
-  `regionState = OPENING`, update meta, advance TRSP to `CONFIRM_OPENED`)
-  **plus** adds an `[type |-> "OPEN", region |-> r, procId |-> pid]`
-  command record to `dispatchedOps[targetServer]`.
-- `TRSPConfirmOpened(pid)` now requires consuming a matching `OPENED`
-  report from `pendingReports` (existential quantification over reports
-  with matching region, code, and procId). The consumed report is removed
-  from `pendingReports`. Until RS-side actions are added (Iteration 8),
-  no reports are produced, so this action is never enabled — regions may
-  reach OPENING but cannot advance to OPEN (expected, resolved next
-  iteration).
-**What was added**:
-- `DispatchFail(pid)`: Non-deterministic RPC failure. Pre: ASSIGN
-  procedure in `CONFIRM_OPENED` state, matching open command exists in
-  `dispatchedOps[targetServer]`. Post: command removed, TRSP reset to
-  `GET_ASSIGN_CANDIDATE`, `targetServer` cleared (`forceNewPlan`).
-  Region remains OPENING with current location; the next
-  `TRSPDispatchOpen` will update location to the new server.
-  Source: `RSProcedureDispatcher.java` `remoteCallFailed()` L325-340.
-- `Next` relation updated: `TRSPOpen` replaced with `TRSPDispatchOpen`,
-  `DispatchFail` added.
-**State space management**: The `DispatchFail` retry loop (dispatch →
-fail → get_candidate(3 choices) → dispatch → ...) and orphaned commands
-from `FailOpen` caused state space explosion (~1.1B states at 3r/3s).
-Two mitigations applied:
-1. **Symmetry reduction**: Added `TLC` to `EXTENDS`, defined
-   `Symmetry == Permutations(Regions) \union Permutations(Servers)`,
-   added `SYMMETRY Symmetry` to cfg. Up to 36× reduction for 3r/3s,
-   semantically lossless.
-2. **FailOpen cleanup**: `FailOpen` now removes the dispatched command
-   from `dispatchedOps` (guarded with `IF s \in Servers` for the case
-   where `DispatchFail` already cleared `targetServer` to `None`).
-   Previously it used `UNCHANGED rpcVars`, leaving orphaned commands.
-**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 →
-39,250 distinct states (247,466 total), depth 28, all 7 invariants
-(TypeOK, OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
-MetaConsistency, LockExclusivity, ProcedureConsistency) + TransitionValid
-action constraint pass. No errors, no warnings. ~1 second on 16 workers.
-State count decreased from 1,441,599 (Iteration 6) due to symmetry
-reduction, despite the new dispatch/fail branching.
+Renamed `TRSPOpen` → `TRSPDispatchOpen` (adds OPEN command to
+`dispatchedOps`). `TRSPConfirmOpened` now requires consuming OPENED
+report from `pendingReports` (blocked until Iter 8 adds RS side).
+Added `DispatchFail` (RPC failure → retry via `GET_ASSIGN_CANDIDATE`).
+`FailOpen` updated to clean up dispatched commands.
+State space explosion (~1.1B) resolved by symmetry reduction
+(`Permutations(Regions) ∪ Permutations(Servers)`, 36× for 3r/3s) and
+orphaned-command cleanup. TLC: 39,250 distinct, ~1s, all 7 invariants
+pass. Git: `794458c718`.
 
 #### Iteration 8 — RS-side open handler and report
 
@@ -962,9 +821,13 @@ on message delivery. Check temporal properties:
 
 #### Iteration 28 — TLC optimization
 
-**What to add**: Symmetry sets for Regions and Servers. State
-constraints to bound message queue sizes. Action constraints to limit
-crash frequency. Measure state space reduction.
+**Already done** (from Iteration 7): Symmetry sets for Regions and
+Servers (`Permutations(Regions) \union Permutations(Servers)`). This
+provided up to 36× reduction for 3r/3s.
+**Remaining work**: State constraints to bound message queue sizes.
+Action constraints to limit crash frequency. Measure cumulative state
+space reduction across all phases. Evaluate whether `nextProcId` bound
+needs adjustment for later phases.
 
 #### Iteration 29 — Advanced scenarios and findings
 
@@ -986,47 +849,53 @@ GoOffline meta divergence (in-memory OFFLINE while meta shows CLOSED).
 
 ## 8. Mapping from Code to TLA+ Actions
 
-This table maps each significant code path to its corresponding TLA+ action.
+This table maps each significant code path to its corresponding TLA+
+action. Actions marked ✅ are implemented; ⏳ are planned. Where the
+actual action name differs from the original plan, the implemented name
+is shown.
 
-| Code Path | TLA+ Action | Phase |
-|-----------|-------------|-------|
-| `AssignmentManager.assign()` | `MasterInitiateAssign(r)` | 1 |
-| `AssignmentManager.unassign()` | `MasterInitiateUnassign(r)` | 1 |
-| `TRSP.queueAssign()` (GET_ASSIGN_CANDIDATE) | `TRSPGetCandidate(p, r)` | 1 |
-| `TRSP.openRegion()` (OPEN) | `TRSPDispatchOpen(p, r, s)` | 1 |
-| `TRSP.confirmOpened()` (CONFIRM_OPENED) | `TRSPConfirmOpened(p, r)` | 1 |
-| `TRSP.closeRegion()` (CLOSE) | `TRSPDispatchClose(p, r, s)` | 1 |
-| `TRSP.confirmClosed()` (CONFIRM_CLOSED) | `TRSPConfirmClosed(p, r)` | 1 |
-| `AssignRegionHandler.process()` | `RSExecuteOpen(s, r)` | 1 |
-| `UnassignRegionHandler.process()` | `RSExecuteClose(s, r)` | 1 |
-| `RS.reportRegionStateTransition(OPENED)` | `RSSendOpened(s, r)` | 1 |
-| `RS.reportRegionStateTransition(CLOSED)` | `RSSendClosed(s, r)` | 1 |
-| `AM.reportRegionStateTransition()` | `MasterReceiveReport(msg)` | 1 |
-| `AM.balance()` / `createMoveRegionProcedure()` | `MasterInitiateMove(r, s)` | 2 |
-| `RS.reportRegionStateTransition(FAILED_OPEN)` | `RSSendFailedOpen(s, r)` | 2 |
-| RS abort on close failure | `RSCrashOnCloseFail(s)` | 2 |
-| Open-while-closing conflict | `RSOpenCloseConflict(s, r)` | 2 |
-| RS crash (non-deterministic) | `ServerCrash(s)` | 3 |
-| ZK crash detection | `DetectCrash(s)` | 3 |
-| `SCP.assignRegions()` | `SCPAssignRegions(scp)` | 3 |
-| `SCP.serverCrashed()` on TRSP | `SCPInterruptTRSP(scp, p)` | 3 |
-| Master crash | `MasterCrash` | 3 |
-| Master recovery (load from store) | `MasterRecover` | 3 |
-| `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(parent, dA, dB)` | 6 |
-| `SplitTableRegionProcedure` CLOSE_PARENT | `SplitCloseParent(p)` | 6 |
-| `SplitTableRegionProcedure` CHECK_CLOSED | `SplitCheckClosed(p)` | 6 |
-| `AssignmentManager.markRegionAsSplit()` | `SplitUpdateMeta(p)` | 6 |
-| `SplitTableRegionProcedure` OPEN_CHILDREN | `SplitOpenChildren(p)` | 6 |
-| `SplitTableRegionProcedure` completion | `SplitDone(p)` | 6 |
-| `SplitTableRegionProcedure.rollbackState()` | `SplitRollback(p)` | 6 |
-| `MergeTableRegionsProcedure.prepareMergeRegion()` | `MergePrepare(r1, r2, m)` | 6 |
-| `MergeTableRegionsProcedure` CLOSE_REGIONS | `MergeCloseRegions(p)` | 6 |
-| `MergeTableRegionsProcedure` CHECK_CLOSED | `MergeCheckClosed(p)` | 6 |
-| `MergeTableRegionsProcedure` CREATE_MERGED | `MergeCreateMerged(p)` | 6 |
-| `AssignmentManager.markRegionAsMerged()` | `MergeUpdateMeta(p)` | 6 |
-| `MergeTableRegionsProcedure` OPEN_MERGED | `MergeOpenMerged(p)` | 6 |
-| `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 6 |
-| `MergeTableRegionsProcedure.rollbackState()` | `MergeRollback(p)` | 6 |
+| Code Path | TLA+ Action | Iter | Status |
+|-----------|-------------|------|--------|
+| `TRSP.queueAssign()` | `TRSPCreate(r)` | 4 | ✅ |
+| `TRSP.executeFromState()` GET_ASSIGN_CANDIDATE | `TRSPGetCandidate(pid, s)` | 4 | ✅ |
+| `TRSP.openRegion()` + `RSProcedureDispatcher` | `TRSPDispatchOpen(pid)` | 7 | ✅ |
+| `TRSP.confirmOpened()` | `TRSPConfirmOpened(pid)` | 7 | ✅ |
+| `RSProcedureDispatcher.remoteCallFailed()` | `DispatchFail(pid)` | 7 | ✅ |
+| Non-deterministic open failure | `FailOpen(r)` | 4 | ✅ |
+| `TRSP.queueAssign()` UNASSIGN | `TRSPCreateUnassign(r)` | 5 | ✅ |
+| `TRSP.closeRegion()` | `TRSPClose(pid)` | 5 | ✅ |
+| `TRSP.confirmClosed()` | `TRSPConfirmClosed(pid)` | 5 | ✅ |
+| `RegionStateNode.offline()` | `GoOffline(r)` | 1 | ✅ |
+| RS crash (OPEN → ABNORMALLY_CLOSED) | `ServerCrash(r)` | 1 | ✅ |
+| `TRSP.serverCrashed()` | `TRSPServerCrashed(pid)` | 5 | ✅ |
+| `AssignRegionHandler.process()` receive | `RSReceiveOpen(s, r)` | 8 | ⏳ |
+| `AssignRegionHandler.process()` complete | `RSCompleteOpen(s, r)` | 8 | ⏳ |
+| `AssignRegionHandler.process()` fail | `RSFailOpen(s, r)` | 8 | ⏳ |
+| `UnassignRegionHandler.process()` receive | `RSReceiveClose(s, r)` | 9 | ⏳ |
+| `UnassignRegionHandler.process()` complete | `RSCompleteClose(s, r)` | 9 | ⏳ |
+| `TRSP.closeRegion()` + dispatch | `TRSPDispatchClose(pid)` | 9 | ⏳ |
+| `AM.reportRegionStateTransition()` | `MasterReceiveReport(rpt)` | 10 | ⏳ |
+| `AM.balance()` / `createMoveRegionProcedure()` | `TRSPCreateMove(r, s)` | 11 | ⏳ |
+| `ServerManager.expireServer()` | `ServerCrash(s)` | 14 | ⏳ |
+| `SCP.assignRegions()` | `SCPAssign(scp)` | 15 | ⏳ |
+| `SCP` + `TRSP.serverCrashed()` interaction | `SCPInterruptTRSP(scp, p)` | 16 | ⏳ |
+| Master crash | `MasterCrash` | 19 | ⏳ |
+| Master recovery (load from store) | `MasterRecover` | 19 | ⏳ |
+| `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(parent, dA, dB)` | 21 | ⏳ |
+| `SplitTableRegionProcedure` CLOSE_PARENT | `SplitCloseParent(p)` | 21 | ⏳ |
+| `SplitTableRegionProcedure` CHECK_CLOSED | `SplitCheckClosed(p)` | 21 | ⏳ |
+| `AssignmentManager.markRegionAsSplit()` | `SplitUpdateMeta(p)` | 22 | ⏳ |
+| `SplitTableRegionProcedure` OPEN_CHILDREN | `SplitOpenChildren(p)` | 23 | ⏳ |
+| `SplitTableRegionProcedure` completion | `SplitDone(p)` | 23 | ⏳ |
+| `SplitTableRegionProcedure.rollbackState()` | `SplitRollback(p)` | 24 | ⏳ |
+| `MergeTableRegionsProcedure.prepareMergeRegion()` | `MergePrepare(r1, r2, m)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure` CLOSE_REGIONS | `MergeCloseRegions(p)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure` CHECK_CLOSED | `MergeCheckClosed(p)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure` CREATE_MERGED | `MergeCreateMerged(p)` | 25 | ⏳ |
+| `AssignmentManager.markRegionAsMerged()` | `MergeUpdateMeta(p)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure` OPEN_MERGED | `MergeOpenMerged(p)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure.rollbackState()` | `MergeRollback(p)` | 25 | ⏳ |
 
 ---
 
@@ -1089,14 +958,20 @@ For each module, the primary source files and their key line ranges:
 
 | Phase | Iterations | Estimated TLA+ Lines | Key Challenge |
 |-------|-----------|---------------------|---------------|
-| Phase 1: Master-Side Foundation | 1-5 | ~250 | State machine + procedures in isolation |
-| Phase 2: RPC and RegionServer | 6-10 | +200 | Two-channel RPC, RS-side state, report validation |
+| Phase 1: Master-Side Foundation | 1-5 | ~500 (actual) | State machine + procedures in isolation |
+| Phase 2: RPC and RegionServer | 6-10 | +200 (~680 at Iter 7) | Two-channel RPC, RS-side state, report validation |
 | Phase 3: MOVE and Failures | 11-13 | +100 | Move lifecycle, retry logic, dispatch ambiguity |
 | Phase 4: RS Crash and Recovery | 14-17 | +200 | SCP, TRSP interaction, double crash |
 | Phase 5: Procedure Store + Master Recovery | 18-19 | +150 | Persistence, crash+rebuild |
 | Phase 6: Split and Merge | 20-26 | +350 | Region pool, multi-region locking, PONR, rollback |
-| Phase 7: Liveness and Refinement | 27-29 | +100 | Fairness, optimization, scenarios |
-| **Total** | **29** | **~1350** | |
+| Phase 7: Liveness and Refinement | 27-29 | +50 | Fairness, scenarios (symmetry already done) |
+| **Total** | **29** | **~1550** | |
+
+Note: Original estimate of ~250 lines for Phase 1 was low. The spec
+reached ~500 lines by Iteration 5 due to detailed comments, source
+references, and the crash recovery action (`TRSPServerCrashed`).
+Phase 7 estimate reduced because symmetry reduction was applied in
+Iteration 7 instead of Iteration 28.
 
 ### Model Checking Feasibility
 
@@ -1104,14 +979,26 @@ For TLC (explicit state model checker), the state space must be kept manageable:
 
 | Parameter | Recommended TLC Value | Notes |
 |-----------|-----------------------|-------|
-| `|Regions|` | 2-3 | More than 3 causes state explosion |
-| `|Servers|` | 2-3 | Minimum 2 needed for MOVE |
+| `\|Regions\|` | 2-3 | More than 3 causes state explosion |
+| `\|Servers\|` | 2-3 | Minimum 2 needed for MOVE |
 | `MaxRetries` | 1-2 | Keep small for state space |
-| Message channels | Bounded (size 2-3) | Prevent unbounded message queues |
-| Concurrent procedures | Bounded (2-3) | Limit active procedures |
+| `nextProcId` bound | 5-7 | Via `StateConstraint`; limits total procedures |
+| Symmetry | `Permutations(R) ∪ Permutations(S)` | Applied since Iter 7; up to 36× reduction for 3r/3s |
 
 For larger parameter values, TLAPS (TLA+ Proof System) can be used for
 proof-based verification of inductive invariants.
+
+### State Space History
+
+| Iteration | Distinct States | Total States | Depth | Time | Notes |
+|-----------|----------------|-------------|-------|------|-------|
+| 1 | 2,197 | 2,197 | 13 | <1s | No symmetry |
+| 2 | 2,197 | 14,197 | 13 | <1s | metaTable is dependent |
+| 3 | 2,197 | 14,197 | 13 | <1s | procedure field is dependent |
+| 4 | 829,329 | 3,845,782 | 26 | ~3s | TRSP intermediate states |
+| 5 | 1,441,599 | 7,142,467 | 27 | ~6s | UNASSIGN + crash recovery |
+| 6 | 1,441,599 | 7,142,467 | 27 | ~56s | RPC channels (empty, 1 worker) |
+| 7 | 39,250 | 247,466 | 28 | ~1s | Symmetry applied; dispatch/fail |
 
 ---
 
