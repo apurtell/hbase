@@ -304,40 +304,58 @@ VARIABLES
 
 ### Prerequisites
 
-- TLA+ Toolbox or VS Code TLA+ extension
-- TLC model checker (bundled with Toolbox)
-- Java 11+ (the TLA+ tools jar requires class file version 55.0+)
-- Familiarity with PlusCal (optional, for algorithmic notation before translating to TLA+)
+- Cursor/VS Code with the TLA+ extension (`tlaplus.vscode-ide`)
+- Java 11+ (**important**: the TLA+ tools jar requires class file version
+  55.0; the default `java` on this system is temurin-8, which will fail
+  with `UnsupportedClassVersionError`)
+- Familiarity with PlusCal (optional, for algorithmic notation before
+  translating to TLA+)
 
-### Running TLC from the Command Line
+### Running TLC via the TLA+ MCP Server (Preferred)
 
-The TLA+ extension for Cursor/VS Code bundles `tla2tools.jar` and
-`CommunityModules-deps.jar`. TLC can be invoked directly:
+The TLA+ extension exposes an MCP server
+(`user-tlaplus.vscode-ide-extension-TLA_MCP_Server`) with tools that
+handle Java selection, classpath, and worker configuration automatically.
+**This is the recommended method for AI agents and interactive use.**
 
-```bash
-cd src/main/spec
+**Required setting** (already configured in Cursor user `settings.json`):
 
-/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
-  -XX:+UseParallelGC \
-  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+```json
+"tlaplus.java.home": "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
 ```
 
-**Key flags:**
+Without this, the extension uses the default `java` on PATH (temurin-8),
+which fails with `UnsupportedClassVersionError` (class file version 55.0
+requires Java 11+).
 
-| Flag | Purpose |
-|------|---------|
-| `-XX:+UseParallelGC` | Throughput-optimized GC (recommended by TLC) |
-| `-workers auto` | Use all available cores |
-| `-cleanup` | Remove generated state files after run |
-| `-config <file>` | Specify the `.cfg` file with constants, invariants, and constraints |
+| MCP Tool | Purpose |
+|----------|---------|
+| `tlaplus_mcp_sany_parse` | Syntax/level check only (no model checking). Fast. |
+| `tlaplus_mcp_tlc_check` | **Exhaustive model check** — verifies all invariants and properties. Use for iteration verification. |
+| `tlaplus_mcp_tlc_smoke` | Simulation-mode smoke test (random behaviors, time-limited). Good for quick sanity checks. |
+| `tlaplus_mcp_tlc_explore` | Generate and print a random behavior of a given length. Useful for understanding the spec. |
+| `tlaplus_mcp_tlc_trace` | Replay a previously generated TLC counterexample trace file. |
 
-**SANY-only parse check** (no model checking):
+**Exhaustive check** (standard iteration verification):
 
-```bash
-/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
-  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar" \
-  tla2sany.SANY AssignmentManager.tla
+```
+CallMcpTool:
+  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
+  toolName: tlaplus_mcp_tlc_check
+  arguments:
+    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
+    cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.cfg
+    extraOpts: ["-workers", "auto", "-cleanup"]
+```
+
+**Parse check only** (verify syntax before running TLC):
+
+```
+CallMcpTool:
+  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
+  toolName: tlaplus_mcp_sany_parse
+  arguments:
+    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
 ```
 
 ---
@@ -509,16 +527,44 @@ intermediate states and crash recovery paths.
 
 ### Phase 2: RPC Channels and RegionServer Side
 
-#### Iteration 6 — RPC channels (data structures only)
+#### Iteration 6 — RPC channels (data structures only) ✅ COMPLETE
 
-**What to add**: Two communication variables:
-- `dispatchedOps`: `[Servers → set of command records]` — master→RS channel
-- `pendingReports`: `set of report records` — RS→master channel
-No actions use them yet. Add `TypeOK` conjuncts for the new variables.
-Verify TLC still passes with the enlarged state.
+**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
+**What was added**:
+- `CommandType` set: `{"OPEN", "CLOSE"}` — RPC command types from master
+  to RS (RSProcedureDispatcher dispatches OpenRegionProcedure /
+  CloseRegionProcedure).
+- `ReportCode` set: `{"OPENED", "FAILED_OPEN", "CLOSED"}` — transition
+  codes reported from RS back to master.
+- `dispatchedOps` variable: `[Servers → SUBSET [type : CommandType,
+  region : Regions, procId : Nat]]` — master→RS command channel, per
+  server. Commands remain until consumed by RS-side actions or discarded
+  on dispatch failure / server crash.
+- `pendingReports` variable: subset of `[server : Servers, region :
+  Regions, code : ReportCode, procId : Nat]` — RS→master report channel.
+  Reports remain until consumed by master-side actions.
+- `rpcVars` shorthand: `<<dispatchedOps, pendingReports>>` used in
+  UNCHANGED clauses throughout.
+- `vars` tuple extended to 6 elements:
+  `<<regionState, metaTable, procedures, nextProcId, dispatchedOps,
+  pendingReports>>`.
+- `TypeOK` extended with type constraints for both new variables.
+- `Init` extended: `dispatchedOps = [s ∈ Servers ↦ {}]`,
+  `pendingReports = {}`.
+- All 11 existing actions updated with `UNCHANGED rpcVars` (or
+  `UNCHANGED <<..., rpcVars>>`).
+- No actions produce or consume messages yet — channels remain empty
+  throughout. This is expected and resolved in Iterations 7-9.
 **Why separate**: Establishes the channel data structures before any
 actions produce or consume messages. Ensures the type invariant is
 correct before building on it.
+**TLC result**: 3 regions, 3 servers, nextProcId ≤ 7 →
+1,441,599 distinct states (7,142,467 total), depth 27, all 7 invariants
+(TypeOK, OpenImpliesLocation, OfflineImpliesNoLocation, SingleAssignment,
+MetaConsistency, LockExclusivity, ProcedureConsistency) + TransitionValid
+action constraint pass. ~56 seconds on 1 worker (16 cores).
+State count unchanged from Iteration 5 (dispatchedOps and pendingReports
+are constant empty — dependent variables with no new state).
 
 #### Iteration 7 — Master dispatches open command via RPC
 
