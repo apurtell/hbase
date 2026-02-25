@@ -27,6 +27,13 @@
  * procedure converts to ASSIGN/GET_ASSIGN_CANDIDATE via the
  * serverCrashed() callback, modeling the TRSP's self-recovery path.
  *
+ * Two RPC channels model the asynchronous communication:
+ *   dispatchedOps:  master→RS command channel (per server)
+ *   pendingReports: RS→master report channel
+ * Commands are dispatched by TRSP actions and consumed by RS-side
+ * actions; reports are produced by RS-side actions and consumed by
+ * master-side report processing.
+ *
  * Currently scoped to the core assign/unassign lifecycle:
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
  *
@@ -98,6 +105,16 @@ ValidTransition ==
 TRSPState == {"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED",
               "CLOSE", "CONFIRM_CLOSED"}
 
+\* RPC command types dispatched from master to RegionServer.
+\* Source: RSProcedureDispatcher dispatches OpenRegionProcedure /
+\*         CloseRegionProcedure via executeProcedures() RPC.
+CommandType == {"OPEN", "CLOSE"}
+
+\* Transition codes reported from RegionServer back to master.
+\* Source: RegionServerStatusService.reportRegionStateTransition()
+\*         with TransitionCode enum values.
+ReportCode == {"OPENED", "FAILED_OPEN", "CLOSED"}
+
 ---------------------------------------------------------------------------
 (* Variables *)
 
@@ -141,7 +158,36 @@ VARIABLE nextProcId
     \* Each new procedure is assigned nextProcId as its ID, then
     \* nextProcId is incremented.
 
-vars == <<regionState, metaTable, procedures, nextProcId>>
+VARIABLE dispatchedOps
+    \* dispatchedOps[s] is a set of command records pending delivery to
+    \* server s.  Each record is:
+    \*   [type : CommandType, region : Regions, procId : Nat]
+    \*
+    \* Models the master→RS command channel: the RSProcedureDispatcher
+    \* batches open/close commands and sends them via executeProcedures()
+    \* RPC.  Commands remain in the set until consumed by RS-side actions
+    \* or discarded on dispatch failure / server crash.
+    \*
+    \* Source: RSProcedureDispatcher.java L200-367.
+
+VARIABLE pendingReports
+    \* pendingReports is a set of report records from RegionServers
+    \* waiting to be processed by the master.  Each record is:
+    \*   [server : Servers, region : Regions, code : ReportCode,
+    \*    procId : Nat]
+    \*
+    \* Models the RS→master report channel: RegionServers report
+    \* transition outcomes via reportRegionStateTransition() RPC.
+    \* Reports remain in the set until consumed by master-side actions
+    \* or discarded if from a crashed server.
+    \*
+    \* Source: RegionServerStatusService.reportRegionStateTransition().
+
+vars == <<regionState, metaTable, procedures, nextProcId,
+          dispatchedOps, pendingReports>>
+
+\* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
+rpcVars == <<dispatchedOps, pendingReports>>
 
 ---------------------------------------------------------------------------
 (* Helper operators *)
@@ -172,6 +218,11 @@ TypeOK ==
          /\ procedures[pid].trspState \in TRSPState
          /\ procedures[pid].region \in Regions
          /\ procedures[pid].targetServer \in Servers \cup {None}
+    /\ dispatchedOps \in [Servers -> SUBSET
+         [type : CommandType, region : Regions, procId : Nat]]
+    /\ pendingReports \subseteq
+         [server : Servers, region : Regions, code : ReportCode,
+          procId : Nat]
 
 ---------------------------------------------------------------------------
 (* Safety invariants *)
@@ -268,6 +319,8 @@ Init ==
          [state |-> "OFFLINE", location |-> None]]
     /\ procedures = <<>>
     /\ nextProcId = 1
+    /\ dispatchedOps = [s \in Servers |-> {}]
+    /\ pendingReports = {}
 
 ---------------------------------------------------------------------------
 (* Actions -- TRSP ASSIGN path *)
@@ -292,7 +345,7 @@ TRSPCreate(r) ==
                              region |-> r,
                              targetServer |-> None])
     /\ nextProcId' = nextProcId + 1
-    /\ UNCHANGED metaTable
+    /\ UNCHANGED <<metaTable, rpcVars>>
 
 \* Choose a target server for the ASSIGN procedure.
 \* Pre: TRSP is in GET_ASSIGN_CANDIDATE state.
@@ -306,7 +359,7 @@ TRSPGetCandidate(pid, s) ==
     /\ procedures[pid].trspState = "GET_ASSIGN_CANDIDATE"
     /\ procedures' = [procedures EXCEPT ![pid].targetServer = s,
                                         ![pid].trspState = "OPEN"]
-    /\ UNCHANGED <<regionState, metaTable, nextProcId>>
+    /\ UNCHANGED <<regionState, metaTable, nextProcId, rpcVars>>
 
 \* Execute the open step: transition region to OPENING.
 \* Pre: TRSP is in OPEN state with a target server.
@@ -328,7 +381,7 @@ TRSPOpen(pid) ==
             ![r] = [state |-> "OPENING", location |-> s]]
        /\ procedures' = [procedures EXCEPT
             ![pid].trspState = "CONFIRM_OPENED"]
-       /\ UNCHANGED nextProcId
+       /\ UNCHANGED <<nextProcId, rpcVars>>
 
 \* Confirm that the region opened successfully.
 \* Pre: TRSP is in CONFIRM_OPENED state, region is OPENING.
@@ -353,7 +406,7 @@ TRSPConfirmOpened(pid) ==
             ![r] = [state |-> "OPEN",
                     location |-> metaTable[r].location]]
        /\ procedures' = RemoveProc(procedures, pid)
-       /\ UNCHANGED nextProcId
+       /\ UNCHANGED <<nextProcId, rpcVars>>
 
 ---------------------------------------------------------------------------
 (* Actions -- failure path *)
@@ -373,7 +426,7 @@ FailOpen(r) ==
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "FAILED_OPEN", location |-> None]]
     /\ procedures' = RemoveProc(procedures, pid)
-    /\ UNCHANGED nextProcId
+    /\ UNCHANGED <<nextProcId, rpcVars>>
 
 ---------------------------------------------------------------------------
 (* Actions -- TRSP UNASSIGN path *)
@@ -398,7 +451,7 @@ TRSPCreateUnassign(r) ==
                              region |-> r,
                              targetServer |-> regionState[r].location])
     /\ nextProcId' = nextProcId + 1
-    /\ UNCHANGED metaTable
+    /\ UNCHANGED <<metaTable, rpcVars>>
 
 \* Execute the close step: transition region to CLOSING.
 \* Pre: UNASSIGN procedure in CLOSE state, region is OPEN.
@@ -419,7 +472,7 @@ TRSPClose(pid) ==
                     location |-> metaTable[r].location]]
        /\ procedures' = [procedures EXCEPT
             ![pid].trspState = "CONFIRM_CLOSED"]
-       /\ UNCHANGED nextProcId
+       /\ UNCHANGED <<nextProcId, rpcVars>>
 
 \* Confirm that the region closed successfully.
 \* Pre: UNASSIGN procedure in CONFIRM_CLOSED state, region is CLOSING.
@@ -443,7 +496,7 @@ TRSPConfirmClosed(pid) ==
        /\ metaTable' = [metaTable EXCEPT
             ![r] = [state |-> "CLOSED", location |-> None]]
        /\ procedures' = RemoveProc(procedures, pid)
-       /\ UNCHANGED nextProcId
+       /\ UNCHANGED <<nextProcId, rpcVars>>
 
 ---------------------------------------------------------------------------
 (* Actions -- external events *)
@@ -460,7 +513,7 @@ GoOffline(r) ==
                  procedure |-> None]]
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "OFFLINE", location |-> None]]
-    /\ UNCHANGED <<procedures, nextProcId>>
+    /\ UNCHANGED <<procedures, nextProcId, rpcVars>>
 
 \* The server hosting an OPEN region crashes.
 \* Pre: region is OPEN with a location.
@@ -475,7 +528,7 @@ ServerCrash(r) ==
                  procedure |-> regionState[r].procedure]]
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "ABNORMALLY_CLOSED", location |-> None]]
-    /\ UNCHANGED <<procedures, nextProcId>>
+    /\ UNCHANGED <<procedures, nextProcId, rpcVars>>
 
 ---------------------------------------------------------------------------
 (* Actions -- crash recovery *)
@@ -502,7 +555,7 @@ TRSPServerCrashed(pid) ==
             ![pid].type = "ASSIGN",
             ![pid].trspState = "GET_ASSIGN_CANDIDATE",
             ![pid].targetServer = None]
-       /\ UNCHANGED <<regionState, metaTable, nextProcId>>
+       /\ UNCHANGED <<regionState, metaTable, nextProcId, rpcVars>>
 
 ---------------------------------------------------------------------------
 (* Next-state relation *)
