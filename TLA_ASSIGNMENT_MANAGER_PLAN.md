@@ -460,66 +460,27 @@ throughout — no actions produce/consume yet. TLC: 1,441,599 distinct
 
 #### Iteration 7 — Master dispatches open command via RPC ✅ COMPLETE
 
-Renamed `TRSPOpen` → `TRSPDispatchOpen` (adds OPEN command to
-`dispatchedOps`). `TRSPConfirmOpened` now requires consuming OPENED
-report from `pendingReports` (blocked until Iter 8 adds RS side).
-Added `DispatchFail` (RPC failure → retry via `GET_ASSIGN_CANDIDATE`).
-`FailOpen` updated to clean up dispatched commands.
-State space explosion (~1.1B) resolved by symmetry reduction
-(`Permutations(Regions) ∪ Permutations(Servers)`, 36× for 3r/3s) and
-orphaned-command cleanup. TLC: 39,250 distinct, ~1s, all 7 invariants
-pass. Git: `794458c718`.
+`TRSPDispatchOpen` (renamed), `TRSPConfirmOpened` (requires OPENED
+report), `DispatchFail` (RPC failure → retry). Symmetry reduction
+(`Permutations`) resolved state explosion. TLC: 39,250 distinct, ~1s.
+Git: `806a9002c4`.
 
-#### Iteration 8 — RS-side open handler and report
+#### Iteration 8 — RS-side open handler and report ✅ COMPLETE
 
-**What to add**: RS-side variables:
-- `rsOnlineRegions`: `[Servers → SUBSET Regions]`
-- `rsTransitions`: `[Servers → [Regions → {"Opening", "Closing", None}]]`
+RS-side variables `rsOnlineRegions`, `rsTransitions`, `rsVars`.
+Actions: `RSReceiveOpen`, `RSCompleteOpen`, `RSFailOpen`. `FailOpen`
+removed from `Next` (superseded). ASSIGN round-trip complete.
+TLC: 5,622,240 distinct, ~67s. Git: `f01818db30`.
 
-RS-side actions:
-- `RSReceiveOpen(s, r)`: Dequeue open command from `dispatchedOps[s]`,
-  set `rsTransitions[s][r] = "Opening"`.
-- `RSCompleteOpen(s, r)`: Pre: `rsTransitions[s][r] = "Opening"`. Add
-  region to `rsOnlineRegions[s]`, clear transition, add `OPENED` report
-  to `pendingReports`.
-- `RSFailOpen(s, r)`: Pre: `rsTransitions[s][r] = "Opening"`. Clear
-  transition, add `FAILED_OPEN` report to `pendingReports`.
-**What to change**: The non-deterministic `FailOpen(r)` action from
-earlier iterations should be removed or disabled once `RSFailOpen`
-provides the proper RS-side failure path. `FailOpen` currently handles
-dispatched command cleanup (added in Iteration 7); `RSFailOpen` produces
-a `FAILED_OPEN` report instead, which the master will process in a
-later iteration.
-**Verify**: The ASSIGN round-trip now completes:
-dispatch → RS receive → RS complete → report → master confirm.
-All invariants should hold. Symmetry reduction (added in Iteration 7)
-keeps state space tractable with the additional RS-side branching.
-**Source**: `AssignRegionHandler.java` `process()` L98-164.
+#### Iteration 9 — Master dispatches close command and RS close handler ✅ COMPLETE
 
-#### Iteration 9 — Master dispatches close command and RS close handler
-
-**What to change**: Split `TRSPClose(p)` into dispatch + confirm, same
-pattern established in Iteration 7 for the open path:
-- `TRSPDispatchClose(p)`: Sets `regionState = CLOSING`, updates meta,
-  adds close command to `dispatchedOps[targetServer]`.
-- Add `DispatchFailClose(p)` following the same pattern as `DispatchFail`
-  for the open path — remove command, reset TRSP to retry. (Note:
-  `DispatchFail` from Iteration 7 only handles ASSIGN/open commands;
-  close dispatch failure needs its own action or a generalization of
-  the existing one.)
-RS-side actions:
-- `RSReceiveClose(s, r)`: Dequeue close command, set
-  `rsTransitions[s][r] = "Closing"`.
-- `RSCompleteClose(s, r)`: Close region, remove from `rsOnlineRegions[s]`,
-  clear transition, add `CLOSED` report to `pendingReports`.
-**What to change**: `TRSPConfirmClosed(p)` now requires consuming a
-matching `CLOSED` report from `pendingReports` (same pattern as
-`TRSPConfirmOpened` from Iteration 7).
-**Verify**: UNASSIGN round-trip now completes. All invariants hold.
-**New invariant**: `RSMasterAgreement` — if a region is OPEN in
-`regionState` and the procedure is `None` (i.e., stable), then the RS
-also has the region in `rsOnlineRegions`.
-**Source**: `UnassignRegionHandler.java` `process()` L92-158.
+`TRSPClose` renamed to `TRSPDispatchClose` (dispatches CLOSE command,
+accepts OPEN/CLOSING for retry). `TRSPConfirmClosed` now requires
+CLOSED report. `DispatchFailClose` (close RPC retry). RS-side:
+`RSReceiveClose`, `RSCompleteClose`. `RSMasterAgreement` invariant
+(stably OPEN region is in `rsOnlineRegions`). Both ASSIGN and UNASSIGN
+round-trips now complete end-to-end through RS.
+TLC: 6,322,817 distinct, depth 43, ~79s. Git: `0a21cdb883`.
 
 #### Iteration 10 — Master report processing with validation
 
