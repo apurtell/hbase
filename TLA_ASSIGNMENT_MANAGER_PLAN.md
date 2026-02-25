@@ -236,18 +236,21 @@ this time.
 
 ```
 AssignmentManager.tla        (monolithic spec, iteratively built)
-AssignmentManager.cfg        (primary TLC config — fast, for development)
-AssignmentManager-full.cfg   (extended TLC config — thorough, periodic)
-AssignmentManager-sim.cfg    (simulation TLC config — deep random traces)
+AssignmentManager.cfg        (primary TLC config — fast exhaustive, every iteration)
+AssignmentManager-sim.cfg    (simulation TLC config — deep random traces, every iteration)
+AssignmentManager-full.cfg   (full TLC config — exhaustive 3r/3s, ad hoc on-demand)
 ```
 
-Three TLC configurations are maintained to balance speed and coverage:
+### 5.2 Model Verification
 
-| Config | Model | Mode | State space | Time |
-|--------|-------|------|-------------|------|
-| `AssignmentManager.cfg` | 2r/2s, procId≤5, crash≤1 | Exhaustive | ~36K distinct | <1s |
-| `AssignmentManager-full.cfg` | 3r/3s, procId≤7, crash≤1 | Exhaustive | ~15M distinct | ~5min |
-| `AssignmentManager-sim.cfg` | 3r/3s, procId≤7, no crash limit | Simulation | random traces, depth ~766 | 3s default |
+Two TLC configurations form the standard verification pair, run at
+every iteration.  A third is reserved for ad hoc on-demand checks.
+
+| Config | Model | Mode | Role | Time |
+|--------|-------|------|------|------|
+| `AssignmentManager.cfg` | 2r/2s, procId≤5, crash≤1 | Exhaustive | **Every iteration** | <10s |
+| `AssignmentManager-sim.cfg` | 3r/3s, procId≤15, no crash limit | Simulation | **Every iteration** | 30s |
+| `AssignmentManager-full.cfg` | 3r/3s, procId≤7, crash≤1 | Exhaustive | **Ad hoc** | ~30min |
 
 - **Primary** (`AssignmentManager.cfg`): **Run at every iteration.**
   Fast exhaustive check (2r/2s) for development iteration feedback.
@@ -257,19 +260,22 @@ Three TLC configurations are maintained to balance speed and coverage:
   a genuine protocol bug, not a false positive from all servers crashing.
 - **Simulation** (`AssignmentManager-sim.cfg`): **Run at every iteration.**
   Random deep traces at full model size (3r/3s) with no crash limit.
-  Explores cascading crash scenarios probabilistically.  Run via
-  `tlaplus_mcp_tlc_smoke` (default 3s) or command line with
-  `-Dtlc2.TLC.stopAfter=N` for longer runs.  **Deadlock checking is OFF**
-  (`-deadlock`) because cascading crashes can legitimately exhaust all
-  servers.
+  `StateConstraintDeep` (`nextProcId ≤ 15`) allows multi-cycle
+  assign/unassign/move/crash/reassign sequences.  Explores cascading
+  crash scenarios and three-way region/server interactions
+  probabilistically.  Run via `tlaplus_mcp_tlc_smoke` with
+  `extraJavaOpts: ["-Dtlc2.TLC.stopAfter=30"]` for 30s (routine) or
+  command line with `-Dtlc2.TLC.stopAfter=300` for 5-minute sweeps.
+  **Deadlock checking is OFF** (`-deadlock`) because cascading crashes
+  can legitimately exhaust all servers.
 - **Full** (`AssignmentManager-full.cfg`): **Run only when explicitly
-  requested by the user.**  Thorough exhaustive check (3r/3s) that
-  catches three-way interactions.  `CrashConstraint` ensures at least
-  one server remains online.  **Deadlock checking is ON** — any deadlock
-  found is a genuine protocol bug.  Cascading crash scenarios are
-  covered by the simulation config.  Takes ~5 minutes.
+  requested by the user** at periodic checkpoints.  Exhaustive 3r/3s
+  check that guarantees all three-way interactions are verified.
+  `CrashConstraint` ensures at least one server remains online.
+  **Deadlock checking is ON** — any deadlock found is a genuine
+  protocol bug.  Can take 30+ minutes as the spec grows.
 
-### 5.2 Abstraction Decisions
+### 5.3 Abstraction Decisions
 
 The following table documents what is modeled concretely vs. abstracted:
 
@@ -293,7 +299,7 @@ The following table documents what is modeled concretely vs. abstracted:
 | Replication queues | **Omitted** | Orthogonal concern |
 | Table enable/disable | **Deferred** | Can be added as a constraint on assignment |
 
-### 5.3 Model Constants and Variables
+### 5.4 Model Constants and Variables
 
 The following shows the full planned variable set. Variables marked with
 ✅ are implemented in the current spec; those marked with ⏳ are planned
@@ -313,7 +319,7 @@ VARIABLES
                       \*              procedure: Nat ∪ {None}]]        ✅ (Iter 4)
     metaTable,        \* [Regions → [state: State,                    ✅ (Iter 2)
                       \*              location: Servers ∪ {None}]]
-    procedures,       \* [Nat → [type: {"ASSIGN","UNASSIGN"},         ✅ (Iter 4)
+    procedures,       \* [Nat → [type: {"ASSIGN","UNASSIGN","MOVE"},  ✅ (Iter 4, MOVE Iter 11)
                       \*          trspState: TRSPState,
                       \*          region: Regions,
                       \*          targetServer: Servers ∪ {None}]]
@@ -337,8 +343,9 @@ VARIABLES
                       \*   "Closing", None}]]
 
     \* --- Failure model ---
-    masterAlive,      \* BOOLEAN                                      ⏳ (Iter 19)
-    serverAlive       \* [Servers → BOOLEAN]                          ⏳ (Iter 14)
+    masterAlive       \* BOOLEAN                                      ⏳ (Iter 19)
+    \* Note: serverAlive was originally planned for Iter 14 but was
+    \* superseded by serverState (above), implemented in Iter 10.
 ```
 
 ---
@@ -374,8 +381,8 @@ requires Java 11+).
 | MCP Tool | Purpose |
 |----------|---------|
 | `tlaplus_mcp_sany_parse` | Syntax/level check only (no model checking). Fast. |
-| `tlaplus_mcp_tlc_check` | **Exhaustive model check** — verifies all invariants and properties. Use for iteration verification. |
-| `tlaplus_mcp_tlc_smoke` | Simulation-mode smoke test (random behaviors, time-limited). Good for quick sanity checks. |
+| `tlaplus_mcp_tlc_check` | **Exhaustive model check** — verifies all invariants and properties. Use with primary config at every iteration. |
+| `tlaplus_mcp_tlc_smoke` | **Simulation model check** — random deep traces, time-limited. Use with sim config at every iteration (30s). |
 | `tlaplus_mcp_tlc_explore` | Generate and print a random behavior of a given length. Useful for understanding the spec. |
 | `tlaplus_mcp_tlc_trace` | Replay a previously generated TLC counterexample trace file. |
 
@@ -391,7 +398,7 @@ CallMcpTool:
     extraOpts: ["-workers", "auto", "-cleanup"]
 ```
 
-**Simulation — deep random traces at full model size**:
+**Simulation — deep random traces at full model size (30s)**:
 
 ```
 CallMcpTool:
@@ -400,6 +407,7 @@ CallMcpTool:
   arguments:
     fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
     cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager-sim.cfg
+    extraJavaOpts: ["-Dtlc2.TLC.stopAfter=30"]
     extraOpts: ["-deadlock"]
 ```
 
@@ -413,16 +421,13 @@ CallMcpTool:
     fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
 ```
 
-### Running TLC via Command Line (Large Models)
+### Running TLC via Command Line
 
-The MCP `tlaplus_mcp_tlc_check` tool may time out for state spaces
-that take more than ~30 seconds.  The full config (~5 min) should be
-run via command line.  Both primary and full configs use
-`CrashConstraint` and keep deadlock checking ON.  The sim config
-disables deadlock checking (`-deadlock`) because cascading crashes
-can legitimately exhaust all servers.
+The MCP tools handle routine iteration checks (primary exhaustive +
+30s simulation).  Use the command line for the full exhaustive config
+(ad hoc, user-requested) or extended simulation runs.
 
-**Exhaustive check** (3r/3s, periodic or before committing):
+**Full exhaustive check** (3r/3s, ad hoc on-demand only):
 
 ```bash
 cd /Users/apurtell/src/hbase/src/main/spec
@@ -432,7 +437,7 @@ $JAVA_HOME/bin/java -XX:+UseParallelGC -Xmx8g \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager-full.cfg -workers auto -cleanup
 ```
 
-**Extended simulation** (longer than the 3s MCP default):
+**Extended simulation** (5 minutes, for thorough pre-commit sweeps):
 
 ```bash
 cd /Users/apurtell/src/hbase/src/main/spec
@@ -526,31 +531,22 @@ TLC: 6,322,817 distinct, ~79s. Git: `3e92a15830`.
 
 `serverState` (`ONLINE`/`CRASHED`), `ServerCrashAll(s)` (atomic per-server
 crash + RS cleanup), `TRSPHandleFailedOpen`, `DropStaleReport`, `ONLINE`
-guards on report-consuming and RS actions. `NoSplitBrain`,
-`RSMasterAgreementConverse` invariants. Three-tier TLC config (2r/2s
-fast, 3r/3s full + `CrashConstraint`, 3r/3s simulation).
-TLC primary: 35,856 distinct, <1s. Git: `0000000000`.
+guards on report-consuming and RS actions. `NoDoubleAssignment`,
+`RSMasterAgreementConverse` invariants. Two-tier TLC verification
+(2r/2s exhaustive + 3r/3s simulation).
+TLC primary: 35,856 distinct, <1s. Git: `cc9a28a29f`.
 
 ---
 
 ### Phase 3: MOVE and Failures
 
-#### Iteration 11 — MOVE transition type
+#### Iteration 11 — MOVE transition type ✅ COMPLETE
 
-**What to add**: MOVE TRSP with state sequence:
-`CLOSE → CONFIRM_CLOSED → GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED → DONE`.
-- `TRSPCreateMove(r, targetServer)`: Pre: region is OPEN. Create MOVE
-  procedure with initial state `CLOSE`. `targetServer` may be specified
-  or `None` (chosen later in GET_ASSIGN_CANDIDATE).
-Reuses existing `TRSPDispatchClose`, `TRSPConfirmClosed`,
-`TRSPGetCandidate`, `TRSPDispatchOpen`, `TRSPConfirmOpened` actions
-— they are parameterized by procedure, not transition type.
-**Verify**: Region is OPEN on new server after MOVE completes.
-All invariants hold.
-**Note**: `NoSplitBrain` invariant (a region is never in `rsOnlineRegions`
-of two different servers simultaneously) was pulled forward to Iteration 10
-and is already checked in all configurations.
-**Source**: `TransitRegionStateProcedure.java` `TransitionType.MOVE` L160-162.
+`TRSPCreateMove(r)`: close-then-open in one procedure. Existing actions
+reused via relaxed type guards; `TRSPConfirmClosed` branches (UNASSIGN
+removes, MOVE advances). Renamed `NoSplitBrain` → `NoDoubleAssignment`.
+TLC primary: 61,151 distinct, ~4s. Full: 85M distinct, ~28min.
+Git: `840c084e18`.
 
 #### Iteration 12 — Open failures: max-attempts give-up path
 
@@ -587,16 +583,15 @@ servers).
 
 #### Iteration 14 — RS crash event
 
-**What to add**: `ServerCrash(s)` action:
-- Set `serverState[s] = "CRASHED"`.
-- Clear `rsOnlineRegions[s]` and `rsTransitions[s]` (RS state is lost).
-- Clear all entries in `dispatchedOps[s]` (in-flight commands lost).
-- Pending reports from `s` in `pendingReports` may be retained (RS might
-  have sent them before crashing) or cleared (non-deterministic).
-**What to add**: For each region with `location = s` and state `OPEN`,
-the master sets state to `ABNORMALLY_CLOSED` and clears location.
-**Verify**: `TypeOK`. Regions on crashed server become ABNORMALLY_CLOSED.
-No reports from crashed server are accepted (server fencing).
+**Note**: The core crash action was pulled forward to Iteration 10 as
+`ServerCrashAll(s)` (atomic per-server crash: sets `serverState` to
+`CRASHED`, clears RS state, discards in-flight commands, marks regions
+`ABNORMALLY_CLOSED`). `DropStaleReport` handles post-crash report
+fencing.
+**What remains**: Decompose `ServerCrashAll` into finer-grained steps
+if needed for SCP interaction (e.g., separate crash detection from
+region state cleanup so SCP can orchestrate the latter).
+**Verify**: `TypeOK`. `NoDoubleAssignment`. `LockExclusivity`.
 **Source**: `ServerManager.expireServer()` L662-720.
 
 #### Iteration 15 — ServerCrashProcedure (basic)
@@ -644,7 +639,7 @@ Allow two servers to crash in the model. Verify that:
   dispatch failure) and reassign to server C.
 - No regions are lost.
 **Config change**: Ensure model has ≥ 3 servers.
-**Verify**: `NoLostRegions`, `NoSplitBrain`, `LockExclusivity`.
+**Verify**: `NoLostRegions`, `NoDoubleAssignment`, `LockExclusivity`.
 
 ---
 
@@ -800,7 +795,7 @@ split/merge procedures. Verify:
 - Post-PONR crash → procedure resumes and completes.
 - SCP interaction: SCP calls `serverCrashed()` on child TRSPs of the
   split/merge procedure; child TRSPs reassign to new server.
-- `NoLostRegions`, `NoSplitBrain`, `SplitCompleteness`,
+- `NoLostRegions`, `NoDoubleAssignment`, `SplitCompleteness`,
   `MergeCompleteness` all hold under crash scenarios.
 **Source**: See Appendix C.9 for crash interaction analysis.
 
@@ -856,23 +851,22 @@ is shown.
 | `TRSP.executeFromState()` GET_ASSIGN_CANDIDATE | `TRSPGetCandidate(pid, s)` | 4 | ✅ |
 | `TRSP.openRegion()` + `RSProcedureDispatcher` | `TRSPDispatchOpen(pid)` | 7 | ✅ |
 | `TRSP.confirmOpened()` | `TRSPConfirmOpened(pid)` | 7 | ✅ |
-| `RSProcedureDispatcher.remoteCallFailed()` | `DispatchFail(pid)` | 7 | ✅ |
-| Non-deterministic open failure | `FailOpen(r)` | 4 | ✅ |
+| `RSProcedureDispatcher.remoteCallFailed()` (open) | `DispatchFail(pid)` | 7 | ✅ |
+| `RSProcedureDispatcher.remoteCallFailed()` (close) | `DispatchFailClose(pid)` | 9 | ✅ |
 | `TRSP.queueAssign()` UNASSIGN | `TRSPCreateUnassign(r)` | 5 | ✅ |
-| `TRSP.closeRegion()` | `TRSPClose(pid)` | 5 | ✅ |
+| `TRSP.closeRegion()` + dispatch | `TRSPDispatchClose(pid)` | 9 | ✅ |
 | `TRSP.confirmClosed()` | `TRSPConfirmClosed(pid)` | 5 | ✅ |
+| `TRSP.confirmOpened()` FAILED_OPEN retry | `TRSPHandleFailedOpen(pid)` | 10 | ✅ |
 | `RegionStateNode.offline()` | `GoOffline(r)` | 1 | ✅ |
-| RS crash (OPEN → ABNORMALLY_CLOSED) | `ServerCrash(r)` | 1 | ✅ |
+| `ServerManager.expireServer()` (atomic per-server) | `ServerCrashAll(s)` | 10 | ✅ |
 | `TRSP.serverCrashed()` | `TRSPServerCrashed(pid)` | 5 | ✅ |
-| `AssignRegionHandler.process()` receive | `RSReceiveOpen(s, r)` | 8 | ⏳ |
-| `AssignRegionHandler.process()` complete | `RSCompleteOpen(s, r)` | 8 | ⏳ |
-| `AssignRegionHandler.process()` fail | `RSFailOpen(s, r)` | 8 | ⏳ |
-| `UnassignRegionHandler.process()` receive | `RSReceiveClose(s, r)` | 9 | ⏳ |
-| `UnassignRegionHandler.process()` complete | `RSCompleteClose(s, r)` | 9 | ⏳ |
-| `TRSP.closeRegion()` + dispatch | `TRSPDispatchClose(pid)` | 9 | ⏳ |
-| `AM.reportRegionStateTransition()` | `MasterReceiveReport(rpt)` | 10 | ⏳ |
-| `AM.balance()` / `createMoveRegionProcedure()` | `TRSPCreateMove(r, s)` | 11 | ⏳ |
-| `ServerManager.expireServer()` | `ServerCrash(s)` | 14 | ⏳ |
+| Drop report from crashed server | `DropStaleReport` | 10 | ✅ |
+| `AssignRegionHandler.process()` receive | `RSReceiveOpen(s, r)` | 8 | ✅ |
+| `AssignRegionHandler.process()` complete | `RSCompleteOpen(s, r)` | 8 | ✅ |
+| `AssignRegionHandler.process()` fail | `RSFailOpen(s, r)` | 8 | ✅ |
+| `UnassignRegionHandler.process()` receive | `RSReceiveClose(s, r)` | 9 | ✅ |
+| `UnassignRegionHandler.process()` complete | `RSCompleteClose(s, r)` | 9 | ✅ |
+| `AM.balance()` / `createMoveRegionProcedure()` | `TRSPCreateMove(r)` | 11 | ✅ |
 | `SCP.assignRegions()` | `SCPAssign(scp)` | 15 | ⏳ |
 | `SCP` + `TRSP.serverCrashed()` interaction | `SCPInterruptTRSP(scp, p)` | 16 | ⏳ |
 | Master crash | `MasterCrash` | 19 | ⏳ |
@@ -995,6 +989,10 @@ proof-based verification of inductive invariants.
 | 5 | 1,441,599 | 7,142,467 | 27 | ~6s | UNASSIGN + crash recovery |
 | 6 | 1,441,599 | 7,142,467 | 27 | ~56s | RPC channels (empty, 1 worker) |
 | 7 | 39,250 | 247,466 | 28 | ~1s | Symmetry applied; dispatch/fail |
+| 8 | 5,622,240 | — | — | ~67s | RS-side open handler + report |
+| 9 | 6,322,817 | — | — | ~79s | Close dispatch + RS close handler |
+| 10 | 35,856 | — | — | <1s | Server liveness + crash (2r/2s primary) |
+| 11 | 61,151 | — | — | ~4s | MOVE transition type (2r/2s primary) |
 
 ---
 
@@ -1065,9 +1063,10 @@ Each iteration follows a fixed loop:
 2. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
 3. **RUN TLC** — Run both mandatory configurations:
    - `AssignmentManager.cfg` (primary, exhaustive 2r/2s) — must pass.
-   - `AssignmentManager-sim.cfg` (simulation, 3r/3s) — must pass.
-   - `AssignmentManager-full.cfg` (full exhaustive 3r/3s) — run **only
-     when the user explicitly requests it**.
+   - `AssignmentManager-sim.cfg` (simulation, 3r/3s, 30s) — must pass.
+   The full exhaustive config (`AssignmentManager-full.cfg`) is not
+   run at every iteration. It is reserved for ad hoc on-demand checks
+   at user-requested checkpoints.
 4. **TRIAGE** — If TLC reports violations, classify each one (see 12.3).
    Repeat from step 1 or 3 as needed.
 5. **REGRESSION CHECK** — Re-verify all invariants and properties from
