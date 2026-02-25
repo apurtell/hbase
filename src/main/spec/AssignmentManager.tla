@@ -1,15 +1,19 @@
---------------------------- MODULE RegionStates ----------------------------
+------------------------ MODULE AssignmentManager -------------------------
 (*
- * Models the HBase region assignment state machine.
+ * TLA+ specification of the HBase AssignmentManager.
  *
- * Each region has a State drawn from RegionState.State (RegionState.java:38-59)
- * and an optional location (the RegionServer hosting it).
+ * Models the region assignment lifecycle: state transitions, persistent
+ * metadata, procedure-driven operations, RPC dispatch, RegionServer-side
+ * behavior, and crash recovery.  Built iteratively per the plan in
+ * TLA_ASSIGNMENT_MANAGER_PLAN.md.
  *
- * This module defines the valid states, the valid transitions between them,
- * and a simple spec that non-deterministically exercises all transitions,
- * allowing TLC to verify that the transition invariant is never violated.
+ * Two parallel views of region state are maintained:
+ *   - regionState: volatile in-memory master state (lost on master crash)
+ *   - metaTable:   persistent state in hbase:meta (survives master crash)
+ * Both are updated atomically (RegionStateNode lock held across both writes;
+ * see plan Appendix A.8 item 2).
  *
- * Scoped to the core assign/unassign lifecycle:
+ * Currently scoped to the core assign/unassign lifecycle:
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
  *
  * Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW,
@@ -79,16 +83,25 @@ ValidTransition ==
 
 VARIABLE regionState
     \* regionState[r] is a record [state: State, location: Servers ∪ {None}]
-    \* for each r ∈ Regions.
+    \* for each r ∈ Regions.  This is volatile master in-memory state.
 
-vars == <<regionState>>
+VARIABLE metaTable
+    \* metaTable[r] is a record [state: State, location: Servers ∪ {None}]
+    \* for each r ∈ Regions.  This is persistent state in hbase:meta.
+    \* Survives master crash; regionState does not.
+    \* Currently updated atomically with regionState (the RegionStateNode
+    \* lock is held across both in-memory and meta writes — see Appendix A.8).
+
+vars == <<regionState, metaTable>>
 
 ---------------------------------------------------------------------------
 (* Type invariant *)
 
 TypeOK ==
-    regionState \in [Regions -> [state : State,
-                                 location : Servers \cup {None}]]
+    /\ regionState \in [Regions -> [state : State,
+                                    location : Servers \cup {None}]]
+    /\ metaTable \in [Regions -> [state : State,
+                                  location : Servers \cup {None}]]
 
 ---------------------------------------------------------------------------
 (* Safety invariants *)
@@ -106,6 +119,16 @@ OfflineImpliesNoLocation ==
                                   "FAILED_OPEN", "ABNORMALLY_CLOSED"}
             => regionState[r].location = None
 
+\* The persistent state in hbase:meta matches the in-memory state.
+\* True by construction in this iteration because all actions update both
+\* atomically.  This invariant becomes non-trivial when master crash is
+\* introduced (Iteration 19): metaTable survives but regionState is lost
+\* and must be rebuilt.  Later still (Iteration 22), this will be relaxed
+\* to allow SPLITTING_NEW/MERGING_NEW in memory while meta says CLOSED.
+MetaConsistency ==
+    \A r \in Regions :
+        metaTable[r] = regionState[r]
+
 \* A given region is OPEN on at most one server.
 \* (Trivially true in this module since location is a scalar, but
 \*  stated explicitly as the foundational safety property.  It
@@ -119,7 +142,8 @@ SingleAssignment ==
 (* Initial state *)
 
 Init ==
-    regionState = [r \in Regions |-> [state |-> "OFFLINE", location |-> None]]
+    /\ regionState = [r \in Regions |-> [state |-> "OFFLINE", location |-> None]]
+    /\ metaTable = [r \in Regions |-> [state |-> "OFFLINE", location |-> None]]
 
 ---------------------------------------------------------------------------
 (* Actions *)
@@ -134,6 +158,8 @@ BeginOpen(r, s) ==
                                   "ABNORMALLY_CLOSED", "FAILED_OPEN"}
     /\ regionState' = [regionState EXCEPT
          ![r] = [state |-> "OPENING", location |-> s]]
+    /\ metaTable' = [metaTable EXCEPT
+         ![r] = [state |-> "OPENING", location |-> s]]
 
 \* Region successfully opened.
 \* Pre: region is OPENING.
@@ -143,6 +169,8 @@ ConfirmOpened(r) ==
     /\ regionState[r].location # None
     /\ regionState' = [regionState EXCEPT
          ![r] = [state |-> "OPEN", location |-> @.location]]
+    /\ metaTable' = [metaTable EXCEPT
+         ![r] = [state |-> "OPEN", location |-> metaTable[r].location]]
 
 \* Region failed to open (after retries exhausted).
 \* Pre: region is OPENING.
@@ -150,6 +178,8 @@ ConfirmOpened(r) ==
 FailOpen(r) ==
     /\ regionState[r].state = "OPENING"
     /\ regionState' = [regionState EXCEPT
+         ![r] = [state |-> "FAILED_OPEN", location |-> None]]
+    /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "FAILED_OPEN", location |-> None]]
 
 \* --- Unassign path ---
@@ -162,6 +192,8 @@ BeginClose(r) ==
     /\ regionState[r].location # None
     /\ regionState' = [regionState EXCEPT
          ![r] = [state |-> "CLOSING", location |-> @.location]]
+    /\ metaTable' = [metaTable EXCEPT
+         ![r] = [state |-> "CLOSING", location |-> metaTable[r].location]]
 
 \* Region successfully closed.
 \* Pre: region is CLOSING.
@@ -169,6 +201,8 @@ BeginClose(r) ==
 ConfirmClosed(r) ==
     /\ regionState[r].state = "CLOSING"
     /\ regionState' = [regionState EXCEPT
+         ![r] = [state |-> "CLOSED", location |-> None]]
+    /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "CLOSED", location |-> None]]
 
 \* --- Transition from CLOSED back to OFFLINE ---
@@ -178,6 +212,8 @@ ConfirmClosed(r) ==
 GoOffline(r) ==
     /\ regionState[r].state = "CLOSED"
     /\ regionState' = [regionState EXCEPT
+         ![r] = [state |-> "OFFLINE", location |-> None]]
+    /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "OFFLINE", location |-> None]]
 
 \* --- Crash path ---
@@ -189,6 +225,8 @@ ServerCrash(r) ==
     /\ regionState[r].state = "OPEN"
     /\ regionState[r].location # None
     /\ regionState' = [regionState EXCEPT
+         ![r] = [state |-> "ABNORMALLY_CLOSED", location |-> None]]
+    /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "ABNORMALLY_CLOSED", location |-> None]]
 
 ---------------------------------------------------------------------------
@@ -235,6 +273,9 @@ THEOREM Spec => []OfflineImpliesNoLocation
 
 \* Safety: at most one server per OPEN region (per region identity).
 THEOREM Spec => []SingleAssignment
+
+\* Safety: persistent meta state matches in-memory state.
+THEOREM Spec => []MetaConsistency
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's "action constraint" or
