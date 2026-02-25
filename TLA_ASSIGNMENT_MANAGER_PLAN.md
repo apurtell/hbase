@@ -228,7 +228,7 @@ Combined with `onlineRegions` membership, the RS-side region lifecycle is:
 
 ```
 HBaseAssignment.tla          (top-level specification, composes all modules)
-  ├── RegionStates.tla       (region state machine and valid transitions)
+  ├── AssignmentManager.tla  (top-level monolithic spec, iteratively built)
   ├── TRSP.tla               (TransitRegionStateProcedure state machine)
   ├── RegionServer.tla        (RS-side open/close behavior)
   ├── ProcedureExecutor.tla   (procedure lifecycle: execute, suspend, crash-recover)
@@ -309,7 +309,7 @@ is the individual iteration.
 
 #### Iteration 1 — Region states and valid transitions ✅ COMPLETE
 
-**File**: `RegionStates.tla` (existing)
+**File**: `AssignmentManager.tla` (originally `RegionStates.tla`, renamed at Iteration 2)
 **What was added**:
 - `State` type: 7 core states (OFFLINE through ABNORMALLY_CLOSED)
 - `ValidTransition` relation (10 valid transitions)
@@ -320,18 +320,25 @@ is the individual iteration.
   `SingleAssignment`, `TransitionValid` (action constraint)
 **TLC result**: 3 regions, 3 servers → 2,197 states, all pass.
 
-#### Iteration 2 — Meta table as persistent state
+#### Iteration 2 — Meta table as persistent state ✅ COMPLETE
 
-**What to add**: A `metaTable` variable mirroring region state. Every
-action that changes `regionState` also atomically updates `metaTable`
-(per Appendix A, Section A.8, item 2: the RegionStateNode lock is held
-across both in-memory and meta updates, so they are a single atomic step).
-**New invariant**: `MetaConsistency` — `metaTable[r] = regionState[r]` for
-all regions at all times (since updates are atomic and immediately
-consistent per resolved question 1).
+**File**: `AssignmentManager.tla` (updated), `AssignmentManager.cfg` (updated)
+**What was added**:
+- `metaTable` variable: `[Regions → [state: State, location: Servers ∪ {None}]]`
+- Every action atomically updates both `regionState` and `metaTable`
+  (per Appendix A, Section A.8, item 2: the RegionStateNode lock is held
+  across both in-memory and meta writes, so they are a single atomic step)
+- `TypeOK` extended with `metaTable` type constraint
+- New invariant: `MetaConsistency` — `metaTable[r] = regionState[r]` for
+  all regions at all times (trivially true by construction in this iteration;
+  becomes non-trivial when master crash breaks the symmetry in Iteration 19)
+- `vars` tuple updated from `<<regionState>>` to `<<regionState, metaTable>>`
 **Why separate**: Introduces the concept of persistent vs. in-memory state
 before any procedures exist. When master crash is added later, meta
 survives but in-memory state is lost — this distinction will matter.
+**TLC result**: 3 regions, 3 servers → 2,197 distinct states (14,197 total),
+depth 13, all 5 invariants + TransitionValid action constraint pass.
+State count unchanged from Iteration 1 (metaTable is a dependent variable).
 
 #### Iteration 3 — Procedure attachment (per-region mutex)
 
@@ -917,7 +924,39 @@ proof-based verification of inductive invariants.
 
 - TLA+ Toolbox or VS Code TLA+ extension
 - TLC model checker (bundled with Toolbox)
+- Java 11+ (the TLA+ tools jar requires class file version 55.0+)
 - Familiarity with PlusCal (optional, for algorithmic notation before translating to TLA+)
+
+### Running TLC from the Command Line
+
+The TLA+ extension for Cursor/VS Code bundles `tla2tools.jar` and
+`CommunityModules-deps.jar`. TLC can be invoked directly:
+
+```bash
+cd src/main/spec
+
+/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
+  -XX:+UseParallelGC \
+  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+```
+
+**Key flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `-XX:+UseParallelGC` | Throughput-optimized GC (recommended by TLC) |
+| `-workers auto` | Use all available cores |
+| `-cleanup` | Remove generated state files after run |
+| `-config <file>` | Specify the `.cfg` file with constants, invariants, and constraints |
+
+**SANY-only parse check** (no model checking):
+
+```bash
+/Library/Java/JavaVirtualMachines/temurin-11.jdk/Contents/Home/bin/java \
+  -cp "${HOME}/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar" \
+  tla2sany.SANY AssignmentManager.tla
+```
 
 ---
 
@@ -950,34 +989,18 @@ iteration is considered complete.
 
 Each iteration follows a fixed loop:
 
-```
- ┌─────────────────────────────────────────────────────────┐
- │  1. WRITE / EDIT                                        │
- │     Add or modify spec per the iteration's scope         │
- │     (see Section 6 for iteration descriptions)           │
- │                                                          │
- │  2. SYNTAX CHECK                                         │
- │     Parse with SANY (TLA+ syntax analyzer).              │
- │     Fix all parse errors before proceeding.              │
- │                                                          │
- │  3. RUN TLC                                              │
- │     Model-check with the documented configuration        │
- │     (constants, constraints, symmetry sets — see 12.4).  │
- │                                                          │
- │  4. TRIAGE                                               │
- │     If TLC reports violations, classify each one          │
- │     (see 12.3). Repeat from step 1 or 3 as needed.      │
- │                                                          │
- │  5. REGRESSION CHECK                                     │
- │     Re-verify all invariants and properties from prior   │
- │     iterations. A fix in iteration N must not break       │
- │     any invariant proven in iterations 1 through N-1.    │
- │                                                          │
- │  6. RECORD                                               │
- │     Document the TLC result, configuration, state        │
- │     count, and any findings (see 12.4 and 12.5).         │
- └─────────────────────────────────────────────────────────┘
-```
+1. **WRITE / EDIT** — Add or modify spec per the iteration's scope
+   (see Section 6 for iteration descriptions).
+2. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
+3. **RUN TLC** — Model-check with the documented configuration
+   (constants, constraints, symmetry sets — see 12.4).
+4. **TRIAGE** — If TLC reports violations, classify each one (see 12.3).
+   Repeat from step 1 or 3 as needed.
+5. **REGRESSION CHECK** — Re-verify all invariants and properties from
+   prior iterations. A fix in iteration N must not break any invariant
+   proven in iterations 1 through N-1.
+6. **RECORD** — Document the TLC result, configuration, state count,
+   and any findings (see 12.4 and 12.5).
 
 Steps 1–4 repeat until TLC either passes cleanly or produces a confirmed
 legitimate finding. Step 5 is mandatory — no iteration is complete without
