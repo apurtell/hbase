@@ -30,9 +30,11 @@
  * Two RPC channels model the asynchronous communication:
  *   dispatchedOps:  master→RS command channel (per server)
  *   pendingReports: RS→master report channel
- * Commands are dispatched by TRSP actions and consumed by RS-side
- * actions; reports are produced by RS-side actions and consumed by
- * master-side report processing.
+ * The ASSIGN path dispatches OPEN commands to dispatchedOps and waits
+ * for OPENED reports in pendingReports.  TRSPConfirmOpened requires
+ * consuming a matching report before advancing.  DispatchFail models
+ * non-deterministic RPC failure: the command is removed without
+ * delivery and the TRSP retries with a fresh candidate server.
  *
  * Currently scoped to the core assign/unassign lifecycle:
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
@@ -40,7 +42,7 @@
  * Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW,
  * MERGING_NEW) and FAILED_CLOSE are deferred to a later phase.
  *)
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     Regions,    \* The finite set of region identifiers
@@ -309,6 +311,11 @@ ProcedureConsistency ==
 
 StateConstraint == nextProcId <= 7
 
+\* Symmetry reduction: regions and servers are interchangeable.
+\* TLC explores one representative per equivalence class, reducing
+\* the state space by up to |Regions|! * |Servers|! (36x for 3r/3s).
+Symmetry == Permutations(Regions) \union Permutations(Servers)
+
 ---------------------------------------------------------------------------
 (* Initial state *)
 
@@ -361,13 +368,16 @@ TRSPGetCandidate(pid, s) ==
                                         ![pid].trspState = "OPEN"]
     /\ UNCHANGED <<regionState, metaTable, nextProcId, rpcVars>>
 
-\* Execute the open step: transition region to OPENING.
+\* Dispatch the open command to the target server via RPC.
 \* Pre: TRSP is in OPEN state with a target server.
 \* Post: region transitions to OPENING with the target server as
-\*       location, meta updated, TRSP advances to CONFIRM_OPENED.
+\*       location, meta updated, open command added to
+\*       dispatchedOps[targetServer], TRSP advances to CONFIRM_OPENED.
+\*       The procedure now waits for an OPENED report from the RS.
 \*
-\* Source: TransitRegionStateProcedure.java openRegion() L293-311.
-TRSPOpen(pid) ==
+\* Source: TransitRegionStateProcedure.java openRegion() L293-311,
+\*         RSProcedureDispatcher.java L200-367.
+TRSPDispatchOpen(pid) ==
     /\ pid \in DOMAIN procedures
     /\ procedures[pid].type = "ASSIGN"
     /\ procedures[pid].trspState = "OPEN"
@@ -381,15 +391,20 @@ TRSPOpen(pid) ==
             ![r] = [state |-> "OPENING", location |-> s]]
        /\ procedures' = [procedures EXCEPT
             ![pid].trspState = "CONFIRM_OPENED"]
-       /\ UNCHANGED <<nextProcId, rpcVars>>
+       /\ dispatchedOps' = [dispatchedOps EXCEPT
+            ![s] = @ \cup {[type |-> "OPEN", region |-> r, procId |-> pid]}]
+       /\ UNCHANGED <<nextProcId, pendingReports>>
 
-\* Confirm that the region opened successfully.
-\* Pre: TRSP is in CONFIRM_OPENED state, region is OPENING.
-\* Post: region transitions to OPEN, procedure removed and detached.
+\* Confirm that the region opened successfully by consuming an OPENED
+\* report from pendingReports.
+\* Pre: TRSP is in CONFIRM_OPENED state, region is OPENING, and a
+\*      matching OPENED report exists in pendingReports.
+\* Post: region transitions to OPEN, procedure removed and detached,
+\*       report consumed from pendingReports.
 \*
-\* In this iteration (no RS side), this models the master confirming
-\* the open directly. In later iterations, this will require consuming
-\* an OPENED report from the RS.
+\* Until RS-side actions are added (Iteration 8), no OPENED reports
+\* are produced, so this action is not enabled — regions may reach
+\* OPENING but cannot advance to OPEN.
 \*
 \* Source: TransitRegionStateProcedure.java confirmOpened() L320-374.
 TRSPConfirmOpened(pid) ==
@@ -398,15 +413,20 @@ TRSPConfirmOpened(pid) ==
     /\ procedures[pid].trspState = "CONFIRM_OPENED"
     /\ LET r == procedures[pid].region IN
        /\ regionState[r].state = "OPENING"
-       /\ regionState' = [regionState EXCEPT
-            ![r] = [state |-> "OPEN",
-                    location |-> regionState[r].location,
-                    procedure |-> None]]
-       /\ metaTable' = [metaTable EXCEPT
-            ![r] = [state |-> "OPEN",
-                    location |-> metaTable[r].location]]
-       /\ procedures' = RemoveProc(procedures, pid)
-       /\ UNCHANGED <<nextProcId, rpcVars>>
+       /\ \E rpt \in pendingReports :
+            /\ rpt.region = r
+            /\ rpt.code = "OPENED"
+            /\ rpt.procId = pid
+            /\ regionState' = [regionState EXCEPT
+                 ![r] = [state |-> "OPEN",
+                         location |-> regionState[r].location,
+                         procedure |-> None]]
+            /\ metaTable' = [metaTable EXCEPT
+                 ![r] = [state |-> "OPEN",
+                         location |-> metaTable[r].location]]
+            /\ procedures' = RemoveProc(procedures, pid)
+            /\ pendingReports' = pendingReports \ {rpt}
+            /\ UNCHANGED <<nextProcId, dispatchedOps>>
 
 ---------------------------------------------------------------------------
 (* Actions -- failure path *)
@@ -415,18 +435,53 @@ TRSPConfirmOpened(pid) ==
 \* Full retry logic deferred to Iteration 12.
 \* Pre: region is OPENING with a procedure attached.
 \* Post: region transitions to FAILED_OPEN, location cleared,
-\*       procedure removed and detached.
+\*       procedure removed and detached, dispatched command cleaned up.
+\*       If targetServer is None (DispatchFail already removed the
+\*       command), dispatchedOps is left unchanged.
 FailOpen(r) ==
     LET pid == regionState[r].procedure IN
     /\ regionState[r].state = "OPENING"
     /\ pid # None
-    /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "FAILED_OPEN", location |-> None,
-                 procedure |-> None]]
-    /\ metaTable' = [metaTable EXCEPT
-         ![r] = [state |-> "FAILED_OPEN", location |-> None]]
-    /\ procedures' = RemoveProc(procedures, pid)
-    /\ UNCHANGED <<nextProcId, rpcVars>>
+    /\ LET s == procedures[pid].targetServer
+           cmd == [type |-> "OPEN", region |-> r, procId |-> pid] IN
+       /\ regionState' = [regionState EXCEPT
+            ![r] = [state |-> "FAILED_OPEN", location |-> None,
+                    procedure |-> None]]
+       /\ metaTable' = [metaTable EXCEPT
+            ![r] = [state |-> "FAILED_OPEN", location |-> None]]
+       /\ procedures' = RemoveProc(procedures, pid)
+       /\ dispatchedOps' = IF s \in Servers
+                           THEN [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
+                           ELSE dispatchedOps
+       /\ UNCHANGED <<nextProcId, pendingReports>>
+
+\* Open command dispatch failed (non-deterministic RPC failure).
+\* The command is removed from dispatchedOps without delivery and
+\* the TRSP returns to GET_ASSIGN_CANDIDATE with forceNewPlan (i.e.,
+\* targetServer is cleared so a fresh candidate will be chosen).
+\* The region remains OPENING with its current location; the next
+\* TRSPDispatchOpen will update the location to the new server.
+\*
+\* Pre: ASSIGN procedure in CONFIRM_OPENED state and the matching
+\*      open command still exists in dispatchedOps (not yet consumed
+\*      by an RS).
+\* Post: command removed, TRSP reset to GET_ASSIGN_CANDIDATE.
+\*
+\* Source: RSProcedureDispatcher.java remoteCallFailed() L325-340.
+DispatchFail(pid) ==
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].trspState = "CONFIRM_OPENED"
+    /\ LET s == procedures[pid].targetServer
+           r == procedures[pid].region IN
+       /\ s # None
+       /\ LET cmd == [type |-> "OPEN", region |-> r, procId |-> pid] IN
+          /\ cmd \in dispatchedOps[s]
+          /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
+       /\ procedures' = [procedures EXCEPT
+            ![pid].trspState = "GET_ASSIGN_CANDIDATE",
+            ![pid].targetServer = None]
+       /\ UNCHANGED <<regionState, metaTable, nextProcId, pendingReports>>
 
 ---------------------------------------------------------------------------
 (* Actions -- TRSP UNASSIGN path *)
@@ -564,9 +619,10 @@ Next ==
     \/ \E r \in Regions : TRSPCreate(r)
     \/ \E pid \in DOMAIN procedures :
          \E s \in Servers : TRSPGetCandidate(pid, s)
-    \/ \E pid \in DOMAIN procedures : TRSPOpen(pid)
+    \/ \E pid \in DOMAIN procedures : TRSPDispatchOpen(pid)
     \/ \E pid \in DOMAIN procedures : TRSPConfirmOpened(pid)
     \/ \E r \in Regions : FailOpen(r)
+    \/ \E pid \in DOMAIN procedures : DispatchFail(pid)
     \/ \E r \in Regions : TRSPCreateUnassign(r)
     \/ \E pid \in DOMAIN procedures : TRSPClose(pid)
     \/ \E pid \in DOMAIN procedures : TRSPConfirmClosed(pid)
@@ -579,9 +635,9 @@ Next ==
 
 \* Weak fairness on region-level creation actions ensures forward
 \* progress.  Fairness on procedure-step actions (TRSPGetCandidate,
-\* TRSPOpen, TRSPConfirmOpened, TRSPClose, TRSPConfirmClosed) is not
-\* expressed here because procedure IDs are dynamically allocated;
-\* full fairness is deferred to Iteration 27.
+\* TRSPDispatchOpen, TRSPConfirmOpened, TRSPClose, TRSPConfirmClosed)
+\* is not expressed here because procedure IDs are dynamically
+\* allocated; full fairness is deferred to Iteration 27.
 Fairness ==
     /\ \A r \in Regions : WF_vars(TRSPCreate(r))
     /\ \A r \in Regions : WF_vars(TRSPCreateUnassign(r))
