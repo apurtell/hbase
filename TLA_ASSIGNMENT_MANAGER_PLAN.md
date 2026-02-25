@@ -71,7 +71,7 @@ MERGED           — Server completed merge (terminal for parents)
 SPLITTING_NEW    — Daughter region being created by split
 MERGING_NEW      — Merged region being created by merge
 FAILED_OPEN      — Open failed, no more retries
-FAILED_CLOSE     — Close failed, no more retries
+FAILED_CLOSE     — Close failed, no more retries (dead state: no code path enters it; RS aborts on close failure)
 ABNORMALLY_CLOSED — Closed due to RS crash
 ```
 
@@ -84,7 +84,7 @@ ABNORMALLY_CLOSED — Closed due to RS crash
   OFFLINE ──► OPENING ──► OPEN ──► CLOSING ──► CLOSED ──► OFFLINE     │
                  │                    │           │                   │
                  v                    │           v                   │
-            FAILED_OPEN               │      FAILED_CLOSE             │
+            FAILED_OPEN               │      FAILED_CLOSE (dead)       │
                  │                    │                               │
                  v                    v                               │
            (retry/abort)      ABNORMALLY_CLOSED ──────────────────────┘

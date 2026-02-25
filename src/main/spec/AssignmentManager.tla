@@ -35,14 +35,24 @@
  *   dispatchedOps:  master->RS command channel (per server)
  *   pendingReports: RS->master report channel
  * The ASSIGN path dispatches OPEN commands to dispatchedOps and waits
- * for OPENED reports in pendingReports.  RS-side actions (RSReceiveOpen,
- * RSCompleteOpen, RSFailOpen) consume commands from dispatchedOps and
- * produce reports in pendingReports.  TRSPConfirmOpened requires
- * consuming a matching report before advancing.  The UNASSIGN path
- * follows the same pattern: TRSPDispatchClose dispatches CLOSE commands,
- * RSReceiveClose/RSCompleteClose produce CLOSED reports consumed by
- * TRSPConfirmClosed.  DispatchFail and DispatchFailClose model
- * non-deterministic RPC failure for each path.
+ * for OPENED reports in pendingReports.  RS-side actions atomically
+ * consume commands from dispatchedOps, update rsOnlineRegions, and
+ * produce reports in pendingReports.  RSOpen models the success path
+ * (consume command, add to rsOnlineRegions, produce OPENED report);
+ * RSFailOpen models the failure path (consume command, produce
+ * FAILED_OPEN report).  TRSPConfirmOpened requires consuming a matching
+ * report before advancing.  The UNASSIGN path follows the same pattern:
+ * TRSPDispatchClose dispatches CLOSE commands, RSClose atomically
+ * consumes the command, removes from rsOnlineRegions, and produces
+ * a CLOSED report consumed by TRSPConfirmClosed.  DispatchFail and
+ * DispatchFailClose model non-deterministic RPC failure for each path.
+ *
+ * RS-side receive and complete steps are merged into single atomic
+ * actions because the intermediate RS state (command consumed but not
+ * yet reported) is not observable by the master and produces the same
+ * crash-recovery outcome as the pre-receive state.  This eliminates
+ * the rsTransitions variable, significantly reducing the state space
+ * without losing safety-relevant interleavings.
  *
  * Server liveness is tracked by serverState.  ServerCrashAll(s) models
  * an RS crash as a per-server event: all regions on the crashed server
@@ -59,7 +69,11 @@
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
  *
  * Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW,
- * MERGING_NEW) and FAILED_CLOSE are deferred to a later phase.
+ * MERGING_NEW) are deferred to Phase 6 (Iterations 20-26).
+ *
+ * FAILED_CLOSE is omitted because no code path transitions into it. The RS
+ * abort triggers crash detection, so close failures are resolved through
+ * ABNORMALLY_CLOSED instead.
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -212,19 +226,10 @@ VARIABLE pendingReports
 
 VARIABLE rsOnlineRegions
     \* rsOnlineRegions[s] is the set of regions currently online on
-    \* server s, from the RS's own perspective.  Updated when the RS
-    \* completes an open transition (RSCompleteOpen).
+    \* server s, from the RS's own perspective.  Updated atomically
+    \* by RSOpen (adds region) and RSClose (removes region).
     \*
     \* Source: HRegionServer.getRegions().
-
-VARIABLE rsTransitions
-    \* rsTransitions[s][r] tracks in-flight region transitions on
-    \* server s.  The value is either None (idle) or a record
-    \*   [status : {"Opening", "Closing"}, procId : Nat]
-    \* capturing the transition type and the procedure ID from the
-    \* dispatched command.
-    \*
-    \* Source: AssignRegionHandler.java, UnassignRegionHandler.java.
 
 VARIABLE serverState
     \* serverState[s] is the liveness state of server s as seen by the
@@ -236,14 +241,13 @@ VARIABLE serverState
     \* Source: ServerManager.ServerStateNode, ServerState.java.
 
 vars == <<regionState, metaTable, procedures, nextProcId,
-          dispatchedOps, pendingReports, rsOnlineRegions, rsTransitions,
-          serverState>>
+          dispatchedOps, pendingReports, rsOnlineRegions, serverState>>
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == <<dispatchedOps, pendingReports>>
 
-\* Shorthand for the RS-side variables (used in UNCHANGED clauses).
-rsVars == <<rsOnlineRegions, rsTransitions>>
+\* Shorthand for the RS-side variable (used in UNCHANGED clauses).
+rsVars == <<rsOnlineRegions>>
 
 ---------------------------------------------------------------------------
 (* Helper operators *)
@@ -295,10 +299,6 @@ TypeOK ==
          [server : Servers, region : Regions, code : ReportCode,
           procId : Nat]
     /\ rsOnlineRegions \in [Servers -> SUBSET Regions]
-    /\ \A s \in Servers : \A r \in Regions :
-         \/ rsTransitions[s][r] = None
-         \/ /\ rsTransitions[s][r].status \in {"Opening", "Closing"}
-            /\ rsTransitions[s][r].procId \in 1..(nextProcId - 1)
     \* Server liveness state is either ONLINE or CRASHED.
     /\ serverState \in [Servers -> {"ONLINE", "CRASHED"}]
 
@@ -401,7 +401,7 @@ ProcedureConsistency ==
 \*
 \* The invariant holds because TRSPConfirmOpened (which sets OPEN and
 \* removes the procedure) requires an OPENED report, which is only
-\* produced by RSCompleteOpen after adding the region to rsOnlineRegions.
+\* produced by RSOpen after adding the region to rsOnlineRegions.
 RSMasterAgreement ==
     \A r \in Regions :
         regionState[r].state = "OPEN" /\ regionState[r].procedure = None
@@ -412,7 +412,7 @@ RSMasterAgreement ==
 \* "ghost regions" where an RS believes it hosts a region the master
 \* has already reassigned or crashed.
 \*
-\* OPENING is included because RSCompleteOpen adds the region to
+\* OPENING is included because RSOpen adds the region to
 \* rsOnlineRegions before TRSPConfirmOpened transitions the master
 \* state from OPENING to OPEN.  ServerCrashAll clears rsOnlineRegions
 \* atomically, so crashed-server ghost entries cannot arise.
@@ -465,8 +465,6 @@ Init ==
     /\ pendingReports = {}
     \* No regions are online on any RS at startup.
     /\ rsOnlineRegions = [s \in Servers |-> {}]
-    \* No RS-side transitions are in progress.
-    /\ rsTransitions = [s \in Servers |-> [r \in Regions |-> None]]
     \* All servers are initially ONLINE.
     /\ serverState = [s \in Servers |-> "ONLINE"]
 
@@ -565,8 +563,8 @@ TRSPDispatchOpen(pid) ==
 \* Post: region transitions to OPEN, procedure removed and detached,
 \*       report consumed from pendingReports.
 \*
-\* RS-side actions (RSReceiveOpen, RSCompleteOpen) produce the OPENED
-\* reports consumed here, completing the ASSIGN round-trip.
+\* RSOpen produces the OPENED reports consumed here, completing the
+\* ASSIGN round-trip.
 \*
 \* Source: TransitRegionStateProcedure.java confirmOpened() L320-374.
 TRSPConfirmOpened(pid) ==
@@ -743,7 +741,10 @@ TRSPCreateUnassign(r) ==
 \* region's current location.  After the close completes, targetServer
 \* is cleared and TRSPGetCandidate picks a new destination.
 \*
-\* Pre: region is OPEN with a location AND no procedure is attached.
+\* Pre: region is OPEN with a location AND no procedure is attached
+\*      AND at least one other ONLINE server exists as a potential
+\*      destination.  The balancer would never generate a move when
+\*      only the hosting server is available (HMaster.move() L2406).
 \* Post: MOVE procedure created in CLOSE state, attached to region.
 \*       Region state is NOT changed yet -- the TRSP will drive the
 \*       OPEN -> CLOSING transition via TRSPDispatchClose.
@@ -755,6 +756,8 @@ TRSPCreateMove(r) ==
     /\ regionState[r].state = "OPEN"
     /\ regionState[r].location # None
     /\ regionState[r].procedure = None
+    /\ \E s \in Servers : s # regionState[r].location
+                           /\ serverState[s] = "ONLINE"
     /\ regionState' = [regionState EXCEPT ![r].procedure = pid]
     /\ procedures' = AddProc(procedures, pid,
                             [type |-> "MOVE",
@@ -812,9 +815,9 @@ TRSPDispatchClose(pid) ==
 \*       with targetServer cleared so a new destination can be chosen.
 \*       Report consumed from pendingReports.
 \*
-\* RS-side actions (RSReceiveClose, RSCompleteClose) produce the CLOSED
-\* reports consumed here.  For UNASSIGN this completes the round-trip;
-\* for MOVE the procedure continues into the assign phase.
+\* RSClose produces the CLOSED reports consumed here.  For UNASSIGN
+\* this completes the round-trip; for MOVE the procedure continues
+\* into the assign phase.
 \*
 \* Source: TransitRegionStateProcedure.java confirmClosed() L409-446.
 TRSPConfirmClosed(pid) ==
@@ -911,8 +914,6 @@ ServerCrashAll(s) ==
     /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = {}]
     \* Clear RS-side state for the crashed server.
     /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = {}]
-    /\ rsTransitions' = [rsTransitions EXCEPT
-         ![s] = [r \in Regions |-> None]]
     \* Procedures and proc id counter unchanged; reports retained.
     /\ UNCHANGED <<procedures, nextProcId, pendingReports>>
 
@@ -969,134 +970,93 @@ DropStaleReport ==
 ---------------------------------------------------------------------------
 (* Actions -- RS-side open handler *)
 
-\* RS receives an OPEN command from the master.
-\* Pre: Server is ONLINE, an OPEN command for region r exists in
-\*      dispatchedOps[s], and no transition is already in progress
-\*      for r on server s.
-\* Post: Command removed from dispatchedOps, RS begins opening
-\*       transition (rsTransitions records status and procId).
+\* RS atomically receives an OPEN command, opens the region, adds it
+\* to rsOnlineRegions, and reports OPENED to the master.  Merges the
+\* former RSReceiveOpen + RSCompleteOpen into a single action because
+\* the intermediate state (command consumed, RS working on open) is
+\* not observable by the master and produces the same crash-recovery
+\* outcome as the pre-receive state.
 \*
-\* Source: AssignRegionHandler.java process() L98-164.
-RSReceiveOpen(s, r) ==
-    \* Guard: server must be ONLINE.
+\* Pre: Server is ONLINE, an OPEN command for region r exists in
+\*      dispatchedOps[s].
+\* Post: Command consumed, r added to rsOnlineRegions[s], OPENED
+\*       report produced in pendingReports.
+\*
+\* Source: AssignRegionHandler.java process() L98-164 (success path).
+RSOpen(s, r) ==
+    \* Guards: server is ONLINE and an OPEN command for region r exists.
     /\ serverState[s] = "ONLINE"
-    \* Guards: an OPEN command for region r exists on server s,
-    \* and no transition is already in progress for r on that server.
     /\ \E cmd \in dispatchedOps[s] :
         /\ cmd.type = "OPEN"
         /\ cmd.region = r
-        /\ rsTransitions[s][r] = None
         \* Consume the command from the server's dispatched ops queue.
         /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
-        \* Begin the RS-side open transition, recording procId for the report.
-        /\ rsTransitions' = [rsTransitions EXCEPT ![s][r] =
-             [status |-> "Opening", procId |-> cmd.procId]]
-        \* Master-side state and other RS variables unchanged.
+        \* Add the region to the server's set of online regions.
+        /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = @ \cup {r}]
+        \* Send an OPENED report to the master for procedure confirmation.
+        /\ pendingReports' = pendingReports \cup
+             {[server |-> s, region |-> r, code |-> "OPENED",
+               procId |-> cmd.procId]}
+        \* Master-side state and server liveness unchanged.
         /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
-                       pendingReports, rsOnlineRegions, serverState>>
+                       serverState>>
 
-\* RS successfully completes opening a region.
-\* Pre: Server is ONLINE, rsTransitions[s][r] is in "Opening" status.
-\* Post: Region added to rsOnlineRegions, transition cleared,
-\*       OPENED report sent to master via pendingReports.
+\* RS atomically receives an OPEN command but fails to open the
+\* region.  The command is consumed and a FAILED_OPEN report is
+\* produced.  The region is NOT added to rsOnlineRegions.
 \*
-\* Source: AssignRegionHandler.java process() L98-164 (success path).
-RSCompleteOpen(s, r) ==
-    \* Guard: server must be ONLINE.
-    /\ serverState[s] = "ONLINE"
-    \* Guards: a transition exists for region r on server s and is in Opening status.
-    /\ rsTransitions[s][r] # None
-    /\ rsTransitions[s][r].status = "Opening"
-    \* Bind the procedure id from the in-progress transition.
-    /\ LET pid == rsTransitions[s][r].procId IN
-       \* Add the region to the server's set of online regions.
-       /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = @ \cup {r}]
-       \* Clear the completed transition record.
-       /\ rsTransitions' = [rsTransitions EXCEPT ![s][r] = None]
-       \* Send an OPENED report to the master for procedure confirmation.
-       /\ pendingReports' = pendingReports \cup
-            {[server |-> s, region |-> r, code |-> "OPENED", procId |-> pid]}
-       \* Master-side state, dispatched ops, and server state unchanged.
-       /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
-                      dispatchedOps, serverState>>
-
-\* RS fails to open a region.
-\* Pre: Server is ONLINE, rsTransitions[s][r] is in "Opening" status.
-\* Post: Transition cleared, FAILED_OPEN report sent to master via
-\*       pendingReports.  Region is NOT added to rsOnlineRegions.
+\* Pre: Server is ONLINE, an OPEN command for region r exists in
+\*      dispatchedOps[s].
+\* Post: Command consumed, FAILED_OPEN report produced.
 \*
 \* Source: AssignRegionHandler.java process() L98-164 (failure path).
 RSFailOpen(s, r) ==
-    \* Guard: server must be ONLINE.
+    \* Guards: server is ONLINE and an OPEN command for region r exists.
     /\ serverState[s] = "ONLINE"
-    \* Guards: a transition exists for region r on server s and is in Opening status.
-    /\ rsTransitions[s][r] # None
-    /\ rsTransitions[s][r].status = "Opening"
-    \* Bind the procedure id from the in-progress transition.
-    /\ LET pid == rsTransitions[s][r].procId IN
-       \* Clear the failed transition record.
-       /\ rsTransitions' = [rsTransitions EXCEPT ![s][r] = None]
-       \* Send a FAILED_OPEN report to the master for error handling.
-       /\ pendingReports' = pendingReports \cup
-            {[server |-> s, region |-> r, code |-> "FAILED_OPEN", procId |-> pid]}
-       \* Master-side state, dispatched ops, online regions, and server
-       \* state unchanged.
-       /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
-                      dispatchedOps, rsOnlineRegions, serverState>>
+    /\ \E cmd \in dispatchedOps[s] :
+        /\ cmd.type = "OPEN"
+        /\ cmd.region = r
+        \* Consume the command from the server's dispatched ops queue.
+        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
+        \* Send a FAILED_OPEN report to the master for error handling.
+        /\ pendingReports' = pendingReports \cup
+             {[server |-> s, region |-> r, code |-> "FAILED_OPEN",
+               procId |-> cmd.procId]}
+        \* Master-side state, online regions, and server liveness unchanged.
+        /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
+                       rsOnlineRegions, serverState>>
 
 ---------------------------------------------------------------------------
 (* Actions -- RS-side close handler *)
 
-\* RS receives a CLOSE command from the master.
-\* Pre: Server is ONLINE, a CLOSE command for region r exists in
-\*      dispatchedOps[s], and no transition is already in progress
-\*      for r on server s.
-\* Post: Command removed from dispatchedOps, RS begins closing
-\*       transition (rsTransitions records status and procId).
+\* RS atomically receives a CLOSE command, closes the region, removes
+\* it from rsOnlineRegions, and reports CLOSED to the master.  Merges
+\* the former RSReceiveClose + RSCompleteClose into a single action
+\* (same rationale as RSOpen — see RS-side open handler comment).
 \*
-\* Source: UnassignRegionHandler.java process() L92-158.
-RSReceiveClose(s, r) ==
-    \* Guard: server must be ONLINE.
+\* Pre: Server is ONLINE, a CLOSE command for region r exists in
+\*      dispatchedOps[s].
+\* Post: Command consumed, r removed from rsOnlineRegions[s], CLOSED
+\*       report produced in pendingReports.
+\*
+\* Source: UnassignRegionHandler.java process() L92-158 (success path).
+RSClose(s, r) ==
+    \* Guards: server is ONLINE and a CLOSE command for region r exists.
     /\ serverState[s] = "ONLINE"
-    \* Guards: a CLOSE command for region r exists on server s,
-    \* and no transition is already in progress for r on that server.
     /\ \E cmd \in dispatchedOps[s] :
         /\ cmd.type = "CLOSE"
         /\ cmd.region = r
-        /\ rsTransitions[s][r] = None
         \* Consume the command from the server's dispatched ops queue.
         /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
-        \* Begin the RS-side close transition, recording procId for the report.
-        /\ rsTransitions' = [rsTransitions EXCEPT ![s][r] =
-             [status |-> "Closing", procId |-> cmd.procId]]
-        \* Master-side state and other RS variables unchanged.
+        \* Remove the region from the server's set of online regions.
+        /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = @ \ {r}]
+        \* Send a CLOSED report to the master for procedure confirmation.
+        /\ pendingReports' = pendingReports \cup
+             {[server |-> s, region |-> r, code |-> "CLOSED",
+               procId |-> cmd.procId]}
+        \* Master-side state and server liveness unchanged.
         /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
-                       pendingReports, rsOnlineRegions, serverState>>
-
-\* RS successfully completes closing a region.
-\* Pre: Server is ONLINE, rsTransitions[s][r] is in "Closing" status.
-\* Post: Region removed from rsOnlineRegions, transition cleared,
-\*       CLOSED report sent to master via pendingReports.
-\*
-\* Source: UnassignRegionHandler.java process() L92-158 (success path).
-RSCompleteClose(s, r) ==
-    \* Guard: server must be ONLINE.
-    /\ serverState[s] = "ONLINE"
-    \* Guards: a transition exists for region r on server s and is in Closing status.
-    /\ rsTransitions[s][r] # None
-    /\ rsTransitions[s][r].status = "Closing"
-    \* Bind the procedure id from the in-progress transition.
-    /\ LET pid == rsTransitions[s][r].procId IN
-       \* Remove the region from the server's set of online regions.
-       /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = @ \ {r}]
-       \* Clear the completed transition record.
-       /\ rsTransitions' = [rsTransitions EXCEPT ![s][r] = None]
-       \* Send a CLOSED report to the master for procedure confirmation.
-       /\ pendingReports' = pendingReports \cup
-            {[server |-> s, region |-> r, code |-> "CLOSED", procId |-> pid]}
-       \* Master-side state, dispatched ops, and server state unchanged.
-       /\ UNCHANGED <<regionState, metaTable, procedures, nextProcId,
-                      dispatchedOps, serverState>>
+                       serverState>>
 
 ---------------------------------------------------------------------------
 (* Next-state relation *)
@@ -1140,17 +1100,13 @@ Next ==
     \* Drop a report from a crashed server.
     \/ DropStaleReport
     \* -- RS-side open handler --
-    \* RS receives and begins processing an OPEN command.
-    \/ \E s \in Servers : \E r \in Regions : RSReceiveOpen(s, r)
-    \* RS successfully completes opening a region.
-    \/ \E s \in Servers : \E r \in Regions : RSCompleteOpen(s, r)
-    \* RS fails to open a region.
+    \* RS atomically receives, opens, and reports OPENED.
+    \/ \E s \in Servers : \E r \in Regions : RSOpen(s, r)
+    \* RS atomically receives but fails to open; reports FAILED_OPEN.
     \/ \E s \in Servers : \E r \in Regions : RSFailOpen(s, r)
     \* -- RS-side close handler --
-    \* RS receives and begins processing a CLOSE command.
-    \/ \E s \in Servers : \E r \in Regions : RSReceiveClose(s, r)
-    \* RS successfully completes closing a region.
-    \/ \E s \in Servers : \E r \in Regions : RSCompleteClose(s, r)
+    \* RS atomically receives, closes, and reports CLOSED.
+    \/ \E s \in Servers : \E r \in Regions : RSClose(s, r)
 
 ---------------------------------------------------------------------------
 (* Fairness *)
