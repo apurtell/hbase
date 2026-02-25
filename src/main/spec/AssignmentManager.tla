@@ -16,10 +16,14 @@
  * Each region carries a `procedure` field (master in-memory only, not
  * persisted to meta) that models the RegionStateNode.setProcedure() /
  * unsetProcedure() discipline: at most one procedure can be attached to
- * a region at any time.  Actions that begin a transition (BeginOpen,
- * BeginClose) require the procedure field to be None and set it; actions
- * that complete a transition (ConfirmOpened, ConfirmClosed, FailOpen)
- * clear it back to None.
+ * a region at any time.  The `procedure` field holds the procedure ID
+ * (a natural number) when a TRSP is attached, or None when idle.
+ *
+ * Procedures are modeled as records in the `procedures` variable, indexed
+ * by procedure ID.  The ASSIGN procedure follows the TRSP state machine:
+ *   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
+ * The UNASSIGN path creates a placeholder procedure (type "UNASSIGN",
+ * trspState "CLOSE") that is expanded into a full TRSP in Iteration 5.
  *
  * Currently scoped to the core assign/unassign lifecycle:
  *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
@@ -86,41 +90,85 @@ ValidTransition ==
       <<"ABNORMALLY_CLOSED",  "OPENING">>,
       <<"FAILED_OPEN",        "OPENING">> }
 
+\* TRSP internal states used in the procedures variable.
+\* ASSIGN path: GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (removed)
+\* UNASSIGN placeholder: CLOSE (expanded in Iteration 5)
+TRSPState == {"GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED", "CLOSE"}
+
 ---------------------------------------------------------------------------
 (* Variables *)
 
 VARIABLE regionState
     \* regionState[r] is a record
     \*   [state : State,
-    \*    location : Servers ∪ {None},
-    \*    procedure : {None, TRUE}]
-    \* for each r ∈ Regions.  This is volatile master in-memory state.
+    \*    location : Servers \cup {None},
+    \*    procedure : Nat \cup {None}]
+    \* for each r in Regions.  This is volatile master in-memory state.
     \*
-    \* The `procedure` field models RegionStateNode.setProcedure() /
-    \* unsetProcedure() (RSN.java L213-224).  It is None when no
-    \* procedure is attached, or TRUE when some procedure holds the
-    \* region lock.  The actual procedure identity (proc ID, type,
-    \* internal state) is introduced in Iteration 4.
+    \* The `procedure` field holds the procedure ID (a natural number)
+    \* when a TRSP or unassign procedure is attached, or None when
+    \* no procedure is attached.
+    \*
+    \* Source: RegionStateNode.java setProcedure() L213-218,
+    \*         unsetProcedure() L220-224.
 
 VARIABLE metaTable
-    \* metaTable[r] is a record [state : State, location : Servers ∪ {None}]
-    \* for each r ∈ Regions.  This is persistent state in hbase:meta.
+    \* metaTable[r] is a record [state : State, location : Servers \cup {None}]
+    \* for each r in Regions.  This is persistent state in hbase:meta.
     \* Survives master crash; regionState does not.
     \*
-    \* The procedure field is NOT persisted to meta — procedures are
+    \* The procedure field is NOT persisted to meta -- procedures are
     \* master in-memory state, recovered from ProcedureStore on restart.
 
-vars == <<regionState, metaTable>>
+VARIABLE procedures
+    \* procedures is a function from a subset of Nat to procedure records.
+    \* Each record is:
+    \*   [type : {"ASSIGN", "UNASSIGN"},
+    \*    trspState : TRSPState,
+    \*    region : Regions,
+    \*    targetServer : Servers \cup {None}]
+    \*
+    \* Procedures are created when a region operation begins and removed
+    \* when it completes.  DOMAIN procedures is the set of active IDs.
+    \*
+    \* Source: TransitRegionStateProcedure.java executeFromState() L483-531.
+
+VARIABLE nextProcId
+    \* nextProcId is a natural number >= 1, monotonically increasing.
+    \* Each new procedure is assigned nextProcId as its ID, then
+    \* nextProcId is incremented.
+
+vars == <<regionState, metaTable, procedures, nextProcId>>
+
+---------------------------------------------------------------------------
+(* Helper operators *)
+
+\* Extend a function's domain by one key.
+AddProc(procs, pid, rec) ==
+    [p \in (DOMAIN procs) \cup {pid} |-> IF p = pid THEN rec ELSE procs[p]]
+
+\* Restrict a function's domain by removing one key.
+RemoveProc(procs, pid) ==
+    [p \in (DOMAIN procs) \ {pid} |-> procs[p]]
 
 ---------------------------------------------------------------------------
 (* Type invariant *)
 
 TypeOK ==
-    /\ regionState \in [Regions -> [state : State,
-                                    location : Servers \cup {None},
-                                    procedure : {None, TRUE}]]
+    /\ \A r \in Regions :
+         /\ regionState[r].state \in State
+         /\ regionState[r].location \in Servers \cup {None}
+         /\ regionState[r].procedure \in {None} \cup DOMAIN procedures
     /\ metaTable \in [Regions -> [state : State,
                                   location : Servers \cup {None}]]
+    /\ nextProcId \in Nat
+    /\ nextProcId >= 1
+    /\ DOMAIN procedures \subseteq 1..(nextProcId - 1)
+    /\ \A pid \in DOMAIN procedures :
+         /\ procedures[pid].type \in {"ASSIGN", "UNASSIGN"}
+         /\ procedures[pid].trspState \in TRSPState
+         /\ procedures[pid].region \in Regions
+         /\ procedures[pid].targetServer \in Servers \cup {None}
 
 ---------------------------------------------------------------------------
 (* Safety invariants *)
@@ -161,24 +209,39 @@ SingleAssignment ==
     \A r \in Regions :
         regionState[r].state = "OPEN" => regionState[r].location # None
 
-\* At most one procedure is attached to a region at any time, and a
-\* procedure is only attached during transitional states (OPENING or
-\* CLOSING).  The "at most one" part is trivially true by construction
-\* (the procedure field is a scalar), but stated explicitly as the
-\* foundational mutual exclusion property.  The state correlation is
-\* a stronger check verifying that acquire/release is correctly paired
-\* with state transitions.
+\* A procedure is attached only during pre-transitional or transitional
+\* states, never during the stable OPEN state.
 \*
-\* Becomes non-trivial in later iterations when SCP and TRSP interact
-\* and procedure handoff must be correctly sequenced.  Will be extended
-\* to include SPLITTING and MERGING states in Phase 6.
+\* Updated from Iteration 3: the TRSP ASSIGN procedure attaches to a
+\* region before transitioning it to OPENING (during GET_ASSIGN_CANDIDATE
+\* and OPEN TRSP states), so the procedure may be attached while the
+\* region is still in OFFLINE, CLOSED, ABNORMALLY_CLOSED, or FAILED_OPEN.
 \*
 \* Source: RegionStateNode.java setProcedure() L213-218,
 \*         unsetProcedure() L220-224.
 LockExclusivity ==
     \A r \in Regions :
         regionState[r].procedure # None =>
-            regionState[r].state \in {"OPENING", "CLOSING"}
+            regionState[r].state \in {"OFFLINE", "CLOSED",
+                                      "ABNORMALLY_CLOSED", "FAILED_OPEN",
+                                      "OPENING", "CLOSING"}
+
+\* Bidirectional consistency between region->procedure and procedure->region.
+\* Every attached procedure ID refers to an active procedure whose region
+\* field points back, and every active procedure's region has that procedure
+\* attached.
+ProcedureConsistency ==
+    /\ \A r \in Regions :
+         regionState[r].procedure # None =>
+            /\ regionState[r].procedure \in DOMAIN procedures
+            /\ procedures[regionState[r].procedure].region = r
+    /\ \A pid \in DOMAIN procedures :
+         regionState[procedures[pid].region].procedure = pid
+
+---------------------------------------------------------------------------
+(* State constraint for TLC *)
+
+StateConstraint == nextProcId <= 7
 
 ---------------------------------------------------------------------------
 (* Initial state *)
@@ -188,130 +251,214 @@ Init ==
          [state |-> "OFFLINE", location |-> None, procedure |-> None]]
     /\ metaTable = [r \in Regions |->
          [state |-> "OFFLINE", location |-> None]]
+    /\ procedures = <<>>
+    /\ nextProcId = 1
 
 ---------------------------------------------------------------------------
-(* Actions *)
+(* Actions -- TRSP ASSIGN path *)
 
-\* --- Assign path ---
-
-\* Begin opening a region on a chosen server.
+\* Create a TRSP ASSIGN procedure for a region eligible for assignment.
 \* Pre: region is in a state eligible for assignment AND no procedure
-\*      is currently attached (the region lock is free).
-\* Post: region transitions to OPENING with a target server; a
-\*       procedure is attached (lock acquired).
-BeginOpen(r, s) ==
+\*      is currently attached.
+\* Post: procedure created in GET_ASSIGN_CANDIDATE state, attached to
+\*       region.  Region state is NOT changed yet -- the TRSP will
+\*       drive transitions in subsequent steps.
+\*
+\* Source: TransitRegionStateProcedure.java queueAssign() L246-278.
+TRSPCreate(r) ==
+    LET pid == nextProcId IN
     /\ regionState[r].state \in {"OFFLINE", "CLOSED",
                                   "ABNORMALLY_CLOSED", "FAILED_OPEN"}
     /\ regionState[r].procedure = None
-    /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "OPENING", location |-> s, procedure |-> TRUE]]
-    /\ metaTable' = [metaTable EXCEPT
-         ![r] = [state |-> "OPENING", location |-> s]]
+    /\ regionState' = [regionState EXCEPT ![r].procedure = pid]
+    /\ procedures' = AddProc(procedures, pid,
+                            [type |-> "ASSIGN",
+                             trspState |-> "GET_ASSIGN_CANDIDATE",
+                             region |-> r,
+                             targetServer |-> None])
+    /\ nextProcId' = nextProcId + 1
+    /\ UNCHANGED metaTable
 
-\* Region successfully opened.
-\* Pre: region is OPENING with a procedure attached.
-\* Post: region transitions to OPEN; procedure detached (lock released).
-ConfirmOpened(r) ==
-    /\ regionState[r].state = "OPENING"
-    /\ regionState[r].location # None
-    /\ regionState[r].procedure # None
-    /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "OPEN", location |-> @.location, procedure |-> None]]
-    /\ metaTable' = [metaTable EXCEPT
-         ![r] = [state |-> "OPEN", location |-> metaTable[r].location]]
+\* Choose a target server for the ASSIGN procedure.
+\* Pre: TRSP is in GET_ASSIGN_CANDIDATE state.
+\* Post: targetServer set, TRSP advances to OPEN state.
+\*
+\* Source: TransitRegionStateProcedure.java executeFromState() L483-496,
+\*         queueAssign() L246-278 (getDestinationServer).
+TRSPGetCandidate(pid, s) ==
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].trspState = "GET_ASSIGN_CANDIDATE"
+    /\ procedures' = [procedures EXCEPT ![pid].targetServer = s,
+                                        ![pid].trspState = "OPEN"]
+    /\ UNCHANGED <<regionState, metaTable, nextProcId>>
 
-\* Region failed to open (after retries exhausted).
+\* Execute the open step: transition region to OPENING.
+\* Pre: TRSP is in OPEN state with a target server.
+\* Post: region transitions to OPENING with the target server as
+\*       location, meta updated, TRSP advances to CONFIRM_OPENED.
+\*
+\* Source: TransitRegionStateProcedure.java openRegion() L293-311.
+TRSPOpen(pid) ==
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].trspState = "OPEN"
+    /\ procedures[pid].targetServer # None
+    /\ LET r == procedures[pid].region
+           s == procedures[pid].targetServer IN
+       /\ regionState' = [regionState EXCEPT
+            ![r].state = "OPENING",
+            ![r].location = s]
+       /\ metaTable' = [metaTable EXCEPT
+            ![r] = [state |-> "OPENING", location |-> s]]
+       /\ procedures' = [procedures EXCEPT
+            ![pid].trspState = "CONFIRM_OPENED"]
+       /\ UNCHANGED nextProcId
+
+\* Confirm that the region opened successfully.
+\* Pre: TRSP is in CONFIRM_OPENED state, region is OPENING.
+\* Post: region transitions to OPEN, procedure removed and detached.
+\*
+\* In this iteration (no RS side), this models the master confirming
+\* the open directly. In later iterations, this will require consuming
+\* an OPENED report from the RS.
+\*
+\* Source: TransitRegionStateProcedure.java confirmOpened() L320-374.
+TRSPConfirmOpened(pid) ==
+    /\ pid \in DOMAIN procedures
+    /\ procedures[pid].type = "ASSIGN"
+    /\ procedures[pid].trspState = "CONFIRM_OPENED"
+    /\ LET r == procedures[pid].region IN
+       /\ regionState[r].state = "OPENING"
+       /\ regionState' = [regionState EXCEPT
+            ![r] = [state |-> "OPEN",
+                    location |-> regionState[r].location,
+                    procedure |-> None]]
+       /\ metaTable' = [metaTable EXCEPT
+            ![r] = [state |-> "OPEN",
+                    location |-> metaTable[r].location]]
+       /\ procedures' = RemoveProc(procedures, pid)
+       /\ UNCHANGED nextProcId
+
+---------------------------------------------------------------------------
+(* Actions -- failure path *)
+
+\* Region failed to open (non-deterministic failure).
+\* Full retry logic deferred to Iteration 12.
 \* Pre: region is OPENING with a procedure attached.
-\* Post: region transitions to FAILED_OPEN, location cleared;
-\*       procedure detached (lock released).
+\* Post: region transitions to FAILED_OPEN, location cleared,
+\*       procedure removed and detached.
 FailOpen(r) ==
+    LET pid == regionState[r].procedure IN
     /\ regionState[r].state = "OPENING"
-    /\ regionState[r].procedure # None
+    /\ pid # None
     /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "FAILED_OPEN", location |-> None, procedure |-> None]]
+         ![r] = [state |-> "FAILED_OPEN", location |-> None,
+                 procedure |-> None]]
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "FAILED_OPEN", location |-> None]]
+    /\ procedures' = RemoveProc(procedures, pid)
+    /\ UNCHANGED nextProcId
 
-\* --- Unassign path ---
+---------------------------------------------------------------------------
+(* Actions -- Unassign path (placeholder, expanded in Iteration 5) *)
 
 \* Begin closing a region.
 \* Pre: region is OPEN AND no procedure is currently attached.
 \* Post: region transitions to CLOSING (location retained during close);
-\*       a procedure is attached (lock acquired).
+\*       a procedure is created and attached.
 BeginClose(r) ==
+    LET pid == nextProcId IN
     /\ regionState[r].state = "OPEN"
     /\ regionState[r].location # None
     /\ regionState[r].procedure = None
     /\ regionState' = [regionState EXCEPT
-         ![r] = [state |-> "CLOSING", location |-> @.location, procedure |-> TRUE]]
+         ![r] = [state |-> "CLOSING",
+                 location |-> regionState[r].location,
+                 procedure |-> pid]]
     /\ metaTable' = [metaTable EXCEPT
-         ![r] = [state |-> "CLOSING", location |-> metaTable[r].location]]
+         ![r] = [state |-> "CLOSING",
+                 location |-> metaTable[r].location]]
+    /\ procedures' = AddProc(procedures, pid,
+                            [type |-> "UNASSIGN",
+                             trspState |-> "CLOSE",
+                             region |-> r,
+                             targetServer |-> regionState[r].location])
+    /\ nextProcId' = nextProcId + 1
 
 \* Region successfully closed.
 \* Pre: region is CLOSING with a procedure attached.
 \* Post: region transitions to CLOSED, location cleared;
-\*       procedure detached (lock released).
+\*       procedure removed and detached.
 ConfirmClosed(r) ==
+    LET pid == regionState[r].procedure IN
     /\ regionState[r].state = "CLOSING"
-    /\ regionState[r].procedure # None
+    /\ pid # None
     /\ regionState' = [regionState EXCEPT
          ![r] = [state |-> "CLOSED", location |-> None, procedure |-> None]]
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "CLOSED", location |-> None]]
+    /\ procedures' = RemoveProc(procedures, pid)
+    /\ UNCHANGED nextProcId
 
-\* --- Transition from CLOSED back to OFFLINE ---
+---------------------------------------------------------------------------
+(* Actions -- external events *)
 
+\* Transition from CLOSED back to OFFLINE.
 \* Used by RegionStateNode.offline() when a region is being taken fully
-\* offline (e.g., table disable).  This is an external action that does
-\* not acquire or release a procedure lock.
+\* offline (e.g., table disable).
+\* Pre: region is CLOSED with no procedure attached.
 GoOffline(r) ==
     /\ regionState[r].state = "CLOSED"
+    /\ regionState[r].procedure = None
     /\ regionState' = [regionState EXCEPT
          ![r] = [state |-> "OFFLINE", location |-> None,
-                 procedure |-> @.procedure]]
+                 procedure |-> None]]
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "OFFLINE", location |-> None]]
-
-\* --- Crash path ---
+    /\ UNCHANGED <<procedures, nextProcId>>
 
 \* The server hosting an OPEN region crashes.
 \* Pre: region is OPEN with a location.
 \* Post: region transitions to ABNORMALLY_CLOSED, location cleared.
-\*       This is an external event that does not acquire or release a
-\*       procedure lock; the procedure field is preserved as-is.
+\*       This is an external event; the procedure field is preserved
+\*       as-is (should be None for stable OPEN regions).
 ServerCrash(r) ==
     /\ regionState[r].state = "OPEN"
     /\ regionState[r].location # None
     /\ regionState' = [regionState EXCEPT
          ![r] = [state |-> "ABNORMALLY_CLOSED", location |-> None,
-                 procedure |-> @.procedure]]
+                 procedure |-> regionState[r].procedure]]
     /\ metaTable' = [metaTable EXCEPT
          ![r] = [state |-> "ABNORMALLY_CLOSED", location |-> None]]
+    /\ UNCHANGED <<procedures, nextProcId>>
 
 ---------------------------------------------------------------------------
 (* Next-state relation *)
 
 Next ==
-    \E r \in Regions :
-        \/ \E s \in Servers : BeginOpen(r, s)
-        \/ ConfirmOpened(r)
-        \/ FailOpen(r)
-        \/ BeginClose(r)
-        \/ ConfirmClosed(r)
-        \/ GoOffline(r)
-        \/ ServerCrash(r)
+    \/ \E r \in Regions : TRSPCreate(r)
+    \/ \E pid \in DOMAIN procedures :
+         \E s \in Servers : TRSPGetCandidate(pid, s)
+    \/ \E pid \in DOMAIN procedures : TRSPOpen(pid)
+    \/ \E pid \in DOMAIN procedures : TRSPConfirmOpened(pid)
+    \/ \E r \in Regions : FailOpen(r)
+    \/ \E r \in Regions : BeginClose(r)
+    \/ \E r \in Regions : ConfirmClosed(r)
+    \/ \E r \in Regions : GoOffline(r)
+    \/ \E r \in Regions : ServerCrash(r)
 
 ---------------------------------------------------------------------------
 (* Fairness *)
 
-\* Weak fairness: if a transition is continuously enabled, it eventually occurs.
-\* Not strictly needed for safety checking but included for liveness exploration.
+\* Weak fairness on region-level actions ensures forward progress.
+\* Fairness on procedure-step actions (TRSPGetCandidate, TRSPOpen,
+\* TRSPConfirmOpened) is not expressed here because procedure IDs are
+\* dynamically allocated; full fairness is deferred to Iteration 27.
 Fairness ==
-    \A r \in Regions :
-        /\ \A s \in Servers : WF_vars(BeginOpen(r, s))
-        /\ WF_vars(ConfirmOpened(r))
-        /\ WF_vars(BeginClose(r))
-        /\ WF_vars(ConfirmClosed(r))
+    /\ \A r \in Regions : WF_vars(TRSPCreate(r))
+    /\ \A r \in Regions : WF_vars(BeginClose(r))
+    /\ \A r \in Regions : WF_vars(ConfirmClosed(r))
 
 ---------------------------------------------------------------------------
 (* Specification *)
@@ -336,13 +483,14 @@ THEOREM Spec => []SingleAssignment
 \* Safety: persistent meta state matches in-memory state.
 THEOREM Spec => []MetaConsistency
 
-\* Safety: procedure lock held only during transitional states.
+\* Safety: procedure lock held only during appropriate states.
 THEOREM Spec => []LockExclusivity
 
+\* Safety: procedure<->region bidirectional consistency.
+THEOREM Spec => []ProcedureConsistency
+
 \* All transitions in every step are members of ValidTransition.
-\* Expressed as an action property checked via TLC's "action constraint" or
-\* by an invariant on primed variables.  For TLC, we check this as an
-\* invariant on the post-state:
+\* Expressed as an action property checked via TLC's action constraint.
 TransitionValid ==
     \A r \in Regions :
         regionState'[r].state # regionState[r].state
