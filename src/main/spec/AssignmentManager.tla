@@ -109,6 +109,14 @@
  * FAILED_CLOSE is omitted because no code path transitions into it. The RS
  * abort triggers crash detection, so close failures are resolved through
  * ABNORMALLY_CLOSED instead.
+ *
+ * UseLocationCheck controls whether SCPAssignRegion applies the
+ * isMatchingRegionLocation() check (SCP.java L529-538).  When TRUE,
+ * SCPAssignRegion skips regions whose location changed between
+ * SCPGetRegions and SCPAssignRegion — matching the implementation.
+ * When FALSE, every region in the SCP snapshot is processed
+ * unconditionally — the correct protocol behavior.  The check is
+ * a known source of bugs (HBASE-24293, HBASE-21623).
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -125,6 +133,22 @@ ASSUME None \notin Servers
 CONSTANTS MaxRetries
 \* Maximum open-retry attempts before giving up (FAILED_OPEN)
 ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
+
+CONSTANTS UseLocationCheck
+\* BOOLEAN: when TRUE, SCPAssignRegion applies the
+\* isMatchingRegionLocation() check — regions whose master-side
+\* location has changed since SCPGetRegions are skipped.
+\* When FALSE, every region in the SCP snapshot is processed
+\* unconditionally (correct protocol behavior).
+\*
+\* The implementation's check is a known source of bugs:
+\* HBASE-24293, HBASE-21623.  Setting FALSE models the ideal
+\* protocol; setting TRUE reproduces the implementation's behavior
+\* and may expose NoLostRegions violations confirming those bugs.
+\*
+\* Source: ServerCrashProcedure.isMatchingRegionLocation()
+\*         SCP.java L498-500; called at SCP.java L529.
+ASSUME UseLocationCheck \in BOOLEAN
 
 ---------------------------------------------------------------------------
 
@@ -280,8 +304,6 @@ VARIABLE serverState
 \* RS-side actions are guarded by serverState = "ONLINE".
 \*
 \* Source: ServerManager.ServerStateNode, ServerState.java.
-VARIABLE serverState
-
 \* scpState[s] tracks the ServerCrashProcedure progress for server s.
 \* "NONE" means no SCP is active for this server.
 \* GET_REGIONS -> FENCE_WALS -> ASSIGN -> DONE is the SCP lifecycle.
@@ -1579,31 +1601,23 @@ SCPFenceWALs(s) ==
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
 \* Each invocation handles a single region and removes it from
-\* scpRegions[s].  Between invocations, arbitrary other actions can
-\* interleave -- this is what exposes the assignment races.
+\* scpRegions[s].  Three sub-paths:
 \*
-\* The model processes every region unconditionally -- no
-\* isMatchingRegionLocation check.  The implementation's check
-\* (SCP.java L540-542) is a known source of bugs (HBASE-24293,
-\* HBASE-21623); the model captures correct protocol behavior.
-\*
-\* Two sub-paths:
+\*   Skip (location check): when UseLocationCheck is TRUE and the
+\*     region's master-side location no longer matches the crashed
+\*     server, SCP skips the region entirely.  This models the
+\*     isMatchingRegionLocation() guard (SCP.java L529-538) and is
+\*     a known source of HBASE-24293 / HBASE-21623 bugs.
 \*   Path A (procedure attached): transition region to ABNORMALLY_CLOSED,
 \*     clear location; existing procedure preserved for TRSPServerCrashed.
 \*   Path B (no procedure): transition to ABNORMALLY_CLOSED, clear
 \*     location, create fresh ASSIGN/GET_ASSIGN_CANDIDATE procedure.
 \*
 \* Pre: scpState[s] = "ASSIGN", r in scpRegions[s], walFenced[s] = TRUE.
-\* Post: r removed from scpRegions[s], region transitioned.
+\* Post: r removed from scpRegions[s], region transitioned (or skipped).
 \*
-\* Source: ServerCrashProcedure.executeFromState()
-\*         SERVER_CRASH_ASSIGN case calls
-\*         ServerCrashProcedure.assignRegions(); assignRegions()
-\*         iterates each region, checking
-\*         ServerCrashProcedure.isMatchingRegionLocation() and
-\*         either calling TRSP.serverCrashed() on an existing
-\*         TRSP (Path A) or creating a new TRSP via
-\*         TRSP.assign() (Path B).
+\* Source: ServerCrashProcedure.assignRegions() SCP.java L512-561;
+\*         isMatchingRegionLocation() SCP.java L498-500.
 SCPAssignRegion(s, r) ==
   /\ scpState[s] = "ASSIGN"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
@@ -1611,68 +1625,100 @@ SCPAssignRegion(s, r) ==
   /\ r \in scpRegions[s]
   /\ walFenced[s] = TRUE
   /\ locked[r] = FALSE
-  \* r is the region being reassigned
-  \* Clear r from rsOnlineRegions on all servers.  The region may have
-  \* moved (e.g. TRSPDispatchOpen + RSOpen on s2) between SCPGetRegions
-  \* and this step; clearing everywhere prevents ghost regions.
-  /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
-  \* Drop stale OPENED reports for r.  When we mark r ABNORMALLY_CLOSED,
-  \* any OPENED report for r is obsolete; consuming it later would set
-  \* OPEN without r in rsOnlineRegions, violating RSMasterAgreement.
-  /\ pendingReports' =
-       {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
-  /\ IF regionState[r].procType # "NONE"
-     THEN \* Path A: TRSP already attached (SCP.java L612-618).
-          \* Transition region to ABNORMALLY_CLOSED; the existing
-          \* TRSPServerCrashed action will convert the procedure to
-          \* ASSIGN/GET_ASSIGN_CANDIDATE as a separate step.
-          /\ regionState' =
-               [regionState EXCEPT
-               ![r].state =
-               "ABNORMALLY_CLOSED",
-               ![r].location =
-               None]
-          /\ metaTable' =
-               [metaTable EXCEPT
-               ![r] =
-               [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
-          /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
-          /\ UNCHANGED << dispatchedOps,
-                serverState,
-                walFenced,
-                scpState,
-                locked,
-                carryingMeta
-             >>
-     ELSE \* Path B: No TRSP attached (SCP.java L624-638).
-          \* Transition to ABNORMALLY_CLOSED and attach a fresh
-          \* ASSIGN procedure at GET_ASSIGN_CANDIDATE.
-          /\ regionState' =
-               [regionState EXCEPT
-               ![r].state =
-               "ABNORMALLY_CLOSED",
-               ![r].location =
-               None,
-               ![r].procType =
-               "ASSIGN",
-               ![r].procStep =
-               "GET_ASSIGN_CANDIDATE",
-               ![r].targetServer =
-               None,
-               ![r].retries =
-               0]
-          /\ metaTable' =
-               [metaTable EXCEPT
-               ![r] =
-               [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
-          /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
-          /\ UNCHANGED << dispatchedOps,
-                serverState,
-                walFenced,
-                scpState,
-                locked,
-                carryingMeta
-             >>
+  /\ \/ \* --- Skip: isMatchingRegionLocation fails (SCP.java L529-538) ---
+        \* Between SCPGetRegions and now, a concurrent TRSP may have moved
+        \* this region to another server.  The implementation skips such
+        \* regions.  This is a known source of bugs: if the concurrent TRSP
+        \* subsequently fails, the region is lost (HBASE-24293).
+        \* Toggle: UseLocationCheck = FALSE disables this path, modeling
+        \* the correct protocol (process every region unconditionally).
+        /\ UseLocationCheck = TRUE
+        /\ regionState[r].location # s
+        \* Skip: only shrink the SCP snapshot; no state changes.
+        /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
+        /\ UNCHANGED << regionState,
+              metaTable,
+              rpcVars,
+              rsOnlineRegions,
+              pendingReports,
+              serverState,
+              walFenced,
+              scpState,
+              locked,
+              carryingMeta
+           >>
+     \/ \* --- Path A: TRSP already attached (SCP.java L540-544) ---
+        \* Location matches (or check disabled); procedure exists.
+        \* Transition region to ABNORMALLY_CLOSED; the existing
+        \* TRSPServerCrashed action will convert the procedure to
+        \* ASSIGN/GET_ASSIGN_CANDIDATE as a separate step.
+        /\ \/ UseLocationCheck = FALSE
+           \/ regionState[r].location = s
+        /\ regionState[r].procType # "NONE"
+        \* Clear r from rsOnlineRegions on all servers.  The region may
+        \* have moved between SCPGetRegions and now; clearing everywhere
+        \* prevents ghost regions.
+        /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
+        \* Drop stale OPENED reports for r: marking ABNORMALLY_CLOSED
+        \* makes them obsolete.
+        /\ pendingReports' =
+             {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
+        /\ regionState' =
+             [regionState EXCEPT
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             None]
+        /\ metaTable' =
+             [metaTable EXCEPT
+             ![r] =
+             [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
+        /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
+        /\ UNCHANGED << dispatchedOps,
+              serverState,
+              walFenced,
+              scpState,
+              locked,
+              carryingMeta
+           >>
+     \/ \* --- Path B: No TRSP attached (SCP.java L554-557) ---
+        \* Location matches (or check disabled); no procedure.
+        \* Transition to ABNORMALLY_CLOSED and attach a fresh
+        \* ASSIGN procedure at GET_ASSIGN_CANDIDATE.
+        /\ \/ UseLocationCheck = FALSE
+           \/ regionState[r].location = s
+        /\ regionState[r].procType = "NONE"
+        \* Clear r from rsOnlineRegions on all servers.
+        /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
+        \* Drop stale OPENED reports for r.
+        /\ pendingReports' =
+             {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
+        /\ regionState' =
+             [regionState EXCEPT
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             None,
+             ![r].procType =
+             "ASSIGN",
+             ![r].procStep =
+             "GET_ASSIGN_CANDIDATE",
+             ![r].targetServer =
+             None,
+             ![r].retries =
+             0]
+        /\ metaTable' =
+             [metaTable EXCEPT
+             ![r] =
+             [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
+        /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
+        /\ UNCHANGED << dispatchedOps,
+              serverState,
+              walFenced,
+              scpState,
+              locked,
+              carryingMeta
+           >>
 
 \* SCP step 4: All regions processed.  Mark SCP as complete.
 \*
