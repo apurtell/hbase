@@ -24,8 +24,11 @@
  *   UNASSIGN: CLOSE -> CONFIRM_CLOSED -> (cleared)
  *   MOVE:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
  *                -> CONFIRM_OPENED -> (cleared)
- * MOVE is an UNASSIGN (close on current server) followed by an ASSIGN
- * (open on a new server), all within a single procedure.
+ *   REOPEN:   CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
+ *                -> CONFIRM_OPENED -> (cleared)
+ * MOVE closes on the current server and opens on a different server.
+ * REOPEN is identical in flow but prefers the same server (assignCandidate
+ * pinned to current location) and does not require another ONLINE server.
  * If a region becomes ABNORMALLY_CLOSED (server crash), the procedure
  * converts to ASSIGN/GET_ASSIGN_CANDIDATE via the serverCrashed()
  * callback, modeling the TRSP's self-recovery path.
@@ -67,7 +70,8 @@
  * Server liveness is tracked by serverState.  RS crash is decomposed
  * into a multi-step ServerCrashProcedure (SCP):
  *   1. MasterDetectCrash(s): master marks server CRASHED, starts SCP.
- *      Regions remain in their pre-crash state; the RS is a zombie.
+ *      Non-deterministically decides if the server was hosting meta.
+ *   1a. SCPAssignMeta(s): if carryingMeta, reassign meta first.
  *   2. SCPGetRegions(s): snapshot regions on the crashed server.
  *   3. SCPFenceWALs(s): revoke WAL leases (prevents zombie writes).
  *   4. SCPAssignRegion(s, r): process regions one at a time, creating
@@ -188,7 +192,9 @@ TRSPState ==
   }
 
 \* Procedure types.  "NONE" means no procedure is attached.
-ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "NONE" }
+\* REOPEN: close on current server then reopen preferring the same server
+\* (assignCandidate pinning); no other ONLINE server required.
+ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN", "NONE" }
 
 \* RPC command types dispatched from master to RegionServer.
 \* Source: RSProcedureDispatcher dispatches OpenRegionProcedure /
@@ -223,8 +229,8 @@ VARIABLE regionState
 \* one procedure can be attached per region and region identity is
 \* sufficient for report/command matching.
 \*
-\* Source: RegionStateNode.java setProcedure() L213-218,
-\*         unsetProcedure() L220-224.
+\* Source: RegionStateNode.setProcedure(),
+\*         RegionStateNode.unsetProcedure().
 VARIABLE metaTable
 
 \* metaTable[r] is a record [state : State, location : Servers \cup {None}]
@@ -244,7 +250,8 @@ VARIABLE dispatchedOps
 \* RPC.  Commands remain in the set until consumed by RS-side actions
 \* or discarded on dispatch failure / server crash.
 \*
-\* Source: RSProcedureDispatcher.java L200-367.
+\* Source: RSProcedureDispatcher.remoteDispatch(),
+\*         RSProcedureDispatcher.ExecuteProceduresRemoteCall.run().
 VARIABLE pendingReports
 
 \* pendingReports is a set of report records from RegionServers
@@ -273,31 +280,55 @@ VARIABLE serverState
 \* RS-side actions are guarded by serverState = "ONLINE".
 \*
 \* Source: ServerManager.ServerStateNode, ServerState.java.
-VARIABLE scpState
+VARIABLE serverState
 
 \* scpState[s] tracks the ServerCrashProcedure progress for server s.
 \* "NONE" means no SCP is active for this server.
 \* GET_REGIONS -> FENCE_WALS -> ASSIGN -> DONE is the SCP lifecycle.
 \*
-\* Source: ServerCrashProcedure.java L142-305.
-VARIABLE scpRegions
+\* Source: ServerCrashProcedure.executeFromState().
+VARIABLE scpState
 
 \* scpRegions[s] is the snapshot of regions taken at GET_REGIONS time.
-\* This snapshot can go STALE: between GET_REGIONS and ASSIGN,
-\* concurrent TRSPs may change region locations, causing
-\* isMatchingRegionLocation() to skip regions.  This staleness is
-\* the root cause of HBASE-21623.
 \*
-\* Source: getRegionsOnCrashedServer() (SCP.java L308-310),
-\*         getRegionsOnServer() (AM.java L501-507).
-VARIABLE walFenced
+\* Source: ServerCrashProcedure.getRegionsOnCrashedServer(),
+\*         AssignmentManager.getRegionsOnServer().
+VARIABLE scpRegions
 
 \* walFenced[s] is TRUE after SCP revokes WAL leases for server s.
 \* Reset to FALSE on ServerRestart.  After fencing, the zombie RS
 \* cannot write to its WALs; any write attempt fails with an HDFS
 \* lease exception, triggering RS self-abort.
 \*
-\* Source: SCP.executeFromState() L221-241, splitLogs() L379-393.
+\* Source: ServerCrashProcedure.executeFromState() SERVER_CRASH_SPLIT_LOGS
+\*         case; MasterWalManager.splitLogs().
+VARIABLE walFenced
+
+\* locked[r] is TRUE while a region-state-mutating action holds the
+\* per-region write lock for region r.  Mirrors the RegionStateNode
+\* write lock acquired by TRSP.beforeExec() / TRSP.afterExec() and
+\* by SCP.assignRegions().  In TLA+ each action is atomic so locked
+\* is acquired and released within the same step (locked'[r]=FALSE
+\* after the step).  The guard locked[r]=FALSE enforces mutual
+\* exclusion between concurrent actions on the same region.
+\*
+\* Source: TRSP.beforeExec()/afterExec() TRSP.java L392-410;
+\*         SCP.assignRegions() regionNode.lock() SCP.java L518-559.
+VARIABLE locked
+
+\* carryingMeta[s] is TRUE when server s was hosting hbase:meta at
+\* the time it crashed.  Set non-deterministically by MasterDetectCrash
+\* (one case per invocation: either TRUE or FALSE).  When TRUE, the
+\* SCP must reassign meta before proceeding to GET_REGIONS; this is
+\* modeled by the ASSIGN_META scpState.  All other SCP actions for
+\* ANY server are gated on meta being available (no server in
+\* ASSIGN_META state), faithfully modeling waitMetaLoaded.
+\*
+\* Source: SCP.executeFromState() SERVER_CRASH_START case;
+\*         SCP.isCarryingMeta() SCP.java L161-195;
+\*         SCP.waitMetaLoaded() SCP.java L154-157.
+VARIABLE carryingMeta
+
 vars ==
   << regionState,
      metaTable,
@@ -307,7 +338,9 @@ vars ==
      serverState,
      scpState,
      scpRegions,
-     walFenced
+     walFenced,
+     locked,
+     carryingMeta
   >>
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -317,7 +350,7 @@ rpcVars == << dispatchedOps, pendingReports >>
 rsVars == << rsOnlineRegions >>
 
 \* Shorthand for the SCP-related variables (used in UNCHANGED clauses).
-scpVars == << scpState, scpRegions, walFenced >>
+scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
 
 ---------------------------------------------------------------------------
 
@@ -357,11 +390,17 @@ TypeOK ==
   /\ serverState \in [Servers -> { "ONLINE", "CRASHED" }]
   \* SCP progress per server.
   /\ scpState \in
-       [Servers -> { "NONE", "GET_REGIONS", "FENCE_WALS", "ASSIGN", "DONE" }]
+       [Servers
+       ->
+       { "NONE", "ASSIGN_META", "GET_REGIONS", "FENCE_WALS", "ASSIGN", "DONE" }]
   \* SCP region snapshot per server.
   /\ scpRegions \in [Servers -> SUBSET Regions]
   \* WAL fencing state per server.
   /\ walFenced \in [Servers -> BOOLEAN]
+  \* Whether crashed server was hosting hbase:meta.
+  /\ carryingMeta \in [Servers -> BOOLEAN]
+  \* Per-region write lock for mutual exclusion.
+  /\ locked \in [Regions -> BOOLEAN]
 
 ---------------------------------------------------------------------------
 
@@ -433,8 +472,8 @@ NoDoubleAssignment ==
 \* Any type may be found on an ABNORMALLY_CLOSED region if a server
 \*   crash occurs while the procedure is in flight.
 \*
-\* Source: RegionStateNode.java setProcedure() L213-218,
-\*         unsetProcedure() L220-224.
+\* Source: RegionStateNode.setProcedure(),
+\*         RegionStateNode.unsetProcedure().
 LockExclusivity ==
   \A r \in Regions:
     regionState[r].procType # "NONE" =>
@@ -449,6 +488,15 @@ LockExclusivity ==
       \/ /\ regionState[r].procType = "UNASSIGN"
          /\ regionState[r].state \in { "OPEN", "CLOSING", "ABNORMALLY_CLOSED" }
       \/ /\ regionState[r].procType = "MOVE"
+         /\ regionState[r].state \in
+              { "OPEN",
+                "CLOSING",
+                "CLOSED",
+                "ABNORMALLY_CLOSED",
+                "FAILED_OPEN",
+                "OPENING"
+              }
+      \/ /\ regionState[r].procType = "REOPEN"
          /\ regionState[r].state \in
               { "OPEN",
                 "CLOSING",
@@ -505,6 +553,21 @@ RSMasterAgreementConverse ==
 ZombieFencingOrder ==
   \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
 
+\* A meta-carrying SCP must reassign meta (complete ASSIGN_META)
+\* before proceeding to GET_REGIONS.  If carryingMeta[s] is TRUE,
+\* the SCP should not have progressed past ASSIGN_META.  The
+\* meta-online guard on SCPGetRegions/SCPFenceWALs/SCPAssignRegion
+\* prevents any SCP from executing while ASSIGN_META is pending,
+\* but MasterDetectCrash may set GET_REGIONS for non-meta crashes;
+\* the key safety property is that the meta-carrying server itself
+\* cannot skip ASSIGN_META.
+\*
+\* Source: SCP.waitMetaLoaded() SCP.java L154-157;
+\*         SCP.executeFromState() ASSIGN_META case SCP.java L161-195.
+MetaAvailableForRecovery ==
+  \A s \in Servers:
+    carryingMeta[s] = TRUE => scpState[s] \in { "NONE", "ASSIGN_META", "DONE" }
+
 \* After any SCP completes, no region is stuck in ABNORMALLY_CLOSED
 \* without a procedure.  Such a region is "lost" -- it will never be
 \* reassigned without manual intervention.  We scope to ABNORMALLY_CLOSED
@@ -512,9 +575,6 @@ ZombieFencingOrder ==
 \* quiescent states (never assigned, explicitly taken offline, or
 \* failed to open); the lost-region bug is specifically ABNORMALLY_CLOSED
 \* with no procedure.
-\*
-\* Source: HBASE-24293 (SCP skips meta when location is null),
-\*         HBASE-21623 (SCP ignores region moved by concurrent TRSP).
 NoLostRegions ==
   ( \E s \in Servers: scpState[s] = "DONE" ) =>
     \A r \in Regions:
@@ -566,6 +626,8 @@ Init ==
   /\ scpRegions = [s \in Servers |-> {}]
   \* No server has been WAL-fenced.
   /\ walFenced = [s \in Servers |-> FALSE]
+  /\ carryingMeta = [s \in Servers |-> FALSE]
+  /\ locked = [r \in Regions |-> FALSE]
 
 ---------------------------------------------------------------------------
 
@@ -577,13 +639,16 @@ Init ==
 \*       lifecycle state is NOT changed yet -- the TRSP will drive
 \*       transitions in subsequent steps.
 \*
-\* Source: TransitRegionStateProcedure.java queueAssign() L246-278.
+\* Source: TRSP.assign() creates the procedure;
+\*         TRSP.queueAssign() applies the GET_ASSIGN_CANDIDATE
+\*         initial state via TRSP.setInitialAndLastState().
 TRSPCreate(r) ==
   \* Guards: region is in an assignable state and has no active procedure.
   /\ regionState[r].state \in
        { "OFFLINE", "CLOSED", "ABNORMALLY_CLOSED", "FAILED_OPEN" }
   /\ regionState[r].procType = "NONE"
   \* Initialize embedded ASSIGN procedure at GET_ASSIGN_CANDIDATE step.
+  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -595,45 +660,45 @@ TRSPCreate(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars >>
+  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
 
-\* Choose a target server for the ASSIGN procedure.
-\* Pre: TRSP is in GET_ASSIGN_CANDIDATE state, target server is ONLINE.
+\* Choose a target server for the ASSIGN, MOVE, or REOPEN procedure.
+\* Pre: TRSP is in GET_ASSIGN_CANDIDATE state, chosen server is ONLINE,
+\*      and no CRASHED server still has r in its rsOnlineRegions (the
+\*      zombie window must be closed: RSAbort clears the zombie RS's
+\*      in-memory region set, after which a new assignment is safe).
 \* Post: targetServer set, TRSP advances to OPEN state.
 \*
-\* Source: TransitRegionStateProcedure.java executeFromState() L483-496,
-\*         queueAssign() L246-278 (getDestinationServer).
+\* The zombie-window guard (\A zombie: CRASHED => r \notin rsOnlineRegions)
+\* is implementation-faithful: the implementation relies on
+\* createDestinationServersList() to exclude CRASHED servers from
+\* candidates and on RSAbort to close the zombie window.  Once RSAbort
+\* fires, rsOnlineRegions[zombie] no longer contains r and
+\* TRSPGetCandidate may safely pick a new server.
+\*
+\* Note: ZombieFencingOrder (scpState[s] = "ASSIGN" => walFenced[s])
+\* and the walFenced guard on SCPAssignRegion remain unchanged --
+\* those faithfully model SCP's own ordering constraint.
+\*
+\* Source: TRSP.queueAssign() -> AM.queueAssign() -> LoadBalancer;
+\*         createDestinationServersList() excludes CRASHED servers;
+\*         HRegionServer.abort() (RSAbort) clears rsOnlineRegions.
 TRSPGetCandidate(r, s) ==
-  \* Guards: procedure is ASSIGN or MOVE at GET_ASSIGN_CANDIDATE, server is ONLINE.
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE" }
+  \* Guards: procedure is ASSIGN, MOVE, or REOPEN at GET_ASSIGN_CANDIDATE;
+  \* chosen server is ONLINE; no CRASHED server still holds r in
+  \* rsOnlineRegions (zombie window must be closed by RSAbort first).
+  \* For REOPEN, s may equal regionState[r].location (same server OK).
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "GET_ASSIGN_CANDIDATE"
   /\ serverState[s] = "ONLINE"
-  \* When the region's location is a CRASHED server, or when ABNORMALLY_CLOSED
-  \* (location already cleared), or when any CRASHED server has r in
-  \* rsOnlineRegions (zombie), do not pick a new server until those
-  \* servers' WALs are fenced.  Otherwise RSOpen on the new server can add
-  \* r before RSAbort clears the zombie, violating NoDoubleAssignment.
   /\ \A sZombie \in Servers:
-       ( serverState[sZombie] = "CRASHED" /\ r \in rsOnlineRegions[sZombie] ) =>
-         walFenced[sZombie] = TRUE
-  /\ LET loc == regionState[r].location
-     IN ( loc \in Servers /\
-               ( serverState[loc] # "CRASHED" \/ walFenced[loc] = TRUE )
-           ) \/
-           ( loc = None /\
-               ( regionState[r].state # "ABNORMALLY_CLOSED" \/
-                   \A sCrash \in Servers:
-                     ( serverState[sCrash] = "CRASHED" /\
-                           r \in scpRegions[sCrash]
-                       ) =>
-                       walFenced[sCrash] = TRUE
-               )
-           )
+       serverState[sZombie] = "CRASHED" => r \notin rsOnlineRegions[sZombie]
   \* Record the chosen server and advance the procedure to the OPEN step.
+  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT ![r].targetServer = s, ![r].procStep = "OPEN"]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars >>
+  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
 
 \* Dispatch the open command to the target server via RPC.
 \* Pre: TRSP is in OPEN state with a target server.
@@ -641,14 +706,18 @@ TRSPGetCandidate(r, s) ==
 \*       location, meta updated, open command added to
 \*       dispatchedOps[targetServer], TRSP advances to CONFIRM_OPENED.
 \*
-\* Source: TransitRegionStateProcedure.java openRegion() L293-311,
-\*         RSProcedureDispatcher.java L200-367.
+\* Source: TRSP.openRegion() calls AM.regionOpening()
+\*         to set OPENING state and meta, then creates an
+\*         OpenRegionProcedure child; RSProcedureDispatcher
+\*         dispatches the RPC via
+\*         RSProcedureDispatcher.ExecuteProceduresRemoteCall.run().
 TRSPDispatchOpen(r) ==
   \* Guards: procedure is ASSIGN or MOVE, in OPEN step, with a target server.
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # None
   \* Bind the target server for readability.
+  /\ locked[r] = FALSE
   /\ LET s == regionState[r].targetServer
      IN \* Transition region to OPENING, record server, advance to CONFIRM_OPENED.
         /\ regionState' =
@@ -668,7 +737,7 @@ TRSPDispatchOpen(r) ==
              ![s] =
              @ \cup { [ type |-> "OPEN", region |-> r ] }]
         \* Pending reports, RS-side state, and server liveness unchanged.
-        /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars >>
+        /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars, locked >>
 
 \* Confirm that the region opened successfully by consuming an OPENED
 \* report from pendingReports.
@@ -682,13 +751,18 @@ TRSPDispatchOpen(r) ==
 \* until the report is processed, so OPENED/FAILED_OPEN ordering is
 \* serialized per region in the implementation.
 \*
-\* Source: TransitRegionStateProcedure.java confirmOpened() L320-374.
+\* Source: TRSP.confirmOpened() on the OPEN branch;
+\*         TRSP.reportTransition() wakes the procedure;
+\*         AM.regionOpenedWithoutProcedure() / AM.regionOpened()
+\*         performs the OPENING -> OPEN state transition and meta
+\*         update.
 TRSPConfirmOpened(r) ==
   \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, region is
   \* OPENING, and a matching OPENED report exists from an ONLINE server.
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].state = "OPENING"
+  /\ locked[r] = FALSE
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
        /\ rpt.code = "OPENED"
@@ -712,7 +786,7 @@ TRSPConfirmOpened(r) ==
        \* Consume the matched report from the pending set.
        /\ pendingReports' = pendingReports \ { rpt }
        \* Dispatched ops, RS-side state, and server liveness unchanged.
-       /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars >>
+       /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars, locked >>
 
 ---------------------------------------------------------------------------
 
@@ -729,12 +803,16 @@ TRSPConfirmOpened(r) ==
 \*      by an RS).
 \* Post: command removed, TRSP reset to GET_ASSIGN_CANDIDATE.
 \*
-\* Source: RSProcedureDispatcher.java remoteCallFailed() L325-340.
+\* Source: RegionRemoteProcedureBase.remoteCallFailed() sets
+\*         DISPATCH_FAIL state and wakes the parent TRSP;
+\*         RSProcedureDispatcher.scheduleForRetry() decides
+\*         whether to retry or fail the remote call.
 DispatchFail(r) ==
   \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, has a
   \* target server, and the OPEN command is still in dispatchedOps.
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
+  /\ locked[r] = FALSE
   /\ LET s == regionState[r].targetServer
      IN /\ s # None
         \* Reconstruct the dispatched command and verify it is still queued.
@@ -754,7 +832,8 @@ DispatchFail(r) ==
               pendingReports,
               rsVars,
               serverState,
-              scpVars
+              scpVars,
+              locked
            >>
 
 \* Close command dispatch failed (non-deterministic RPC failure).
@@ -767,12 +846,16 @@ DispatchFail(r) ==
 \*      matching close command still exists in dispatchedOps.
 \* Post: command removed, TRSP reset to CLOSE.
 \*
-\* Source: RSProcedureDispatcher.java remoteCallFailed() L325-340.
+\* Source: RegionRemoteProcedureBase.remoteCallFailed() sets
+\*         DISPATCH_FAIL state and wakes the parent TRSP;
+\*         RSProcedureDispatcher.scheduleForRetry() decides
+\*         whether to retry or fail the remote call.
 DispatchFailClose(r) ==
   \* Guards: procedure is UNASSIGN or MOVE, in CONFIRM_CLOSED step, has a
   \* target server, and the CLOSE command is still in dispatchedOps.
-  /\ regionState[r].procType \in { "UNASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
+  /\ locked[r] = FALSE
   /\ LET s == regionState[r].targetServer
      IN /\ s # None
         \* Reconstruct the dispatched command and verify it is still queued.
@@ -787,7 +870,8 @@ DispatchFailClose(r) ==
               pendingReports,
               rsVars,
               serverState,
-              scpVars
+              scpVars,
+              locked
            >>
 
 \* Handle a FAILED_OPEN report from the RS by retrying the assignment.
@@ -803,16 +887,19 @@ DispatchFailClose(r) ==
 \* Post: report consumed, retry counter incremented, TRSP reset to
 \*       GET_ASSIGN_CANDIDATE.
 \*
-\* Source: TransitRegionStateProcedure.java confirmOpened() L345-374.
+\* Source: TRSP.confirmOpened() retry branch (retries <
+\*         maxAttempts); AM.regionFailedOpen() updates
+\*         bookkeeping; forceNewPlan is set to choose a new server.
 TRSPHandleFailedOpen(r) ==
   \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, retries
   \* not exhausted, region is OPENING, and a matching FAILED_OPEN report
   \* exists from an ONLINE server.
   \* Do not handle FAILED_OPEN when OPENED exists for r: the RS may have
   \* succeeded on a retry (RSOpen ran after a prior RSFailOpen); prefer OPENED.
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].retries < MaxRetries
+  /\ locked[r] = FALSE
   /\ regionState[r].state = "OPENING"
   /\ ~\E rpt2 \in pendingReports: rpt2.region = r /\ rpt2.code = "OPENED"
   /\ \E rpt \in pendingReports:
@@ -841,7 +928,7 @@ TRSPHandleFailedOpen(r) ==
               {cmd \in dispatchedOps[t]: cmd.region # r \/ cmd.type # "OPEN"}
             ]
        \* META, RS-side state, and server liveness unchanged.
-       /\ UNCHANGED << metaTable, rsVars, serverState, scpVars >>
+       /\ UNCHANGED << metaTable, rsVars, serverState, scpVars, locked >>
 
 \* Give up on opening a region after exhausting the retry budget.
 \* Consumes the FAILED_OPEN report, transitions the region to
@@ -853,16 +940,18 @@ TRSPHandleFailedOpen(r) ==
 \* Post: region becomes FAILED_OPEN with no location or procedure,
 \*       meta updated, report consumed.
 \*
-\* Source: TransitRegionStateProcedure.java confirmOpened() L345-374
-\*         (retryCounter >= maxAttempts branch).
+\* Source: TRSP.confirmOpened() give-up branch (retries >=
+\*         maxAttempts); AM.regionFailedOpen(regionNode, true)
+\*         persists FAILED_OPEN to meta and clears location.
 TRSPGiveUpOpen(r) ==
   \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, retries
   \* exhausted, region is OPENING, and a matching FAILED_OPEN report
   \* exists from an ONLINE server.
   \* Do not give up when OPENED exists for r: prefer OPENED (RS succeeded).
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].retries >= MaxRetries
+  /\ locked[r] = FALSE
   /\ regionState[r].state = "OPENING"
   /\ ~\E rpt2 \in pendingReports: rpt2.region = r /\ rpt2.code = "OPENED"
   /\ \E rpt \in pendingReports:
@@ -888,7 +977,7 @@ TRSPGiveUpOpen(r) ==
        \* Consume the matched report from the pending set.
        /\ pendingReports' = pendingReports \ { rpt }
        \* Dispatched ops, RS-side state, and server liveness unchanged.
-       /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars >>
+       /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars, locked >>
 
 ---------------------------------------------------------------------------
 
@@ -900,14 +989,18 @@ TRSPGiveUpOpen(r) ==
 \*       state is NOT changed yet -- the TRSP will drive the
 \*       OPEN -> CLOSING transition in the next step.
 \*
-\* Source: TransitRegionStateProcedure.java queueAssign() L246-278
-\*         (UNASSIGN path), setProcedure() before closeRegion().
+\* Source: TRSP.unassign() creates the procedure with
+\*         TransitionType.UNASSIGN; TRSP.setInitialAndLastState()
+\*         sets initial state to CLOSE and last state to
+\*         CONFIRM_CLOSED; RegionStateNode.setProcedure()
+\*         attaches it to the region.
 TRSPCreateUnassign(r) ==
   \* Guards: region is OPEN, has a location, and has no active procedure.
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # None
   /\ regionState[r].procType = "NONE"
   \* Initialize embedded UNASSIGN procedure at CLOSE step, targeting current server.
+  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -919,7 +1012,7 @@ TRSPCreateUnassign(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars >>
+  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
 
 \* Create a TRSP MOVE procedure for an OPEN region.
 \* A MOVE is an UNASSIGN (close on the current server) followed by an
@@ -933,8 +1026,11 @@ TRSPCreateUnassign(r) ==
 \*      destination.
 \* Post: MOVE procedure created in CLOSE state, attached to region.
 \*
-\* Source: TransitRegionStateProcedure.java TransitionType.MOVE L160-162,
-\*         queueAssign() L246-278 (MOVE path).
+\* Source: TRSP.move() / TRSP.reopen() creates the procedure with
+\*         TransitionType.MOVE; TRSP.setInitialAndLastState()
+\*         sets initial state to CLOSE and last state to
+\*         CONFIRM_OPENED; RegionStateNode.setProcedure()
+\*         attaches it to the region.
 TRSPCreateMove(r) ==
   \* Guards: region is OPEN, has a location, has no active procedure,
   \* and at least one other ONLINE server exists as a destination.
@@ -943,6 +1039,7 @@ TRSPCreateMove(r) ==
   /\ regionState[r].procType = "NONE"
   /\ \E s \in Servers: s # regionState[r].location /\ serverState[s] = "ONLINE"
   \* Initialize embedded MOVE procedure at CLOSE step, targeting current server.
+  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -954,7 +1051,43 @@ TRSPCreateMove(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars >>
+  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+
+\* Create a TRSP REOPEN procedure for an OPEN region.
+\* REOPEN follows the same flow as MOVE (CLOSE -> CONFIRM_CLOSED ->
+\* GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED) but differs in that
+\* assignCandidate is pre-set to the region's current server, so
+\* TRSPGetCandidate may choose the same server.  There is no requirement
+\* that another ONLINE server exists (contrast with TRSPCreateMove).
+\*
+\* Pre: region is OPEN, has a location, and has no active procedure.
+\* Post: REOPEN procedure created in CLOSE state, targetServer set
+\*       to the region's current location (assignCandidate pinning).
+\*
+\* Source: TRSP.reopen() TRSP.java L673-676;
+\*         TRSP.setInitialAndLastState() TRSP.java L154-158;
+\*         TRSP.queueAssign() L238-270 (retain=true when assignCandidate set).
+TRSPCreateReopen(r) ==
+  \* Guards: region is OPEN, has a server location, no active procedure.
+  \* No requirement that another ONLINE server exists.
+  /\ regionState[r].state = "OPEN"
+  /\ regionState[r].location # None
+  /\ regionState[r].procType = "NONE"
+  \* Initialize embedded REOPEN procedure at CLOSE step, targeting the
+  \* region's current server (assignCandidate pinning).
+  /\ locked[r] = FALSE
+  /\ regionState' =
+       [regionState EXCEPT
+       ![r].procType =
+       "REOPEN",
+       ![r].procStep =
+       "CLOSE",
+       ![r].targetServer =
+       regionState[r].location,
+       ![r].retries =
+       0]
+  \* META, RPC channels, RS-side state, and server liveness unchanged.
+  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
 
 \* Dispatch the close command to the target server via RPC.
 \* Pre: UNASSIGN or MOVE procedure in CLOSE state, region is OPEN or
@@ -963,15 +1096,19 @@ TRSPCreateMove(r) ==
 \*       meta updated, close command added to dispatchedOps[targetServer],
 \*       TRSP advances to CONFIRM_CLOSED.
 \*
-\* Source: TransitRegionStateProcedure.java closeRegion() L389-407,
-\*         RSProcedureDispatcher.java L200-367.
+\* Source: TRSP.closeRegion() calls AM.regionClosing()
+\*         to set CLOSING state and meta, then creates a
+\*         CloseRegionProcedure child; RSProcedureDispatcher
+\*         dispatches the RPC via
+\*         RSProcedureDispatcher.ExecuteProceduresRemoteCall.run().
 TRSPDispatchClose(r) ==
   \* Guards: procedure is UNASSIGN or MOVE, in CLOSE step, has a target
   \* server, and region is OPEN or CLOSING (CLOSING on retry).
-  /\ regionState[r].procType \in { "UNASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CLOSE"
   /\ regionState[r].targetServer # None
   \* Bind the target server for readability.
+  /\ locked[r] = FALSE
   /\ LET s == regionState[r].targetServer
      IN /\ regionState[r].state \in { "OPEN", "CLOSING" }
         \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
@@ -992,10 +1129,23 @@ TRSPDispatchClose(r) ==
              ![s] =
              @ \cup { [ type |-> "CLOSE", region |-> r ] }]
         \* Pending reports, RS-side state, and server liveness unchanged.
-        /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars >>
+        /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars, locked >>
 
 \* Confirm that the region closed successfully, OR handle the case
 \* where the region's server crashed (ABNORMALLY_CLOSED) during close.
+\*
+\* Pre: UNASSIGN or MOVE procedure in CONFIRM_CLOSED state.  Either
+\*      the region is CLOSING with a matching CLOSED report from the
+\*      target server (Path 1), or the region is ABNORMALLY_CLOSED
+\*      (Path 2, server crash during close).
+\* Post (Path 1 - normal close): region transitions to CLOSED with no
+\*      location.  UNASSIGN: procedure cleared to idle.  MOVE: procedure
+\*      advances to GET_ASSIGN_CANDIDATE for re-open.  Report consumed,
+\*      meta updated.
+\* Post (Path 2 - crash during close): procedure converts to
+\*      ASSIGN/GET_ASSIGN_CANDIDATE to reopen the region (needed to
+\*      process recovered edits).  Stale dispatched commands for the
+\*      region are cleared.
 \*
 \* Two paths (disjunction):
 \* Path 1 (normal close): Region is CLOSING, a CLOSED report exists.
@@ -1009,10 +1159,16 @@ TRSPDispatchClose(r) ==
 \*   TRSPServerCrashed.  The region needs to be reopened to process
 \*   recovered edits before any further operations.
 \*
-\* Source: TransitRegionStateProcedure.java confirmClosed() L353-390.
+\* Source: TRSP.confirmClosed(); Path 1 checks
+\*         regionNode.isInState(CLOSED) and completes or advances
+\*         to GET_ASSIGN_CANDIDATE; Path 2 detects
+\*         ABNORMALLY_CLOSED and sets forceNewPlan to reopen.
+\*         AM.regionClosedAbnormally() persists the
+\*         ABNORMALLY_CLOSED state to meta.
 TRSPConfirmClosed(r) ==
-  /\ regionState[r].procType \in { "UNASSIGN", "MOVE" }
+  /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
+  /\ locked[r] = FALSE
   /\ \/ \* --- Path 1: Normal close (CLOSING -> CLOSED) ---
         /\ regionState[r].state = "CLOSING"
         /\ \E rpt \in pendingReports:
@@ -1052,7 +1208,12 @@ TRSPConfirmClosed(r) ==
              \* Consume the matched report from the pending set.
              /\ pendingReports' = pendingReports \ { rpt }
              \* Dispatched ops, RS-side state, and server liveness unchanged.
-             /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars >>
+             /\ UNCHANGED << dispatchedOps,
+                   rsVars,
+                   serverState,
+                   scpVars,
+                   locked
+                >>
      \/ \* --- Path 2: Crash during close (ABNORMALLY_CLOSED) ---
         \* The target server crashed while the close was in flight.
         \* The procedure self-recovers: convert to ASSIGN at
@@ -1067,8 +1228,8 @@ TRSPConfirmClosed(r) ==
         \* effectively abandons it.  The model must do the equivalent
         \* to prevent stale commands from racing with the new ASSIGN.
         \*
-        \* Source: TRSP.java confirmClosed() L376-390,
-        \*         RegionRemoteProcedureBase.serverCrashed() L240-261.
+        \* Source: TRSP.confirmClosed(),
+        \*         RegionRemoteProcedureBase.serverCrashed().
         /\ regionState[r].state = "ABNORMALLY_CLOSED"
         /\ regionState' =
              [regionState EXCEPT
@@ -1088,7 +1249,8 @@ TRSPConfirmClosed(r) ==
               pendingReports,
               rsVars,
               serverState,
-              scpVars
+              scpVars,
+              locked
            >>
 
 ---------------------------------------------------------------------------
@@ -1098,6 +1260,12 @@ TRSPConfirmClosed(r) ==
 \* Used by RegionStateNode.offline() when a region is being taken fully
 \* offline (e.g., table disable).
 \* Pre: region is CLOSED with no procedure attached.
+\* Post: regionState set to OFFLINE with cleared location (in-memory
+\*       only -- metaTable is NOT updated).  META retains CLOSED;
+\*       divergence is resolved on master restart.
+\*
+\* Source: RegionStateNode.offline() sets state to OFFLINE
+\*         and clears the region location without writing to meta.
 GoOffline(r) ==
   \* Guards: region is CLOSED and has no active procedure.
   /\ regionState[r].state = "CLOSED"
@@ -1108,7 +1276,7 @@ GoOffline(r) ==
   \* Meta is NOT updated: RegionStateNode.offline() (RSN.java L132-134)
   \* does not write to meta.  metaTable retains CLOSED; divergence is
   \* resolved on master restart.  See Appendix D.5.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars >>
+  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
 
 \* The master detects that a RegionServer has crashed (ZK ephemeral
 \* node expired).  Marks the server as CRASHED and initiates a
@@ -1123,19 +1291,30 @@ GoOffline(r) ==
 \* Pre: server is ONLINE and has at least one region assigned.
 \* Post: serverState set to CRASHED, scpState set to GET_REGIONS.
 \*
-\* Source: ServerManager.expireServer() L662-720.
+\* Source: ServerManager.expireServer() calls
+\*         ServerManager.moveFromOnlineToDeadServers() and then
+\*         AM.submitServerCrash(), which transitions the
+\*         ServerStateNode to CRASHED and submits a
+\*         ServerCrashProcedure.
 MasterDetectCrash(s) ==
   /\ serverState[s] = "ONLINE"
   /\ \E r \in Regions: regionState[r].location = s
   /\ serverState' = [serverState EXCEPT ![s] = "CRASHED"]
-  /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
+  \* Non-deterministic: crashed server may or may not have been
+  \* hosting hbase:meta.  If carryingMeta, SCP must reassign meta
+  \* first (ASSIGN_META state); otherwise proceed to GET_REGIONS.
+  /\ \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
+        /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
+     \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
+        /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ UNCHANGED << regionState,
         metaTable,
         dispatchedOps,
         pendingReports,
         rsOnlineRegions,
         scpRegions,
-        walFenced
+        walFenced,
+        locked
      >>
 
 \* A process supervisor (Kubernetes, systemd, etc.) restarts a crashed
@@ -1158,8 +1337,9 @@ MasterDetectCrash(s) ==
 \* Post: serverState set to ONLINE, pending reports from s discarded,
 \*       SCP state reset, walFenced cleared.
 \*
-\* Source: Environmental assumption -- process supervisor guarantees
-\*         crashed processes are eventually restarted.
+\* Source: Environmental assumption -- a process supervisor
+\*         (Kubernetes, systemd, etc.) guarantees that crashed
+\*         RegionServer processes are eventually restarted.
 ServerRestart(s) ==
   \* Guard: server is CRASHED and SCP is complete (or never started).
   /\ serverState[s] = "CRASHED"
@@ -1183,8 +1363,9 @@ ServerRestart(s) ==
   /\ scpState' = [scpState EXCEPT ![s] = "NONE"]
   /\ scpRegions' = [scpRegions EXCEPT ![s] = {}]
   /\ walFenced' = [walFenced EXCEPT ![s] = FALSE]
+  /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
   \* Region state and META unchanged.
-  /\ UNCHANGED << regionState, metaTable >>
+  /\ UNCHANGED << regionState, metaTable, locked >>
 
 ---------------------------------------------------------------------------
 
@@ -1201,12 +1382,26 @@ ServerRestart(s) ==
 \* SCP machinery (ServerCrashProcedure) orchestrates WHEN this callback
 \* fires; this action models WHAT happens to the TRSP.
 \*
-\* Source: TransitRegionStateProcedure.java serverCrashed() L566-586,
-\*         closeRegion() L389-407 (else branch).
+\* Pre: region has an active procedure (any type) AND region state is
+\*      ABNORMALLY_CLOSED.
+\* Post: procedure converted to ASSIGN/GET_ASSIGN_CANDIDATE with
+\*       cleared targetServer and reset retries.  Stale CLOSE commands
+\*       for this region cleared from all servers' dispatchedOps.
+\*       Stale CLOSED reports for this region dropped from
+\*       pendingReports.
+\*
+\* Source: TRSP.serverCrashed() delegates to
+\*         RegionRemoteProcedureBase.serverCrashed()
+\*         if a sub-procedure is in flight, or directly calls
+\*         AM.regionClosedAbnormally();
+\*         TRSP.closeRegion() else-branch sets forceNewPlan
+\*         and advances to GET_ASSIGN_CANDIDATE when the region
+\*         is not in a closeable state.
 TRSPServerCrashed(r) ==
   \* Guards: region has an active procedure and is ABNORMALLY_CLOSED.
   /\ regionState[r].procType # "NONE"
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
+  /\ locked[r] = FALSE
   \* Convert the procedure to ASSIGN at GET_ASSIGN_CANDIDATE, clear target.
   /\ regionState' =
        [regionState EXCEPT
@@ -1232,7 +1427,7 @@ TRSPServerCrashed(r) ==
   /\ pendingReports' =
        {pr \in pendingReports: pr.region # r \/ pr.code # "CLOSED"}
   \* META, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rsVars, serverState, scpVars >>
+  /\ UNCHANGED << metaTable, rsVars, serverState, scpVars, locked >>
 
 ---------------------------------------------------------------------------
 
@@ -1247,7 +1442,15 @@ TRSPServerCrashed(r) ==
 \* condition (the RS might self-detect death before WAL fencing).
 \* WF on RSAbort ensures the zombie eventually shuts down.
 \*
-\* Source: HRegionServer.abort().
+\* Pre: server is CRASHED AND still has residual RS-side state
+\*      (rsOnlineRegions[s] non-empty OR dispatchedOps[s] non-empty).
+\* Post: rsOnlineRegions[s] cleared to {}, dispatchedOps[s] cleared
+\*       to {}.  Master-side state (regionState, metaTable,
+\*       pendingReports, serverState, scpVars) unchanged.
+\*
+\* Source: HRegionServer.abort() triggers the RS shutdown
+\*         sequence, clearing online regions and stopping RPC
+\*         handlers.
 RSAbort(s) ==
   \* Guards: server is CRASHED and still has residual RS-side state.
   /\ serverState[s] = "CRASHED"
@@ -1261,7 +1464,8 @@ RSAbort(s) ==
         metaTable,
         pendingReports,
         serverState,
-        scpVars
+        scpVars,
+        locked
      >>
 
 ---------------------------------------------------------------------------
@@ -1285,12 +1489,46 @@ RSAbort(s) ==
 \* Post: scpRegions[s] = snapshot of regions with location = s,
 \*       scpState advances to "FENCE_WALS".
 \*
-\* Source: getRegionsOnCrashedServer() (SCP.java L272-275),
-\*         getRegionsOnServer() (AM.java),
-\*         markRegionsAsCrashed() (AM.java L2308-2322).
+\* Source: ServerCrashProcedure.executeFromState()
+\*         SERVER_CRASH_GET_REGIONS case calls
+\*         ServerCrashProcedure.getRegionsOnCrashedServer()
+\*         which delegates to AM.getRegionsOnServer();
+\*         then AM.markRegionsAsCrashed() updates
+\*         RIT tracking for each region.
+\* SCP meta-reassignment step: when the crashed server was hosting
+\* hbase:meta, the SCP must reassign meta before proceeding to the
+\* normal crash-recovery path.  This models the ASSIGN_META sub-step
+\* of the ServerCrashProcedure.  Meta reassignment is abstracted as
+\* a single atomic step (the actual implementation creates a TRSP
+\* for the meta region and waits for it to complete).
+\*
+\* Pre: scpState[s] = "ASSIGN_META", carryingMeta[s] = TRUE.
+\* Post: scpState[s] = "GET_REGIONS" (meta is now online, SCP
+\*       proceeds to the normal path).
+\*
+\* Source: SCP.executeFromState() SERVER_CRASH_SPLIT_META_LOGS
+\*         and ASSIGN_META cases; SCP.java L161-195.
+SCPAssignMeta(s) ==
+  /\ scpState[s] = "ASSIGN_META"
+  /\ carryingMeta[s] = TRUE
+  /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
+  \* Meta is now online; clear the carryingMeta flag.
+  /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
+  /\ UNCHANGED << regionState,
+        metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpRegions,
+        walFenced,
+        locked
+     >>
+
 SCPGetRegions(s) ==
   \* Guard: SCP is in GET_REGIONS state for this crashed server.
   /\ scpState[s] = "GET_REGIONS"
+  \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
+  /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   \* Snapshot all regions currently assigned to the crashed server.
   /\ scpRegions' =
        [scpRegions EXCEPT ![s] = {r \in Regions: regionState[r].location = s}]
@@ -1302,7 +1540,9 @@ SCPGetRegions(s) ==
         rpcVars,
         rsVars,
         serverState,
-        walFenced
+        walFenced,
+        locked,
+        carryingMeta
      >>
 
 \* SCP step 2: Revoke WAL leases for the crashed server.  After this
@@ -1313,10 +1553,15 @@ SCPGetRegions(s) ==
 \* Pre: scpState[s] = "FENCE_WALS".
 \* Post: walFenced[s] = TRUE, scpState advances to "ASSIGN".
 \*
-\* Source: SCP.executeFromState() L221-241, splitLogs() L379-393.
+\* Source: ServerCrashProcedure.executeFromState()
+\*         SERVER_CRASH_SPLIT_LOGS case creates WAL splitting
+\*         sub-procedures; the model abstracts this as a single
+\*         fencing step.
 SCPFenceWALs(s) ==
   \* Guard: SCP is in FENCE_WALS state for this crashed server.
   /\ scpState[s] = "FENCE_WALS"
+  \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
+  /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   \* Revoke WAL leases — zombie RS can no longer write.
   /\ walFenced' = [walFenced EXCEPT ![s] = TRUE]
   \* Advance SCP to the region assignment step.
@@ -1327,7 +1572,9 @@ SCPFenceWALs(s) ==
         rpcVars,
         rsVars,
         serverState,
-        scpRegions
+        scpRegions,
+        locked,
+        carryingMeta
      >>
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
@@ -1335,9 +1582,10 @@ SCPFenceWALs(s) ==
 \* scpRegions[s].  Between invocations, arbitrary other actions can
 \* interleave -- this is what exposes the assignment races.
 \*
-\* Simplified for Iteration 14: no isMatchingRegionLocation check
-\* (that is added in Iteration 15 to expose HBASE-24293/HBASE-21623).
-\* Here, SCP always processes every region in its snapshot.
+\* The model processes every region unconditionally -- no
+\* isMatchingRegionLocation check.  The implementation's check
+\* (SCP.java L540-542) is a known source of bugs (HBASE-24293,
+\* HBASE-21623); the model captures correct protocol behavior.
 \*
 \* Two sub-paths:
 \*   Path A (procedure attached): transition region to ABNORMALLY_CLOSED,
@@ -1348,11 +1596,22 @@ SCPFenceWALs(s) ==
 \* Pre: scpState[s] = "ASSIGN", r in scpRegions[s], walFenced[s] = TRUE.
 \* Post: r removed from scpRegions[s], region transitioned.
 \*
-\* Source: assignRegions() (SCP.java L562-645).
+\* Source: ServerCrashProcedure.executeFromState()
+\*         SERVER_CRASH_ASSIGN case calls
+\*         ServerCrashProcedure.assignRegions(); assignRegions()
+\*         iterates each region, checking
+\*         ServerCrashProcedure.isMatchingRegionLocation() and
+\*         either calling TRSP.serverCrashed() on an existing
+\*         TRSP (Path A) or creating a new TRSP via
+\*         TRSP.assign() (Path B).
 SCPAssignRegion(s, r) ==
   /\ scpState[s] = "ASSIGN"
+  \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
+  /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   /\ r \in scpRegions[s]
   /\ walFenced[s] = TRUE
+  /\ locked[r] = FALSE
+  \* r is the region being reassigned
   \* Clear r from rsOnlineRegions on all servers.  The region may have
   \* moved (e.g. TRSPDispatchOpen + RSOpen on s2) between SCPGetRegions
   \* and this step; clearing everywhere prevents ghost regions.
@@ -1378,7 +1637,13 @@ SCPAssignRegion(s, r) ==
                ![r] =
                [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
           /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
-          /\ UNCHANGED << dispatchedOps, serverState, walFenced, scpState >>
+          /\ UNCHANGED << dispatchedOps,
+                serverState,
+                walFenced,
+                scpState,
+                locked,
+                carryingMeta
+             >>
      ELSE \* Path B: No TRSP attached (SCP.java L624-638).
           \* Transition to ABNORMALLY_CLOSED and attach a fresh
           \* ASSIGN procedure at GET_ASSIGN_CANDIDATE.
@@ -1401,14 +1666,22 @@ SCPAssignRegion(s, r) ==
                ![r] =
                [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
           /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
-          /\ UNCHANGED << dispatchedOps, serverState, walFenced, scpState >>
+          /\ UNCHANGED << dispatchedOps,
+                serverState,
+                walFenced,
+                scpState,
+                locked,
+                carryingMeta
+             >>
 
 \* SCP step 4: All regions processed.  Mark SCP as complete.
 \*
 \* Pre: scpState[s] = "ASSIGN", scpRegions[s] = {} (all processed).
 \* Post: scpState[s] = "DONE".
 \*
-\* Source: SERVER_CRASH_FINISH (SCP.java L292-296).
+\* Source: ServerCrashProcedure.executeFromState()
+\*         SERVER_CRASH_FINISH case -- the procedure
+\*         completes and is cleaned up by the ProcedureExecutor.
 SCPDone(s) ==
   \* Guards: SCP is in ASSIGN state and all regions have been processed.
   /\ scpState[s] = "ASSIGN"
@@ -1422,7 +1695,9 @@ SCPDone(s) ==
         rsVars,
         serverState,
         scpRegions,
-        walFenced
+        walFenced,
+        locked,
+        carryingMeta
      >>
 
 ---------------------------------------------------------------------------
@@ -1433,6 +1708,14 @@ SCPDone(s) ==
 \* Reports from crashed servers cannot be consumed by TRSPConfirmOpened,
 \* TRSPConfirmClosed, or TRSPHandleFailedOpen (server ONLINE guard),
 \* so this action cleans them up.
+\*
+\* Pre: a pending report exists from a CRASHED server.
+\* Post: the stale report is removed from pendingReports.  All other
+\*       state variables unchanged.
+\*
+\* Source: AM.reportRegionStateTransition() rejects
+\*         reports when serverNode is not in ONLINE state
+\*         ("You are dead" error path).
 DropStaleReport ==
   \* Guard: a pending report exists from a CRASHED server.
     \E rpt \in pendingReports:
@@ -1445,7 +1728,8 @@ DropStaleReport ==
           dispatchedOps,
           rsVars,
           serverState,
-          scpVars
+          scpVars,
+          locked
        >>
 
 ---------------------------------------------------------------------------
@@ -1463,7 +1747,10 @@ DropStaleReport ==
 \* Post: Command consumed, r added to rsOnlineRegions[s], OPENED
 \*       report produced in pendingReports.
 \*
-\* Source: AssignRegionHandler.java process() L98-164 (success path).
+\* Source: AssignRegionHandler.process() success path:
+\*         opens the region via HRegion.openHRegion(), adds it
+\*         to the RS's online regions, and reports OPENED via
+\*         reportRegionStateTransition() RPC.
 RSOpen(s, r) ==
   \* Guards: server is ONLINE, region is NOT already online on this
   \* server, and an OPEN command for region r exists.
@@ -1490,7 +1777,7 @@ RSOpen(s, r) ==
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "OPENED" ] }
        \* Master-side state and server liveness unchanged.
-       /\ UNCHANGED << regionState, metaTable, serverState, scpVars >>
+       /\ UNCHANGED << regionState, metaTable, serverState, scpVars, locked >>
 
 \* RS atomically receives an OPEN command but fails to open the
 \* region.  The command is consumed and a FAILED_OPEN report is
@@ -1500,7 +1787,10 @@ RSOpen(s, r) ==
 \*      dispatchedOps[s].
 \* Post: Command consumed, FAILED_OPEN report produced.
 \*
-\* Source: AssignRegionHandler.java process() L98-164 (failure path).
+\* Source: AssignRegionHandler.process() failure path:
+\*         AssignRegionHandler.cleanUpAndReportFailure()
+\*         reports FAILED_OPEN via reportRegionStateTransition()
+\*         RPC; the region is NOT added to online regions.
 RSFailOpen(s, r) ==
   \* Guards: server is ONLINE and an OPEN command for region r exists.
   /\ serverState[s] = "ONLINE"
@@ -1518,7 +1808,8 @@ RSFailOpen(s, r) ==
              metaTable,
              rsOnlineRegions,
              serverState,
-             scpVars
+             scpVars,
+             locked
           >>
 
 ---------------------------------------------------------------------------
@@ -1534,7 +1825,10 @@ RSFailOpen(s, r) ==
 \* Post: Command consumed, r removed from rsOnlineRegions[s], CLOSED
 \*       report produced in pendingReports.
 \*
-\* Source: UnassignRegionHandler.java process() L92-158 (success path).
+\* Source: UnassignRegionHandler.process() success path:
+\*         closes the region via HRegion.close(), removes it from
+\*         the RS's online regions, and reports CLOSED via
+\*         reportRegionStateTransition() RPC.
 RSClose(s, r) ==
   \* Guards: server is ONLINE and a CLOSE command for region r exists.
   /\ serverState[s] = "ONLINE"
@@ -1544,13 +1838,13 @@ RSClose(s, r) ==
        \* Consume the command from the server's dispatched ops queue.
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
        \* Remove the region from the server's set of online regions.
-       /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = @ \ { r }]
+       /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
        \* Send a CLOSED report to the master for procedure confirmation.
        /\ pendingReports' =
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "CLOSED" ] }
        \* Master-side state and server liveness unchanged.
-       /\ UNCHANGED << regionState, metaTable, serverState, scpVars >>
+       /\ UNCHANGED << regionState, metaTable, serverState, scpVars, locked >>
 
 ---------------------------------------------------------------------------
 
@@ -1567,6 +1861,8 @@ Next == \* -- ASSIGN path --
         \/ \E r \in Regions: TRSPCreateUnassign(r)
         \* -- MOVE path --
         \/ \E r \in Regions: TRSPCreateMove(r)
+        \* -- REOPEN path --
+        \/ \E r \in Regions: TRSPCreateReopen(r)
         \/ \E r \in Regions: TRSPDispatchClose(r)
         \/ \E r \in Regions: TRSPConfirmClosed(r)
         \/ \E r \in Regions: DispatchFailClose(r)
@@ -1579,6 +1875,7 @@ Next == \* -- ASSIGN path --
         \* -- RS abort (zombie shutdown) --
         \/ \E s \in Servers: RSAbort(s)
         \* -- SCP state machine --
+        \/ \E s \in Servers: SCPAssignMeta(s)
         \/ \E s \in Servers: SCPGetRegions(s)
         \/ \E s \in Servers: SCPFenceWALs(s)
         \/ \E s \in Servers: \E r \in Regions: SCPAssignRegion(s, r)
@@ -1606,6 +1903,7 @@ Fairness ==
   /\ \A r \in Regions: WF_vars(TRSPCreate(r))
   /\ \A r \in Regions: WF_vars(TRSPCreateUnassign(r))
   /\ \A r \in Regions: WF_vars(TRSPCreateMove(r))
+  /\ \A r \in Regions: WF_vars(TRSPCreateReopen(r))
   /\ \A s \in Servers: WF_vars(ServerRestart(s))
   \* Deterministic procedure steps
   /\ \A r \in Regions: \A s \in Servers: WF_vars(TRSPGetCandidate(r, s))
@@ -1621,6 +1919,7 @@ Fairness ==
   \* RS abort (zombie eventually shuts down)
   /\ \A s \in Servers: WF_vars(RSAbort(s))
   \* SCP state machine
+  /\ \A s \in Servers: WF_vars(SCPAssignMeta(s))
   /\ \A s \in Servers: WF_vars(SCPGetRegions(s))
   /\ \A s \in Servers: WF_vars(SCPFenceWALs(s))
   /\ \A s \in Servers: \A r \in Regions: WF_vars(SCPAssignRegion(s, r))
