@@ -348,7 +348,7 @@ The following table documents what is modeled concretely vs. abstracted:
 | RS crash / zombie window | **Concrete** (Iter 14) | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
 | RS epoch / ServerName | **Omitted** (currently) | Currently achieved via atomic crash+restart; explicit per-server Nat (`serverEpoch`) planned for Iter 14 if crash is decomposed into non-atomic steps |
 | TRSPGetCandidate guard (walFenced) | **Strengthened** — to be corrected (Iter 15) | Current model adds a `walFenced` check that is absent from the implementation. The implementation relies on `createDestinationServersList()` excluding CRASHED servers, not on walFenced. Iter 15 removes the guard to model the implementation faithfully. If `NoDoubleAssignment` then fails TLC, that is a genuine finding. |
-| `isMatchingRegionLocation()` in SCP | **Omitted** (Iter 16) | The model processes every region in the SCP snapshot unconditionally — this is the correct protocol behavior.  The implementation's `isMatchingRegionLocation()` check (SCP.java L540-542) is a known source of bugs (HBASE-24293, HBASE-21623).  Code analysis at each iteration compares model vs. implementation to surface such gaps. |
+| `isMatchingRegionLocation()` in SCP | **Configurable** (Iter 16) | Controlled by `UseLocationCheck` BOOLEAN constant. When TRUE, `SCPAssignRegion` skips regions whose location changed since `SCPGetRegions` — matching the implementation (SCP.java L529-538). When FALSE, every region is processed unconditionally (correct protocol). The implementation's check is a known source of bugs (HBASE-24293, HBASE-21623); setting TRUE may expose `NoLostRegions` violations confirming those bugs. |
 | Coprocessor hooks | **Omitted** | Not relevant to correctness of assignment protocol |
 | Replication queues | **Omitted** | Orthogonal concern |
 | Table enable/disable | **Deferred** | Can be added as a constraint on assignment |
@@ -384,7 +384,7 @@ VARIABLES
     metaTable,        \* [Regions → [state: State,                    ✅ (Iter 2)
                       \*              location: Servers ∪ {None}]]
     serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ✅ (Iter 10)
-    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 19)
+    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 18)
 
     \* --- Communication ---
     dispatchedOps,    \* [Servers → SUBSET [type: CommandType,        ✅ (Iter 6)
@@ -428,7 +428,7 @@ VARIABLES
                       \* SCPAssign and the NoDoubleWrite invariant.
 
     \* --- Failure model ---
-    masterAlive       \* BOOLEAN                                      ⏳ (Iter 20)
+    masterAlive       \* BOOLEAN                                      ⏳ (Iter 19)
     \* Note: serverAlive was originally planned for Iter 14 but was
     \* superseded by serverState (above), implemented in Iter 10.
 ```
@@ -710,121 +710,32 @@ mutating actions. `carryingMeta` variable; `MasterDetectCrash` non-
 deterministic; `SCPAssignMeta(s)` action (`ASSIGN_META` → `GET_REGIONS`);
 SCP actions\ gated on `∀ t: scpState[t] ≠ "ASSIGN_META"`
 (`waitMetaLoaded`); new `MetaAvailableForRecovery` invariant.
-TLC primary: 74,500,838 distinct, ~19min. Git: `6d0b336824`.
+TLC primary: 74,500,838 distinct, ~19min. Git: `90bfdf8f07`.
 
 ---
 
-#### Iteration 16 — SCP per-region assignment (code-analysis grounded)
+#### Iteration 16 — `isMatchingRegionLocation` in SCP (code-analysis grounded)
 
-**Note**: The TRSP's `serverCrashed()` self-recovery logic (procedure
-converts to ASSIGN/GET_ASSIGN_CANDIDATE when region is ABNORMALLY_CLOSED)
-is already modeled by `TRSPServerCrashed` from Iteration 5.  This
-iteration adds the SCP's orchestration of WHEN that callback is invoked.
-**Code analysis**: Before writing TLA+, analyze `SCP.assignRegions()`
-(SCP.java L562-645) to ground the model to the implementation. 
-**What to add**: The full `SCPAssignRegion(s, r)` action, which models
-one iteration of the `assignRegions()` loop (SCP.java L562-645).
-Each invocation processes ONE region unconditionally and removes it
-from `scpRegions[s]`.  Between invocations, arbitrary other actions
-can interleave.
-
-```tla
-SCPAssignRegion(s, r) ==
-    /\ scpState[s] = "ASSIGN"
-    /\ r \in scpRegions[s]
-    /\ walFenced[s] = TRUE
-    \* --- Default: process every region unconditionally ---
-    \* No isMatchingRegionLocation skip.  The default model ensures
-    \* every region in the SCP snapshot is handled, which is what
-    \* correct SCP behavior should guarantee.
-    /\ IF regionState[r].procType # "NONE"
-       THEN
-            \* Path A: TRSP already attached (SCP.java L612-618).
-            \* Call serverCrashed() on the existing TRSP.
-            \* This triggers regionClosedAbnormally() which
-            \* transitions the region to ABNORMALLY_CLOSED
-            \* (TRSP.java L582-583), then the existing
-            \* TRSPServerCrashed action converts the procedure
-            \* to ASSIGN/GET_ASSIGN_CANDIDATE.
-            \* SCP does NOT create a new TRSP.
-            \*
-            \* TRSP.serverCrashed() sub-paths (TRSP.java L570-585):
-            \* - If remoteProc != null: wakes child procedure
-            \*   (remoteProc.serverCrashed)
-            \* - If remoteProc == null AND region NOT
-            \*   ABNORMALLY_CLOSED: calls regionClosedAbnormally()
-            \* - If remoteProc == null AND region IS
-            \*   ABNORMALLY_CLOSED: no-op (retry case)
-            \* Net effect: region → ABNORMALLY_CLOSED, procedure
-            \* will be converted by TRSPServerCrashed.
-            /\ regionState' = [regionState EXCEPT
-                 ![r].state = "ABNORMALLY_CLOSED",
-                 ![r].location = None]
-            /\ metaTable' = [metaTable EXCEPT
-                 ![r] = [state |-> "ABNORMALLY_CLOSED",
-                         location |-> None]]
-            /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ {r}]
-            /\ UNCHANGED <<rpcVars, rsVars, serverState,
-                           walFenced, scpState>>
-       ELSE
-            \* Path B: No TRSP attached (SCP.java L624-638).
-            \* SCP creates a new TRSP(ASSIGN) directly.
-            \* Transition region to ABNORMALLY_CLOSED and attach
-            \* a fresh ASSIGN procedure at GET_ASSIGN_CANDIDATE.
-            /\ regionState' = [regionState EXCEPT
-                 ![r].state = "ABNORMALLY_CLOSED",
-                 ![r].location = None,
-                 ![r].procType = "ASSIGN",
-                 ![r].procStep = "GET_ASSIGN_CANDIDATE",
-                 ![r].targetServer = None,
-                 ![r].retries = 0]
-            /\ metaTable' = [metaTable EXCEPT
-                 ![r] = [state |-> "ABNORMALLY_CLOSED",
-                         location |-> None]]
-            /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ {r}]
-            /\ UNCHANGED <<rpcVars, rsVars, serverState,
-                           walFenced, scpState>>
-```
-**Key modeling decisions**
-1. Every region in the SCP snapshot is processed unconditionally.
-   This ensures `NoLostRegions` passes.
-2. Path A (procedure attached) transitions the region to ABNORMALLY_CLOSED
-   atomically within `SCPAssignRegion`.  The subsequent conversion to
-   ASSIGN/GET_ASSIGN_CANDIDATE happens via the existing `TRSPServerCrashed`
-   action (from Iteration 5), which fires as a separate step.
-3. Path B (no procedure) combines the ABNORMALLY_CLOSED transition AND
-   procedure creation into a single atomic step, matching the real code
-   where SCP creates the TRSP under the region lock.
-4. `scpRegions` shrinks by one element per invocation.  `SCPDone` fires
-   when `scpRegions[s] = {}`.  Between successive `SCPAssignRegion`
-   calls, any other action can interleave — this is what exposes the
-   races.
-**Verify**: `NoLostRegions` (Section 4.1.4) passes, `LockExclusivity`,
-`NoDoubleAssignment`, `NoDoubleWrite`.  No duplicate procedures for
-the same region.
-**Source**: `ServerCrashProcedure.java` L562-645 (`assignRegions()`),
-L540-542 (`isMatchingRegionLocation()`), L612-618 (procedure attached),
-L624-638 (no procedure);
-`TransitRegionStateProcedure.serverCrashed()` L566-586.
-
-#### Iteration 17 — Double crash
-
-**What to add**: No new code — this is a **verification-only** iteration.
-Allow two servers to crash in the model. Verify that:
-- SCP for server A creates TRSPs that target server B.
-- If server B also crashes, a second SCP is created.
-- The first SCP's TRSPs detect the crash (via `serverCrashed()` or
-  dispatch failure) and reassign to server C.
-- No regions are lost.
-**Config change**: Ensure model has ≥ 3 servers.
-**Verify**: `NoLostRegions`, `NoDoubleWrite`, `LockExclusivity`.
+`UseLocationCheck` BOOLEAN constant added, controlling
+`isMatchingRegionLocation()` (SCP.java L498-500, L529-538).
+`SCPAssignRegion(s, r)` restructured from 2-way IF/THEN/ELSE to 3-way
+disjunction: Skip (location changed, `UseLocationCheck=TRUE`), Path A
+(proc attached → ABNORMALLY_CLOSED, `TRSPServerCrashed` converts),
+Path B (no proc → ABNORMALLY_CLOSED + fresh ASSIGN).  Skip path
+removes `r` from `scpRegions` with no state change.  Path A/B guard
+`¬UseLocationCheck ∨ location=s`.  All configs default
+`UseLocationCheck=TRUE` (matching implementation); `FALSE` models
+violations (needs ≥3 servers; 2r/2s skip path never fires because the
+only assignment target during SCP is the surviving server).
+TLC primary (TRUE): 1,527,546 distinct, 14s. TLC primary (FALSE):
+74,500,838 distinct, ~12min. Git: `2097e19d14`.
 
 ---
 
 ### Phase 5: Procedure Persistence and Master Recovery
 
 
-#### Iteration 18 — Procedure store
+#### Iteration 17 — Procedure store
 
 **What to add**: `procStore` variable — a persistent set of procedure
 records (survives master crash). Actions that modify procedure state
@@ -839,7 +750,7 @@ The `procStore` variable is not modified by `ServerCrash` or
 matching entry in `procStore`.
 **Source**: `WALProcedureStore.java` insert/update/delete L527-694.
 
-#### Iteration 19 — Master crash and recovery
+#### Iteration 18 — Master crash and recovery
 
 **What to add**: Master crash/recovery actions, `RSOpenDuplicate`
 for HBASE-26283, and `restoreSucceedState` modeling for HBASE-29364.
@@ -982,7 +893,7 @@ exposing the HBASE-26283 design gap.
 
 ### Phase 6: Split and Merge (Deferred)
 
-#### Iteration 20 — Split/merge region states and region pool
+#### Iteration 19 — Split/merge region states and region pool
 
 **What to add**: Extend `State` with `SPLITTING`, `SPLIT`,
 `SPLITTING_NEW`, `MERGING`, `MERGED`, `MERGING_NEW`. Extend
@@ -994,7 +905,7 @@ All actions guard on `regionExists[r] = TRUE`.
 **Verify**: `TypeOK` and `TransitionValid` with the extended state space.
 TLC with 2 primary regions, 4 daughter pool slots, 2 servers.
 
-#### Iteration 21 — Split procedure: PREPARE through CLOSE_PARENT
+#### Iteration 20 — Split procedure: PREPARE through CLOSE_PARENT
 
 **What to add**: Split procedure state machine, initially covering only
 the pre-PONR states: `SPLIT_PREPARE → SPLIT_CLOSE_PARENT →
@@ -1012,7 +923,7 @@ No daughters exist yet (`regionExists` still FALSE).
 **Source**: `SplitTableRegionProcedure.java` `prepareSplitRegion()` L509-593,
 `createUnassignProcedures()` L950-954.
 
-#### Iteration 22 — Split PONR: atomic meta update creates daughters
+#### Iteration 21 — Split PONR: atomic meta update creates daughters
 
 **What to add**: The PONR step:
 - `SplitUpdateMeta(p)`: Atomically:
@@ -1028,7 +939,7 @@ No daughters exist yet (`regionExists` still FALSE).
 **Source**: `AssignmentManager.markRegionAsSplit()` L2364-2390,
 `RegionStateStore.splitRegion()` L367-410.
 
-#### Iteration 23 — Split post-PONR: open daughters
+#### Iteration 22 — Split post-PONR: open daughters
 
 **What to add**:
 - `SplitOpenChildren(p)`: Create child TRSP(ASSIGN) for each daughter.
@@ -1040,7 +951,7 @@ OPEN and parent is SPLIT. `NoOrphanedDaughters` — every SPLITTING_NEW
 region has a parent split procedure.
 **Source**: `SplitTableRegionProcedure.java` `createAssignProcedures()` L956-963.
 
-#### Iteration 24 — Split pre-PONR rollback
+#### Iteration 23 — Split pre-PONR rollback
 
 **What to add**: Non-deterministic failure action for pre-PONR states:
 - `SplitFail(p)`: Pre: split procedure is in a pre-PONR state
@@ -1053,7 +964,7 @@ region has a parent split procedure.
 daughters exist, no procedures attached. All safety invariants hold.
 **Source**: `SplitTableRegionProcedure.java` `rollbackState()` L368-411.
 
-#### Iteration 25 — Merge procedure (full lifecycle)
+#### Iteration 24 — Merge procedure (full lifecycle)
 
 **What to add**: Complete merge procedure following the same pattern as
 split:
@@ -1073,7 +984,7 @@ split:
 parents are MERGED. All safety invariants hold.
 **Source**: `MergeTableRegionsProcedure.java` `executeFromState()` L189-255.
 
-#### Iteration 26 — Crash during split/merge
+#### Iteration 25 — Crash during split/merge
 
 **What to add**: No new actions — this is a **verification-only** iteration.
 Configure TLC to allow RS crash and master crash during active
@@ -1090,14 +1001,14 @@ split/merge procedures. Verify:
 
 ### Phase 7: Liveness and Refinement (Deferred)
 
-#### Iteration 27 — Fairness and liveness
+#### Iteration 26 — Fairness and liveness
 
 **What to add**: Weak fairness on procedure execution, strong fairness
 on message delivery. Check temporal properties:
 - `□(regionState[r].state = "OFFLINE" ⇒ ◇ regionState[r].state = "OPEN")`
 - `□(scp_started(s) ⇒ ◇ scp_done(s))`
 
-#### Iteration 28 — TLC optimization
+#### Iteration 27 — TLC optimization
 
 **Already done** (from Iteration 7): Symmetry sets for Regions and
 Servers (`Permutations(Regions) \union Permutations(Servers)`). This
@@ -1106,7 +1017,7 @@ provided up to 36× reduction for 3r/3s.
 Action constraints to limit crash frequency. Measure cumulative state
 space reduction across all phases.
 
-#### Iteration 29 — Advanced scenarios and findings
+#### Iteration 28 — Advanced scenarios and findings
 
 **What to verify**: Cascade crashes, master failover during SCP,
 concurrent split and move on the same region, split during merge of
@@ -1477,7 +1388,7 @@ The following rules govern backward compatibility across iterations:
    must be triaged and resolved before proceeding.
 
 4. **Configuration consistency**: When increasing model size (e.g., adding
-   a third server for double-crash in Iteration 17), all prior invariants
+   a third server for a multi-crash scenario), all prior invariants
    must still pass at the new size. If a prior invariant only passed at a
    smaller size due to state space limitations, this must be documented.
 
@@ -2602,7 +2513,7 @@ in-memory state reflects reality, and meta will catch up on retry.
 step 2 succeeds, meta retains the old value (OPENING or CLOSING). The procedure
 state REPORT_SUCCEED is persisted to the ProcedureStore (WAL). On master recovery,
 the procedure is reloaded and replays step 2, retrying `persistToMeta()`. This is
-the core scenario for Iteration 19 (master crash and recovery).
+the core scenario for Iteration 18 (master crash and recovery).
 
 ### D.5 GoOffline: No Meta Write
 
@@ -2631,7 +2542,7 @@ specification. The justification:
    or doesn't. If it doesn't fire in a given step, it may fire in a later step.
    This naturally models the retry semantics without explicit failure/revert logic.
 
-3. **Pattern C is refined in Iteration 19**: The two-step persistence window
+3. **Pattern C is refined in Iteration 18**: The two-step persistence window
    (in-memory updated, meta not yet) becomes non-trivial when master crash is
    introduced. At that point, the model must split the OPENING→OPEN and
    CLOSING→CLOSED transitions into separate in-memory and meta steps, with
