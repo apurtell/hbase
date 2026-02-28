@@ -332,22 +332,22 @@ The following table documents what is modeled concretely vs. abstracted:
 | TRSP state machine | **Concrete** | The heart of assignment logic |
 | RegionRemoteProcedure (Open/Close) | **Merged into TRSP** | Simplify by treating open/close dispatch as atomic TRSP actions |
 | RS open/close execution | **Concrete** | Models the RS-side lifecycle and failure modes |
-| ProcedureExecutor | **Abstract** | Model execute/suspend/resume/crash-recover, not thread pool details |
+| ProcedureExecutor | **Abstract** (Iter 19 adds thread pool) | Model execute/suspend/resume/crash-recover; Iter 19 adds counting-semaphore model of PEWorker thread pool for exhaustion analysis |
 | ProcedureStore (WAL) | **Abstract** | Model as a persistent set of procedure states; no WAL rolling details |
 | hbase:meta | **Abstract** | Model as a function `Region → (State, Server)` |
 | ZooKeeper crash detection | **Abstract** | Model as non-deterministic crash detection with delay |
 | Network/RPC | **Abstract** | Model as unreliable async message channels (can lose, reorder, duplicate) |
-| RegionStateNode locking | **Partially concrete** (Iter 15) | Implementation serializes all TRSP and SCP per-region actions under `regionNode.lock()`. Current model omits the lock variable; mutual exclusion is achieved by a global clear of `rsOnlineRegions` in `SCPAssignRegion`. Iter 15 replaces this with a per-region `locked[r]` boolean. |
+| RegionStateNode locking | **Concrete** (Iter 15) ✅ | Per-region `locked[r]` boolean serializes all TRSP and SCP per-region actions under `regionNode.lock()`. |
 | ServerStateNode locking | **Abstract** | Modeled as `serverState` ONLINE/CRASHED flag; read/write lock semantics are implicit in action guards |
 | Load balancer | **Abstract** | Non-deterministic choice of move targets |
-| REOPEN vs MOVE | **Partially modeled** (Iter 15) | Current model folds REOPEN into MOVE (identical state machine: CLOSE → CONFIRM_CLOSED → GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED). Key difference: `TRSP.reopen()` pre-sets `assignCandidate` to the region's *current* server so `queueAssign()` prefers reassignment to the *same* server, whereas `TRSP.move()` forces a new plan. Iter 15 adds `TRSPCreateReopen` and removes the "other server exists" guard. |
-| SCP carryingMeta path | **Omitted** (Iter 15) | When the crashed server hosted hbase:meta, SCP takes a distinct early path: SPLIT_META_LOGS → ASSIGN_META before GET_REGIONS. All non-meta SCP steps gate on `waitMetaLoaded`. This ordering is safety-relevant and is added in Iter 15. |
-| Split/Merge procedures | **Deferred** (Phase 3) | Complex; build after core model is validated |
+| REOPEN vs MOVE | **Concrete** (Iter 15) ✅ | `TRSPCreateReopen` pins `assignCandidate` to the region's current server; `TRSPCreateMove` forces a new plan. Separate `REOPEN` ProcType added. |
+| SCP carryingMeta path | **Concrete** (Iter 15) ✅ | `carryingMeta` variable, `SCPAssignMeta` action (`ASSIGN_META` → `GET_REGIONS`), all non-meta SCP steps gated on `∀ t: scpState[t] ≠ "ASSIGN_META"` (`waitMetaLoaded`). `MetaAvailableForRecovery` invariant. |
+| Split/Merge procedures | **Deferred** (Phase 7) | Complex; build after core model is validated |
 | ServerCrashProcedure | **Concrete** | Critical failure recovery path |
 | WAL lease revocation (fencing) | **Abstract** | Modeled as per-server Boolean (`walFenced`); fencing property only, no HDFS lease or log-splitting details |
 | RS crash / zombie window | **Concrete** (Iter 14) | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
-| RS epoch / ServerName | **Omitted** (currently) | Currently achieved via atomic crash+restart; explicit per-server Nat (`serverEpoch`) planned for Iter 14 if crash is decomposed into non-atomic steps |
-| TRSPGetCandidate guard (walFenced) | **Strengthened** — to be corrected (Iter 15) | Current model adds a `walFenced` check that is absent from the implementation. The implementation relies on `createDestinationServersList()` excluding CRASHED servers, not on walFenced. Iter 15 removes the guard to model the implementation faithfully. If `NoDoubleAssignment` then fails TLC, that is a genuine finding. |
+| RS epoch / ServerName | **Omitted** (resolved) | Not needed: `serverState` ONLINE/CRASHED flag (Iter 10) plus atomic crash/restart provides equivalent fencing without an explicit epoch counter. |
+| TRSPGetCandidate guard (walFenced) | **Corrected** (Iter 15) ✅ | Iter 15 removed the model-specific `walFenced` guard; `serverState[s]="ONLINE"` suffices, matching the implementation's `createDestinationServersList()`. |
 | `isMatchingRegionLocation()` in SCP | **Configurable** (Iter 16) | Controlled by `UseLocationCheck` BOOLEAN constant. When TRUE, `SCPAssignRegion` skips regions whose location changed since `SCPGetRegions` — matching the implementation (SCP.java L529-538). When FALSE, every region is processed unconditionally (correct protocol). The implementation's check is a known source of bugs (HBASE-24293, HBASE-21623); setting TRUE may expose `NoLostRegions` violations confirming those bugs. |
 | Coprocessor hooks | **Omitted** | Not relevant to correctness of assignment protocol |
 | Replication queues | **Omitted** | Orthogonal concern |
@@ -384,7 +384,7 @@ VARIABLES
     metaTable,        \* [Regions → [state: State,                    ✅ (Iter 2)
                       \*              location: Servers ∪ {None}]]
     serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ✅ (Iter 10)
-    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 18)
+    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 17)
 
     \* --- Communication ---
     dispatchedOps,    \* [Servers → SUBSET [type: CommandType,        ✅ (Iter 6)
@@ -428,7 +428,7 @@ VARIABLES
                       \* SCPAssign and the NoDoubleWrite invariant.
 
     \* --- Failure model ---
-    masterAlive       \* BOOLEAN                                      ⏳ (Iter 19)
+    masterAlive       \* BOOLEAN                                      ⏳ (Iter 18)
     \* Note: serverAlive was originally planned for Iter 14 but was
     \* superseded by serverState (above), implemented in Iter 10.
 ```
@@ -891,9 +891,117 @@ exposing the HBASE-26283 design gap.
 
 ---
 
-### Phase 6: Split and Merge (Deferred)
+### Phase 6: PEWorker Pool and Meta-Blocking Semantics
 
-#### Iteration 19 — Split/merge region states and region pool
+#### Iteration 19 — PEWorker pool and meta-blocking semantics
+
+This iteration faithfully models the ProcedureExecutor's finite worker
+thread pool as it exists in the branch-2.6 implementation.  The
+ProcedureExecutor uses a fixed pool of `PEWorker` threads (default 16,
+configurable via `hbase.procedure.worker.count`) to execute all
+procedures.  In branch-2.6, when a procedure performs a synchronous
+write to `hbase:meta` via `RegionStateStore.updateRegionLocation()`, the
+calling PEWorker thread blocks until the RPC completes.  If meta is
+unavailable (e.g., the meta RS has crashed and meta is being
+reassigned), the thread blocks indefinitely.
+
+The model captures this synchronous blocking behavior using a
+counting-semaphore abstraction for the worker pool.  A
+`UseSuspendOnMetaBlock` constant enables comparative analysis against
+the alternative async implementation in branch-3, where procedures
+suspend and release the PEWorker thread when meta is unavailable.
+
+**What to add**:
+
+1. **New constants**:
+   - `MaxWorkers ∈ Nat \ {0}` — PEWorker thread pool size.
+   - `UseSuspendOnMetaBlock ∈ BOOLEAN` — `FALSE` = branch-2.6
+     behavior (synchronous meta writes hold the PEWorker thread),
+     `TRUE` = branch-3 behavior (procedure suspends and releases the
+     PEWorker; re-enqueued when meta becomes available).
+
+2. **New variables**:
+   - `availableWorkers ∈ 0..MaxWorkers` — counting semaphore for
+     idle PEWorker threads.
+   - `blockedOnMeta ⊆ Regions` — regions whose procedures are
+     blocked on a synchronous meta write (holds PEWorker thread).
+   - `suspendedOnMeta ⊆ Regions` — regions whose procedures have
+     yielded and released the PEWorker thread while waiting for meta.
+
+3. **Modified actions** (guard with `availableWorkers > 0`):
+   All TRSP and SCP procedure-step actions acquire a PEWorker at the
+   start and release it at the end.  Since TLA+ steps are atomic,
+   non-blocking actions have a net-zero change on `availableWorkers`
+   (the guard enforces availability, but the step finishes immediately).
+   The interesting case is meta-writing actions when meta is unavailable.
+
+4. **Meta-blocking semantics** (faithful to `RegionStateStore`):
+   - `MetaIsAvailable` predicate: `TRUE` when no server is in
+     `ASSIGN_META` scpState (reuses existing `carryingMeta` / `scpState`).
+   - Modified `TRSPDispatchOpen(r)` and `SCPAssignRegion(s, r)`: when
+     the action attempts a meta write and `¬MetaIsAvailable`:
+     - **Branch-2.6** (`UseSuspendOnMetaBlock = FALSE`): add `r` to
+       `blockedOnMeta`, decrement `availableWorkers`.  The PEWorker is
+       held — faithfully modeling the synchronous
+       `RegionStateStore.updateRegionLocation()` call blocking on an
+       unavailable meta table.
+     - **Branch-3 comparison** (`UseSuspendOnMetaBlock = TRUE`): add
+       `r` to `suspendedOnMeta`.  `availableWorkers` is NOT
+       decremented.  Models the `CompletableFuture`-based async path.
+   - `TRSPResumeFromMeta(r)` / `SCPResumeFromMeta(r)`: when
+     `MetaIsAvailable` becomes `TRUE`, remove `r` from
+     `blockedOnMeta` / `suspendedOnMeta` and allow the procedure to
+     continue.  Branch-2.6: increment `availableWorkers` (worker
+     released).  Branch-3: procedure re-enters the scheduler normally.
+
+5. **New invariant** — `NoPEWorkerDeadlock`:
+   ```tla
+   NoPEWorkerDeadlock ==
+     (availableWorkers = 0 /\ ~MetaIsAvailable)
+       => \E r \in Regions:
+            /\ regionState[r].procType = "ASSIGN"
+            /\ r \notin blockedOnMeta
+            /\ r \notin suspendedOnMeta
+   ```
+   This invariant checks that when all PEWorker threads are consumed
+   and meta is unavailable, at least one free worker remains available
+   to execute the meta assignment procedure.  Any violation represents
+   a worker-pool deadlock in the implementation.
+
+6. **New liveness property** — `MetaEventuallyAssigned`:
+   ```tla
+   MetaEventuallyAssigned ==
+     \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
+   ```
+   Checks that the meta assignment procedure eventually completes
+   despite concurrent procedure load on the PEWorker pool.
+
+**Verify**:
+- `TypeOK` with new variables.
+- All existing invariants hold with `UseSuspendOnMetaBlock = FALSE`
+  (branch-2.6 faithful model).
+- Check `NoPEWorkerDeadlock` and `MetaEventuallyAssigned` with the
+  branch-2.6 configuration.  If violations are found, analyze the
+  counterexample traces — they represent genuine thread-pool exhaustion
+  scenarios in the implementation.
+- Compare results with `UseSuspendOnMetaBlock = TRUE` (branch-3
+  comparison) to understand whether the async suspension path
+  eliminates the deadlock class.
+- TLC primary config: 2r/2s (or 3r/2s), MaxWorkers=2, MaxRetries=1.
+
+**Source**: `ProcedureExecutor.WorkerThread.run()` L1986-2030;
+`TransitRegionStateProcedure.executeFromState()`;
+`RegionStateStore.updateRegionLocation()` L158-240 (synchronous
+`Table.put()` in branch-2.6; async `CompletableFuture` in branch-3).
+For context on known thread-pool exhaustion scenarios: HBASE-24526,
+HBASE-24673.  Branch-3 async path: HBASE-28196, HBASE-28199,
+HBASE-28240.
+
+---
+
+### Phase 7: Split and Merge
+
+#### Iteration 20 — Split/merge region states and region pool
 
 **What to add**: Extend `State` with `SPLITTING`, `SPLIT`,
 `SPLITTING_NEW`, `MERGING`, `MERGED`, `MERGING_NEW`. Extend
@@ -905,7 +1013,7 @@ All actions guard on `regionExists[r] = TRUE`.
 **Verify**: `TypeOK` and `TransitionValid` with the extended state space.
 TLC with 2 primary regions, 4 daughter pool slots, 2 servers.
 
-#### Iteration 20 — Split procedure: PREPARE through CLOSE_PARENT
+#### Iteration 21 — Split procedure: PREPARE through CLOSE_PARENT
 
 **What to add**: Split procedure state machine, initially covering only
 the pre-PONR states: `SPLIT_PREPARE → SPLIT_CLOSE_PARENT →
@@ -923,7 +1031,7 @@ No daughters exist yet (`regionExists` still FALSE).
 **Source**: `SplitTableRegionProcedure.java` `prepareSplitRegion()` L509-593,
 `createUnassignProcedures()` L950-954.
 
-#### Iteration 21 — Split PONR: atomic meta update creates daughters
+#### Iteration 22 — Split PONR: atomic meta update creates daughters
 
 **What to add**: The PONR step:
 - `SplitUpdateMeta(p)`: Atomically:
@@ -939,7 +1047,7 @@ No daughters exist yet (`regionExists` still FALSE).
 **Source**: `AssignmentManager.markRegionAsSplit()` L2364-2390,
 `RegionStateStore.splitRegion()` L367-410.
 
-#### Iteration 22 — Split post-PONR: open daughters
+#### Iteration 23 — Split post-PONR: open daughters
 
 **What to add**:
 - `SplitOpenChildren(p)`: Create child TRSP(ASSIGN) for each daughter.
@@ -951,7 +1059,7 @@ OPEN and parent is SPLIT. `NoOrphanedDaughters` — every SPLITTING_NEW
 region has a parent split procedure.
 **Source**: `SplitTableRegionProcedure.java` `createAssignProcedures()` L956-963.
 
-#### Iteration 23 — Split pre-PONR rollback
+#### Iteration 24 — Split pre-PONR rollback
 
 **What to add**: Non-deterministic failure action for pre-PONR states:
 - `SplitFail(p)`: Pre: split procedure is in a pre-PONR state
@@ -964,7 +1072,7 @@ region has a parent split procedure.
 daughters exist, no procedures attached. All safety invariants hold.
 **Source**: `SplitTableRegionProcedure.java` `rollbackState()` L368-411.
 
-#### Iteration 24 — Merge procedure (full lifecycle)
+#### Iteration 25 — Merge procedure (full lifecycle)
 
 **What to add**: Complete merge procedure following the same pattern as
 split:
@@ -984,7 +1092,7 @@ split:
 parents are MERGED. All safety invariants hold.
 **Source**: `MergeTableRegionsProcedure.java` `executeFromState()` L189-255.
 
-#### Iteration 25 — Crash during split/merge
+#### Iteration 26 — Crash during split/merge
 
 **What to add**: No new actions — this is a **verification-only** iteration.
 Configure TLC to allow RS crash and master crash during active
@@ -999,16 +1107,16 @@ split/merge procedures. Verify:
 
 ---
 
-### Phase 7: Liveness and Refinement (Deferred)
+### Phase 8: Liveness and Refinement
 
-#### Iteration 26 — Fairness and liveness
+#### Iteration 27 — Fairness and liveness
 
 **What to add**: Weak fairness on procedure execution, strong fairness
 on message delivery. Check temporal properties:
 - `□(regionState[r].state = "OFFLINE" ⇒ ◇ regionState[r].state = "OPEN")`
 - `□(scp_started(s) ⇒ ◇ scp_done(s))`
 
-#### Iteration 27 — TLC optimization
+#### Iteration 28 — TLC optimization
 
 **Already done** (from Iteration 7): Symmetry sets for Regions and
 Servers (`Permutations(Regions) \union Permutations(Servers)`). This
@@ -1017,7 +1125,7 @@ provided up to 36× reduction for 3r/3s.
 Action constraints to limit crash frequency. Measure cumulative state
 space reduction across all phases.
 
-#### Iteration 28 — Advanced scenarios and findings
+#### Iteration 29 — Advanced scenarios and findings
 
 **What to verify**: Cascade crashes, master failover during SCP,
 concurrent split and move on the same region, split during merge of
@@ -1155,10 +1263,11 @@ For each module, the primary source files and their key line ranges:
 | Phase 1: Master-Side Foundation | 1-5 | ~500 (actual) | State machine + procedures in isolation |
 | Phase 2: RPC and RegionServer | 6-10 | ~800 (actual at Iter 10) | Two-channel RPC, RS-side state, report validation |
 | Phase 3: MOVE and Failures | 11-13 | ~1200 (actual at Iter 13) | Move lifecycle, retry logic, server restart, procedure inlining refactor, fairness, liveness |
-| Phase 4: RS Crash and Recovery | 14-17 | +200 | SCP, TRSP interaction, double crash |
-| Phase 5: Procedure Store + Master Recovery | 18-19 | +150 | Persistence, crash+rebuild |
-| Phase 6: Split and Merge | 20-26 | +350 | Region pool, multi-region locking, PONR, rollback |
-| Phase 7: Liveness and Refinement | 27-29 | +50 | Fairness, scenarios (symmetry already done) |
+| Phase 4: RS Crash and Recovery | 14-16 | +200 | SCP, TRSP interaction, double crash |
+| Phase 5: Procedure Store + Master Recovery | 17-18 | +150 | Persistence, crash+rebuild |
+| Phase 6: PEWorker Pool + Meta-Blocking | 19 | +100 | Finite worker pool, synchronous meta-blocking semantics |
+| Phase 7: Split and Merge | 20-26 | +350 | Region pool, multi-region locking, PONR, rollback |
+| Phase 8: Liveness and Refinement | 27-29 | +50 | Fairness, scenarios (symmetry already done) |
 | **Total** | **29** | **~1860** (est.) | |
 
 ---
@@ -1378,7 +1487,7 @@ The following rules govern backward compatibility across iterations:
 
 2. **Invariant weakening**: An invariant may be weakened (relaxed) in a
    later iteration if the original formulation was too strong — e.g.,
-   `MetaConsistency` is relaxed in Iteration 22 to account for the
+   `MetaConsistency` is relaxed in Iteration 23 to account for the
    SPLITTING_NEW/MERGING_NEW discrepancy. The weakening must be justified
    by reference to the implementation behavior that necessitates it.
 
@@ -2551,7 +2660,7 @@ specification. The justification:
 
 4. **Meta write failure as an advanced scenario**: Full meta write failure
    modeling (splitting every meta-writing action, adding a `metaWritePending`
-   variable, weakening 4 invariants) is a candidate for Iteration 29 (advanced
+   variable, weakening 4 invariants) is a candidate for Iteration 30 (advanced
    scenarios). It would roughly double the action count and significantly
    increase the state space, but could validate the revert correctness and
    the interaction between meta write failure and crash recovery.
