@@ -217,18 +217,20 @@ Combined with `onlineRegions` membership, the RS-side region lifecycle is:
              (scpState[s] = "DONE"
              \* ...if r was on server s at crash detection time
              \* (implicitly: r was in the original scpRegions snapshot)
-             \* ...then r must either have a procedure handling it
+              \* ...then r must either have a procedure handling it
              \* or already be OPEN.
              /\ regionState[r].location = None
              /\ regionState[r].state # "OPEN")
              => regionState[r].procType # "NONE"
      ```
-   - This invariant FAILS when `isMatchingRegionLocation()` causes
-     SCP to skip a region AND no other mechanism picks it up —
-     directly catching HBASE-24293 (SCP skips meta when location is
-     null) and HBASE-21623 (SCP ignores region moved by concurrent
-     TRSP).  The `scpRegions` snapshot going stale between
-     `GET_REGIONS` and `ASSIGN` is the root cause.
+   - This invariant PASSES because the model processes every region
+     in the SCP snapshot unconditionally.  Code analysis at each
+     iteration compares this correct protocol behavior against the
+     actual implementation to identify gaps (e.g., the
+     `isMatchingRegionLocation()` check in SCP.java L540-542 is a
+     known source of HBASE-24293 and HBASE-21623, where the
+     `scpRegions` snapshot goes stale between `GET_REGIONS` and
+     `ASSIGN`).
 
 5. **Procedure Atomicity**: Each procedure either completes fully or is fully rolled back.
    - For pre-PONR states, rollback is possible. After PONR (e.g., meta update in split/merge), the procedure must complete.
@@ -236,8 +238,8 @@ Combined with `onlineRegions` membership, the RS-side region lifecycle is:
 6. **Lock Exclusivity**: At most one `TransitRegionStateProcedure` is attached to a `RegionStateNode` at any time.
 
 7. **No Double Write** (Iteration 13): A region is never *writable* on
-   two servers simultaneously.  A region is writable on server `s` when
-   `r ∈ rsOnlineRegions[s] ∧ walFenced[s] = FALSE`.  This is the
+   two servers simultaneously. A region is writable on server `s` when
+   `r ∈ rsOnlineRegions[s] ∧ walFenced[s] = FALSE`. This is the
    fundamental safety property for the zombie RS scenario: after the
    master revokes a crashed RS's WAL leases (`walFenced[s] = TRUE`),
    the zombie RS can no longer write, so even though it may still be
@@ -335,14 +337,18 @@ The following table documents what is modeled concretely vs. abstracted:
 | hbase:meta | **Abstract** | Model as a function `Region → (State, Server)` |
 | ZooKeeper crash detection | **Abstract** | Model as non-deterministic crash detection with delay |
 | Network/RPC | **Abstract** | Model as unreliable async message channels (can lose, reorder, duplicate) |
-| RegionStateNode locking | **Concrete** | Critical for mutual exclusion; model as per-region mutex |
+| RegionStateNode locking | **Partially concrete** (Iter 15) | Implementation serializes all TRSP and SCP per-region actions under `regionNode.lock()`. Current model omits the lock variable; mutual exclusion is achieved by a global clear of `rsOnlineRegions` in `SCPAssignRegion`. Iter 15 replaces this with a per-region `locked[r]` boolean. |
 | ServerStateNode locking | **Abstract** | Modeled as `serverState` ONLINE/CRASHED flag; read/write lock semantics are implicit in action guards |
 | Load balancer | **Abstract** | Non-deterministic choice of move targets |
+| REOPEN vs MOVE | **Partially modeled** (Iter 15) | Current model folds REOPEN into MOVE (identical state machine: CLOSE → CONFIRM_CLOSED → GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED). Key difference: `TRSP.reopen()` pre-sets `assignCandidate` to the region's *current* server so `queueAssign()` prefers reassignment to the *same* server, whereas `TRSP.move()` forces a new plan. Iter 15 adds `TRSPCreateReopen` and removes the "other server exists" guard. |
+| SCP carryingMeta path | **Omitted** (Iter 15) | When the crashed server hosted hbase:meta, SCP takes a distinct early path: SPLIT_META_LOGS → ASSIGN_META before GET_REGIONS. All non-meta SCP steps gate on `waitMetaLoaded`. This ordering is safety-relevant and is added in Iter 15. |
 | Split/Merge procedures | **Deferred** (Phase 3) | Complex; build after core model is validated |
 | ServerCrashProcedure | **Concrete** | Critical failure recovery path |
 | WAL lease revocation (fencing) | **Abstract** | Modeled as per-server Boolean (`walFenced`); fencing property only, no HDFS lease or log-splitting details |
-| RS crash / zombie window | **Planned concrete** (Iter 14) | Currently atomic via `ServerCrashAll`; Iter 14 decomposes into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
+| RS crash / zombie window | **Concrete** (Iter 14) | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
 | RS epoch / ServerName | **Omitted** (currently) | Currently achieved via atomic crash+restart; explicit per-server Nat (`serverEpoch`) planned for Iter 14 if crash is decomposed into non-atomic steps |
+| TRSPGetCandidate guard (walFenced) | **Strengthened** — to be corrected (Iter 15) | Current model adds a `walFenced` check that is absent from the implementation. The implementation relies on `createDestinationServersList()` excluding CRASHED servers, not on walFenced. Iter 15 removes the guard to model the implementation faithfully. If `NoDoubleAssignment` then fails TLC, that is a genuine finding. |
+| `isMatchingRegionLocation()` in SCP | **Omitted** (Iter 16) | The model processes every region in the SCP snapshot unconditionally — this is the correct protocol behavior.  The implementation's `isMatchingRegionLocation()` check (SCP.java L540-542) is a known source of bugs (HBASE-24293, HBASE-21623).  Code analysis at each iteration compares model vs. implementation to surface such gaps. |
 | Coprocessor hooks | **Omitted** | Not relevant to correctness of assignment protocol |
 | Replication queues | **Omitted** | Orthogonal concern |
 | Table enable/disable | **Deferred** | Can be added as a constraint on assignment |
@@ -378,7 +384,7 @@ VARIABLES
     metaTable,        \* [Regions → [state: State,                    ✅ (Iter 2)
                       \*              location: Servers ∪ {None}]]
     serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ✅ (Iter 10)
-    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 18)
+    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 19)
 
     \* --- Communication ---
     dispatchedOps,    \* [Servers → SUBSET [type: CommandType,        ✅ (Iter 6)
@@ -416,13 +422,13 @@ VARIABLES
                       \* crash is decomposed into non-atomic steps
                       \* (Iter 14).  See spec design note at
                       \* ServerRestart.
-    walFenced,        \* [Servers → BOOLEAN]                          ⏳ (Iter 15)
+    walFenced,        \* [Servers → BOOLEAN]                          ✅ (Iter 14)
                       \* TRUE after SCP revokes WAL leases for server.
                       \* Reset to FALSE on ServerRestart. Guards
                       \* SCPAssign and the NoDoubleWrite invariant.
 
     \* --- Failure model ---
-    masterAlive       \* BOOLEAN                                      ⏳ (Iter 19)
+    masterAlive       \* BOOLEAN                                      ⏳ (Iter 20)
     \* Note: serverAlive was originally planned for Iter 14 but was
     \* superseded by serverState (above), implemented in Iter 10.
 ```
@@ -676,135 +682,124 @@ TLC primary: 35,726 distinct, <1s. Git: `b5fbed2f22`.
 
 #### Iteration 14 — ServerCrashProcedure with WAL lease fencing ✅ COMPLETE
 
-Replace `ServerCrashAll` with `MasterDetectCrash` +
-`RSAbort` + SCP state machine (GET_REGIONS → FENCE_WALS → ASSIGN →
-DONE).  New vars: `scpState`, `scpRegions`, `walFenced`.  No
-`isMatchingRegionLocation` (Iteration 15); SCP processes every region.
-Path A (proc attached): ABNORMALLY_CLOSED, TRSPServerCrashed converts.
-Path B (no proc): ABNORMALLY_CLOSED + fresh ASSIGN.  `SCPAssignRegion`
-clears `r` from `rsOnlineRegions` on all servers, drops stale OPENED.
-`ServerRestart` — pre: `scpState ∈ {DONE,NONE}`;
-resets SCP vars, clears `dispatchedOps[s]`, `rsOnlineRegions[s]`.
-`TRSPGetCandidate` — guards for zombie/walFenced.  `TRSPHandleFailedOpen`
-— prefer OPENED; clear dispatched OPEN.  `TRSPConfirmClosed` — skip if
-`r` reopened.  `TRSPServerCrashed` — clear dispatched CLOSE; drop CLOSED.
-`RSOpen` — guards `r ∉ rsOnlineRegions[s]`, `state=OPENING`, `location=s`.
-`NoDoubleAssignment` refined (writable only);
-`RSMasterAgreement`/`RSMasterAgreementConverse` exempt CRASHED; new
-`ZombieFencingOrder`, `NoLostRegions`. TLC primary: 5,525,325 distinct,
-~20s. Git: `0000000000`.
+Replace `ServerCrashAll` with `MasterDetectCrash` + `RSAbort` + SCP
+state machine (GET_REGIONS → FENCE_WALS → ASSIGN → DONE).  New vars:
+`scpState`, `scpRegions`, `walFenced`.  No `isMatchingRegionLocation`
+(Iter 16); SCP processes every region.  Path A (proc attached):
+ABNORMALLY_CLOSED, `TRSPServerCrashed` converts.  Path B (no proc):
+ABNORMALLY_CLOSED + fresh ASSIGN.  `SCPAssignRegion` clears `r` from
+`rsOnlineRegions` on all servers, drops stale OPENED.  `ServerRestart`:
+pre `scpState ∈ {DONE,NONE}`; resets SCP vars, `dispatchedOps[s]`,
+`rsOnlineRegions[s]`.  `TRSPGetCandidate` guards zombie/walFenced.
+`TRSPHandleFailedOpen` prefers OPENED, clears dispatched OPEN.
+`TRSPConfirmClosed` skips if `r` reopened.  `TRSPServerCrashed` clears
+dispatched CLOSE, drops CLOSED.  `RSOpen` guards `r ∉ rsOnlineRegions[s]`,
+`state=OPENING`, `location=s`.  `NoDoubleAssignment` refined (writable
+only); `RSMasterAgreement`/`RSMasterAgreementConverse` exempt CRASHED;
+new `ZombieFencingOrder`, `NoLostRegions`.
+TLC primary: 5,525,325 distinct, ~20s. Git: `a466c53e1e`.
 
-#### Iteration 15 — SCP per-region assignment with isMatchingRegionLocation
+#### Iteration 15 — Fidelity improvements: REOPEN type, per-region lock, TRSPGetCandidate guard, carryingMeta SCP ✅ COMPLETE
+
+Four fidelity fixes.  Removed model-specific `walFenced` guard from
+`TRSPGetCandidate`; `serverState[s]="ONLINE"` suffices. `"REOPEN"` added
+to `ProcType`; `TRSPCreateReopen(r)` pins `assignCandidate` to current
+location; 9 action guards updated. Per-region `locked` variable
+(`RegionStateNode.lock()`); `locked[r]=FALSE` guard on all 15 region-
+mutating actions. `carryingMeta` variable; `MasterDetectCrash` non-
+deterministic; `SCPAssignMeta(s)` action (`ASSIGN_META` → `GET_REGIONS`);
+SCP actions\ gated on `∀ t: scpState[t] ≠ "ASSIGN_META"`
+(`waitMetaLoaded`); new `MetaAvailableForRecovery` invariant.
+TLC primary: 74,500,838 distinct, ~19min. Git: `6d0b336824`.
+
+---
+
+#### Iteration 16 — SCP per-region assignment (code-analysis grounded)
 
 **Note**: The TRSP's `serverCrashed()` self-recovery logic (procedure
 converts to ASSIGN/GET_ASSIGN_CANDIDATE when region is ABNORMALLY_CLOSED)
 is already modeled by `TRSPServerCrashed` from Iteration 5.  This
-iteration adds the SCP's orchestration of WHEN that callback is invoked,
-and — critically — the `isMatchingRegionLocation()` check that causes
-HBASE-24293 (SCP skips meta when location is null) and HBASE-21623
-(SCP stomps on a RIT for a wrong server).
-
+iteration adds the SCP's orchestration of WHEN that callback is invoked.
+**Code analysis**: Before writing TLA+, analyze `SCP.assignRegions()`
+(SCP.java L562-645) to ground the model to the implementation. 
 **What to add**: The full `SCPAssignRegion(s, r)` action, which models
 one iteration of the `assignRegions()` loop (SCP.java L562-645).
-Each invocation processes ONE region and removes it from `scpRegions[s]`.
-Between invocations, arbitrary other actions can interleave.
+Each invocation processes ONE region unconditionally and removes it
+from `scpRegions[s]`.  Between invocations, arbitrary other actions
+can interleave.
 
 ```tla
 SCPAssignRegion(s, r) ==
     /\ scpState[s] = "ASSIGN"
     /\ r \in scpRegions[s]
     /\ walFenced[s] = TRUE
-    \* --- isMatchingRegionLocation check (SCP.java L601) ---
-    \* If the region's current location no longer matches the crashed
-    \* server s, SCP skips assignment.  This can happen when a concurrent
-    \* TRSP has already cleared the location (e.g., during close) or
-    \* moved the region to a new server.
-    \* HBASE-24293: if location is None (cleared by concurrent TRSP),
-    \*   serverName.equals(null) returns false → region silently skipped
-    \*   even if it is the meta region.
-    \* HBASE-21623: if a concurrent TRSP moved the region to newServer,
-    \*   location = newServer ≠ s → region skipped, but SCP may have
-    \*   already written ABNORMALLY_CLOSED to meta, clobbering the TRSP.
-    /\ IF regionState[r].location # s
+    \* --- Default: process every region unconditionally ---
+    \* No isMatchingRegionLocation skip.  The default model ensures
+    \* every region in the SCP snapshot is handled, which is what
+    \* correct SCP behavior should guarantee.
+    /\ IF regionState[r].procType # "NONE"
        THEN
-            \* Skip: remove from snapshot, no state change.
+            \* Path A: TRSP already attached (SCP.java L612-618).
+            \* Call serverCrashed() on the existing TRSP.
+            \* This triggers regionClosedAbnormally() which
+            \* transitions the region to ABNORMALLY_CLOSED
+            \* (TRSP.java L582-583), then the existing
+            \* TRSPServerCrashed action converts the procedure
+            \* to ASSIGN/GET_ASSIGN_CANDIDATE.
+            \* SCP does NOT create a new TRSP.
+            \*
+            \* TRSP.serverCrashed() sub-paths (TRSP.java L570-585):
+            \* - If remoteProc != null: wakes child procedure
+            \*   (remoteProc.serverCrashed)
+            \* - If remoteProc == null AND region NOT
+            \*   ABNORMALLY_CLOSED: calls regionClosedAbnormally()
+            \* - If remoteProc == null AND region IS
+            \*   ABNORMALLY_CLOSED: no-op (retry case)
+            \* Net effect: region → ABNORMALLY_CLOSED, procedure
+            \* will be converted by TRSPServerCrashed.
+            /\ regionState' = [regionState EXCEPT
+                 ![r].state = "ABNORMALLY_CLOSED",
+                 ![r].location = None]
+            /\ metaTable' = [metaTable EXCEPT
+                 ![r] = [state |-> "ABNORMALLY_CLOSED",
+                         location |-> None]]
             /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ {r}]
-            /\ UNCHANGED <<regionState, metaTable, rpcVars, rsVars,
-                           serverState, walFenced, scpState>>
+            /\ UNCHANGED <<rpcVars, rsVars, serverState,
+                           walFenced, scpState>>
        ELSE
-            \* --- Two sub-paths based on existing procedure ---
-            /\ IF regionState[r].procType # "NONE"
-               THEN
-                    \* Path A: TRSP already attached (SCP.java L612-618).
-                    \* Call serverCrashed() on the existing TRSP.
-                    \* This triggers regionClosedAbnormally() which
-                    \* transitions the region to ABNORMALLY_CLOSED
-                    \* (TRSP.java L582-583), then the existing
-                    \* TRSPServerCrashed action converts the procedure
-                    \* to ASSIGN/GET_ASSIGN_CANDIDATE.
-                    \* SCP does NOT create a new TRSP.
-                    \*
-                    \* TRSP.serverCrashed() sub-paths (TRSP.java L570-585):
-                    \* - If remoteProc != null: wakes child procedure
-                    \*   (remoteProc.serverCrashed)
-                    \* - If remoteProc == null AND region NOT
-                    \*   ABNORMALLY_CLOSED: calls regionClosedAbnormally()
-                    \* - If remoteProc == null AND region IS
-                    \*   ABNORMALLY_CLOSED: no-op (retry case)
-                    \* Net effect: region → ABNORMALLY_CLOSED, procedure
-                    \* will be converted by TRSPServerCrashed.
-                    /\ regionState' = [regionState EXCEPT
-                         ![r].state = "ABNORMALLY_CLOSED",
-                         ![r].location = None]
-                    /\ metaTable' = [metaTable EXCEPT
-                         ![r] = [state |-> "ABNORMALLY_CLOSED",
-                                 location |-> None]]
-                    /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ {r}]
-                    /\ UNCHANGED <<rpcVars, rsVars, serverState,
-                                   walFenced, scpState>>
-               ELSE
-                    \* Path B: No TRSP attached (SCP.java L624-638).
-                    \* SCP creates a new TRSP(ASSIGN) directly.
-                    \* Transition region to ABNORMALLY_CLOSED and attach
-                    \* a fresh ASSIGN procedure at GET_ASSIGN_CANDIDATE.
-                    /\ regionState' = [regionState EXCEPT
-                         ![r].state = "ABNORMALLY_CLOSED",
-                         ![r].location = None,
-                         ![r].procType = "ASSIGN",
-                         ![r].procStep = "GET_ASSIGN_CANDIDATE",
-                         ![r].targetServer = None,
-                         ![r].retries = 0]
-                    /\ metaTable' = [metaTable EXCEPT
-                         ![r] = [state |-> "ABNORMALLY_CLOSED",
-                                 location |-> None]]
-                    /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ {r}]
-                    /\ UNCHANGED <<rpcVars, rsVars, serverState,
-                                   walFenced, scpState>>
+            \* Path B: No TRSP attached (SCP.java L624-638).
+            \* SCP creates a new TRSP(ASSIGN) directly.
+            \* Transition region to ABNORMALLY_CLOSED and attach
+            \* a fresh ASSIGN procedure at GET_ASSIGN_CANDIDATE.
+            /\ regionState' = [regionState EXCEPT
+                 ![r].state = "ABNORMALLY_CLOSED",
+                 ![r].location = None,
+                 ![r].procType = "ASSIGN",
+                 ![r].procStep = "GET_ASSIGN_CANDIDATE",
+                 ![r].targetServer = None,
+                 ![r].retries = 0]
+            /\ metaTable' = [metaTable EXCEPT
+                 ![r] = [state |-> "ABNORMALLY_CLOSED",
+                         location |-> None]]
+            /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ {r}]
+            /\ UNCHANGED <<rpcVars, rsVars, serverState,
+                           walFenced, scpState>>
 ```
-
-**Key modeling decisions**:
-
-1. The `isMatchingRegionLocation` check (`regionState[r].location # s`)
-   faithfully models `this.serverName.equals(rsn.getRegionLocation())`
-   (SCP.java L540-542).  When location is `None` (cleared by a concurrent
-   TRSP), this evaluates to `None # s` which is `TRUE`, causing the
-   skip — exactly matching the Java `serverName.equals(null) → false`.
-
+**Key modeling decisions**
+1. Every region in the SCP snapshot is processed unconditionally.
+   This ensures `NoLostRegions` passes.
 2. Path A (procedure attached) transitions the region to ABNORMALLY_CLOSED
    atomically within `SCPAssignRegion`.  The subsequent conversion to
    ASSIGN/GET_ASSIGN_CANDIDATE happens via the existing `TRSPServerCrashed`
    action (from Iteration 5), which fires as a separate step.
-
 3. Path B (no procedure) combines the ABNORMALLY_CLOSED transition AND
    procedure creation into a single atomic step, matching the real code
    where SCP creates the TRSP under the region lock.
-
 4. `scpRegions` shrinks by one element per invocation.  `SCPDone` fires
    when `scpRegions[s] = {}`.  Between successive `SCPAssignRegion`
    calls, any other action can interleave — this is what exposes the
    races.
-
-**Verify**: `NoLostRegions` (Section 4.1.4), `LockExclusivity`,
+**Verify**: `NoLostRegions` (Section 4.1.4) passes, `LockExclusivity`,
 `NoDoubleAssignment`, `NoDoubleWrite`.  No duplicate procedures for
 the same region.
 **Source**: `ServerCrashProcedure.java` L562-645 (`assignRegions()`),
@@ -812,7 +807,7 @@ L540-542 (`isMatchingRegionLocation()`), L612-618 (procedure attached),
 L624-638 (no procedure);
 `TransitRegionStateProcedure.serverCrashed()` L566-586.
 
-#### Iteration 16 — Double crash
+#### Iteration 17 — Double crash
 
 **What to add**: No new code — this is a **verification-only** iteration.
 Allow two servers to crash in the model. Verify that:
@@ -828,7 +823,8 @@ Allow two servers to crash in the model. Verify that:
 
 ### Phase 5: Procedure Persistence and Master Recovery
 
-#### Iteration 17 — Procedure store
+
+#### Iteration 18 — Procedure store
 
 **What to add**: `procStore` variable — a persistent set of procedure
 records (survives master crash). Actions that modify procedure state
@@ -843,7 +839,7 @@ The `procStore` variable is not modified by `ServerCrash` or
 matching entry in `procStore`.
 **Source**: `WALProcedureStore.java` insert/update/delete L527-694.
 
-#### Iteration 18 — Master crash and recovery
+#### Iteration 19 — Master crash and recovery
 
 **What to add**: Master crash/recovery actions, `RSOpenDuplicate`
 for HBASE-26283, and `restoreSucceedState` modeling for HBASE-29364.
@@ -908,13 +904,15 @@ up).
   regionClosedWithoutPersistingToMeta() L2253-2261,
   persistToMeta() L2289-2300.
 
-**`RSOpenDuplicate` action for HBASE-26283**: After master recovery,
-the master may re-dispatch OPEN commands for regions that the RS
-already has online (because the master rebuilt its state from meta,
-which may lag behind the RS's in-memory state).  The RS's
+**`RSOpenDuplicate` action (faithful modeling of RS behavior)**: After
+master recovery, the master may re-dispatch OPEN commands for regions
+that the RS already has online (because the master rebuilt its state
+from meta, which may lag behind the RS's in-memory state).  The RS's
 `AssignRegionHandler.process()` (L105-112) silently drops the
 duplicate open — it returns without reporting OPENED back to the
-master.  The master's TRSP stays stuck at CONFIRM_OPENED forever.
+master.  This is the **actual implementation behavior**, not a bug
+being injected into the model.  The master's TRSP stays stuck at
+CONFIRM_OPENED, which is a real design gap (HBASE-26283).
 
 ```tla
 RSOpenDuplicate(s, r) ==
@@ -941,13 +939,11 @@ drops it.  The liveness property "No Stuck Transitions" (Section
 4.2.4) would flag the resulting deadlock: the TRSP waits for an
 OPENED report that will never arrive.
 
-**`restoreSucceedState` modeling for HBASE-29364**: When the master
-recovers procedures from `procStore`, the recovery action
-`restoreSucceedState()` (TRSP.java) replays the persisted
-`transitionCode`.  HBASE-29364 occurs because the persisted code
-may be `FAILED_OPEN` but the recovery logic treats any
-`REPORT_SUCCEED` state as a successful transition.  This causes a
-region that failed to open to be recorded as OPEN in meta.
+**`restoreSucceedState` modeling (correct behavior by default)**:
+When the master recovers procedures from `procStore`, the recovery
+action `restoreSucceedState()` (TRSP.java) replays the persisted
+`transitionCode`.  The default model specs to correct behavior:
+the `transitionCode` is honored faithfully.
 
 The model should distinguish the `transitionCode` in the procedure
 store record.  During `MasterRecover`, when replaying a procedure
@@ -960,26 +956,23 @@ MasterRecoverProcedure(r) ==
        THEN \* Normal case: persist OPEN to meta
             /\ metaTable' = [metaTable EXCEPT ![r] =
                  [state |-> "OPEN", location |-> procStore[r].server]]
-       ELSE \* Bug (HBASE-29364): transitionCode is FAILED_OPEN
-            \* but restoreSucceedState persists OPEN anyway.
-            \* Model the buggy behavior to demonstrate the violation.
+       ELSE \* transitionCode is FAILED_OPEN:
+            \* Correct behavior: persist FAILED_OPEN and retry.
             /\ metaTable' = [metaTable EXCEPT ![r] =
-                 [state |-> "OPEN", location |-> procStore[r].server]]
-            \* MetaConsistency will flag: meta says OPEN but region
-            \* is not actually open on the target server.
+                 [state |-> "FAILED_OPEN", location |-> None]]
 ```
 
-If modeling the correct (fixed) behavior instead of the buggy one,
-the ELSE branch should transition to FAILED_OPEN and retry.  Modeling
-the buggy behavior demonstrates the issue; `MetaConsistency` and
-`RSMasterAgreement` invariants will fail.
+**Code analysis note**: The implementation's `restoreSucceedState()`
+(HBASE-29364) treats any `REPORT_SUCCEED` as a successful transition
+regardless of `transitionCode`, persisting OPEN even for FAILED_OPEN.
+The model captures correct behavior; the gap is identified through code
+analysis at each iteration.
 
 **Verify**: After `MasterRecover`, the system eventually reaches a
 consistent state. `MetaConsistency` holds after recovery. No lost
-regions. No stuck procedures. The `RSOpenDuplicate` scenario triggers
-a "No Stuck Transitions" liveness violation (HBASE-26283). The
-`restoreSucceedState` scenario triggers a `MetaConsistency` violation
-(HBASE-29364).
+regions. No stuck procedures. The `RSOpenDuplicate` action (faithful
+modeling) triggers a "No Stuck Transitions" liveness violation,
+exposing the HBASE-26283 design gap.
 **Source**: `ProcedureExecutor.java` `load()` L328-609,
 `AssignmentManager.start()` L313-362,
 `AssignRegionHandler.process()` L98-164 (HBASE-26283),
@@ -989,7 +982,7 @@ a "No Stuck Transitions" liveness violation (HBASE-26283). The
 
 ### Phase 6: Split and Merge (Deferred)
 
-#### Iteration 19 — Split/merge region states and region pool
+#### Iteration 20 — Split/merge region states and region pool
 
 **What to add**: Extend `State` with `SPLITTING`, `SPLIT`,
 `SPLITTING_NEW`, `MERGING`, `MERGED`, `MERGING_NEW`. Extend
@@ -1001,7 +994,7 @@ All actions guard on `regionExists[r] = TRUE`.
 **Verify**: `TypeOK` and `TransitionValid` with the extended state space.
 TLC with 2 primary regions, 4 daughter pool slots, 2 servers.
 
-#### Iteration 20 — Split procedure: PREPARE through CLOSE_PARENT
+#### Iteration 21 — Split procedure: PREPARE through CLOSE_PARENT
 
 **What to add**: Split procedure state machine, initially covering only
 the pre-PONR states: `SPLIT_PREPARE → SPLIT_CLOSE_PARENT →
@@ -1019,7 +1012,7 @@ No daughters exist yet (`regionExists` still FALSE).
 **Source**: `SplitTableRegionProcedure.java` `prepareSplitRegion()` L509-593,
 `createUnassignProcedures()` L950-954.
 
-#### Iteration 21 — Split PONR: atomic meta update creates daughters
+#### Iteration 22 — Split PONR: atomic meta update creates daughters
 
 **What to add**: The PONR step:
 - `SplitUpdateMeta(p)`: Atomically:
@@ -1035,7 +1028,7 @@ No daughters exist yet (`regionExists` still FALSE).
 **Source**: `AssignmentManager.markRegionAsSplit()` L2364-2390,
 `RegionStateStore.splitRegion()` L367-410.
 
-#### Iteration 22 — Split post-PONR: open daughters
+#### Iteration 23 — Split post-PONR: open daughters
 
 **What to add**:
 - `SplitOpenChildren(p)`: Create child TRSP(ASSIGN) for each daughter.
@@ -1047,7 +1040,7 @@ OPEN and parent is SPLIT. `NoOrphanedDaughters` — every SPLITTING_NEW
 region has a parent split procedure.
 **Source**: `SplitTableRegionProcedure.java` `createAssignProcedures()` L956-963.
 
-#### Iteration 23 — Split pre-PONR rollback
+#### Iteration 24 — Split pre-PONR rollback
 
 **What to add**: Non-deterministic failure action for pre-PONR states:
 - `SplitFail(p)`: Pre: split procedure is in a pre-PONR state
@@ -1060,7 +1053,7 @@ region has a parent split procedure.
 daughters exist, no procedures attached. All safety invariants hold.
 **Source**: `SplitTableRegionProcedure.java` `rollbackState()` L368-411.
 
-#### Iteration 24 — Merge procedure (full lifecycle)
+#### Iteration 25 — Merge procedure (full lifecycle)
 
 **What to add**: Complete merge procedure following the same pattern as
 split:
@@ -1080,7 +1073,7 @@ split:
 parents are MERGED. All safety invariants hold.
 **Source**: `MergeTableRegionsProcedure.java` `executeFromState()` L189-255.
 
-#### Iteration 25 — Crash during split/merge
+#### Iteration 26 — Crash during split/merge
 
 **What to add**: No new actions — this is a **verification-only** iteration.
 Configure TLC to allow RS crash and master crash during active
@@ -1097,14 +1090,14 @@ split/merge procedures. Verify:
 
 ### Phase 7: Liveness and Refinement (Deferred)
 
-#### Iteration 26 — Fairness and liveness
+#### Iteration 27 — Fairness and liveness
 
 **What to add**: Weak fairness on procedure execution, strong fairness
 on message delivery. Check temporal properties:
 - `□(regionState[r].state = "OFFLINE" ⇒ ◇ regionState[r].state = "OPEN")`
 - `□(scp_started(s) ⇒ ◇ scp_done(s))`
 
-#### Iteration 27 — TLC optimization
+#### Iteration 28 — TLC optimization
 
 **Already done** (from Iteration 7): Symmetry sets for Regions and
 Servers (`Permutations(Regions) \union Permutations(Servers)`). This
@@ -1113,7 +1106,7 @@ provided up to 36× reduction for 3r/3s.
 Action constraints to limit crash frequency. Measure cumulative state
 space reduction across all phases.
 
-#### Iteration 28 — Advanced scenarios and findings
+#### Iteration 29 — Advanced scenarios and findings
 
 **What to verify**: Cascade crashes, master failover during SCP,
 concurrent split and move on the same region, split during merge of
@@ -1162,26 +1155,30 @@ is shown.
 | `AM.balance()` / `createMoveRegionProcedure()` | `TRSPCreateMove(r)` | 11 | ✅ |
 | `TRSP.confirmOpened()` maxAttempts give-up | `TRSPGiveUpOpen(r)` | 12 | ✅ |
 | Kubernetes / process supervisor restart | `ServerRestart(s)` | 12 | ✅ |
-| `SCP.splitLogs()` (WAL lease revocation) | `SCPFenceWALs(scp)` | 15 | ⏳ |
-| `SCP.assignRegions()` | `SCPAssign(scp)` | 15 | ⏳ |
-| `SCP` + `TRSP.serverCrashed()` interaction | `SCPInterruptTRSP(scp, p)` | 16 | ⏳ |
-| Master crash | `MasterCrash` | 19 | ⏳ |
-| Master recovery (load from store) | `MasterRecover` | 19 | ⏳ |
-| `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(parent, dA, dB)` | 21 | ⏳ |
-| `SplitTableRegionProcedure` CLOSE_PARENT | `SplitCloseParent(p)` | 21 | ⏳ |
-| `SplitTableRegionProcedure` CHECK_CLOSED | `SplitCheckClosed(p)` | 21 | ⏳ |
-| `AssignmentManager.markRegionAsSplit()` | `SplitUpdateMeta(p)` | 22 | ⏳ |
-| `SplitTableRegionProcedure` OPEN_CHILDREN | `SplitOpenChildren(p)` | 23 | ⏳ |
-| `SplitTableRegionProcedure` completion | `SplitDone(p)` | 23 | ⏳ |
-| `SplitTableRegionProcedure.rollbackState()` | `SplitRollback(p)` | 24 | ⏳ |
-| `MergeTableRegionsProcedure.prepareMergeRegion()` | `MergePrepare(r1, r2, m)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure` CLOSE_REGIONS | `MergeCloseRegions(p)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure` CHECK_CLOSED | `MergeCheckClosed(p)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure` CREATE_MERGED | `MergeCreateMerged(p)` | 25 | ⏳ |
-| `AssignmentManager.markRegionAsMerged()` | `MergeUpdateMeta(p)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure` OPEN_MERGED | `MergeOpenMerged(p)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure.rollbackState()` | `MergeRollback(p)` | 25 | ⏳ |
+| `SCP.splitLogs()` (WAL lease revocation) | `SCPFenceWALs(scp)` | 14 | ✅ |
+| `SCP.assignRegions()` (simplified) | `SCPAssignRegion(s, r)` | 14 | ✅ |
+| `TRSP.reopen()` | `TRSPCreateReopen(r)` | 15 | ⏳ |
+| Per-region write lock | `locked[r]` variable | 15 | ⏳ |
+| SCP carryingMeta path | `SCPSplitMetaLogs`, `SCPAssignMeta` | 15 | ⏳ |
+| `SCP.assignRegions()` with `isMatchingRegionLocation` | `SCPAssignRegion(s,r)` refined | 16 | ⏳ |
+| `SCP` + `TRSP.serverCrashed()` interaction | `SCPInterruptTRSP(scp, p)` | 17 | ⏳ |
+| Master crash | `MasterCrash` | 20 | ⏳ |
+| Master recovery (load from store) | `MasterRecover` | 20 | ⏳ |
+| `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(parent, dA, dB)` | 22 | ⏳ |
+| `SplitTableRegionProcedure` CLOSE_PARENT | `SplitCloseParent(p)` | 22 | ⏳ |
+| `SplitTableRegionProcedure` CHECK_CLOSED | `SplitCheckClosed(p)` | 22 | ⏳ |
+| `AssignmentManager.markRegionAsSplit()` | `SplitUpdateMeta(p)` | 23 | ⏳ |
+| `SplitTableRegionProcedure` OPEN_CHILDREN | `SplitOpenChildren(p)` | 24 | ⏳ |
+| `SplitTableRegionProcedure` completion | `SplitDone(p)` | 24 | ⏳ |
+| `SplitTableRegionProcedure.rollbackState()` | `SplitRollback(p)` | 25 | ⏳ |
+| `MergeTableRegionsProcedure.prepareMergeRegion()` | `MergePrepare(r1, r2, m)` | 26 | ⏳ |
+| `MergeTableRegionsProcedure` CLOSE_REGIONS | `MergeCloseRegions(p)` | 26 | ⏳ |
+| `MergeTableRegionsProcedure` CHECK_CLOSED | `MergeCheckClosed(p)` | 26 | ⏳ |
+| `MergeTableRegionsProcedure` CREATE_MERGED | `MergeCreateMerged(p)` | 26 | ⏳ |
+| `AssignmentManager.markRegionAsMerged()` | `MergeUpdateMeta(p)` | 26 | ⏳ |
+| `MergeTableRegionsProcedure` OPEN_MERGED | `MergeOpenMerged(p)` | 26 | ⏳ |
+| `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 26 | ⏳ |
+| `MergeTableRegionsProcedure.rollbackState()` | `MergeRollback(p)` | 26 | ⏳ |
 
 ---
 
@@ -1325,10 +1322,17 @@ iteration is considered complete.
 
 Each iteration follows a fixed loop:
 
-1. **WRITE / EDIT** — Add or modify spec per the iteration's scope
+1. **CODE ANALYSIS** — Before writing TLA+, analyze the relevant
+   implementation code paths for this iteration's scope.  Ground the
+   model to the actual implementation behavior.  The spec captures
+   the correct protocol behavior — do NOT model known bugs.  At the
+   end of each iteration, compare the model against the
+   implementation to identify gaps where the code diverges from the
+   correct protocol.  These gaps are the findings.
+2. **WRITE / EDIT** — Add or modify spec per the iteration's scope
    (see Section 7 for iteration descriptions).
-2. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
-3. **RUN TLC** — Run both mandatory configurations:
+3. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
+4. **RUN TLC** — Run both mandatory configurations:
    - `AssignmentManager.cfg` (primary, exhaustive 2r/2s) — must pass.
    - `AssignmentManager-sim.cfg` (simulation, 3r/3s, 300s) — must pass.
    After completing an iteration, run a 15-minute post-iteration
@@ -1337,15 +1341,15 @@ Each iteration follows a fixed loop:
    (`AssignmentManager-full.cfg`) is not run at every iteration.
    It is reserved for ad hoc on-demand checks at user-requested
    checkpoints.
-4. **TRIAGE** — If TLC reports violations, classify each one (see 12.3).
-   Repeat from step 1 or 3 as needed.
-5. **REGRESSION CHECK** — Re-verify all invariants and properties from
+5. **TRIAGE** — If TLC reports violations, classify each one (see 12.3).
+   Repeat from step 1 or 4 as needed.
+6. **REGRESSION CHECK** — Re-verify all invariants and properties from
    prior iterations. A fix in iteration N must not break any invariant
    proven in iterations 1 through N-1. The primary and simulation
    configs provide this coverage automatically at every iteration.
-6. **RECORD** — Document the TLC result, configuration, state count,
+7. **RECORD** — Document the TLC result, configuration, state count,
    and any findings (see 12.4 and 12.5).
-7. **UPDATE PLAN** — Mark the iteration complete in this plan document
+8. **UPDATE PLAN** — Mark the iteration complete in this plan document
    (Section 7). Append `✅ COMPLETE` to the iteration heading, convert
    the "What to add" description to past tense ("What was added"), and
    add a `**TLC result**` line summarizing the final model-checking
@@ -1353,16 +1357,16 @@ Each iteration follows a fixed loop:
    If the iteration produced a legitimate finding, note it here with
    its Finding ID (see 12.5). This keeps the plan document as the
    single source of truth for iteration status.
-8. **GIT COMMIT** — Commit the successful spec files, configuration,
+9. **GIT COMMIT** — Commit the successful spec files, configuration,
    updated plan document, and iteration record to version control. The
    commit message must identify the iteration number and summarize the
    outcome (clean pass or legitimate finding). This ensures every
    completed iteration has a recoverable checkpoint and provides an
    auditable history of the specification's evolution.
 
-Steps 1–4 repeat until TLC either passes cleanly or produces a confirmed
-legitimate finding. Step 5 is mandatory — no iteration is complete without
-a regression check against all prior invariants. Steps 7–8 are the
+Steps 1–5 repeat until TLC either passes cleanly or produces a confirmed
+legitimate finding. Step 6 is mandatory — no iteration is complete without
+a regression check against all prior invariants. Steps 8–9 are the
 terminal actions — an iteration is not considered done until the plan
 document is updated and the results are committed.
 
@@ -1463,7 +1467,7 @@ The following rules govern backward compatibility across iterations:
 
 2. **Invariant weakening**: An invariant may be weakened (relaxed) in a
    later iteration if the original formulation was too strong — e.g.,
-   `MetaConsistency` is relaxed in Iteration 21 to account for the
+   `MetaConsistency` is relaxed in Iteration 22 to account for the
    SPLITTING_NEW/MERGING_NEW discrepancy. The weakening must be justified
    by reference to the implementation behavior that necessitates it.
 
@@ -1473,7 +1477,7 @@ The following rules govern backward compatibility across iterations:
    must be triaged and resolved before proceeding.
 
 4. **Configuration consistency**: When increasing model size (e.g., adding
-   a third server for double-crash in Iteration 16), all prior invariants
+   a third server for double-crash in Iteration 17), all prior invariants
    must still pass at the new size. If a prior invariant only passed at a
    smaller size due to state space limitations, this must be documented.
 
@@ -2598,7 +2602,7 @@ in-memory state reflects reality, and meta will catch up on retry.
 step 2 succeeds, meta retains the old value (OPENING or CLOSING). The procedure
 state REPORT_SUCCEED is persisted to the ProcedureStore (WAL). On master recovery,
 the procedure is reloaded and replays step 2, retrying `persistToMeta()`. This is
-the core scenario for Iteration 18 (master crash and recovery).
+the core scenario for Iteration 19 (master crash and recovery).
 
 ### D.5 GoOffline: No Meta Write
 
@@ -2627,7 +2631,7 @@ specification. The justification:
    or doesn't. If it doesn't fire in a given step, it may fire in a later step.
    This naturally models the retry semantics without explicit failure/revert logic.
 
-3. **Pattern C is refined in Iteration 18**: The two-step persistence window
+3. **Pattern C is refined in Iteration 19**: The two-step persistence window
    (in-memory updated, meta not yet) becomes non-trivial when master crash is
    introduced. At that point, the model must split the OPENING→OPEN and
    CLOSING→CLOSED transitions into separate in-memory and meta steps, with
@@ -2636,7 +2640,7 @@ specification. The justification:
 
 4. **Meta write failure as an advanced scenario**: Full meta write failure
    modeling (splitting every meta-writing action, adding a `metaWritePending`
-   variable, weakening 4 invariants) is a candidate for Iteration 28 (advanced
+   variable, weakening 4 invariants) is a candidate for Iteration 29 (advanced
    scenarios). It would roughly double the action count and significantly
    increase the state space, but could validate the revert correctness and
    the interaction between meta write failure and crash recovery.
