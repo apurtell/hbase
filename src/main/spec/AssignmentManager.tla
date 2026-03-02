@@ -116,39 +116,42 @@
  * SCPGetRegions and SCPAssignRegion — matching the implementation.
  * When FALSE, every region in the SCP snapshot is processed
  * unconditionally — the correct protocol behavior.  The check is
- * a known source of bugs (HBASE-24293, HBASE-21623).
+ * a known source of bugs.
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Regions,    \* The finite set of region identifiers
          Servers
+
 \* The finite set of regionserver identifiers
 ASSUME Regions # {}
 ASSUME Servers # {}
 
-CONSTANTS None
 \* Sentinel model value for "no server assigned"
+CONSTANTS None
 ASSUME None \notin Servers
 
-CONSTANTS MaxRetries
 \* Maximum open-retry attempts before giving up (FAILED_OPEN)
+CONSTANTS MaxRetries
 ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
 
-CONSTANTS UseLocationCheck
-\* BOOLEAN: when TRUE, SCPAssignRegion applies the
+\* UseLocationCheck: when TRUE, SCPAssignRegion applies the
 \* isMatchingRegionLocation() check — regions whose master-side
 \* location has changed since SCPGetRegions are skipped.
 \* When FALSE, every region in the SCP snapshot is processed
-\* unconditionally (correct protocol behavior).
-\*
-\* The implementation's check is a known source of bugs:
-\* HBASE-24293, HBASE-21623.  Setting FALSE models the ideal
-\* protocol; setting TRUE reproduces the implementation's behavior
-\* and may expose NoLostRegions violations confirming those bugs.
+\* unconditionally.
 \*
 \* Source: ServerCrashProcedure.isMatchingRegionLocation()
 \*         SCP.java L498-500; called at SCP.java L529.
+CONSTANTS UseLocationCheck
 ASSUME UseLocationCheck \in BOOLEAN
+
+\* UseReopen: when TRUE, TRSPCreateReopen is enabled, modeling the
+\* branch-2.6 REOPEN transition type (close then reopen on the same
+\* server).  master (branch-3+) does not have REOPEN, only MOVE.
+\* Setting FALSE disables REOPEN, reducing the state space.
+CONSTANTS UseReopen
+ASSUME UseReopen \in BOOLEAN
 
 ---------------------------------------------------------------------------
 
@@ -351,6 +354,21 @@ VARIABLE locked
 \*         SCP.waitMetaLoaded() SCP.java L154-157.
 VARIABLE carryingMeta
 
+\* serverRegions[s] is the set of regions tracked by server s's
+\* ServerStateNode in the implementation.  This is maintained by
+\* addRegionToServer/removeRegionFromServer calls in AM.regionOpening(),
+\* AM.regionClosedWithoutPersistingToMeta(), AM.regionFailedOpen(), and
+\* AM.regionClosedAbnormally().  SCP's getRegionsOnServer() reads from
+\* this tracking, NOT from regionState[r].location.  These two can
+\* desynchronize when a TRSP updates one before the other, providing
+\* the mechanism for the race where SCP snapshots a stale set of
+\* regions for a crashed server.
+\*
+\* Source: RegionStates.addRegionToServer() / removeRegionFromServer();
+\*         ServerStateNode.addRegion() / removeRegion();
+\*         AssignmentManager.getRegionsOnServer() AM.java L492-498.
+VARIABLE serverRegions
+
 vars ==
   << regionState,
      metaTable,
@@ -362,7 +380,8 @@ vars ==
      scpRegions,
      walFenced,
      locked,
-     carryingMeta
+     carryingMeta,
+     serverRegions
   >>
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -423,6 +442,8 @@ TypeOK ==
   /\ carryingMeta \in [Servers -> BOOLEAN]
   \* Per-region write lock for mutual exclusion.
   /\ locked \in [Regions -> BOOLEAN]
+  \* Per-server region tracking (ServerStateNode).
+  /\ serverRegions \in [Servers -> SUBSET Regions]
 
 ---------------------------------------------------------------------------
 
@@ -590,18 +611,32 @@ MetaAvailableForRecovery ==
   \A s \in Servers:
     carryingMeta[s] = TRUE => scpState[s] \in { "NONE", "ASSIGN_META", "DONE" }
 
-\* After any SCP completes, no region is stuck in ABNORMALLY_CLOSED
-\* without a procedure.  Such a region is "lost" -- it will never be
-\* reassigned without manual intervention.  We scope to ABNORMALLY_CLOSED
-\* only: OFFLINE, CLOSED, FAILED_OPEN with no procedure are legitimate
-\* quiescent states (never assigned, explicitly taken offline, or
-\* failed to open); the lost-region bug is specifically ABNORMALLY_CLOSED
-\* with no procedure.
+\* After any SCP completes, no region is stuck without a procedure and
+\* without an SCP that will process it.  A region is lost when it is
+\* in a non-terminal state with no active procedure and no coverage
+\* from any SCP snapshot.  Two cases:
+\*
+\*   (1) ABNORMALLY_CLOSED with no procedure: SCP should have
+\*       attached an ASSIGN procedure.  If it skipped the region
+\*       (e.g., due to the isMatchingRegionLocation check), the
+\*       region is lost.
+\*   (2) Non-terminal mid-transition (OPENING, CLOSING) with
+\*       location=None, no procedure, and not in any SCP's snapshot:
+\*       this region is stranded mid-transition with no active owner.
+\*       This can occur when a location-check skip combined with a
+\*       concurrent TRSP clearing the location leaves the region
+\*       untracked.  OFFLINE is excluded: it is a legitimate quiescent
+\*       state (initial state or post-GoOffline).
 NoLostRegions ==
   ( \E s \in Servers: scpState[s] = "DONE" ) =>
     \A r \in Regions:
-      regionState[r].state = "ABNORMALLY_CLOSED" =>
-        regionState[r].procType # "NONE"
+      /\ ( regionState[r].state = "ABNORMALLY_CLOSED" =>
+             regionState[r].procType # "NONE"
+         )
+      /\ ( /\ regionState[r].state \in { "OPENING", "CLOSING" }
+           /\ regionState[r].location = None
+           /\ regionState[r].procType = "NONE"
+           => \E s \in Servers: r \in scpRegions[s] )
 
 ---------------------------------------------------------------------------
 
@@ -650,6 +685,7 @@ Init ==
   /\ walFenced = [s \in Servers |-> FALSE]
   /\ carryingMeta = [s \in Servers |-> FALSE]
   /\ locked = [r \in Regions |-> FALSE]
+  /\ serverRegions = [s \in Servers |-> {}]
 
 ---------------------------------------------------------------------------
 
@@ -669,6 +705,12 @@ TRSPCreate(r) ==
   /\ regionState[r].state \in
        { "OFFLINE", "CLOSED", "ABNORMALLY_CLOSED", "FAILED_OPEN" }
   /\ regionState[r].procType = "NONE"
+  \* Don't auto-create ASSIGN for ABNORMALLY_CLOSED regions while any SCP
+  \* is actively processing a crash.  In the implementation, SCP owns
+  \* crash recovery; no background daemon races to create procedures for
+  \* crashed regions during the SCP assign loop.
+  /\ \/ regionState[r].state # "ABNORMALLY_CLOSED"
+     \/ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
   \* Initialize embedded ASSIGN procedure at GET_ASSIGN_CANDIDATE step.
   /\ locked[r] = FALSE
   /\ regionState' =
@@ -682,7 +724,14 @@ TRSPCreate(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 \* Choose a target server for the ASSIGN, MOVE, or REOPEN procedure.
 \* Pre: TRSP is in GET_ASSIGN_CANDIDATE state, chosen server is ONLINE,
@@ -720,7 +769,14 @@ TRSPGetCandidate(r, s) ==
   /\ regionState' =
        [regionState EXCEPT ![r].targetServer = s, ![r].procStep = "OPEN"]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 \* Dispatch the open command to the target server via RPC.
 \* Pre: TRSP is in OPEN state with a target server.
@@ -758,6 +814,14 @@ TRSPDispatchOpen(r) ==
              [dispatchedOps EXCEPT
              ![s] =
              @ \cup { [ type |-> "OPEN", region |-> r ] }]
+        \* ServerStateNode tracking: AM.regionOpening() adds r to the
+        \* new target server's set.  It does NOT remove r from the old
+        \* server's set — that removal happens only in regionFailedOpen,
+        \* regionClosedWithoutPersistingToMeta, or regionClosedAbnormally.
+        \* This means r may appear on two servers' ServerStateNode
+        \* simultaneously (old and new) during the OPENING window.
+        \* Source: AM.regionOpening() AM.java L2178-2196.
+        /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \cup { r }]
         \* Pending reports, RS-side state, and server liveness unchanged.
         /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars, locked >>
 
@@ -788,7 +852,9 @@ TRSPConfirmOpened(r) ==
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
        /\ rpt.code = "OPENED"
-       /\ serverState[rpt.server] = "ONLINE"
+       \* No serverState ONLINE guard: models the race where
+       \* an OPENED report arrives before crash detection (see
+       \* TRSPConfirmClosed comment for rationale).
        \* Finalize region as OPEN, keep location, clear procedure fields.
        /\ regionState' =
             [regionState EXCEPT
@@ -808,7 +874,13 @@ TRSPConfirmOpened(r) ==
        \* Consume the matched report from the pending set.
        /\ pendingReports' = pendingReports \ { rpt }
        \* Dispatched ops, RS-side state, and server liveness unchanged.
-       /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars, locked >>
+       /\ UNCHANGED << dispatchedOps,
+             rsVars,
+             serverState,
+             scpVars,
+             locked,
+             serverRegions
+          >>
 
 ---------------------------------------------------------------------------
 
@@ -855,7 +927,8 @@ DispatchFail(r) ==
               rsVars,
               serverState,
               scpVars,
-              locked
+              locked,
+              serverRegions
            >>
 
 \* Close command dispatch failed (non-deterministic RPC failure).
@@ -893,7 +966,8 @@ DispatchFailClose(r) ==
               rsVars,
               serverState,
               scpVars,
-              locked
+              locked,
+              serverRegions
            >>
 
 \* Handle a FAILED_OPEN report from the RS by retrying the assignment.
@@ -951,6 +1025,14 @@ TRSPHandleFailedOpen(r) ==
             ]
        \* META, RS-side state, and server liveness unchanged.
        /\ UNCHANGED << metaTable, rsVars, serverState, scpVars, locked >>
+       \* ServerStateNode tracking: AM.regionFailedOpen() calls
+       \* removeRegionFromServer() for the region's current location.
+       \* Source: AM.regionFailedOpen() AM.java L2201-2224.
+       /\ LET loc == regionState[r].location
+          IN serverRegions' =
+                IF loc # None
+                THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
+                ELSE serverRegions
 
 \* Give up on opening a region after exhausting the retry budget.
 \* Consumes the FAILED_OPEN report, transitions the region to
@@ -1000,6 +1082,14 @@ TRSPGiveUpOpen(r) ==
        /\ pendingReports' = pendingReports \ { rpt }
        \* Dispatched ops, RS-side state, and server liveness unchanged.
        /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars, locked >>
+       \* ServerStateNode tracking: AM.regionFailedOpen() calls
+       \* removeRegionFromServer() for the region's current location.
+       \* Source: AM.regionFailedOpen() AM.java L2201-2224.
+       /\ LET loc == regionState[r].location
+          IN serverRegions' =
+                IF loc # None
+                THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
+                ELSE serverRegions
 
 ---------------------------------------------------------------------------
 
@@ -1034,7 +1124,14 @@ TRSPCreateUnassign(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 \* Create a TRSP MOVE procedure for an OPEN region.
 \* A MOVE is an UNASSIGN (close on the current server) followed by an
@@ -1073,7 +1170,14 @@ TRSPCreateMove(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 \* Create a TRSP REOPEN procedure for an OPEN region.
 \* REOPEN follows the same flow as MOVE (CLOSE -> CONFIRM_CLOSED ->
@@ -1090,8 +1194,9 @@ TRSPCreateMove(r) ==
 \*         TRSP.setInitialAndLastState() TRSP.java L154-158;
 \*         TRSP.queueAssign() L238-270 (retain=true when assignCandidate set).
 TRSPCreateReopen(r) ==
-  \* Guards: region is OPEN, has a server location, no active procedure.
-  \* No requirement that another ONLINE server exists.
+  \* Guards: UseReopen enabled, region is OPEN, has a server location,
+  \* no active procedure.  No requirement that another ONLINE server exists.
+  /\ UseReopen = TRUE
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # None
   /\ regionState[r].procType = "NONE"
@@ -1109,7 +1214,14 @@ TRSPCreateReopen(r) ==
        ![r].retries =
        0]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 \* Dispatch the close command to the target server via RPC.
 \* Pre: UNASSIGN or MOVE procedure in CLOSE state, region is OPEN or
@@ -1151,7 +1263,13 @@ TRSPDispatchClose(r) ==
              ![s] =
              @ \cup { [ type |-> "CLOSE", region |-> r ] }]
         \* Pending reports, RS-side state, and server liveness unchanged.
-        /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars, locked >>
+        /\ UNCHANGED << pendingReports,
+              rsVars,
+              serverState,
+              scpVars,
+              locked,
+              serverRegions
+           >>
 
 \* Confirm that the region closed successfully, OR handle the case
 \* where the region's server crashed (ABNORMALLY_CLOSED) during close.
@@ -1196,12 +1314,14 @@ TRSPConfirmClosed(r) ==
         /\ \E rpt \in pendingReports:
              /\ rpt.region = r
              /\ rpt.code = "CLOSED"
-             /\ serverState[rpt.server] = "ONLINE"
+             \* No serverState ONLINE guard. Models the race where a CLOSED
+             \* report is processed by the master RPC handler before crash
+             \* detection marks the server dead.
              \* The report must come from the server where the CLOSE was
              \* dispatched.
              /\ rpt.server = regionState[r].targetServer
              \* Do not consume if r was reopened on that server (RSOpen ran
-             \* after the CLOSED was produced); that would violate RSMasterAgreementConverse.
+             \* after a prior RSFailOpen); prefer OPENED.
              /\ r \notin rsOnlineRegions[rpt.server]
              \* Finalize region as CLOSED, clear location and target server.
              \* UNASSIGN: clear procedure to idle.
@@ -1231,11 +1351,19 @@ TRSPConfirmClosed(r) ==
              /\ pendingReports' = pendingReports \ { rpt }
              \* Dispatched ops, RS-side state, and server liveness unchanged.
              /\ UNCHANGED << dispatchedOps,
-                   rsVars,
-                   serverState,
-                   scpVars,
-                   locked
-                >>
+                     rsVars,
+                     serverState,
+                     scpVars,
+                     locked
+                  >> \* ServerStateNode tracking: AM.regionClosedWithoutPersisting()
+                  \* calls removeRegionFromServer() for the region's location.
+                  \* Source: AM.regionClosedWithoutPersistingToMeta() AM.java L2253-2260.
+                  /\
+                  LET loc == regionState[r].location
+                  IN serverRegions' =
+                        IF loc # None
+                        THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
+                        ELSE serverRegions
      \/ \* --- Path 2: Crash during close (ABNORMALLY_CLOSED) ---
         \* The target server crashed while the close was in flight.
         \* The procedure self-recovers: convert to ASSIGN at
@@ -1274,6 +1402,14 @@ TRSPConfirmClosed(r) ==
               scpVars,
               locked
            >>
+        \* ServerStateNode tracking: AM.regionClosedAbnormally() calls
+        \* removeRegionFromServer() for the region's location.
+        \* Source: AM.regionClosedAbnormally() AM.java L2230-2246.
+        /\ LET loc == regionState[r].location
+           IN serverRegions' =
+                 IF loc # None
+                 THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
+                 ELSE serverRegions
 
 ---------------------------------------------------------------------------
 
@@ -1298,7 +1434,14 @@ GoOffline(r) ==
   \* Meta is NOT updated: RegionStateNode.offline() (RSN.java L132-134)
   \* does not write to meta.  metaTable retains CLOSED; divergence is
   \* resolved on master restart.  See Appendix D.5.
-  /\ UNCHANGED << metaTable, rpcVars, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rpcVars,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 \* The master detects that a RegionServer has crashed (ZK ephemeral
 \* node expired).  Marks the server as CRASHED and initiates a
@@ -1336,7 +1479,8 @@ MasterDetectCrash(s) ==
         rsOnlineRegions,
         scpRegions,
         walFenced,
-        locked
+        locked,
+        serverRegions
      >>
 
 \* A process supervisor (Kubernetes, systemd, etc.) restarts a crashed
@@ -1388,6 +1532,10 @@ ServerRestart(s) ==
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
   \* Region state and META unchanged.
   /\ UNCHANGED << regionState, metaTable, locked >>
+  \* Clear ServerStateNode tracking for the restarting server.
+  \* In the implementation, SCP.removeServer() calls
+  \* RegionStates.removeServer() which removes the ServerStateNode.
+  /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
 
 ---------------------------------------------------------------------------
 
@@ -1449,7 +1597,13 @@ TRSPServerCrashed(r) ==
   /\ pendingReports' =
        {pr \in pendingReports: pr.region # r \/ pr.code # "CLOSED"}
   \* META, RS-side state, and server liveness unchanged.
-  /\ UNCHANGED << metaTable, rsVars, serverState, scpVars, locked >>
+  /\ UNCHANGED << metaTable,
+        rsVars,
+        serverState,
+        scpVars,
+        locked,
+        serverRegions
+     >>
 
 ---------------------------------------------------------------------------
 
@@ -1487,7 +1641,8 @@ RSAbort(s) ==
         pendingReports,
         serverState,
         scpVars,
-        locked
+        locked,
+        serverRegions
      >>
 
 ---------------------------------------------------------------------------
@@ -1543,7 +1698,8 @@ SCPAssignMeta(s) ==
         serverState,
         scpRegions,
         walFenced,
-        locked
+        locked,
+        serverRegions
      >>
 
 SCPGetRegions(s) ==
@@ -1551,9 +1707,12 @@ SCPGetRegions(s) ==
   /\ scpState[s] = "GET_REGIONS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
-  \* Snapshot all regions currently assigned to the crashed server.
-  /\ scpRegions' =
-       [scpRegions EXCEPT ![s] = {r \in Regions: regionState[r].location = s}]
+  \* Snapshot regions from the ServerStateNode tracking for the
+  \* crashed server.  In the implementation, getRegionsOnServer()
+  \* reads from the ServerStateNode's region set, NOT from
+  \* regionNode.getRegionLocation().  These two can be out of sync.
+  \* Source: AM.getRegionsOnServer() AM.java L492-498.
+  /\ scpRegions' = [scpRegions EXCEPT ![s] = serverRegions[s]]
   \* Advance SCP to the WAL fencing step.
   /\ scpState' = [scpState EXCEPT ![s] = "FENCE_WALS"]
   \* Region state, meta, RPCs, RS-side state, and WAL fencing unchanged.
@@ -1564,7 +1723,8 @@ SCPGetRegions(s) ==
         serverState,
         walFenced,
         locked,
-        carryingMeta
+        carryingMeta,
+        serverRegions
      >>
 
 \* SCP step 2: Revoke WAL leases for the crashed server.  After this
@@ -1596,7 +1756,8 @@ SCPFenceWALs(s) ==
         serverState,
         scpRegions,
         locked,
-        carryingMeta
+        carryingMeta,
+        serverRegions
      >>
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
@@ -1606,8 +1767,7 @@ SCPFenceWALs(s) ==
 \*   Skip (location check): when UseLocationCheck is TRUE and the
 \*     region's master-side location no longer matches the crashed
 \*     server, SCP skips the region entirely.  This models the
-\*     isMatchingRegionLocation() guard (SCP.java L529-538) and is
-\*     a known source of HBASE-24293 / HBASE-21623 bugs.
+\*     isMatchingRegionLocation() guard (SCP.java L529-538).
 \*   Path A (procedure attached): transition region to ABNORMALLY_CLOSED,
 \*     clear location; existing procedure preserved for TRSPServerCrashed.
 \*   Path B (no procedure): transition to ABNORMALLY_CLOSED, clear
@@ -1628,8 +1788,8 @@ SCPAssignRegion(s, r) ==
   /\ \/ \* --- Skip: isMatchingRegionLocation fails (SCP.java L529-538) ---
         \* Between SCPGetRegions and now, a concurrent TRSP may have moved
         \* this region to another server.  The implementation skips such
-        \* regions.  This is a known source of bugs: if the concurrent TRSP
-        \* subsequently fails, the region is lost (HBASE-24293).
+        \* regions.  If the concurrent TRSP subsequently fails, the region
+        \* may be lost without manual intervention.
         \* Toggle: UseLocationCheck = FALSE disables this path, modeling
         \* the correct protocol (process every region unconditionally).
         /\ UseLocationCheck = TRUE
@@ -1645,7 +1805,8 @@ SCPAssignRegion(s, r) ==
               walFenced,
               scpState,
               locked,
-              carryingMeta
+              carryingMeta,
+              serverRegions
            >>
      \/ \* --- Path A: TRSP already attached (SCP.java L540-544) ---
         \* Location matches (or check disabled); procedure exists.
@@ -1681,6 +1842,8 @@ SCPAssignRegion(s, r) ==
               locked,
               carryingMeta
            >>
+        \* ServerStateNode tracking: remove r from crashed server s.
+        /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
      \/ \* --- Path B: No TRSP attached (SCP.java L554-557) ---
         \* Location matches (or check disabled); no procedure.
         \* Transition to ABNORMALLY_CLOSED and attach a fresh
@@ -1719,6 +1882,8 @@ SCPAssignRegion(s, r) ==
               locked,
               carryingMeta
            >>
+        \* ServerStateNode tracking: remove r from crashed server s.
+        /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
 
 \* SCP step 4: All regions processed.  Mark SCP as complete.
 \*
@@ -1743,7 +1908,8 @@ SCPDone(s) ==
         scpRegions,
         walFenced,
         locked,
-        carryingMeta
+        carryingMeta,
+        serverRegions
      >>
 
 ---------------------------------------------------------------------------
@@ -1775,7 +1941,8 @@ DropStaleReport ==
           rsVars,
           serverState,
           scpVars,
-          locked
+          locked,
+          serverRegions
        >>
 
 ---------------------------------------------------------------------------
@@ -1803,14 +1970,13 @@ RSOpen(s, r) ==
   \* The r \notin rsOnlineRegions[s] guard matches the implementation:
   \* AssignRegionHandler.process() (L105-112) returns without reporting
   \* OPENED if the region is already online.
-  \* The regionState[r].state = "OPENING" /\ regionState[r].location = s
-  \* guard rejects stale OPEN commands: if SCPAssignRegion has already
-  \* moved the region to ABNORMALLY_CLOSED (or location changed), the
-  \* command is obsolete and must not add to rsOnlineRegions.
+  \* No regionState guard: the RS does not consult the master state
+  \* before processing an OPEN command.  Removing the former
+  \* regionState[r].state = "OPENING" /\\ regionState[r].location = s
+  \* guard is faithful to the implementation and enables detection
+  \* of ghost-region scenarios from stale OPEN commands.
   /\ serverState[s] = "ONLINE"
   /\ r \notin rsOnlineRegions[s]
-  /\ regionState[r].state = "OPENING"
-  /\ regionState[r].location = s
   /\ \E cmd \in dispatchedOps[s]:
        /\ cmd.type = "OPEN"
        /\ cmd.region = r
@@ -1823,7 +1989,13 @@ RSOpen(s, r) ==
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "OPENED" ] }
        \* Master-side state and server liveness unchanged.
-       /\ UNCHANGED << regionState, metaTable, serverState, scpVars, locked >>
+       /\ UNCHANGED << regionState,
+             metaTable,
+             serverState,
+             scpVars,
+             locked,
+             serverRegions
+          >>
 
 \* RS atomically receives an OPEN command but fails to open the
 \* region.  The command is consumed and a FAILED_OPEN report is
@@ -1855,7 +2027,8 @@ RSFailOpen(s, r) ==
              rsOnlineRegions,
              serverState,
              scpVars,
-             locked
+             locked,
+             serverRegions
           >>
 
 ---------------------------------------------------------------------------
@@ -1890,7 +2063,13 @@ RSClose(s, r) ==
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "CLOSED" ] }
        \* Master-side state and server liveness unchanged.
-       /\ UNCHANGED << regionState, metaTable, serverState, scpVars, locked >>
+       /\ UNCHANGED << regionState,
+             metaTable,
+             serverState,
+             scpVars,
+             locked,
+             serverRegions
+          >>
 
 ---------------------------------------------------------------------------
 
@@ -1907,7 +2086,7 @@ Next == \* -- ASSIGN path --
         \/ \E r \in Regions: TRSPCreateUnassign(r)
         \* -- MOVE path --
         \/ \E r \in Regions: TRSPCreateMove(r)
-        \* -- REOPEN path --
+        \* -- REOPEN path (branch-2.6 only, controlled by UseReopen) --
         \/ \E r \in Regions: TRSPCreateReopen(r)
         \/ \E r \in Regions: TRSPDispatchClose(r)
         \/ \E r \in Regions: TRSPConfirmClosed(r)
@@ -1937,7 +2116,7 @@ Next == \* -- ASSIGN path --
 ---------------------------------------------------------------------------
 
 (* Fairness *)
-\* Weak fairness on all deterministic actions ensures forward progress.
+\* Weak fairness on deterministic actions ensures forward progress.
 \* Procedure-step actions, crash-recovery actions, SCP state machine
 \* steps, and RS-side processing are all deterministic once enabled and
 \* therefore receive WF.  Non-deterministic environmental events
@@ -1945,11 +2124,12 @@ Next == \* -- ASSIGN path --
 \* GoOffline) receive no fairness -- they may occur but are not
 \* required to.
 Fairness ==
-  \* Creation actions
-  /\ \A r \in Regions: WF_vars(TRSPCreate(r))
+  \* Procedure invocations
+  \* Note: No WF on TRSPCreate: In the implementation, no automatic
+  \* process creates ASSIGN procedures for lost regions.
   /\ \A r \in Regions: WF_vars(TRSPCreateUnassign(r))
   /\ \A r \in Regions: WF_vars(TRSPCreateMove(r))
-  /\ \A r \in Regions: WF_vars(TRSPCreateReopen(r))
+  /\ ( UseReopen => \A r \in Regions: WF_vars(TRSPCreateReopen(r)) )
   /\ \A s \in Servers: WF_vars(ServerRestart(s))
   \* Deterministic procedure steps
   /\ \A r \in Regions: \A s \in Servers: WF_vars(TRSPGetCandidate(r, s))
