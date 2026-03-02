@@ -730,6 +730,30 @@ only assignment target during SCP is the surviving server).
 TLC primary (TRUE): 1,527,546 distinct, 14s. TLC primary (FALSE):
 74,500,838 distinct, ~12min. Git: `2097e19d14`.
 
+#### Iteration 16.5 — Simulation fidelity: race-window and guard audit
+
+Guard audit to make the `SCPAssignRegion` skip path reachable with
+`UseLocationCheck=TRUE`.  `TRSPCreate`: SCP-active guard added,
+`WF` removed (lost regions need manual intervention).
+`TRSPConfirmClosed` Path 1 / `TRSPConfirmOpened`: removed
+`serverState ONLINE` guard on reports (models race with crash
+detection).  `RSOpen`: removed spec-only `regionState` guard.
+`UseReopen` BOOLEAN constant added (branch-2.6 REOPEN; default FALSE).
+`serverRegions[s]` variable (`[Servers → SUBSET Regions]`): models
+`ServerStateNode` tracking independent from `regionState[r].location`.
+`TRSPDispatchOpen` only adds to new server (matching `regionOpening()`
+which calls `addRegion()` but NOT `removeRegionFromServer()`); r may
+appear on two servers' tracking simultaneously during OPENING.
+Removal by `TRSPHandleFailedOpen`, `TRSPGiveUpOpen`,
+`TRSPConfirmClosed` Paths 1–2, `SCPAssignRegion` Paths A–B,
+`ServerRestart` (clear).  `SCPGetRegions` snapshot changed to
+`serverRegions[s]` (was location-based filter), matching
+`AM.getRegionsOnServer()` reading from `ServerStateNode`.
+`NoLostRegions` strengthened: (1) ABNORMALLY_CLOSED with no procedure,
+(2) OPENING/CLOSING with `location=None`, no procedure, not in any
+SCP snapshot.  TLC 2r/2s: 3,157,489 distinct, 28s, clean.
+Git: `f3e4303dd9`.
+
 ---
 
 ### Phase 5: Procedure Persistence and Master Recovery
