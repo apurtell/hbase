@@ -290,7 +290,6 @@ vars ==
 
 ---------------------------------------------------------------------------
 
-
 (* Module instantiation *)
 \* Instantiate action modules.  Each sub-module declares its shared
 \* variables as CONSTANTS with the SAME names as the variables declared
@@ -380,7 +379,7 @@ OfflineImpliesNoLocation ==
 \* without writing to meta, so metaTable may retain CLOSED while
 \* regionState shows OFFLINE.  Both are "unassigned" states with no
 \* location; the divergence is resolved on master restart when
-\* in-memory state is rebuilt from meta.  See Appendix D.5.
+\* in-memory state is rebuilt from meta.
 \*
 \* Becomes further non-trivial when master crash is introduced:
 \* metaTable survives but regionState is lost and must be rebuilt.
@@ -504,8 +503,7 @@ RSMasterAgreementConverse ==
 \* leases have been revoked (walFenced = TRUE).  Verified by
 \* construction (SCP state machine: FENCE_WALS precedes ASSIGN)
 \* but stated explicitly as a safety net.
-ZombieFencingOrder ==
-  \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
+FencingOrder == \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
 
 \* A meta-carrying SCP must reassign meta (complete ASSIGN_META)
 \* before proceeding to GET_REGIONS.  If carryingMeta[s] is TRUE,
@@ -563,11 +561,6 @@ ProcStoreConsistency ==
 
 
 (* State constraints for TLC *)
-\* Limit the number of simultaneously crashed servers.  No longer
-\* required in configs now that ServerRestart + WF ensures crashed
-\* servers eventually come back online (preventing the all-crashed
-\* deadlock).  Retained as a definition for ad-hoc bounded runs.
-CrashConstraint == Cardinality({s \in Servers: serverState[s] = "CRASHED"}) <= 1
 
 \* Symmetry reduction: regions and servers are interchangeable.
 \* TLC explores one representative per equivalence class, reducing
@@ -702,35 +695,36 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 ---------------------------------------------------------------------------
 
 (* Theorems / properties to check *)
-        \* Safety: every step preserves the type invariant.
-        THEOREM Spec => []TypeOK
+
+\* Safety: every step preserves the type invariant.
+THEOREM Spec => []TypeOK
 
 \* Safety: OPEN regions always have a location.
-        THEOREM Spec => []OpenImpliesLocation
+THEOREM Spec => []OpenImpliesLocation
 
 \* Safety: offline-like regions never have a location.
-        THEOREM Spec => []OfflineImpliesNoLocation
+THEOREM Spec => []OfflineImpliesNoLocation
 
 \* Safety: no double assignment (region writable on at most one server).
-        THEOREM Spec => []NoDoubleAssignment
+THEOREM Spec => []NoDoubleAssignment
 
 \* Safety: SCP does not reassign until WAL leases are revoked.
-        THEOREM Spec => []ZombieFencingOrder
+THEOREM Spec => []FencingOrder
 
 \* Safety: after SCP completes, no region is lost (stuck without a procedure).
-        THEOREM Spec => []NoLostRegions
+THEOREM Spec => []NoLostRegions
 
 \* Safety: persistent meta state matches in-memory state.
-        THEOREM Spec => []MetaConsistency
+THEOREM Spec => []MetaConsistency
 
 \* Safety: procedure lock held only during appropriate states.
-        THEOREM Spec => []LockExclusivity
+THEOREM Spec => []LockExclusivity
 
 \* Safety: stably OPEN region is online on its RS.
-        THEOREM Spec => []RSMasterAgreement
+THEOREM Spec => []RSMasterAgreement
 
 \* Safety: RS-online region is acknowledged by master.
-        THEOREM Spec => []RSMasterAgreementConverse
+THEOREM Spec => []RSMasterAgreementConverse
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.
