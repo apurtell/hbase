@@ -108,7 +108,7 @@ TRSPCreate(r) ==
 \* fires, rsOnlineRegions[zombie] no longer contains r and
 \* TRSPGetCandidate may safely pick a new server.
 \*
-\* Note: ZombieFencingOrder (scpState[s] = "ASSIGN" => walFenced[s])
+\* Note: FencingOrder (scpState[s] = "ASSIGN" => walFenced[s])
 \* and the walFenced guard on SCPAssignRegion remain unchanged --
 \* those faithfully model SCP's own ordering constraint.
 \*
