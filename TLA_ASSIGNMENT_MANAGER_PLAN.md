@@ -563,19 +563,19 @@ is the individual iteration.
 
 `State` (7 states), `ValidTransition` (10 transitions), per-region
 `[state, location]` records, 7 actions, 4 invariants + `TransitionValid`.
-TLC: 2,197 states. Git: `1e09615768`
+TLC: 2,197 states.
 
 #### Iteration 2 — Meta table as persistent state ✅ COMPLETE
 
 Added `metaTable` (persistent `[state, location]` per region), atomic
 dual update with `regionState`, `MetaConsistency` invariant. TLC: 2,197
-distinct (metaTable is dependent). Git: `1e09615768`.
+distinct (metaTable is dependent).
 
 #### Iteration 3 — Procedure attachment (per-region mutex) ✅ COMPLETE
 
 Added `procedure` field (`None`/`TRUE`) to `regionState`, lock
 acquire/release guards, `LockExclusivity` invariant. TLC: 2,197
-distinct. Git: `5f21f83d37`.
+distinct.
 
 #### Iteration 4 — TRSP state machine for ASSIGN (master-side only) ✅ COMPLETE
 
@@ -583,7 +583,7 @@ distinct. Git: `5f21f83d37`.
 procedure field changed to Nat. Actions: `TRSPCreate`, `TRSPGetCandidate`,
 `TRSPOpen`, `TRSPConfirmOpened`. `ProcedureConsistency` invariant.
 `StateConstraint`, `AddProc`/`RemoveProc` helpers. TLC: 829,329 distinct,
-~3s. Git: `ad76a4d4db`.
+~3s.
 *Subsequently refactored*: procedure state inlined into `regionState`
 records (region-keyed), eliminating the `procedures` map, `nextProcId`
 counter, `StateConstraint`, `ProcedureConsistency`, and
@@ -594,7 +594,7 @@ counter, `StateConstraint`, `ProcedureConsistency`, and
 Actions: `TRSPCreateUnassign`, `TRSPClose`, `TRSPConfirmClosed`.
 `LockExclusivity` strengthened (type-correlated). Deadlock from
 `ServerCrash` stranding UNASSIGN resolved by `TRSPServerCrashed`.
-TLC: 1,441,599 distinct, ~6s. Git: `ec0b870b5c`.
+TLC: 1,441,599 distinct, ~6s.
 
 ---
 
@@ -605,22 +605,21 @@ TLC: 1,441,599 distinct, ~6s. Git: `ec0b870b5c`.
 `dispatchedOps` (per-server command set), `pendingReports` (report set),
 `CommandType`, `ReportCode`, `rpcVars` shorthand. Channels empty
 throughout — no actions produce/consume yet. TLC: 1,441,599 distinct
-(channels are dependent). Git: `dd4c127fff`.
+(channels are dependent).
 
 #### Iteration 7 — Master dispatches open command via RPC ✅ COMPLETE
 
 `TRSPDispatchOpen` (renamed), `TRSPConfirmOpened` (requires OPENED
 report), `DispatchFail` (RPC failure → retry). Symmetry reduction
 (`Permutations`) resolved state explosion. TLC: 39,250 distinct, ~1s.
-Git: `806a9002c4`.
 
 #### Iteration 8 — RS-side open handler and report ✅ COMPLETE
 
 RS-side variables `rsOnlineRegions`, `rsTransitions`, `rsVars`.
 Actions: `RSReceiveOpen`, `RSCompleteOpen`, `RSFailOpen`. `FailOpen`
 removed from `Next` (superseded). ASSIGN round-trip complete.
-TLC: 5,622,240 distinct, ~67s. Git: `f01818db30`.
-*Subsequently simplified*: `rsTransitions` dropped; `rsOnlineRegions`
+TLC: 5,622,240 distinct, ~67s.
+*ubsequently simplified*: `rsTransitions` dropped; `rsOnlineRegions`
 alone captures the RS view. `RSReceiveOpen`+`RSCompleteOpen` merged
 into atomic `RSOpen` (intermediate RS state is not observable by the
 master and produces the same crash-recovery outcome).
@@ -630,7 +629,7 @@ master and produces the same crash-recovery outcome).
 `TRSPDispatchClose` (renamed), `TRSPConfirmClosed` (requires CLOSED
 report), `DispatchFailClose`, `RSReceiveClose`, `RSCompleteClose`.
 `RSMasterAgreement` invariant. Both round-trips end-to-end through RS.
-TLC: 6,322,817 distinct, ~79s. Git: `3e92a15830`.
+TLC: 6,322,817 distinct, ~79s.
 *Subsequently simplified*: `RSReceiveClose`+`RSCompleteClose` merged
 into atomic `RSClose` (same rationale as `RSOpen` — see Iter 8 note).
 
@@ -641,7 +640,7 @@ crash + RS cleanup), `TRSPHandleFailedOpen`, `DropStaleReport`, `ONLINE`
 guards on report-consuming and RS actions. `NoDoubleAssignment`,
 `RSMasterAgreementConverse` invariants. Two-tier TLC verification
 (2r/2s exhaustive + 3r/3s simulation).
-TLC primary: 35,856 distinct, <1s. Git: `cc9a28a29f`.
+TLC primary: 35,856 distinct, <1s.
 
 ---
 
@@ -653,7 +652,6 @@ TLC primary: 35,856 distinct, <1s. Git: `cc9a28a29f`.
 reused via relaxed type guards; `TRSPConfirmClosed` branches (UNASSIGN
 removes, MOVE advances). Renamed `NoSplitBrain` → `NoDoubleAssignment`.
 TLC primary: 61,151 distinct, ~4s. Full: 85M distinct, ~28min.
-Git: `732d3aa9b9`.
 
 #### Iteration 12 — Open failures give-up path and server restart ✅ COMPLETE
 
@@ -662,7 +660,7 @@ limit. `ServerRestart(s)` restarts CRASHED servers (WF liveness);
 epoch-based stale-report rejection; `CrashConstraint` removed. Procedure
 state inlined into `regionState`, dropping `procedures`, `nextProcId`,
 `StateConstraint`. RS actions merged; `rsTransitions` dropped.
-TLC primary: 307,449 distinct, ~16s. Git: `765bee6bf4`.
+TLC primary: 307,449 distinct, ~16s.
 
 #### Iteration 13 — Phase 3 close-out: fidelity fixes and fairness ✅ COMPLETE
 
@@ -674,7 +672,7 @@ deterministic procedure steps, crash recovery, and RS-side actions; no
 fairness on non-deterministic environmental events.  Post-audit fix:
 `TRSPServerCrashed` now resets `retries` to 0 (matching
 `retryCounter = null` on crash recovery paths, TRSP.java L329/L443).
-TLC primary: 35,726 distinct, <1s. Git: `b5fbed2f22`.
+TLC primary: 35,726 distinct, <1s.
 
 ---
 
@@ -697,7 +695,7 @@ dispatched CLOSE, drops CLOSED.  `RSOpen` guards `r ∉ rsOnlineRegions[s]`,
 `state=OPENING`, `location=s`.  `NoDoubleAssignment` refined (writable
 only); `RSMasterAgreement`/`RSMasterAgreementConverse` exempt CRASHED;
 new `ZombieFencingOrder`, `NoLostRegions`.
-TLC primary: 5,525,325 distinct, ~20s. Git: `a466c53e1e`.
+TLC primary: 5,525,325 distinct, ~20s.
 
 #### Iteration 15 — Fidelity improvements: REOPEN type, per-region lock, TRSPGetCandidate guard, carryingMeta SCP ✅ COMPLETE
 
@@ -710,7 +708,7 @@ mutating actions. `carryingMeta` variable; `MasterDetectCrash` non-
 deterministic; `SCPAssignMeta(s)` action (`ASSIGN_META` → `GET_REGIONS`);
 SCP actions\ gated on `∀ t: scpState[t] ≠ "ASSIGN_META"`
 (`waitMetaLoaded`); new `MetaAvailableForRecovery` invariant.
-TLC primary: 74,500,838 distinct, ~19min. Git: `90bfdf8f07`.
+TLC primary: 74,500,838 distinct, ~19min.
 
 ---
 
@@ -728,7 +726,7 @@ removes `r` from `scpRegions` with no state change.  Path A/B guard
 violations (needs ≥3 servers; 2r/2s skip path never fires because the
 only assignment target during SCP is the surviving server).
 TLC primary (TRUE): 1,527,546 distinct, 14s. TLC primary (FALSE):
-74,500,838 distinct, ~12min. Git: `2097e19d14`.
+74,500,838 distinct, ~12min.
 
 #### Iteration 16.5 — Simulation fidelity: race-window and guard audit
 
@@ -752,7 +750,6 @@ Removal by `TRSPHandleFailedOpen`, `TRSPGiveUpOpen`,
 `NoLostRegions` strengthened: (1) ABNORMALLY_CLOSED with no procedure,
 (2) OPENING/CLOSING with `location=None`, no procedure, not in any
 SCP snapshot.  TLC 2r/2s: 3,157,489 distinct, 28s, clean.
-Git: `c46d820f2a`.
 
 ---
 
@@ -772,7 +769,7 @@ TRSPConfirmClosed Path 1 UNASSIGN).  DispatchFail actions use UNCHANGED
 (not persisted, matching `remoteCallFailed()` L139).
 `ProcStoreConsistency` invariant: bijection between `procType ≠ NONE`
 and `procStore[r] ≠ NoneRecord`.  TLC 2r/2s: 3,465,621 distinct, 31s,
-clean. Git: `86a13663a2`
+clean.
 
 #### Iteration 17.5 — Cross-variable consistency invariants
 
@@ -796,146 +793,48 @@ state but preserves `procStore`; weaken to one-direction implication
 with converse holding only when master is alive.
 TLC 2r/2s: 3,339,614 distinct, 41s, clean.  Simulation 3r/3s
 (300s): 48,540,636 states, 427,311 traces, clean.
-Git: `b5768ce0e9`
 
 #### Iteration 18 — Master crash and recovery
 
-**What to add**: Master crash/recovery actions, `RSOpenDuplicate`
-for HBASE-26283, and `restoreSucceedState` modeling for HBASE-29364.
-
-**Master crash/recovery actions**:
-- `MasterCrash`: Clears ALL in-memory master state: `regionState`,
-  `serverState`, `procedures`, `dispatchedOps`, `pendingReports`.
-  `metaTable` and `procStore` survive.
-- `MasterRecover`:
-  1. Rebuild `regionState` from `metaTable` (scan meta).
-  2. Reload `procedures` from `procStore`.
-  3. Re-attach procedures to regions.
-  4. Set `serverState` for all servers to ONLINE (RS will re-register).
-  5. Resumed procedures pick up from their last persisted state.
-**Two-phase report processing (Pattern C inconsistency window)**:
-This iteration must model the two-phase report processing flow
-implemented by `RegionRemoteProcedureBase` (branch-2.6).  This is
-the mechanism identified in analysis recommendation 8
-("Branch-2.6 vs TLA+ Model Analysis").
-
-In branch-2.6, when a RegionServer reports a transition (OPENED,
-CLOSED, FAILED_OPEN), processing happens in two distinct phases:
-
-*Phase 1* — `RegionRemoteProcedureBase.reportTransition()` (L201-238):
-  1. Persist the `transitionCode` and `seqId` to the ProcedureStore
-     (via `persistAndWake`).
-  2. Update in-memory state WITHOUT persisting to meta (via
-     `updateTransitionWithoutPersistingToMeta`).  For OPENED, this
-     calls `regionOpenedWithoutPersistingToMeta()` (AM.java L2245-2250)
-     which transitions to OPEN in memory.  For CLOSED, this calls
-     `regionClosedWithoutPersistingToMeta()` (AM.java L2253-2261)
-     which transitions to CLOSED in memory.
-  3. Wake the parent TRSP procedure.
-
-*Phase 2* — TRSP's `confirmOpened()` / `confirmClosed()`:
-  4. The woken TRSP calls `persistToMeta()` (AM.java L2289-2300)
-     to update hbase:meta with the final state and location.
-
-If the master crashes between Phase 1 step 2 and Phase 2 step 4,
-meta retains the old value (OPENING or CLOSING) while the
-procedure state in `procStore` is REPORT_SUCCEED. On recovery, the
-procedure replays `persistToMeta` to resolve the inconsistency.
-
-**Model decomposition**: The current model's `TRSPConfirmOpened` and
-`TRSPConfirmClosed` actions perform an atomic regionState + metaTable
-update.  For this iteration, these should be decomposed:
-  - `TRSPReportSucceed(r)`: Consumes the report, updates `regionState`
-    in memory, persists procedure state to `procStore` with
-    `step = "REPORT_SUCCEED"`.  Meta is NOT updated yet.
-  - `TRSPPersistToMeta(r)`: Persists the final state to `metaTable`.
-    Procedure completes (or advances, for MOVE).
-  - `MasterCrash` can fire between these two steps.
-
-`MetaConsistency` must be relaxed to allow in-memory / meta
-divergence when a procedure's persisted state is REPORT_SUCCEED
-(indicating the in-memory update completed but meta has not caught
-up).
-
-**Source**: `RegionRemoteProcedureBase.java` reportTransition() L201-238,
-  serverCrashed() L240-261, remoteCallFailed() L117-145;
-  `AssignmentManager.java` regionOpenedWithoutPersistingToMeta() L2245-2250,
-  regionClosedWithoutPersistingToMeta() L2253-2261,
-  persistToMeta() L2289-2300.
-
-**`RSOpenDuplicate` action (faithful modeling of RS behavior)**: After
-master recovery, the master may re-dispatch OPEN commands for regions
-that the RS already has online (because the master rebuilt its state
-from meta, which may lag behind the RS's in-memory state).  The RS's
-`AssignRegionHandler.process()` (L105-112) silently drops the
-duplicate open — it returns without reporting OPENED back to the
-master.  This is the **actual implementation behavior**, not a bug
-being injected into the model.  The master's TRSP stays stuck at
-CONFIRM_OPENED, which is a real design gap (HBASE-26283).
-
-```tla
-RSOpenDuplicate(s, r) ==
-    \* Pre: server is ONLINE, region is already online on this server,
-    \* and there is a pending OPEN command for this region.
-    /\ serverState[s] = "ONLINE"
-    /\ r \in rsOnlineRegions[s]
-    /\ \E cmd \in dispatchedOps[s] :
-        /\ cmd.type = "OPEN" /\ cmd.region = r
-        \* Post: consume the command WITHOUT producing an OPENED report.
-        \* The master's TRSP remains stuck at CONFIRM_OPENED.
-        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ {cmd}]
-        /\ UNCHANGED <<regionState, metaTable, pendingReports,
-                        rsOnlineRegions, serverState, walFenced,
-                        scpState, scpRegions>>
-```
-
-This action fires non-deterministically — it is NOT a fairness
-obligation.  The existing `RSOpen` action is guarded by
-`r \notin rsOnlineRegions[s]` (see Part 5a, already applied in the
-current spec), so when a duplicate open arrives for an already-online
-region, the ONLY enabled action is `RSOpenDuplicate`, which silently
-drops it.  The liveness property "No Stuck Transitions" (Section
-4.2.4) would flag the resulting deadlock: the TRSP waits for an
-OPENED report that will never arrive.
-
-**`restoreSucceedState` modeling (correct behavior by default)**:
-When the master recovers procedures from `procStore`, the recovery
-action `restoreSucceedState()` (TRSP.java) replays the persisted
-`transitionCode`.  The default model specs to correct behavior:
-the `transitionCode` is honored faithfully.
-
-The model should distinguish the `transitionCode` in the procedure
-store record.  During `MasterRecover`, when replaying a procedure
-at `REPORT_SUCCEED`:
-
-```tla
-MasterRecoverProcedure(r) ==
-    /\ procStore[r].step = "REPORT_SUCCEED"
-    /\ IF procStore[r].transitionCode = "OPENED"
-       THEN \* Normal case: persist OPEN to meta
-            /\ metaTable' = [metaTable EXCEPT ![r] =
-                 [state |-> "OPEN", location |-> procStore[r].server]]
-       ELSE \* transitionCode is FAILED_OPEN:
-            \* Correct behavior: persist FAILED_OPEN and retry.
-            /\ metaTable' = [metaTable EXCEPT ![r] =
-                 [state |-> "FAILED_OPEN", location |-> None]]
-```
-
-**Code analysis note**: The implementation's `restoreSucceedState()`
-(HBASE-29364) treats any `REPORT_SUCCEED` as a successful transition
-regardless of `transitionCode`, persisting OPEN even for FAILED_OPEN.
-The model captures correct behavior; the gap is identified through code
-analysis at each iteration.
-
-**Verify**: After `MasterRecover`, the system eventually reaches a
-consistent state. `MetaConsistency` holds after recovery. No lost
-regions. No stuck procedures. The `RSOpenDuplicate` action (faithful
-modeling) triggers a "No Stuck Transitions" liveness violation,
-exposing the HBASE-26283 design gap.
-**Source**: `ProcedureExecutor.java` `load()` L328-609,
-`AssignmentManager.start()` L313-362,
-`AssignRegionHandler.process()` L98-164 (HBASE-26283),
-`TransitRegionStateProcedure.restoreSucceedState()` (HBASE-29364).
+Added `masterAlive` (BOOLEAN), `procStore` (durable procedure
+store), `NewProcRecord` constructor, `NoServer`/`NoProcedure`/
+`NoTransition` sentinels (renamed from `None`/`NoneRecord`),
+`UseRestoreSucceedQuirk` and `UseRSOpenDuplicateQuirk` toggles.
+New modules: `ProcStore.tla` (invariants + `RestoreSucceedState`
+operator), `Master.tla` (extracted from `ExternalEvents.tla`:
+`GoOffline`, `MasterDetectCrash`, `MasterCrash`, `MasterRecover`);
+`RSRestart` moved to `RegionServer.tla`; `ExternalEvents.tla` deleted.
+Decomposed `TRSPConfirmOpened`/`TRSPConfirmClosed` into two-phase
+report processing modeling `RegionRemoteProcedureBase`:
+Phase 1 (`TRSPReportSucceedOpen`/`Close`) consumes report, updates
+in-memory state, persists procedure with `transitionCode`;
+Phase 2 (`TRSPPersistToMetaOpen`/`Close`) writes meta.  FAILED_OPEN
+faithfully keeps state as OPENING during Phase 1
+(`regionFailedOpen(giveUp=false)` does not change state).
+`MasterCrash` clears all in-memory state; `MasterRecover` rebuilds
+from `metaTable` + `procStore`, applying `RestoreSucceedState`
+(branches on `transitionCode`, not type) for REPORT_SUCCEED
+procedures.  Invariant adjustments: `LockExclusivity` widened
+(OPEN in ASSIGN, CLOSED in UNASSIGN for REPORT_SUCCEED window);
+`MetaConsistency` relaxed for any active procedure;
+`ProcStepConsistency` allows OPENING at REPORT_SUCCEED;
+`ProcStoreConsistency` allows CLOSED for MOVE/REOPEN close-phase.
+Added minimal ZK-based server liveness model: new `ZK.tla` module
+with `zkNode[s] ∈ BOOLEAN` variable and `ZKSessionExpire(s)` action.
+ZK is modeled as the ground truth for RS liveness, independent of
+master state.  Correct causal chain: `ZKSessionExpire` (ZK detects
+RS death, deletes ephemeral node) → `MasterDetectCrash` (master
+watcher fires, guards on `zkNode[s]=FALSE`) → SCP.  `RSAbort` now
+guards on `zkNode[s]=FALSE` (RS detects own session expiry) instead
+of `serverState[s]="CRASHED"`.  RS-side actions (`RSOpen`, `RSClose`,
+`RSFailOpen`, `RSOpenDuplicate`) guard on `zkNode[s]=TRUE`.
+`MasterRecover` reads `zkNode` to determine server liveness during
+recovery, replacing the inaccurate `isDead(s)` proxy.  `RSRestart`
+creates a fresh ZK ephemeral node.  `RSMasterAgreement` and
+`RSMasterAgreementConverse` updated to exempt the ZK session expiry
+window (between `ZKSessionExpire` and `MasterDetectCrash`).
+`RestoreSucceedState` FAILED_OPEN location fixed to `NoServer`.
+TLC 2r/2s: 17,430,108 distinct, 63,165,534 generated, 20m26s, clean.
 
 ---
 
