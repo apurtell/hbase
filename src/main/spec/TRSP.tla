@@ -1,6 +1,6 @@
 ------------------------------ MODULE TRSP ------------------------------------
 (*
- * TransitionalRegionStateProcedure actions for the HBase AssignmentManager.
+ * TransitionRegionStateProcedure actions for the HBase AssignmentManager.
  *
  * Contains all TRSP actions: ASSIGN path (create, get-candidate,
  * dispatch-open, confirm-opened), failure path (dispatch-fail,
@@ -8,6 +8,37 @@
  * UNASSIGN path (create-unassign), MOVE path (create-move),
  * REOPEN path (create-reopen), CLOSE path (dispatch-close,
  * confirm-closed), and crash recovery (server-crashed).
+ *
+ * The TRSPState set maps 1:1 to the RegionStateTransitionState protobuf
+ * enum (MasterProcedure.proto):
+ *
+ *   TRSPState              | Protobuf enum value
+ *   -----------------------+---------------------------------------------
+ *   "GET_ASSIGN_CANDIDATE" | REGION_STATE_TRANSITION_GET_ASSIGN_CANDIDATE (=1)
+ *   "OPEN"                 | REGION_STATE_TRANSITION_OPEN (=2)
+ *   "CONFIRM_OPENED"       | REGION_STATE_TRANSITION_CONFIRM_OPENED (=3)
+ *   "CLOSE"                | REGION_STATE_TRANSITION_CLOSE (=4)
+ *   "CONFIRM_CLOSED"       | REGION_STATE_TRANSITION_CONFIRM_CLOSED (=5)
+ *
+ * RegionRemoteProcedureBase child procedure absorption
+ * ----------------------------------------------------
+ * The implementation uses child procedures (OpenRegionProcedure,
+ * CloseRegionProcedure) that extend RegionRemoteProcedureBase and
+ * have their own 4-state machine (RegionRemoteProcedureBaseState in
+ * MasterProcedure.proto).  The model merges these into TRSP actions:
+ *
+ *   RRPB state             | Absorbed by TLA+ action(s)
+ *   -----------------------+---------------------------------------------
+ *   DISPATCH (=1)          | TRSPDispatchOpen, TRSPDispatchClose
+ *                          |   RPC dispatch is atomic within the TRSP step.
+ *   REPORT_SUCCEED (=2)    | TRSPConfirmOpened, TRSPConfirmClosed
+ *                          |   Will be decomposed to model the
+ *                          |   crash window between in-memory update and
+ *                          |   meta persist (Pattern C inconsistency).
+ *   DISPATCH_FAIL (=3)     | DispatchFail, DispatchFailClose
+ *                          |   RPC failure resets TRSP to retry.
+ *   SERVER_CRASH (=4)      | TRSPServerCrashed
+ *                          |   Server crash converts TRSP to ASSIGN.
  *
  * This module declares all shared variables as CONSTANT parameters.
  * The root AssignmentManager module instantiates it with
@@ -148,6 +179,11 @@ TRSPGetCandidate(r, s) ==
 \* Post: region transitions to OPENING with the target server as
 \*       location, meta updated, open command added to
 \*       dispatchedOps[targetServer], TRSP advances to CONFIRM_OPENED.
+\*
+\* Impl states absorbed: REGION_STATE_TRANSITION_OPEN (=2) from the
+\*   parent TRSP, plus REGION_REMOTE_PROCEDURE_DISPATCH (=1) from the
+\*   child OpenRegionProcedure.  The model treats open-region-state-
+\*   transition + child-dispatch as a single atomic step.
 \*
 \* Source: TRSP.openRegion() calls AM.regionOpening()
 \*         to set OPENING state and meta, then creates an
