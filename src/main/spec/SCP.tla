@@ -50,8 +50,11 @@ rsVars == << rsOnlineRegions >>
 \* Source: SCP.executeFromState() SERVER_CRASH_SPLIT_META_LOGS
 \*         and ASSIGN_META cases.
 SCPAssignMeta(s) ==
+  \* SCP is in the meta-recovery sub-path.
   /\ scpState[s] = "ASSIGN_META"
+  \* Only servers that were hosting hbase:meta enter this path.
   /\ carryingMeta[s] = TRUE
+  \* Meta reassigned (abstracted); advance to normal crash-recovery.
   /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   \* Meta is now online; clear the carryingMeta flag.
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
@@ -92,7 +95,7 @@ SCPAssignMeta(s) ==
 \*         then AM.markRegionsAsCrashed() updates
 \*         RIT tracking for each region.
 SCPGetRegions(s) ==
-  \* Guard: SCP is in GET_REGIONS state for this crashed server.
+  \* SCP is in GET_REGIONS state for this crashed server.
   /\ scpState[s] = "GET_REGIONS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
@@ -130,7 +133,7 @@ SCPGetRegions(s) ==
 \*         sub-procedures; the model abstracts this as a single
 \*         fencing step.
 SCPFenceWALs(s) ==
-  \* Guard: SCP is in FENCE_WALS state for this crashed server.
+  \* SCP is in FENCE_WALS state for this crashed server.
   /\ scpState[s] = "FENCE_WALS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
@@ -170,11 +173,17 @@ SCPFenceWALs(s) ==
 \* Source: ServerCrashProcedure.assignRegions();
 \*         ServerCrashProcedure.isMatchingRegionLocation().
 SCPAssignRegion(s, r) ==
+  \* SCP is in ASSIGN state for this crashed server.
   /\ scpState[s] = "ASSIGN"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
+  \* Region is in this SCP's snapshot (collected at GET_REGIONS).
   /\ r \in scpRegions[s]
+  \* WAL leases for the crashed server must already be revoked
+  \* before reassigning any of its regions.
   /\ walFenced[s] = TRUE
+  \* Region must not be locked by an in-progress procedure step
+  \* (e.g., a concurrent meta write).
   /\ locked[r] = FALSE
   /\ \/ \* --- Skip: isMatchingRegionLocation fails ---
         \* Between SCPGetRegions and now, a concurrent TRSP may have moved
@@ -199,41 +208,71 @@ SCPAssignRegion(s, r) ==
            >>
      \/ \* --- Path A: TRSP already attached ---
         \* Location matches; procedure exists.
-        \* Transition region to ABNORMALLY_CLOSED; the existing
-        \* TRSPServerCrashed action will convert the procedure to
-        \* ASSIGN/GET_ASSIGN_CANDIDATE as a separate step.
+        \* Transition region to ABNORMALLY_CLOSED and atomically
+        \* convert the existing TRSP to ASSIGN/GET_ASSIGN_CANDIDATE.
+        \* This models the implementation's serverCrashed() callback
+        \* firing under the same RegionStateNode lock as the state
+        \* transition — they are a single atomic step.
+        \*
+        \* Source: ServerCrashProcedure.assignRegions() acquires
+        \*         RegionStateNode.lock(), then calls
+        \*         regionNode.getProcedure().serverCrashed(env, ...);
+        \*         TRSP.serverCrashed() → AM.regionClosedAbnormally()
+        \*         all execute under that same lock.
         /\ regionState[r].location = s
         /\ regionState[r].procType # "NONE"
         \* Clear r from rsOnlineRegions on all servers.  The region may
         \* have moved between SCPGetRegions and now; clearing everywhere
         \* prevents ghost regions.
         /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
-        \* Drop stale OPENED reports for r: marking ABNORMALLY_CLOSED
-        \* makes them obsolete.
-        /\ pendingReports' =
-             {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
+        \* Clear ALL stale commands for this region from every server.
+        \* The procedure is being reset; any in-flight OPEN/CLOSE RPCs
+        \* are obsolete.
+        /\ dispatchedOps' =
+             [t \in Servers |-> {cmd \in dispatchedOps[t]: cmd.region # r}
+             ]
+        \* Drop ALL reports for r: any OPENED/CLOSED/FAILED_OPEN
+        \* reports are from the abandoned procedure and must not be
+        \* consumed after reassignment.
+        /\ pendingReports' = {pr \in pendingReports: pr.region # r}
+        \* Atomically: mark ABNORMALLY_CLOSED, clear location,
+        \* AND convert procedure to ASSIGN/GET_ASSIGN_CANDIDATE.
         /\ regionState' =
              [regionState EXCEPT
              ![r].state =
              "ABNORMALLY_CLOSED",
              ![r].location =
-             None]
+             None,
+             ![r].procType =
+             "ASSIGN",
+             ![r].procStep =
+             "GET_ASSIGN_CANDIDATE",
+             ![r].targetServer =
+             None,
+             ![r].retries =
+             0]
         /\ metaTable' =
              [metaTable EXCEPT
              ![r] =
              [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
+        \* Update persisted procedure: convert to ASSIGN.
+        /\ procStore' =
+             [procStore EXCEPT
+             ![r] =
+             [ type |-> "ASSIGN",
+               step |-> "GET_ASSIGN_CANDIDATE",
+               targetServer |-> None
+             ]]
         \* ServerStateNode tracking: remove r from crashed server s.
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
-        \* Dispatched ops, server state, WAL fencing, SCP state, locks, and
+        \* Server state, WAL fencing, SCP state, locks, and
         \* meta-carrying flag unchanged.
-        /\ UNCHANGED << dispatchedOps,
-              serverState,
+        /\ UNCHANGED << serverState,
               walFenced,
               scpState,
               locked,
-              carryingMeta,
-              procStore
+              carryingMeta
            >>
      \/ \* --- Path B: No TRSP attached ---
         \* Location matches; no procedure.
