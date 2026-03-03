@@ -155,10 +155,10 @@ SCPFenceWALs(s) ==
 \* Each invocation handles a single region and removes it from
 \* scpRegions[s].  Three sub-paths:
 \*
-\*   Skip (location check): when UseLocationCheck is TRUE and the
-\*     region's master-side location no longer matches the crashed
-\*     server, SCP skips the region entirely.  This models the
-\*     isMatchingRegionLocation() guard.
+\*   Skip (location check): if the region's master-side location no
+\*     longer matches the crashed server, SCP skips the region entirely.
+\*     This models the isMatchingRegionLocation() guard, which the
+\*     implementation always applies.
 \*   Path A (procedure attached): transition region to ABNORMALLY_CLOSED,
 \*     clear location; existing procedure preserved for TRSPServerCrashed.
 \*   Path B (no procedure): transition to ABNORMALLY_CLOSED, clear
@@ -180,10 +180,7 @@ SCPAssignRegion(s, r) ==
         \* Between SCPGetRegions and now, a concurrent TRSP may have moved
         \* this region to another server.  The implementation skips such
         \* regions.  If the concurrent TRSP subsequently fails, the region
-        \* may be lost without manual intervention.
-        \* Toggle: UseLocationCheck = FALSE disables this path, modeling
-        \* the correct protocol (process every region unconditionally).
-        /\ UseLocationCheck = TRUE
+        \* may be lost without manual intervention (HBASE-24293).
         /\ regionState[r].location # s
         \* Skip: only shrink the SCP snapshot; no state changes.
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
@@ -201,12 +198,11 @@ SCPAssignRegion(s, r) ==
               procStore
            >>
      \/ \* --- Path A: TRSP already attached ---
-        \* Location matches (or check disabled); procedure exists.
+        \* Location matches; procedure exists.
         \* Transition region to ABNORMALLY_CLOSED; the existing
         \* TRSPServerCrashed action will convert the procedure to
         \* ASSIGN/GET_ASSIGN_CANDIDATE as a separate step.
-        /\ \/ UseLocationCheck = FALSE
-           \/ regionState[r].location = s
+        /\ regionState[r].location = s
         /\ regionState[r].procType # "NONE"
         \* Clear r from rsOnlineRegions on all servers.  The region may
         \* have moved between SCPGetRegions and now; clearing everywhere
@@ -240,11 +236,10 @@ SCPAssignRegion(s, r) ==
               procStore
            >>
      \/ \* --- Path B: No TRSP attached ---
-        \* Location matches (or check disabled); no procedure.
+        \* Location matches; no procedure.
         \* Transition to ABNORMALLY_CLOSED and attach a fresh
         \* ASSIGN procedure at GET_ASSIGN_CANDIDATE.
-        /\ \/ UseLocationCheck = FALSE
-           \/ regionState[r].location = s
+        /\ regionState[r].location = s
         /\ regionState[r].procType = "NONE"
         \* Clear r from rsOnlineRegions on all servers.
         /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
