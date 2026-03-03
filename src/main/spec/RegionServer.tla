@@ -3,14 +3,11 @@
  * RegionServer-side actions for the HBase AssignmentManager.
  *
  * Contains RS-side open/close handlers (RSOpen, RSFailOpen, RSClose),
- * the zombie RS abort action (RSAbort), and stale report cleanup
- * (DropStaleReport).
- *
- * This module declares all shared variables as CONSTANT parameters.
- * The root AssignmentManager module instantiates it with
- * INSTANCE RegionServer WITH ... substituting the actual variables.
+ * the zombie RS abort action (RSAbort), RS restart (RSRestart),
+ * stale report cleanup (DropStaleReport), and the conditional
+ * RSOpenDuplicate action.
  *)
-EXTENDS AssignmentManagerTypes
+EXTENDS Types
 
 \* All shared variables are declared as VARIABLE parameters so that
 \* the root module can substitute its own variables via INSTANCE.
@@ -26,13 +23,24 @@ VARIABLE regionState,
          locked,
          carryingMeta,
          serverRegions,
-         procStore
+         procStore,
+         masterAlive,
+         zkNode
 
 \* Shorthand for the RS-side variable (used in UNCHANGED clauses).
 rsVars == << rsOnlineRegions >>
 
 \* Shorthand for the SCP-related variables (used in UNCHANGED clauses).
 scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
+
+\* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
+masterVars == << masterAlive >>
+
+\* Shorthand for procedure/lock variables (used in UNCHANGED clauses).
+procVars == << procStore, locked >>
+
+\* Shorthand for server tracking variables (used in UNCHANGED clauses).
+serverVars == << serverState, serverRegions >>
 
 ---------------------------------------------------------------------------
 
@@ -42,37 +50,36 @@ scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
 \* state (online regions and pending commands).
 \*
 \* This action is non-deterministic in timing: it may fire at any time
-\* after MasterDetectCrash, including before or after SCPFenceWALs.
-\* walFenced[s] = TRUE is a sufficient but not necessary enabling
-\* condition (the RS might self-detect death before WAL fencing).
-\* WF on RSAbort ensures the zombie eventually shuts down.
+\* after ZKSessionExpire, including before or after MasterDetectCrash
+\* and before or after SCPFenceWALs.  The RS discovers its own death
+\* by detecting the ZK session expiry (zkNode[s] = FALSE is the
+\* ground truth).
 \*
-\* Pre: server is CRASHED AND still has residual RS-side state
-\*      (rsOnlineRegions[s] non-empty OR dispatchedOps[s] non-empty).
+\* Pre: ZK ephemeral node is gone (RS is dead) AND still has
+\*      residual RS-side state.
 \* Post: rsOnlineRegions[s] cleared to {}, dispatchedOps[s] cleared
-\*       to {}.  Master-side state (regionState, metaTable,
-\*       pendingReports, serverState, scpVars) unchanged.
+\*       to {}.  Master-side state unchanged.
 \*
 \* Source: HRegionServer.abort() triggers the RS shutdown
 \*         sequence, clearing online regions and stopping RPC
 \*         handlers.
 RSAbort(s) ==
-  \* Guards: server is CRASHED and still has residual RS-side state.
-  /\ serverState[s] = "CRASHED"
+  \* Guard: ZK says this RS is dead, and it still has residual state.
+  /\ zkNode[s] = FALSE
   /\ rsOnlineRegions[s] # {} \/ dispatchedOps[s] # {}
   \* Purge all regions the zombie RS considers online.
   /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = {}]
   \* Discard all unprocessed commands queued for this RS.
   /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = {}]
   \* Master-side state, meta, reports, and SCP state are unaffected.
-  /\ UNCHANGED << regionState,
+  /\ UNCHANGED << scpVars,
+        serverVars,
+        procVars,
+        masterVars,
+        regionState,
         metaTable,
         pendingReports,
-        serverState,
-        scpVars,
-        locked,
-        serverRegions,
-        procStore
+        zkNode
      >>
 
 ---------------------------------------------------------------------------
@@ -98,15 +105,15 @@ DropStaleReport ==
     \* Discard the stale report.
     /\ pendingReports' = pendingReports \ { rpt }
     \* All other state variables unchanged.
-    /\ UNCHANGED << regionState,
+    /\ UNCHANGED << scpVars,
+          serverVars,
+          procVars,
+          rsVars,
+          masterVars,
+          regionState,
           metaTable,
           dispatchedOps,
-          rsVars,
-          serverState,
-          scpVars,
-          locked,
-          serverRegions,
-          procStore
+          zkNode
        >>
 
 ---------------------------------------------------------------------------
@@ -136,10 +143,11 @@ RSOpen(s, r) ==
   \* if the region is already online.
   \* No regionState guard: the RS does not consult the master state
   \* before processing an OPEN command.  Removing the former
-  \* regionState[r].state = "OPENING" /\\ regionState[r].location = s
+  \* regionState[r].state = "OPENING" /\ regionState[r].location = s
   \* guard is faithful to the implementation and enables detection
   \* of ghost-region scenarios from stale OPEN commands.
   /\ serverState[s] = "ONLINE"
+  /\ zkNode[s] = TRUE
   /\ r \notin rsOnlineRegions[s]
   /\ \E cmd \in dispatchedOps[s]:
        /\ cmd.type = "OPEN"
@@ -153,13 +161,13 @@ RSOpen(s, r) ==
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "OPENED" ] }
        \* Master-side state and server liveness unchanged.
-       /\ UNCHANGED << regionState,
+       /\ UNCHANGED << scpVars,
+             serverVars,
+             procVars,
+             masterVars,
+             regionState,
              metaTable,
-             serverState,
-             scpVars,
-             locked,
-             serverRegions,
-             procStore
+             zkNode
           >>
 
 \* RS atomically receives an OPEN command but fails to open the
@@ -177,6 +185,7 @@ RSOpen(s, r) ==
 RSFailOpen(s, r) ==
   \* Guards: server is ONLINE and an OPEN command for region r exists.
   /\ serverState[s] = "ONLINE"
+  /\ zkNode[s] = TRUE
   /\ \E cmd \in dispatchedOps[s]:
        /\ cmd.type = "OPEN"
        /\ cmd.region = r
@@ -187,14 +196,14 @@ RSFailOpen(s, r) ==
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "FAILED_OPEN" ] }
        \* Master-side state, online regions, and server liveness unchanged.
-       /\ UNCHANGED << regionState,
+       /\ UNCHANGED << scpVars,
+             serverVars,
+             procVars,
+             rsVars,
+             masterVars,
+             regionState,
              metaTable,
-             rsOnlineRegions,
-             serverState,
-             scpVars,
-             locked,
-             serverRegions,
-             procStore
+             zkNode
           >>
 
 ---------------------------------------------------------------------------
@@ -217,6 +226,7 @@ RSFailOpen(s, r) ==
 RSClose(s, r) ==
   \* Guards: server is ONLINE and a CLOSE command for region r exists.
   /\ serverState[s] = "ONLINE"
+  /\ zkNode[s] = TRUE
   /\ \E cmd \in dispatchedOps[s]:
        /\ cmd.type = "CLOSE"
        /\ cmd.region = r
@@ -229,13 +239,120 @@ RSClose(s, r) ==
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "CLOSED" ] }
        \* Master-side state and server liveness unchanged.
-       /\ UNCHANGED << regionState,
+       /\ UNCHANGED << scpVars,
+             serverVars,
+             procVars,
+             masterVars,
+             regionState,
              metaTable,
-             serverState,
-             scpVars,
-             locked,
-             serverRegions,
-             procStore
+             zkNode
           >>
+
+---------------------------------------------------------------------------
+
+(* Actions -- RS-side duplicate open handler *)
+\* RS receives an OPEN command for a region that is already online on
+\* this server.  The command is consumed WITHOUT producing an OPENED
+\* report, modeling AssignRegionHandler.process() L107-115 where the
+\* handler returns early ("region already online") without calling
+\* reportRegionStateTransition().
+\*
+\* This means the TRSP on the master side will never receive the
+\* expected OPENED report and will get stuck at CONFIRM_OPENED,
+\* eventually causing deadlock.
+\*
+\* Guarded by UseRSOpenDuplicateQuirk: disabled by default to
+\* avoid deadlock in model checking.  Enable to faithfully model
+\* this implementation quirk and generate counterexample traces.
+\*
+\* Pre: UseRSOpenDuplicateQuirk = TRUE, server is ONLINE, region r
+\*      is already in rsOnlineRegions[s], an OPEN command for r exists.
+\* Post: Command consumed, NO report produced, rsOnlineRegions unchanged.
+\*
+\* Source: AssignRegionHandler.process() L107-115.
+RSOpenDuplicate(s, r) ==
+  \* Quirk modeling must be enabled.
+  /\ UseRSOpenDuplicateQuirk = TRUE
+  \* Server is ONLINE, region is ALREADY online on this server.
+  /\ serverState[s] = "ONLINE"
+  /\ zkNode[s] = TRUE
+  /\ r \in rsOnlineRegions[s]
+  /\ \E cmd \in dispatchedOps[s]:
+       /\ cmd.type = "OPEN"
+       /\ cmd.region = r
+       \* Consume the command — but produce NO report.
+       /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
+       \* All other state unchanged: no report, no rsOnlineRegions change.
+       /\ UNCHANGED << scpVars,
+             serverVars,
+             procVars,
+             rsVars,
+             masterVars,
+             regionState,
+             metaTable,
+             pendingReports,
+             zkNode
+          >>
+
+---------------------------------------------------------------------------
+
+
+(* Actions -- RS restart *)
+\* A process supervisor (Kubernetes, systemd, etc.) restarts a crashed
+\* RegionServer.  The restarted server is empty: no regions, no pending
+\* commands, no RS-side state.  Any pending reports from the previous
+\* incarnation are discarded.  SCP state is reset to "NONE" and
+\* walFenced is cleared.
+\*
+\* Design note -- RS epochs are NOT modeled explicitly.  Real HBase uses
+\* ServerName (host + startcode) to distinguish incarnations. Stale
+\* reports carry the old ServerName and are rejected.  Here the same
+\* effect is achieved by atomic crash plus atomic restart (this action
+\* purges stale reports).  An explicit epoch variable would only add
+\* value if crash or restart were decomposed into non-atomic multi-step
+\* sequences.
+\*
+\* Pre: server is CRASHED AND SCP for this server is complete or was
+\*      never started.  The guard prevents premature restart while SCP
+\*      is still processing regions from the crashed server.
+\* Post: serverState set to ONLINE, pending reports from s discarded,
+\*       SCP state reset, walFenced cleared.
+\*
+\* Source: Environmental assumption -- a process supervisor
+\*         (Kubernetes, systemd, etc.) guarantees that crashed
+\*         RegionServer processes are eventually restarted.
+RSRestart(s) ==
+  \* Server is CRASHED and SCP is complete (or never started).
+  /\ serverState[s] = "CRASHED"
+  /\ scpState[s] \in { "DONE", "NONE" }
+  \* Bring the server back ONLINE.
+  /\ serverState' = [serverState EXCEPT ![s] = "ONLINE"]
+  \* Purge all stale pending reports from this server's prior incarnation.
+  /\ pendingReports' = {rpt \in pendingReports: rpt.server # s}
+  \* Clear stale commands for the restarting server.  The prior incarnation
+  \* never received them (or crashed before consuming); the new process
+  \* starts with an empty queue.  Without this, RSOpen could fire on
+  \* stale OPEN commands, creating ghost regions (r in rsOnlineRegions
+  \* but master has regionState ABNORMALLY_CLOSED / no location).
+  /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = {}]
+  \* Clear RS-side state for the restarting server.  The new process has
+  \* no regions; the zombie's rsOnlineRegions was never cleared by RSAbort.
+  \* Without this, RSMasterAgreementConverse fails: restarted server ONLINE
+  \* but rsOnlineRegions[s] still has regions the master has ABNORMALLY_CLOSED.
+  /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = {}]
+  \* Reset SCP state for the restarting server.
+  /\ scpState' = [scpState EXCEPT ![s] = "NONE"]
+  /\ scpRegions' = [scpRegions EXCEPT ![s] = {}]
+  /\ walFenced' = [walFenced EXCEPT ![s] = FALSE]
+  /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
+  \* Clear ServerStateNode tracking for the restarting server.
+  \* In the implementation, SCP.removeServer() calls
+  \* RegionStates.removeServer() which removes the ServerStateNode.
+  /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
+  \* Register a fresh ZK ephemeral node for the restarted server.
+  \* Source: HRegionServer.run() -> createMyEphemeralNode().
+  /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
+  \* Region state and META unchanged.
+  /\ UNCHANGED << procVars, masterVars, regionState, metaTable >>
 
 ============================================================================
