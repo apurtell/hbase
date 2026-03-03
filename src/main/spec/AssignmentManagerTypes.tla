@@ -23,16 +23,6 @@ ASSUME None \notin Servers
 CONSTANTS MaxRetries
 ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
 
-\* UseLocationCheck: when TRUE, SCPAssignRegion applies the
-\* isMatchingRegionLocation() check — regions whose master-side
-\* location has changed since SCPGetRegions are skipped.
-\* When FALSE, every region in the SCP snapshot is processed
-\* unconditionally.
-\*
-\* Source: ServerCrashProcedure.isMatchingRegionLocation();
-\*         called from ServerCrashProcedure.assignRegions().
-CONSTANTS UseLocationCheck
-ASSUME UseLocationCheck \in BOOLEAN
 
 \* UseReopen: when TRUE, TRSPCreateReopen is enabled, modeling the
 \* branch-2.6 REOPEN transition type (close then reopen on the same
