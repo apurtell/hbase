@@ -83,6 +83,9 @@ GoOffline(r) ==
 \* Pre: server is ONLINE and has at least one region assigned.
 \* Post: serverState set to CRASHED, scpState set to GET_REGIONS.
 \*
+\* Impl state: SERVER_CRASH_START (=1), absorbed into this action.
+\*   See SCP.tla header for the full enum traceability table.
+\*
 \* Source: ServerManager.expireServer() calls
 \*         ServerManager.moveFromOnlineToDeadServers() and then
 \*         AM.submitServerCrash(), which transitions the
@@ -114,8 +117,8 @@ MasterDetectCrash(s) ==
 \* A process supervisor (Kubernetes, systemd, etc.) restarts a crashed
 \* RegionServer.  The restarted server is empty: no regions, no pending
 \* commands, no RS-side state.  Any pending reports from the previous
-\* incarnation are discarded (in real HBase, epoch mismatch rejects
-\* them).  SCP state is reset to "NONE" and walFenced is cleared.
+\* incarnation are discarded.  SCP state is reset to "NONE" and
+\* walFenced is cleared.
 \*
 \* Design note -- RS epochs are NOT modeled explicitly.  Real HBase uses
 \* ServerName (host + startcode) to distinguish incarnations. Stale

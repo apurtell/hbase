@@ -38,7 +38,26 @@ CONSTANTS NoneRecord
 
 (* State definitions *)
 \* Core assignment lifecycle states.
-\* Mirrors RegionState.State for the assign/unassign/move path.
+\* Mirrors RegionState.State (HBase.proto / RegionState.java) for the
+\* assign/unassign/move path.
+\*
+\*   Modeled             | Impl enum value
+\*   --------------------+---------------------------------------------
+\*   "OFFLINE"           | OFFLINE (=0)
+\*   "OPENING"           | OPENING (=1)
+\*   "OPEN"              | OPEN (=2)
+\*   "CLOSING"           | CLOSING (=3)
+\*   "CLOSED"            | CLOSED (=4)
+\*   "FAILED_OPEN"       | FAILED_OPEN (=8)
+\*   "ABNORMALLY_CLOSED" | ABNORMALLY_CLOSED (=10)
+\*
+\* Deferred:
+\*   SPLITTING (=5), SPLIT (=6), MERGING (=9), MERGED (=11),
+\*   SPLITTING_NEW (=7), MERGING_NEW (=12)
+\*
+\* Omitted:
+\*   FAILED_CLOSE (not in proto; RS aborts on close failure,
+\*   resolved through ABNORMALLY_CLOSED instead)
 State ==
   { "OFFLINE",
     "OPENING",
@@ -91,6 +110,10 @@ ValidTransition ==
 \* UNASSIGN path: CLOSE -> CONFIRM_CLOSED -> (cleared)
 \* MOVE path:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
 \*                   -> CONFIRM_OPENED -> (cleared)
+\*
+\* 1:1 match with RegionStateTransitionState enum
+\* (MasterProcedure.proto).  See TRSP.tla header for the full
+\* traceability table.
 TRSPState ==
   { "GET_ASSIGN_CANDIDATE",
     "OPEN",
@@ -102,14 +125,35 @@ TRSPState ==
 \* Procedure types.  "NONE" means no procedure is attached.
 \* REOPEN: close on current server then reopen preferring the same server
 \* (assignCandidate pinning); no other ONLINE server required.
+\*
+\* Maps to RegionTransitionType enum (MasterProcedure.proto):
+\*   "ASSIGN"   -> ASSIGN (=1)
+\*   "UNASSIGN" -> UNASSIGN (=2)
+\*   "MOVE"     -> MOVE (=3)
+\*   "REOPEN"   -> REOPEN (=4)
+\*   "NONE"     -> (no protobuf equivalent; model-only sentinel)
 ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN", "NONE" }
 
 \* RPC command types dispatched from master to RegionServer.
+\* Maps to RegionRemoteProcedureBase subclasses:
+\*   "OPEN"  -> OpenRegionProcedure (dispatches via executeProcedures() RPC)
+\*   "CLOSE" -> CloseRegionProcedure (dispatches via executeProcedures() RPC)
+\*
 \* Source: RSProcedureDispatcher dispatches OpenRegionProcedure /
 \*         CloseRegionProcedure via executeProcedures() RPC.
 CommandType == { "OPEN", "CLOSE" }
 
 \* Transition codes reported from RegionServer back to master.
+\* Maps to RegionServerStatusService.RegionStateTransition.TransitionCode
+\* (RegionServerStatus.proto):
+\*   "OPENED"      -> OPENED (=0)
+\*   "FAILED_OPEN" -> FAILED_OPEN (=1)
+\*   "CLOSED"      -> CLOSED (=3)
+\*
+\* Omitted:
+\*   READY_TO_SPLIT (=4), SPLIT (=5), SPLIT_REVERTED (=7),
+\*   READY_TO_MERGE (=8), MERGED (=9), MERGE_REVERTED (=10)
+\*
 \* Source: RegionServerStatusService.reportRegionStateTransition()
 \*         with TransitionCode enum values.
 ReportCode == { "OPENED", "FAILED_OPEN", "CLOSED" }

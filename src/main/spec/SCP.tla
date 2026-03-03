@@ -36,6 +36,41 @@ rsVars == << rsOnlineRegions >>
 ---------------------------------------------------------------------------
 
 (* Actions -- ServerCrashProcedure (SCP) state machine *)
+\*
+\* The implementation's ServerCrashState enum (MasterProcedure.proto)
+\* has 13 values (3 deprecated).  The model abstracts these into 6
+\* states that capture the assignment-relevant SCP lifecycle.  States
+\* omitted from the model are pass-through cleanup/replication steps
+\* that do not interact with region state, assignment, or fencing.
+\*
+\*   Model state      | Implementation enum(s) abstracted
+\*   -----------------+--------------------------------------------------
+\*   (MasterDetect-   | SERVER_CRASH_START (=1)
+\*    Crash, in       |   Determines if server carries meta, sets initial
+\*    ExternalEvents) |   SCP state.  Collapsed into MasterDetectCrash.
+\*   "ASSIGN_META"    | SERVER_CRASH_SPLIT_META_LOGS (=10),
+\*                    |   SERVER_CRASH_ASSIGN_META (=11),
+\*                    |   SERVER_CRASH_DELETE_SPLIT_META_WALS_DIR (=12)
+\*                    |   Meta WAL split + meta reassign + cleanup.
+\*                    |   Modeled as single atomic meta reassignment.
+\*   "GET_REGIONS"    | SERVER_CRASH_GET_REGIONS (=3)
+\*                    |   1:1 match.
+\*   "FENCE_WALS"     | SERVER_CRASH_SPLIT_LOGS (=5)
+\*                    |   WAL splitting → fencing semantics only.
+\*   "ASSIGN"         | SERVER_CRASH_ASSIGN (=8),
+\*                    |   SERVER_CRASH_WAIT_ON_ASSIGN (=9)
+\*                    |   Assign + wait collapsed into per-region
+\*                    |   SCPAssignRegion + SCPDone.
+\*   "DONE"           | SERVER_CRASH_CLAIM_REPLICATION_QUEUES (=14),
+\*                    |   SERVER_CRASH_DELETE_SPLIT_WALS_DIR (=13),
+\*                    |   SERVER_CRASH_FINISH (=100)
+\*                    |   Replication queue claiming and WAL dir cleanup
+\*                    |   are orthogonal to assignment; collapsed with
+\*                    |   FINISH into terminal "DONE".
+\*   (not modeled)    | SERVER_CRASH_PROCESS_META (=2, deprecated),
+\*                    |   SERVER_CRASH_NO_SPLIT_LOGS (=4, deprecated),
+\*                    |   SERVER_CRASH_HANDLE_RIT2 (=20, deprecated)
+\*
 \* SCP meta-reassignment step: when the crashed server was hosting
 \* hbase:meta, the SCP must reassign meta before proceeding to the
 \* normal crash-recovery path.  This models the ASSIGN_META sub-step
@@ -129,9 +164,7 @@ SCPGetRegions(s) ==
 \* Post: walFenced[s] = TRUE, scpState advances to "ASSIGN".
 \*
 \* Source: ServerCrashProcedure.executeFromState()
-\*         SERVER_CRASH_SPLIT_LOGS case creates WAL splitting
-\*         sub-procedures; the model abstracts this as a single
-\*         fencing step.
+\*         SERVER_CRASH_SPLIT_LOGS case.
 SCPFenceWALs(s) ==
   \* SCP is in FENCE_WALS state for this crashed server.
   /\ scpState[s] = "FENCE_WALS"
@@ -333,7 +366,7 @@ SCPAssignRegion(s, r) ==
 \*         SERVER_CRASH_FINISH case -- the procedure
 \*         completes and is cleaned up by the ProcedureExecutor.
 SCPDone(s) ==
-  \* Guards: SCP is in ASSIGN state and all regions have been processed.
+  \* SCP is in ASSIGN state and all regions have been processed.
   /\ scpState[s] = "ASSIGN"
   /\ scpRegions[s] = {}
   \* Mark SCP as complete for this crashed server.

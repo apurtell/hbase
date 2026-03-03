@@ -796,7 +796,7 @@ state but preserves `procStore`; weaken to one-direction implication
 with converse holding only when master is alive.
 TLC 2r/2s: 3,339,614 distinct, 41s, clean.  Simulation 3r/3s
 (300s): 48,540,636 states, 427,311 traces, clean.
-Git: `debfba5195`
+Git: `b5768ce0e9`
 
 #### Iteration 18 — Master crash and recovery
 
