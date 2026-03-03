@@ -559,9 +559,152 @@ ProcStoreConsistency ==
     /\ ( regionState[r].procType # "NONE" ) => ( procStore[r] # NoneRecord )
     /\ ( procStore[r] # NoneRecord ) => ( regionState[r].procType # "NONE" )
 
+\* TRSP procStep must correlate with the region's lifecycle state.
+\*
+\*   GET_ASSIGN_CANDIDATE: region is idle or mid-transition
+\*     (OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN, or OPENING
+\*     if DispatchFail reset the step while the region was still OPENING).
+\*   OPEN: target chosen, region not yet transitioned to OPENING
+\*     (same set as GET_ASSIGN_CANDIDATE — TRSPDispatchOpen will move it).
+\*   CONFIRM_OPENED: region is OPENING (TRSPDispatchOpen transitioned it).
+\*   CLOSE: region is OPEN or CLOSING (CLOSING on retry after DispatchFailClose),
+\*     or ABNORMALLY_CLOSED (TRSPConfirmClosed Path 2 re-routes to close).
+\*   CONFIRM_CLOSED: region is CLOSING or ABNORMALLY_CLOSED.
+\*
+\* Source: TRSP.executeFromState() action guards.
+ProcStepConsistency ==
+  \A r \in Regions:
+    regionState[r].procType # "NONE" =>
+      /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
+             regionState[r].state \in
+               { "OFFLINE",
+                 "CLOSED",
+                 "ABNORMALLY_CLOSED",
+                 "FAILED_OPEN",
+                 "OPENING"
+               }
+         )
+      /\ ( regionState[r].procStep = "OPEN" =>
+             regionState[r].state \in
+               { "OFFLINE",
+                 "CLOSED",
+                 "ABNORMALLY_CLOSED",
+                 "FAILED_OPEN",
+                 "OPENING"
+               }
+         )
+      /\ ( regionState[r].procStep = "CONFIRM_OPENED" =>
+             regionState[r].state = "OPENING"
+         )
+      /\ ( regionState[r].procStep = "CLOSE" =>
+             regionState[r].state \in { "OPEN", "CLOSING", "ABNORMALLY_CLOSED" }
+         )
+      /\ ( regionState[r].procStep = "CONFIRM_CLOSED" =>
+             regionState[r].state \in { "CLOSING", "ABNORMALLY_CLOSED" }
+         )
+
+\* targetServer presence/absence correlates with procStep.
+\* At GET_ASSIGN_CANDIDATE, no candidate has been chosen yet.
+\* At OPEN, CONFIRM_OPENED, and CONFIRM_CLOSED, a target must exist.
+\*
+\* Source: TRSPGetCandidate sets targetServer;
+\*         TRSPCreate/TRSPHandleFailedOpen/TRSPServerCrashed clear it.
+TargetServerConsistency ==
+  \A r \in Regions:
+    regionState[r].procType # "NONE" =>
+      /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
+             regionState[r].targetServer = None
+         )
+      /\ ( regionState[r].procStep \in
+               { "OPEN", "CONFIRM_OPENED", "CONFIRM_CLOSED" } =>
+             regionState[r].targetServer # None
+         )
+
+\* A region in OPENING state always has a non-None location.
+\* TRSPDispatchOpen atomically sets state=OPENING and location=targetServer.
+\*
+\* Source: TRSPDispatchOpen — the only action that creates OPENING state.
+OpeningImpliesLocation ==
+  \A r \in Regions:
+    regionState[r].state = "OPENING" => regionState[r].location # None
+
+\* A region in CLOSING state always has a non-None location.
+\* TRSPDispatchClose transitions to CLOSING while preserving the existing
+\* location; clearing the location only happens at TRSPConfirmClosed Path 1
+\* (CLOSING -> CLOSED) or SCPAssignRegion (CLOSING -> ABNORMALLY_CLOSED).
+\*
+\* Source: TRSPDispatchClose — preserves location on CLOSING transition.
+ClosingImpliesLocation ==
+  \A r \in Regions:
+    regionState[r].state = "CLOSING" => regionState[r].location # None
+
+\* For a region that has a known location, no active procedure, and whose
+\* server is not CRASHED, the serverRegions tracking must include it.
+\* This validates the independent serverRegions variable (which SCP reads
+\* for its snapshot) against the authoritative regionState.location.
+\*
+\* Active procedures are exempt because during TRSP execution,
+\* serverRegions and location may temporarily desynchronize
+\* (regionOpening adds to new server without removing from old).
+\*
+\* Source: AM.regionOpening(), AM.regionClosedWithoutPersisting(),
+\*         AM.regionFailedOpen(), AM.regionClosedAbnormally().
+ServerRegionsTrackLocation ==
+  \A r \in Regions:
+    ( /\ regionState[r].location # None
+      /\ regionState[r].procType = "NONE"
+      /\ serverState[regionState[r].location] # "CRASHED" ) =>
+      r \in serverRegions[regionState[r].location]
+
+\* Every dispatched command for a region corresponds to an active
+\* procedure on that region, or the target server is CRASHED (stale
+\* commands awaiting cleanup by RSAbort/ServerRestart).  Catches
+\* orphaned commands that could cause ghost opens/closes.
+\*
+\* Source: TRSP dispatch actions produce commands only when a procedure
+\*         is active; RS consume actions and RSAbort/ServerRestart clean up.
+DispatchCorrespondance ==
+  \A s \in Servers:
+    \A cmd \in dispatchedOps[s]: \/ regionState[cmd.region].procType # "NONE"
+                                 \/ serverState[s] = "CRASHED"
+
+\* A procedure-bearing region must never be in OFFLINE state.
+\* OFFLINE is a quiescent state entered only by GoOffline (which
+\* requires procType = NONE).  TRSPCreate may attach to OFFLINE
+\* but it does not SET the region to OFFLINE—it attaches ASSIGN
+\* at GET_ASSIGN_CANDIDATE while the region stays OFFLINE until
+\* TRSPDispatchOpen transitions it to OPENING.  Wait—that means
+\* a region CAN be OFFLINE with an ASSIGN procedure attached
+\* (between TRSPCreate and TRSPDispatchOpen).  This is correct
+\* behavior; the invariant below accounts for it.
+\*
+\* Source: RegionStateNode.offline(); TRSPCreate action guards.
+NoOrphanedProcedures ==
+  \A r \in Regions:
+    ( regionState[r].state = "OFFLINE" /\ regionState[r].procType # "NONE" ) =>
+      regionState[r].procType = "ASSIGN"
+
+\* Action constraint: SCP state machine transitions are strictly monotonic.
+\* The SCP never moves backward; only forward along the defined sequence,
+\* plus the DONE->NONE reset on ServerRestart.
+\*
+\* Source: SCP state machine actions in SCP.tla, ServerRestart in
+\*         ExternalEvents.tla.
+SCPMonotonicity ==
+  \A s \in Servers:
+    scpState'[s] # scpState[s] =>
+      << scpState[s], scpState'[s] >> \in
+        { << "NONE", "ASSIGN_META" >>,
+          << "NONE", "GET_REGIONS" >>,
+          << "ASSIGN_META", "GET_REGIONS" >>,
+          << "GET_REGIONS", "FENCE_WALS" >>,
+          << "FENCE_WALS", "ASSIGN" >>,
+          << "ASSIGN", "DONE" >>,
+          << "DONE", "NONE" >>
+        }
+
 
 (* State constraints for TLC *)
-
 \* Symmetry reduction: regions and servers are interchangeable.
 \* TLC explores one representative per equivalence class, reducing
 \* the state space by up to |Regions|! * |Servers|! (36x for 3r/3s).
@@ -694,37 +837,58 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 ---------------------------------------------------------------------------
 
-(* Theorems / properties to check *)
 
-\* Safety: every step preserves the type invariant.
-THEOREM Spec => []TypeOK
+(* Theorems / properties to check *)
+        \* Safety: every step preserves the type invariant.
+        THEOREM Spec => []TypeOK
 
 \* Safety: OPEN regions always have a location.
-THEOREM Spec => []OpenImpliesLocation
+        THEOREM Spec => []OpenImpliesLocation
 
 \* Safety: offline-like regions never have a location.
-THEOREM Spec => []OfflineImpliesNoLocation
+        THEOREM Spec => []OfflineImpliesNoLocation
 
 \* Safety: no double assignment (region writable on at most one server).
-THEOREM Spec => []NoDoubleAssignment
+        THEOREM Spec => []NoDoubleAssignment
 
 \* Safety: SCP does not reassign until WAL leases are revoked.
-THEOREM Spec => []FencingOrder
+        THEOREM Spec => []FencingOrder
 
 \* Safety: after SCP completes, no region is lost (stuck without a procedure).
-THEOREM Spec => []NoLostRegions
+        THEOREM Spec => []NoLostRegions
 
 \* Safety: persistent meta state matches in-memory state.
-THEOREM Spec => []MetaConsistency
+        THEOREM Spec => []MetaConsistency
 
 \* Safety: procedure lock held only during appropriate states.
-THEOREM Spec => []LockExclusivity
+        THEOREM Spec => []LockExclusivity
 
 \* Safety: stably OPEN region is online on its RS.
-THEOREM Spec => []RSMasterAgreement
+        THEOREM Spec => []RSMasterAgreement
 
 \* Safety: RS-online region is acknowledged by master.
-THEOREM Spec => []RSMasterAgreementConverse
+        THEOREM Spec => []RSMasterAgreementConverse
+
+\* Safety: procStep correlates with region lifecycle state.
+        THEOREM Spec => []ProcStepConsistency
+
+\* Safety: targetServer presence correlates with procStep.
+        THEOREM Spec => []TargetServerConsistency
+
+\* Safety: OPENING region always has a location.
+        THEOREM Spec => []OpeningImpliesLocation
+
+\* Safety: CLOSING region always has a location.
+        THEOREM Spec => []ClosingImpliesLocation
+
+\* Safety: serverRegions tracks location for stable regions.
+        THEOREM Spec => []ServerRegionsTrackLocation
+
+\* Safety: dispatched commands have corresponding procedures.
+        THEOREM Spec => []DispatchCorrespondance
+
+\* Safety: OFFLINE procedure-bearing regions are ASSIGN only.
+        THEOREM Spec => []NoOrphanedProcedures
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.

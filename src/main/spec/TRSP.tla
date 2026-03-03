@@ -54,7 +54,7 @@ scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
 \*         TRSP.queueAssign() applies the GET_ASSIGN_CANDIDATE
 \*         initial state via TRSP.setInitialAndLastState().
 TRSPCreate(r) ==
-  \* Guards: region is in an assignable state and has no active procedure.
+  \* Region is in an assignable state and has no active procedure.
   /\ regionState[r].state \in
        { "OFFLINE", "CLOSED", "ABNORMALLY_CLOSED", "FAILED_OPEN" }
   /\ regionState[r].procType = "NONE"
@@ -64,8 +64,9 @@ TRSPCreate(r) ==
   \* crashed regions during the SCP assign loop.
   /\ \/ regionState[r].state # "ABNORMALLY_CLOSED"
      \/ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
-  \* Initialize embedded ASSIGN procedure at GET_ASSIGN_CANDIDATE step.
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Initialize embedded ASSIGN procedure at GET_ASSIGN_CANDIDATE step.
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -116,8 +117,8 @@ TRSPCreate(r) ==
 \*         createDestinationServersList() excludes CRASHED servers;
 \*         HRegionServer.abort() (RSAbort) clears rsOnlineRegions.
 TRSPGetCandidate(r, s) ==
-  \* Guards: procedure is ASSIGN, MOVE, or REOPEN at GET_ASSIGN_CANDIDATE;
-  \* chosen server is ONLINE; no CRASHED server still holds r in
+  \* Procedure is ASSIGN, MOVE, or REOPEN at GET_ASSIGN_CANDIDATE.
+  \* Chosen server is ONLINE; no CRASHED server still holds r in
   \* rsOnlineRegions (zombie window must be closed by RSAbort first).
   \* For REOPEN, s may equal regionState[r].location (same server OK).
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
@@ -125,8 +126,9 @@ TRSPGetCandidate(r, s) ==
   /\ serverState[s] = "ONLINE"
   /\ \A sZombie \in Servers:
        serverState[sZombie] = "CRASHED" => r \notin rsOnlineRegions[sZombie]
-  \* Record the chosen server and advance the procedure to the OPEN step.
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Record the chosen server and advance the procedure to the OPEN step.
   /\ regionState' =
        [regionState EXCEPT ![r].targetServer = s, ![r].procStep = "OPEN"]
   \* Update persisted procedure with target server and step.
@@ -153,15 +155,15 @@ TRSPGetCandidate(r, s) ==
 \*         dispatches the RPC via
 \*         RSProcedureDispatcher.ExecuteProceduresRemoteCall.run().
 TRSPDispatchOpen(r) ==
-  \* Guards: procedure is ASSIGN or MOVE, in OPEN step, with a target server.
+  \* Procedure is ASSIGN or MOVE, in OPEN step, with a target server.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # None
-  \* Bind the target server for readability.
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Transition region to OPENING, record server, advance to CONFIRM_OPENED.
   /\ LET s == regionState[r].targetServer
-     IN \* Transition region to OPENING, record server, advance to CONFIRM_OPENED.
-        /\ regionState' =
+     IN /\ regionState' =
              [regionState EXCEPT
              ![r].state =
              "OPENING",
@@ -208,11 +210,12 @@ TRSPDispatchOpen(r) ==
 \*         performs the OPENING -> OPEN state transition and meta
 \*         update.
 TRSPConfirmOpened(r) ==
-  \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, region is
+  \* Procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, region is
   \* OPENING, and a matching OPENED report exists from an ONLINE server.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].state = "OPENING"
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
@@ -269,11 +272,13 @@ TRSPConfirmOpened(r) ==
 \*         RSProcedureDispatcher.scheduleForRetry() decides
 \*         whether to retry or fail the remote call.
 DispatchFail(r) ==
-  \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, has a
+  \* Procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, has a
   \* target server, and the OPEN command is still in dispatchedOps.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Bind the target server; it must have been set by TRSPGetCandidate.
   /\ LET s == regionState[r].targetServer
      IN /\ s # None
         \* Reconstruct the dispatched command and verify it is still queued.
@@ -314,11 +319,13 @@ DispatchFail(r) ==
 \*         RSProcedureDispatcher.scheduleForRetry() decides
 \*         whether to retry or fail the remote call.
 DispatchFailClose(r) ==
-  \* Guards: procedure is UNASSIGN or MOVE, in CONFIRM_CLOSED step, has a
+  \* Procedure is UNASSIGN or MOVE, in CONFIRM_CLOSED step, has a
   \* target server, and the CLOSE command is still in dispatchedOps.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Bind the target server; it must have been set by TRSPGetCandidate.
   /\ LET s == regionState[r].targetServer
      IN /\ s # None
         \* Reconstruct the dispatched command and verify it is still queued.
@@ -356,7 +363,7 @@ DispatchFailClose(r) ==
 \*         maxAttempts); AM.regionFailedOpen() updates
 \*         bookkeeping; forceNewPlan is set to choose a new server.
 TRSPHandleFailedOpen(r) ==
-  \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, retries
+  \* Procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, retries
   \* not exhausted, region is OPENING, and a matching FAILED_OPEN report
   \* exists from an ONLINE server.
   \* Do not handle FAILED_OPEN when OPENED exists for r: the RS may have
@@ -364,8 +371,12 @@ TRSPHandleFailedOpen(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].retries < MaxRetries
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Region must still be in OPENING state (not yet confirmed open).
   /\ regionState[r].state = "OPENING"
+  \* No OPENED report exists for r — if one does, prefer TRSPConfirmOpened
+  \* (the RS may have succeeded after initially reporting failure).
   /\ ~\E rpt2 \in pendingReports: rpt2.region = r /\ rpt2.code = "OPENED"
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
@@ -387,7 +398,7 @@ TRSPHandleFailedOpen(r) ==
        \* OPEN is now stale since we are picking a new server.  Without this,
        \* RSOpen could consume the stale OPEN and violate RSMasterAgreementConverse.
        \* The implementation's procedure ordering (CONFIRM_OPENED suspends until
-       \* report) may prevent this race; the clear is a conservative mitigation.
+       \* report) may prevent this race. The clear is a conservative mitigation.
        /\ dispatchedOps' =
             [t \in Servers |->
               {cmd \in dispatchedOps[t]: cmd.region # r \/ cmd.type # "OPEN"}
@@ -424,15 +435,19 @@ TRSPHandleFailedOpen(r) ==
 \*         maxAttempts); AM.regionFailedOpen(regionNode, true)
 \*         persists FAILED_OPEN to meta and clears location.
 TRSPGiveUpOpen(r) ==
-  \* Guards: procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, retries
+  \* Procedure is ASSIGN or MOVE, in CONFIRM_OPENED step, retries
   \* exhausted, region is OPENING, and a matching FAILED_OPEN report
   \* exists from an ONLINE server.
   \* Do not give up when OPENED exists for r: prefer OPENED (RS succeeded).
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].retries >= MaxRetries
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Region must still be in OPENING state (not yet confirmed open).
   /\ regionState[r].state = "OPENING"
+  \* No OPENED report exists for r, or if one does, prefer TRSPConfirmOpened
+  \* (the RS may have succeeded after initially reporting failure).
   /\ ~\E rpt2 \in pendingReports: rpt2.region = r /\ rpt2.code = "OPENED"
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
@@ -485,12 +500,13 @@ TRSPGiveUpOpen(r) ==
 \*         CONFIRM_CLOSED; RegionStateNode.setProcedure()
 \*         attaches it to the region.
 TRSPCreateUnassign(r) ==
-  \* Guards: region is OPEN, has a location, and has no active procedure.
+  \* Region is OPEN, has a location, and has no active procedure.
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # None
   /\ regionState[r].procType = "NONE"
-  \* Initialize embedded UNASSIGN procedure at CLOSE step, targeting current server.
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Initialize embedded UNASSIGN procedure at CLOSE step, targeting current server.
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -537,14 +553,15 @@ TRSPCreateUnassign(r) ==
 \*         CONFIRM_OPENED; RegionStateNode.setProcedure()
 \*         attaches it to the region.
 TRSPCreateMove(r) ==
-  \* Guards: region is OPEN, has a location, has no active procedure,
+  \* Region is OPEN, has a location, has no active procedure,
   \* and at least one other ONLINE server exists as a destination.
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # None
   /\ regionState[r].procType = "NONE"
   /\ \E s \in Servers: s # regionState[r].location /\ serverState[s] = "ONLINE"
-  \* Initialize embedded MOVE procedure at CLOSE step, targeting current server.
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Initialize embedded MOVE procedure at CLOSE step, targeting current server.
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -588,15 +605,16 @@ TRSPCreateMove(r) ==
 \*         TRSP.setInitialAndLastState();
 \*         TRSP.queueAssign() (retain=true when assignCandidate set).
 TRSPCreateReopen(r) ==
-  \* Guards: UseReopen enabled, region is OPEN, has a server location,
+  \* UseReopen enabled, region is OPEN, has a server location,
   \* no active procedure.  No requirement that another ONLINE server exists.
   /\ UseReopen = TRUE
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # None
   /\ regionState[r].procType = "NONE"
+  \* Region is not locked by an in-progress procedure step.
+  /\ locked[r] = FALSE
   \* Initialize embedded REOPEN procedure at CLOSE step, targeting the
   \* region's current server (assignCandidate pinning).
-  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType =
@@ -638,13 +656,14 @@ TRSPCreateReopen(r) ==
 \*         dispatches the RPC via
 \*         RSProcedureDispatcher.ExecuteProceduresRemoteCall.run().
 TRSPDispatchClose(r) ==
-  \* Guards: procedure is UNASSIGN or MOVE, in CLOSE step, has a target
+  \* Procedure is UNASSIGN or MOVE, in CLOSE step, has a target
   \* server, and region is OPEN or CLOSING (CLOSING on retry).
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CLOSE"
   /\ regionState[r].targetServer # None
-  \* Bind the target server for readability.
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
+  \* Bind the target server for readability.
   /\ LET s == regionState[r].targetServer
      IN /\ regionState[r].state \in { "OPEN", "CLOSING" }
         \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
@@ -710,8 +729,10 @@ TRSPDispatchClose(r) ==
 \*         AM.regionClosedAbnormally() persists the
 \*         ABNORMALLY_CLOSED state to meta.
 TRSPConfirmClosed(r) ==
+  \* Procedure is UNASSIGN, MOVE, or REOPEN, in CONFIRM_CLOSED step.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
   /\ \/ \* --- Path 1: Normal close (CLOSING -> CLOSED) ---
         /\ regionState[r].state = "CLOSING"
@@ -863,9 +884,13 @@ TRSPConfirmClosed(r) ==
 \*         and advances to GET_ASSIGN_CANDIDATE when the region
 \*         is not in a closeable state.
 TRSPServerCrashed(r) ==
-  \* Guards: region has an active procedure and is ABNORMALLY_CLOSED.
+  \* Region has an active procedure, is ABNORMALLY_CLOSED,
+  \* and the procedure has not already been converted to
+  \* GET_ASSIGN_CANDIDATE by SCPAssignRegion Path A.
   /\ regionState[r].procType # "NONE"
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
+  /\ regionState[r].procStep # "GET_ASSIGN_CANDIDATE"
+  \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
   \* Convert the procedure to ASSIGN at GET_ASSIGN_CANDIDATE, clear target.
   /\ regionState' =

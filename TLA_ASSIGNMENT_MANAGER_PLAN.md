@@ -774,6 +774,30 @@ TRSPConfirmClosed Path 1 UNASSIGN).  DispatchFail actions use UNCHANGED
 and `procStore[r] ≠ NoneRecord`.  TLC 2r/2s: 3,465,621 distinct, 31s,
 clean. Git: `86a13663a2`
 
+#### Iteration 17.5 — Cross-variable consistency invariants
+
+Eight new invariants (no new variables or actions) tightening
+cross-variable correlations.  `ProcStepConsistency`: procStep
+correlates with region lifecycle state (e.g. CONFIRM_OPENED ⇒
+OPENING).  `TargetServerConsistency`: targetServer presence ↔
+procStep.  `OpeningImpliesLocation`, `ClosingImpliesLocation`:
+mid-transition regions always have a location.
+`ServerRegionsTrackLocation`: serverRegions tracks location for
+stable regions.  `DispatchCorrespondance`: dispatched commands have
+corresponding procedures.  `NoOrphanedProcedures`: OFFLINE +
+procedure ⇒ ASSIGN only.  `SCPMonotonicity` (ACTION_CONSTRAINT):
+SCP state never moves backward.  Model fix: `SCPAssignRegion`
+Path A tightened to atomically convert the existing TRSP (matching
+`serverCrashed()` under `RegionStateNode.lock()`);
+`TRSPServerCrashed` guard updated to skip already-converted regions.
+`ProcStoreConsistency` evolution note: bijection will require
+relaxation in Iteration 18 when `MasterCrash` clears in-memory
+state but preserves `procStore`; weaken to one-direction implication
+with converse holding only when master is alive.
+TLC 2r/2s: 3,339,614 distinct, 41s, clean.  Simulation 3r/3s
+(300s): 48,540,636 states, 427,311 traces, clean.
+Git: `debfba5195`
+
 #### Iteration 18 — Master crash and recovery
 
 **What to add**: Master crash/recovery actions, `RSOpenDuplicate`
