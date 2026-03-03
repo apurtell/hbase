@@ -120,14 +120,6 @@
  * FAILED_CLOSE is omitted because no code path transitions into it. The RS
  * abort triggers crash detection, so close failures are resolved through
  * ABNORMALLY_CLOSED instead.
- *
- * UseLocationCheck controls whether SCPAssignRegion applies the
- * isMatchingRegionLocation() check.  When TRUE,
- * SCPAssignRegion skips regions whose location changed between
- * SCPGetRegions and SCPAssignRegion — matching the implementation.
- * When FALSE, every region in the SCP snapshot is processed
- * unconditionally — the correct protocol behavior.  The check is
- * a known source of bugs.
  *)
 EXTENDS AssignmentManagerTypes
 
