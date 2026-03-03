@@ -752,7 +752,7 @@ Removal by `TRSPHandleFailedOpen`, `TRSPGiveUpOpen`,
 `NoLostRegions` strengthened: (1) ABNORMALLY_CLOSED with no procedure,
 (2) OPENING/CLOSING with `location=None`, no procedure, not in any
 SCP snapshot.  TLC 2r/2s: 3,157,489 distinct, 28s, clean.
-Git: `f3e4303dd9`.
+Git: `c46d820f2a`.
 
 ---
 
@@ -761,18 +761,19 @@ Git: `f3e4303dd9`.
 
 #### Iteration 17 — Procedure store
 
-**What to add**: `procStore` variable — a persistent set of procedure
-records (survives master crash). Actions that modify procedure state
-also persist to `procStore`:
-- Procedure creation → insert into `procStore`.
-- State transitions → update in `procStore`.
-- Procedure completion → delete from `procStore`.
-The `procStore` variable is not modified by `ServerCrash` or
-`MasterCrash` — it survives both.
-**Verify**: `TypeOK` with `procStore`. All existing invariants hold.
-`ProcStoreConsistency`: every active procedure in `procedures` has a
-matching entry in `procStore`.
-**Source**: `WALProcedureStore.java` insert/update/delete L527-694.
+`procStore` variable (`[Regions → ProcStoreRecord ∪ {NoneRecord}]`):
+models the WALProcedureStore / RegionProcedureStore persistence layer.
+Record: `[type, step, targetServer]`; `NoneRecord` when no procedure
+persisted.  14 actions actively update procStore: 4 inserts (TRSPCreate,
+TRSPCreateUnassign, TRSPCreateMove, TRSPCreateReopen), procedure step
+updates (TRSPGetCandidate, TRSPDispatchOpen, TRSPDispatchClose,
+TRSPHandleFailedOpen, TRSPConfirmClosed Path 2, TRSPServerCrashed,
+SCPAssignRegion Path B), 3 deletes (TRSPConfirmOpened, TRSPGiveUpOpen,
+TRSPConfirmClosed Path 1 UNASSIGN).  DispatchFail actions use UNCHANGED
+(not persisted, matching `remoteCallFailed()` L139).
+`ProcStoreConsistency` invariant: bijection between `procType ≠ NONE`
+and `procStore[r] ≠ NoneRecord`.  TLC 2r/2s: 3,465,621 distinct, 31s,
+clean.
 
 #### Iteration 18 — Master crash and recovery
 
