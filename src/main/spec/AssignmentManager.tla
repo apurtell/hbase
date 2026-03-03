@@ -153,6 +153,9 @@ ASSUME UseLocationCheck \in BOOLEAN
 CONSTANTS UseReopen
 ASSUME UseReopen \in BOOLEAN
 
+\* Sentinel model value for "no persisted procedure".
+CONSTANTS NoneRecord
+
 ---------------------------------------------------------------------------
 
 (* State definitions *)
@@ -369,6 +372,26 @@ VARIABLE carryingMeta
 \*         AssignmentManager.getRegionsOnServer() AM.java L492-498.
 VARIABLE serverRegions
 
+\* procStore[r] is the persisted procedure record for region r, or
+\* NoneRecord when no procedure is persisted.  Models the
+\* WALProcedureStore / RegionProcedureStore persistence layer.
+\* Survives master crash — only cleared by procedure completion or
+\* explicit delete.  Updated by ProcedureExecutor.store.update()
+\* after each executeFromState step (except when skipPersistence
+\* is called, e.g., DispatchFail).
+\*
+\* Source: ProcedureExecutor.execProcedure() persistence;
+\*         RegionRemoteProcedureBase.persistAndWake();
+\*         WALProcedureStore / RegionProcedureStore.
+VARIABLE procStore
+
+\* Type definition for persisted procedure records.
+ProcStoreRecord ==
+  [type:ProcType \ { "NONE" },
+    step:TRSPState,
+    targetServer:Servers \cup { None }
+  ]
+
 vars ==
   << regionState,
      metaTable,
@@ -381,7 +404,8 @@ vars ==
      walFenced,
      locked,
      carryingMeta,
-     serverRegions
+     serverRegions,
+     procStore
   >>
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -444,6 +468,8 @@ TypeOK ==
   /\ locked \in [Regions -> BOOLEAN]
   \* Per-server region tracking (ServerStateNode).
   /\ serverRegions \in [Servers -> SUBSET Regions]
+  \* Persisted procedure store: record per region or NoneRecord.
+  /\ procStore \in [Regions -> ProcStoreRecord \cup { NoneRecord }]
 
 ---------------------------------------------------------------------------
 
@@ -638,7 +664,18 @@ NoLostRegions ==
            /\ regionState[r].procType = "NONE"
            => \E s \in Servers: r \in scpRegions[s] )
 
----------------------------------------------------------------------------
+\* Every active in-memory procedure has a matching persisted record,
+\* and every persisted record corresponds to an active in-memory
+\* procedure.  This invariant will require relaxation in iteration 18
+\* when MasterCrash clears in-memory state but preserves procStore.
+\*
+\* Source: ProcedureExecutor lifecycle — insert on creation,
+\*         update on each step, delete on completion.
+ProcStoreConsistency ==
+  \A r \in Regions:
+    /\ ( regionState[r].procType # "NONE" ) => ( procStore[r] # NoneRecord )
+    /\ ( procStore[r] # NoneRecord ) => ( regionState[r].procType # "NONE" )
+
 
 (* State constraints for TLC *)
 \* Limit the number of simultaneously crashed servers.  No longer
@@ -686,6 +723,8 @@ Init ==
   /\ carryingMeta = [s \in Servers |-> FALSE]
   /\ locked = [r \in Regions |-> FALSE]
   /\ serverRegions = [s \in Servers |-> {}]
+  \* No procedures are persisted initially.
+  /\ procStore = [r \in Regions |-> NoneRecord]
 
 ---------------------------------------------------------------------------
 
@@ -723,6 +762,14 @@ TRSPCreate(r) ==
        None,
        ![r].retries =
        0]
+  \* Persist the new procedure to the procedure store.
+  /\ procStore' =
+       [procStore EXCEPT
+       ![r] =
+       [ type |-> "ASSIGN",
+         step |-> "GET_ASSIGN_CANDIDATE",
+         targetServer |-> None
+       ]]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
   /\ UNCHANGED << metaTable,
         rpcVars,
@@ -768,6 +815,8 @@ TRSPGetCandidate(r, s) ==
   /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT ![r].targetServer = s, ![r].procStep = "OPEN"]
+  \* Update persisted procedure with target server and step.
+  /\ procStore' = [procStore EXCEPT ![r].step = "OPEN", ![r].targetServer = s]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
   /\ UNCHANGED << metaTable,
         rpcVars,
@@ -822,6 +871,8 @@ TRSPDispatchOpen(r) ==
         \* simultaneously (old and new) during the OPENING window.
         \* Source: AM.regionOpening() AM.java L2178-2196.
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \cup { r }]
+        \* Update persisted procedure step.
+        /\ procStore' = [procStore EXCEPT ![r].step = "CONFIRM_OPENED"]
         \* Pending reports, RS-side state, and server liveness unchanged.
         /\ UNCHANGED << pendingReports, rsVars, serverState, scpVars, locked >>
 
@@ -873,6 +924,8 @@ TRSPConfirmOpened(r) ==
             [ state |-> "OPEN", location |-> metaTable[r].location ]]
        \* Consume the matched report from the pending set.
        /\ pendingReports' = pendingReports \ { rpt }
+       \* Delete the completed procedure from the store.
+       /\ procStore' = [procStore EXCEPT ![r] = NoneRecord]
        \* Dispatched ops, RS-side state, and server liveness unchanged.
        /\ UNCHANGED << dispatchedOps,
              rsVars,
@@ -928,7 +981,8 @@ DispatchFail(r) ==
               serverState,
               scpVars,
               locked,
-              serverRegions
+              serverRegions,
+              procStore
            >>
 
 \* Close command dispatch failed (non-deterministic RPC failure).
@@ -967,7 +1021,8 @@ DispatchFailClose(r) ==
               serverState,
               scpVars,
               locked,
-              serverRegions
+              serverRegions,
+              procStore
            >>
 
 \* Handle a FAILED_OPEN report from the RS by retrying the assignment.
@@ -1024,7 +1079,13 @@ TRSPHandleFailedOpen(r) ==
               {cmd \in dispatchedOps[t]: cmd.region # r \/ cmd.type # "OPEN"}
             ]
        \* META, RS-side state, and server liveness unchanged.
-       /\ UNCHANGED << metaTable, rsVars, serverState, scpVars, locked >>
+       \* Update persisted procedure step.
+       /\ procStore' =
+            [procStore EXCEPT
+            ![r].step =
+            "GET_ASSIGN_CANDIDATE",
+            ![r].targetServer =
+            None]
        \* ServerStateNode tracking: AM.regionFailedOpen() calls
        \* removeRegionFromServer() for the region's current location.
        \* Source: AM.regionFailedOpen() AM.java L2201-2224.
@@ -1033,6 +1094,7 @@ TRSPHandleFailedOpen(r) ==
                 IF loc # None
                 THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
                 ELSE serverRegions
+       /\ UNCHANGED << metaTable, rsVars, serverState, scpVars, locked >>
 
 \* Give up on opening a region after exhausting the retry budget.
 \* Consumes the FAILED_OPEN report, transitions the region to
@@ -1082,6 +1144,8 @@ TRSPGiveUpOpen(r) ==
        /\ pendingReports' = pendingReports \ { rpt }
        \* Dispatched ops, RS-side state, and server liveness unchanged.
        /\ UNCHANGED << dispatchedOps, rsVars, serverState, scpVars, locked >>
+       \* Delete the completed procedure from the store.
+       /\ procStore' = [procStore EXCEPT ![r] = NoneRecord]
        \* ServerStateNode tracking: AM.regionFailedOpen() calls
        \* removeRegionFromServer() for the region's current location.
        \* Source: AM.regionFailedOpen() AM.java L2201-2224.
@@ -1123,6 +1187,14 @@ TRSPCreateUnassign(r) ==
        regionState[r].location,
        ![r].retries =
        0]
+  \* Persist the new procedure to the procedure store.
+  /\ procStore' =
+       [procStore EXCEPT
+       ![r] =
+       [ type |-> "UNASSIGN",
+         step |-> "CLOSE",
+         targetServer |-> regionState[r].location
+       ]]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
   /\ UNCHANGED << metaTable,
         rpcVars,
@@ -1169,6 +1241,14 @@ TRSPCreateMove(r) ==
        regionState[r].location,
        ![r].retries =
        0]
+  \* Persist the new procedure to the procedure store.
+  /\ procStore' =
+       [procStore EXCEPT
+       ![r] =
+       [ type |-> "MOVE",
+         step |-> "CLOSE",
+         targetServer |-> regionState[r].location
+       ]]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
   /\ UNCHANGED << metaTable,
         rpcVars,
@@ -1213,6 +1293,14 @@ TRSPCreateReopen(r) ==
        regionState[r].location,
        ![r].retries =
        0]
+  \* Persist the new procedure to the procedure store.
+  /\ procStore' =
+       [procStore EXCEPT
+       ![r] =
+       [ type |-> "REOPEN",
+         step |-> "CLOSE",
+         targetServer |-> regionState[r].location
+       ]]
   \* META, RPC channels, RS-side state, and server liveness unchanged.
   /\ UNCHANGED << metaTable,
         rpcVars,
@@ -1263,6 +1351,8 @@ TRSPDispatchClose(r) ==
              ![s] =
              @ \cup { [ type |-> "CLOSE", region |-> r ] }]
         \* Pending reports, RS-side state, and server liveness unchanged.
+        \* Update persisted procedure step.
+        /\ procStore' = [procStore EXCEPT ![r].step = "CONFIRM_CLOSED"]
         /\ UNCHANGED << pendingReports,
               rsVars,
               serverState,
@@ -1349,21 +1439,30 @@ TRSPConfirmClosed(r) ==
                   [ state |-> "CLOSED", location |-> None ]]
              \* Consume the matched report from the pending set.
              /\ pendingReports' = pendingReports \ { rpt }
+             \* Procedure store: delete if UNASSIGN (complete), update if MOVE/REOPEN.
+             /\ procStore' =
+                  IF regionState[r].procType = "UNASSIGN"
+                  THEN [procStore EXCEPT ![r] = NoneRecord]
+                  ELSE [procStore EXCEPT
+                    ![r].step =
+                    "GET_ASSIGN_CANDIDATE",
+                    ![r].targetServer =
+                    None]
+             \* ServerStateNode tracking: AM.regionClosedWithoutPersisting()
+             \* calls removeRegionFromServer() for the region's location.
+             \* Source: AM.regionClosedWithoutPersistingToMeta() AM.java L2253-2260.
+             /\ LET loc == regionState[r].location
+                IN serverRegions' =
+                      IF loc # None
+                      THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
+                      ELSE serverRegions
              \* Dispatched ops, RS-side state, and server liveness unchanged.
              /\ UNCHANGED << dispatchedOps,
-                     rsVars,
-                     serverState,
-                     scpVars,
-                     locked
-                  >> \* ServerStateNode tracking: AM.regionClosedWithoutPersisting()
-                  \* calls removeRegionFromServer() for the region's location.
-                  \* Source: AM.regionClosedWithoutPersistingToMeta() AM.java L2253-2260.
-                  /\
-                  LET loc == regionState[r].location
-                  IN serverRegions' =
-                        IF loc # None
-                        THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
-                        ELSE serverRegions
+                   rsVars,
+                   serverState,
+                   scpVars,
+                   locked
+                >>
      \/ \* --- Path 2: Crash during close (ABNORMALLY_CLOSED) ---
         \* The target server crashed while the close was in flight.
         \* The procedure self-recovers: convert to ASSIGN at
@@ -1395,13 +1494,14 @@ TRSPConfirmClosed(r) ==
         /\ dispatchedOps' =
              [s \in Servers |-> {cmd \in dispatchedOps[s]: cmd.region # r}
              ]
-        /\ UNCHANGED << metaTable,
-              pendingReports,
-              rsVars,
-              serverState,
-              scpVars,
-              locked
-           >>
+        \* Update persisted procedure: convert to ASSIGN.
+        /\ procStore' =
+             [procStore EXCEPT
+             ![r] =
+             [ type |-> "ASSIGN",
+               step |-> "GET_ASSIGN_CANDIDATE",
+               targetServer |-> None
+             ]]
         \* ServerStateNode tracking: AM.regionClosedAbnormally() calls
         \* removeRegionFromServer() for the region's location.
         \* Source: AM.regionClosedAbnormally() AM.java L2230-2246.
@@ -1410,6 +1510,13 @@ TRSPConfirmClosed(r) ==
                  IF loc # None
                  THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
                  ELSE serverRegions
+        /\ UNCHANGED << metaTable,
+              pendingReports,
+              rsVars,
+              serverState,
+              scpVars,
+              locked
+           >>
 
 ---------------------------------------------------------------------------
 
@@ -1440,7 +1547,8 @@ GoOffline(r) ==
         serverState,
         scpVars,
         locked,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 \* The master detects that a RegionServer has crashed (ZK ephemeral
@@ -1480,7 +1588,8 @@ MasterDetectCrash(s) ==
         scpRegions,
         walFenced,
         locked,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 \* A process supervisor (Kubernetes, systemd, etc.) restarts a crashed
@@ -1530,12 +1639,12 @@ ServerRestart(s) ==
   /\ scpRegions' = [scpRegions EXCEPT ![s] = {}]
   /\ walFenced' = [walFenced EXCEPT ![s] = FALSE]
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
-  \* Region state and META unchanged.
-  /\ UNCHANGED << regionState, metaTable, locked >>
   \* Clear ServerStateNode tracking for the restarting server.
   \* In the implementation, SCP.removeServer() calls
   \* RegionStates.removeServer() which removes the ServerStateNode.
   /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
+  \* Region state and META unchanged.
+  /\ UNCHANGED << regionState, metaTable, locked, procStore >>
 
 ---------------------------------------------------------------------------
 
@@ -1597,6 +1706,14 @@ TRSPServerCrashed(r) ==
   /\ pendingReports' =
        {pr \in pendingReports: pr.region # r \/ pr.code # "CLOSED"}
   \* META, RS-side state, and server liveness unchanged.
+  \* Update persisted procedure: convert to ASSIGN.
+  /\ procStore' =
+       [procStore EXCEPT
+       ![r] =
+       [ type |-> "ASSIGN",
+         step |-> "GET_ASSIGN_CANDIDATE",
+         targetServer |-> None
+       ]]
   /\ UNCHANGED << metaTable,
         rsVars,
         serverState,
@@ -1642,7 +1759,8 @@ RSAbort(s) ==
         serverState,
         scpVars,
         locked,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 ---------------------------------------------------------------------------
@@ -1699,7 +1817,8 @@ SCPAssignMeta(s) ==
         scpRegions,
         walFenced,
         locked,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 SCPGetRegions(s) ==
@@ -1724,7 +1843,8 @@ SCPGetRegions(s) ==
         walFenced,
         locked,
         carryingMeta,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 \* SCP step 2: Revoke WAL leases for the crashed server.  After this
@@ -1757,7 +1877,8 @@ SCPFenceWALs(s) ==
         scpRegions,
         locked,
         carryingMeta,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
@@ -1806,7 +1927,8 @@ SCPAssignRegion(s, r) ==
               scpState,
               locked,
               carryingMeta,
-              serverRegions
+              serverRegions,
+              procStore
            >>
      \/ \* --- Path A: TRSP already attached (SCP.java L540-544) ---
         \* Location matches (or check disabled); procedure exists.
@@ -1840,7 +1962,8 @@ SCPAssignRegion(s, r) ==
               walFenced,
               scpState,
               locked,
-              carryingMeta
+              carryingMeta,
+              procStore
            >>
         \* ServerStateNode tracking: remove r from crashed server s.
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
@@ -1882,6 +2005,14 @@ SCPAssignRegion(s, r) ==
               locked,
               carryingMeta
            >>
+        \* Insert a fresh ASSIGN procedure into the store.
+        /\ procStore' =
+             [procStore EXCEPT
+             ![r] =
+             [ type |-> "ASSIGN",
+               step |-> "GET_ASSIGN_CANDIDATE",
+               targetServer |-> None
+             ]]
         \* ServerStateNode tracking: remove r from crashed server s.
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
 
@@ -1909,7 +2040,8 @@ SCPDone(s) ==
         walFenced,
         locked,
         carryingMeta,
-        serverRegions
+        serverRegions,
+        procStore
      >>
 
 ---------------------------------------------------------------------------
@@ -1942,7 +2074,8 @@ DropStaleReport ==
           serverState,
           scpVars,
           locked,
-          serverRegions
+          serverRegions,
+          procStore
        >>
 
 ---------------------------------------------------------------------------
@@ -1994,7 +2127,8 @@ RSOpen(s, r) ==
              serverState,
              scpVars,
              locked,
-             serverRegions
+             serverRegions,
+             procStore
           >>
 
 \* RS atomically receives an OPEN command but fails to open the
@@ -2028,7 +2162,8 @@ RSFailOpen(s, r) ==
              serverState,
              scpVars,
              locked,
-             serverRegions
+             serverRegions,
+             procStore
           >>
 
 ---------------------------------------------------------------------------
@@ -2068,7 +2203,8 @@ RSClose(s, r) ==
              serverState,
              scpVars,
              locked,
-             serverRegions
+             serverRegions,
+             procStore
           >>
 
 ---------------------------------------------------------------------------
