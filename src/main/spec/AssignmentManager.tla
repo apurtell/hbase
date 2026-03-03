@@ -504,8 +504,7 @@ RSMasterAgreementConverse ==
 \* leases have been revoked (walFenced = TRUE).  Verified by
 \* construction (SCP state machine: FENCE_WALS precedes ASSIGN)
 \* but stated explicitly as a safety net.
-ZombieFencingOrder ==
-  \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
+FencingOrder == \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
 
 \* A meta-carrying SCP must reassign meta (complete ASSIGN_META)
 \* before proceeding to GET_REGIONS.  If carryingMeta[s] is TRUE,
@@ -715,7 +714,7 @@ Spec == Init /\ [][Next]_vars /\ Fairness
         THEOREM Spec => []NoDoubleAssignment
 
 \* Safety: SCP does not reassign until WAL leases are revoked.
-        THEOREM Spec => []ZombieFencingOrder
+        THEOREM Spec => []FencingOrder
 
 \* Safety: after SCP completes, no region is lost (stuck without a procedure).
         THEOREM Spec => []NoLostRegions
