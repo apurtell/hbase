@@ -758,7 +758,6 @@ Git: `c46d820f2a`.
 
 ### Phase 5: Procedure Persistence and Master Recovery
 
-
 #### Iteration 17 — Procedure store
 
 `procStore` variable (`[Regions → ProcStoreRecord ∪ {NoneRecord}]`):
@@ -773,7 +772,7 @@ TRSPConfirmClosed Path 1 UNASSIGN).  DispatchFail actions use UNCHANGED
 (not persisted, matching `remoteCallFailed()` L139).
 `ProcStoreConsistency` invariant: bijection between `procType ≠ NONE`
 and `procStore[r] ≠ NoneRecord`.  TLC 2r/2s: 3,465,621 distinct, 31s,
-clean.
+clean. Git: `86a13663a2`
 
 #### Iteration 18 — Master crash and recovery
 
