@@ -1,10 +1,7 @@
----------------------- MODULE AssignmentManagerTypes ---------------------------
+---------------------- MODULE Types ---------------------------
 (*
  * Pure-definition module: constants, type sets, and state definitions
  * for the HBase AssignmentManager specification.
- *
- * This module contains no variables — it is included via EXTENDS by
- * all other modules in the AssignmentManager family.
  *)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -16,8 +13,16 @@ ASSUME Regions # {}
 ASSUME Servers # {}
 
 \* Sentinel model value for "no server assigned"
-CONSTANTS None
-ASSUME None \notin Servers
+CONSTANTS NoServer
+ASSUME NoServer \notin Servers
+
+\* Sentinel model value for "no transition code recorded".
+\* Used in ProcStoreRecord.transitionCode for all procedure steps
+\* except REPORT_SUCCEED.
+CONSTANTS NoTransition
+
+\* Sentinel model value for "no persisted procedure".
+CONSTANTS NoProcedure
 
 \* Maximum open-retry attempts before giving up (FAILED_OPEN)
 CONSTANTS MaxRetries
@@ -31,8 +36,24 @@ ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
 CONSTANTS UseReopen
 ASSUME UseReopen \in BOOLEAN
 
-\* Sentinel model value for "no persisted procedure".
-CONSTANTS NoneRecord
+\* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
+\* enabled, modeling AssignRegionHandler.process() L107-115 where the
+\* RS silently drops OPEN requests for already-online regions without
+\* reporting back.  This can cause TRSP deadlock (stuck at
+\* CONFIRM_OPENED).  Default FALSE to avoid deadlock in model checking;
+\* set TRUE to surface the implementation quirk and generate traces.
+CONSTANTS UseRSOpenDuplicateQuirk
+ASSUME UseRSOpenDuplicateQuirk \in BOOLEAN
+
+\* UseRestoreSucceedQuirk: when TRUE, RestoreSucceedState faithfully
+\* reproduces the OpenRegionProcedure.restoreSucceedState() L128-136
+\* bug where OPEN-type procedures always replay as OPENED regardless
+\* of the persisted transitionCode (even FAILED_OPEN).  Default FALSE
+\* so that recovery correctly checks transitionCode and branches;
+\* set TRUE to demonstrate the violation and generate counterexample
+\* traces.
+CONSTANTS UseRestoreSucceedQuirk
+ASSUME UseRestoreSucceedQuirk \in BOOLEAN
 
 ---------------------------------------------------------------------------
 
@@ -111,6 +132,11 @@ ValidTransition ==
 \* MOVE path:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
 \*                   -> CONFIRM_OPENED -> (cleared)
 \*
+\* REPORT_SUCCEED: intermediate state after RegionRemoteProcedureBase
+\*   has consumed the RS report and updated in-memory state, but before
+\*   the final state has been persisted to metaTable.  Exposes the
+\*   crash-vulnerable window for master crash and recovery modeling.
+\*
 \* 1:1 match with RegionStateTransitionState enum
 \* (MasterProcedure.proto).  See TRSP.tla header for the full
 \* traceability table.
@@ -119,7 +145,8 @@ TRSPState ==
     "OPEN",
     "CONFIRM_OPENED",
     "CLOSE",
-    "CONFIRM_CLOSED"
+    "CONFIRM_CLOSED",
+    "REPORT_SUCCEED"
   }
 
 \* Procedure types.  "NONE" means no procedure is attached.
@@ -159,10 +186,27 @@ CommandType == { "OPEN", "CLOSE" }
 ReportCode == { "OPENED", "FAILED_OPEN", "CLOSED" }
 
 \* Type definition for persisted procedure records.
+\* transitionCode records the RS report outcome when step = REPORT_SUCCEED;
+\* set to NoTransition for all other steps.
 ProcStoreRecord ==
   [type:ProcType \ { "NONE" },
     step:TRSPState,
-    targetServer:Servers \cup { None }
+    targetServer:Servers \cup { NoServer },
+    transitionCode:ReportCode \cup { NoTransition }
+  ]
+
+---------------------------------------------------------------------------
+
+
+(* Helpers *)
+\* Constructor for procStore records.  All sites that write to procStore
+\* must call this instead of constructing an inline record literal,
+\* ensuring the 4-field shape is maintained in one place.
+NewProcRecord(type, step, server, tc) ==
+  [ type |-> type,
+    step |-> step,
+    targetServer |-> server,
+    transitionCode |-> tc
   ]
 
 ============================================================================

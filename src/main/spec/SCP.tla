@@ -4,12 +4,8 @@
  *
  * Contains the SCP state machine: SCPAssignMeta, SCPGetRegions,
  * SCPFenceWALs, SCPAssignRegion, and SCPDone.
- *
- * This module declares all shared variables as CONSTANT parameters.
- * The root AssignmentManager module instantiates it with
- * INSTANCE SCP WITH ... substituting the actual variables.
  *)
-EXTENDS AssignmentManagerTypes
+EXTENDS Types
 
 \* All shared variables are declared as VARIABLE parameters so that
 \* the root module can substitute its own variables via INSTANCE.
@@ -25,13 +21,24 @@ VARIABLE regionState,
          locked,
          carryingMeta,
          serverRegions,
-         procStore
+         procStore,
+         masterAlive,
+         zkNode
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
 
 \* Shorthand for the RS-side variable (used in UNCHANGED clauses).
 rsVars == << rsOnlineRegions >>
+
+\* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
+masterVars == << masterAlive >>
+
+\* Shorthand for procedure/lock variables (used in UNCHANGED clauses).
+procVars == << procStore, locked >>
+
+\* Shorthand for server tracking variables (used in UNCHANGED clauses).
+serverVars == << serverState, serverRegions >>
 
 ---------------------------------------------------------------------------
 
@@ -85,6 +92,8 @@ rsVars == << rsOnlineRegions >>
 \* Source: SCP.executeFromState() SERVER_CRASH_SPLIT_META_LOGS
 \*         and ASSIGN_META cases.
 SCPAssignMeta(s) ==
+  \* Master must be alive for SCP to execute.
+  /\ masterAlive = TRUE
   \* SCP is in the meta-recovery sub-path.
   /\ scpState[s] = "ASSIGN_META"
   \* Only servers that were hosting hbase:meta enter this path.
@@ -93,16 +102,16 @@ SCPAssignMeta(s) ==
   /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   \* Meta is now online; clear the carryingMeta flag.
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
-  /\ UNCHANGED << regionState,
-        metaTable,
-        rpcVars,
+  /\ UNCHANGED << rpcVars,
+        serverVars,
+        procVars,
         rsVars,
-        serverState,
+        masterVars,
+        regionState,
+        metaTable,
         scpRegions,
         walFenced,
-        locked,
-        serverRegions,
-        procStore
+        zkNode
      >>
 
 \* SCP step 1: Snapshot the set of regions assigned to the crashed
@@ -130,6 +139,8 @@ SCPAssignMeta(s) ==
 \*         then AM.markRegionsAsCrashed() updates
 \*         RIT tracking for each region.
 SCPGetRegions(s) ==
+  \* Master must be alive for SCP to execute.
+  /\ masterAlive = TRUE
   \* SCP is in GET_REGIONS state for this crashed server.
   /\ scpState[s] = "GET_REGIONS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
@@ -143,16 +154,16 @@ SCPGetRegions(s) ==
   \* Advance SCP to the WAL fencing step.
   /\ scpState' = [scpState EXCEPT ![s] = "FENCE_WALS"]
   \* Region state, meta, RPCs, RS-side state, and WAL fencing unchanged.
-  /\ UNCHANGED << regionState,
-        metaTable,
-        rpcVars,
+  /\ UNCHANGED << rpcVars,
+        serverVars,
+        procVars,
         rsVars,
-        serverState,
+        masterVars,
+        regionState,
+        metaTable,
         walFenced,
-        locked,
         carryingMeta,
-        serverRegions,
-        procStore
+        zkNode
      >>
 
 \* SCP step 2: Revoke WAL leases for the crashed server.  After this
@@ -166,6 +177,8 @@ SCPGetRegions(s) ==
 \* Source: ServerCrashProcedure.executeFromState()
 \*         SERVER_CRASH_SPLIT_LOGS case.
 SCPFenceWALs(s) ==
+  \* Master must be alive for SCP to execute.
+  /\ masterAlive = TRUE
   \* SCP is in FENCE_WALS state for this crashed server.
   /\ scpState[s] = "FENCE_WALS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
@@ -175,16 +188,16 @@ SCPFenceWALs(s) ==
   \* Advance SCP to the region assignment step.
   /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN"]
   \* Region state, meta, RPCs, RS-side state, and region snapshot unchanged.
-  /\ UNCHANGED << regionState,
-        metaTable,
-        rpcVars,
+  /\ UNCHANGED << rpcVars,
+        serverVars,
+        procVars,
         rsVars,
-        serverState,
+        masterVars,
+        regionState,
+        metaTable,
         scpRegions,
-        locked,
         carryingMeta,
-        serverRegions,
-        procStore
+        zkNode
      >>
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
@@ -206,6 +219,8 @@ SCPFenceWALs(s) ==
 \* Source: ServerCrashProcedure.assignRegions();
 \*         ServerCrashProcedure.isMatchingRegionLocation().
 SCPAssignRegion(s, r) ==
+  \* Master must be alive for SCP to execute.
+  /\ masterAlive = TRUE
   \* SCP is in ASSIGN state for this crashed server.
   /\ scpState[s] = "ASSIGN"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
@@ -226,18 +241,17 @@ SCPAssignRegion(s, r) ==
         /\ regionState[r].location # s
         \* Skip: only shrink the SCP snapshot; no state changes.
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
-        /\ UNCHANGED << regionState,
+        /\ UNCHANGED << rpcVars,
+              serverVars,
+              procVars,
+              rsVars,
+              masterVars,
+              regionState,
               metaTable,
-              rpcVars,
-              rsOnlineRegions,
-              pendingReports,
-              serverState,
-              walFenced,
               scpState,
-              locked,
+              walFenced,
               carryingMeta,
-              serverRegions,
-              procStore
+              zkNode
            >>
      \/ \* --- Path A: TRSP already attached ---
         \* Location matches; procedure exists.
@@ -275,37 +289,36 @@ SCPAssignRegion(s, r) ==
              ![r].state =
              "ABNORMALLY_CLOSED",
              ![r].location =
-             None,
+             NoServer,
              ![r].procType =
              "ASSIGN",
              ![r].procStep =
              "GET_ASSIGN_CANDIDATE",
              ![r].targetServer =
-             None,
+             NoServer,
              ![r].retries =
              0]
         /\ metaTable' =
              [metaTable EXCEPT
              ![r] =
-             [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
+             [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Update persisted procedure: convert to ASSIGN.
         /\ procStore' =
              [procStore EXCEPT
              ![r] =
-             [ type |-> "ASSIGN",
-               step |-> "GET_ASSIGN_CANDIDATE",
-               targetServer |-> None
-             ]]
+             NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
         \* ServerStateNode tracking: remove r from crashed server s.
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
         \* Server state, WAL fencing, SCP state, locks, and
         \* meta-carrying flag unchanged.
-        /\ UNCHANGED << serverState,
-              walFenced,
+        /\ UNCHANGED << masterVars,
+              serverState,
               scpState,
+              walFenced,
               locked,
-              carryingMeta
+              carryingMeta,
+              zkNode
            >>
      \/ \* --- Path B: No TRSP attached ---
         \* Location matches; no procedure.
@@ -323,38 +336,37 @@ SCPAssignRegion(s, r) ==
              ![r].state =
              "ABNORMALLY_CLOSED",
              ![r].location =
-             None,
+             NoServer,
              ![r].procType =
              "ASSIGN",
              ![r].procStep =
              "GET_ASSIGN_CANDIDATE",
              ![r].targetServer =
-             None,
+             NoServer,
              ![r].retries =
              0]
         /\ metaTable' =
              [metaTable EXCEPT
              ![r] =
-             [ state |-> "ABNORMALLY_CLOSED", location |-> None ]]
+             [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Insert a fresh ASSIGN procedure into the store.
         /\ procStore' =
              [procStore EXCEPT
              ![r] =
-             [ type |-> "ASSIGN",
-               step |-> "GET_ASSIGN_CANDIDATE",
-               targetServer |-> None
-             ]]
+             NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
         \* ServerStateNode tracking: remove r from crashed server s.
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
         \* Dispatched ops, server state, WAL fencing, SCP state, locks, and
         \* meta-carrying flag unchanged.
-        /\ UNCHANGED << dispatchedOps,
+        /\ UNCHANGED << masterVars,
+              dispatchedOps,
               serverState,
-              walFenced,
               scpState,
+              walFenced,
               locked,
-              carryingMeta
+              carryingMeta,
+              zkNode
            >>
 
 \* SCP step 4: All regions processed.  Mark SCP as complete.
@@ -366,23 +378,25 @@ SCPAssignRegion(s, r) ==
 \*         SERVER_CRASH_FINISH case -- the procedure
 \*         completes and is cleaned up by the ProcedureExecutor.
 SCPDone(s) ==
+  \* Master must be alive for SCP to execute.
+  /\ masterAlive = TRUE
   \* SCP is in ASSIGN state and all regions have been processed.
   /\ scpState[s] = "ASSIGN"
   /\ scpRegions[s] = {}
   \* Mark SCP as complete for this crashed server.
   /\ scpState' = [scpState EXCEPT ![s] = "DONE"]
   \* All other state unchanged — region reassignments already applied.
-  /\ UNCHANGED << regionState,
-        metaTable,
-        rpcVars,
+  /\ UNCHANGED << rpcVars,
+        serverVars,
+        procVars,
         rsVars,
-        serverState,
+        masterVars,
+        regionState,
+        metaTable,
         scpRegions,
         walFenced,
-        locked,
         carryingMeta,
-        serverRegions,
-        procStore
+        zkNode
      >>
 
 ============================================================================
