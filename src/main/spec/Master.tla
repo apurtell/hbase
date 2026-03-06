@@ -26,7 +26,10 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -46,6 +49,9 @@ procVars == << procStore, locked >>
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
 
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+
 ---------------------------------------------------------------------------
 
 
@@ -53,7 +59,8 @@ serverVars == << serverState, serverRegions >>
 \* Transition from CLOSED back to OFFLINE.
 \* Used by RegionStateNode.offline() when a region is being taken fully
 \* offline (e.g., table disable).
-\* Pre: region is CLOSED with no procedure attached, master is alive.
+\* Pre: region is CLOSED with no procedure attached, master is alive,
+\*      no SCP is actively processing on any server.
 \* Post: regionState set to OFFLINE with cleared location (in-memory
 \*       only -- metaTable is NOT updated).  META retains CLOSED;
 \*       divergence is resolved on master restart.
@@ -66,6 +73,11 @@ GoOffline(r) ==
   \* Guards: region is CLOSED and has no active procedure.
   /\ regionState[r].state = "CLOSED"
   /\ regionState[r].procType = "NONE"
+  \* Guard: no SCP is actively processing on any server.
+  \* In the implementation, GoOffline runs as part of DisableTableProcedure,
+  \* which is not created during crash recovery.  This prevents GoOffline
+  \* from firing on regions that are about to be processed by SCP.
+  /\ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
   \* Move region to OFFLINE with cleared location (in-memory only).
   /\ regionState' =
        [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
@@ -79,6 +91,7 @@ GoOffline(r) ==
         rsVars,
         masterVars,
         metaTable,
+        peVars,
         zkNode
      >>
 
@@ -119,6 +132,7 @@ MasterDetectCrash(s) ==
      \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ UNCHANGED << rpcVars,
+        peVars,
         procVars,
         rsVars,
         masterVars,
@@ -165,7 +179,10 @@ MasterCrash ==
         scpRegions,
         locked,
         serverRegions,
-        carryingMeta
+        carryingMeta,
+        availableWorkers,
+        suspendedOnMeta,
+        blockedOnMeta
      >>
   \* Durable state survives.
   /\ UNCHANGED << metaTable, procStore >>
@@ -288,10 +305,13 @@ MasterRecover ==
   /\ scpState' =
        [s \in Servers |-> IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"
        ]
+  \* Reset SCP region sets (fresh SCPs will re-scan meta).
   /\ scpRegions' = [s \in Servers |-> {}]
+  \* Reset carryingMeta (meta assignment handled by fresh SCP if needed).
   /\ carryingMeta' = [s \in Servers |-> FALSE]
-  \* Clear in-flight RPCs and reports (stale from pre-crash master).
+  \* Clear in-flight RPCs (stale from pre-crash master).
   /\ dispatchedOps' = [s \in Servers |-> {}]
+  \* Clear pending reports (stale from pre-crash master).
   /\ pendingReports' = {}
   \* Reset locks.
   /\ locked' = [r \in Regions |-> FALSE]
@@ -317,6 +337,12 @@ MasterRecover ==
        ]
   \* Master is now alive.
   /\ masterAlive' = TRUE
+  \* Reset PEWorker pool state on recovery.
+  /\ availableWorkers' = MaxWorkers
+  \* Clear suspended procedures.
+  /\ suspendedOnMeta' = {}
+  \* Clear blocked procedures.
+  /\ blockedOnMeta' = {}
   \* Durable state unchanged.
   /\ UNCHANGED << metaTable, procStore, rsOnlineRegions, walFenced, zkNode >>
 

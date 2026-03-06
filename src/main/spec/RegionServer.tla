@@ -25,7 +25,10 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
 
 \* Shorthand for the RS-side variable (used in UNCHANGED clauses).
 rsVars == << rsOnlineRegions >>
@@ -41,6 +44,9 @@ procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
+
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 
 ---------------------------------------------------------------------------
 
@@ -79,6 +85,7 @@ RSAbort(s) ==
         regionState,
         metaTable,
         pendingReports,
+        peVars,
         zkNode
      >>
 
@@ -91,7 +98,7 @@ RSAbort(s) ==
 \* TRSPConfirmClosed, or TRSPHandleFailedOpen (server ONLINE guard),
 \* so this action cleans them up.
 \*
-\* Pre: a pending report exists from a CRASHED server.
+\* Pre: master is alive, a pending report exists from a CRASHED server.
 \* Post: the stale report is removed from pendingReports.  All other
 \*       state variables unchanged.
 \*
@@ -99,13 +106,16 @@ RSAbort(s) ==
 \*         reports when serverNode is not in ONLINE state
 \*         ("You are dead" error path).
 DropStaleReport ==
-  \* Guard: a pending report exists from a CRASHED server.
-    \E rpt \in pendingReports:
-    /\ serverState[rpt.server] = "CRASHED"
+  \* Master must be alive for report processing.
+  /\ masterAlive = TRUE
+  \* A pending report exists from a CRASHED server.
+  /\ \E rpt \in pendingReports:
+     /\ serverState[rpt.server] = "CRASHED"
     \* Discard the stale report.
     /\ pendingReports' = pendingReports \ { rpt }
     \* All other state variables unchanged.
     /\ UNCHANGED << scpVars,
+          peVars,
           serverVars,
           procVars,
           rsVars,
@@ -147,10 +157,15 @@ RSOpen(s, r) ==
   \* guard is faithful to the implementation and enables detection
   \* of ghost-region scenarios from stale OPEN commands.
   /\ serverState[s] = "ONLINE"
+  \* ZK confirms server is still alive.
   /\ zkNode[s] = TRUE
+  \* Region is not already online on this server.
   /\ r \notin rsOnlineRegions[s]
+  \* An OPEN command for region r exists in the server's queue.
   /\ \E cmd \in dispatchedOps[s]:
+       \* Command must be an OPEN command.
        /\ cmd.type = "OPEN"
+       \* Command must target region r.
        /\ cmd.region = r
        \* Consume the command from the server's dispatched ops queue.
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
@@ -162,6 +177,7 @@ RSOpen(s, r) ==
               { [ server |-> s, region |-> r, code |-> "OPENED" ] }
        \* Master-side state and server liveness unchanged.
        /\ UNCHANGED << scpVars,
+             peVars,
              serverVars,
              procVars,
              masterVars,
@@ -183,11 +199,15 @@ RSOpen(s, r) ==
 \*         reports FAILED_OPEN via reportRegionStateTransition()
 \*         RPC; the region is NOT added to online regions.
 RSFailOpen(s, r) ==
-  \* Guards: server is ONLINE and an OPEN command for region r exists.
+  \* Server is ONLINE and an OPEN command for region r exists.
   /\ serverState[s] = "ONLINE"
+  \* ZK confirms server is still alive.
   /\ zkNode[s] = TRUE
+  \* An OPEN command for region r exists in the server's queue.
   /\ \E cmd \in dispatchedOps[s]:
+       \* Command must be an OPEN command.
        /\ cmd.type = "OPEN"
+       \* Command must target region r.
        /\ cmd.region = r
        \* Consume the command from the server's dispatched ops queue.
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
@@ -197,6 +217,7 @@ RSFailOpen(s, r) ==
               { [ server |-> s, region |-> r, code |-> "FAILED_OPEN" ] }
        \* Master-side state, online regions, and server liveness unchanged.
        /\ UNCHANGED << scpVars,
+             peVars,
              serverVars,
              procVars,
              rsVars,
@@ -224,11 +245,15 @@ RSFailOpen(s, r) ==
 \*         the RS's online regions, and reports CLOSED via
 \*         reportRegionStateTransition() RPC.
 RSClose(s, r) ==
-  \* Guards: server is ONLINE and a CLOSE command for region r exists.
+  \* Server is ONLINE and a CLOSE command for region r exists.
   /\ serverState[s] = "ONLINE"
+  \* ZK confirms server is still alive.
   /\ zkNode[s] = TRUE
+  \* A CLOSE command for region r exists in the server's queue.
   /\ \E cmd \in dispatchedOps[s]:
+       \* Command must be a CLOSE command.
        /\ cmd.type = "CLOSE"
+       \* Command must target region r.
        /\ cmd.region = r
        \* Consume the command from the server's dispatched ops queue.
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
@@ -240,6 +265,7 @@ RSClose(s, r) ==
               { [ server |-> s, region |-> r, code |-> "CLOSED" ] }
        \* Master-side state and server liveness unchanged.
        /\ UNCHANGED << scpVars,
+             peVars,
              serverVars,
              procVars,
              masterVars,
@@ -275,16 +301,22 @@ RSOpenDuplicate(s, r) ==
   /\ UseRSOpenDuplicateQuirk = TRUE
   \* Server is ONLINE, region is ALREADY online on this server.
   /\ serverState[s] = "ONLINE"
+  \* ZK confirms server is still alive.
   /\ zkNode[s] = TRUE
+  \* Region is already online on this server (duplicate).
   /\ r \in rsOnlineRegions[s]
+  \* An OPEN command for region r exists in the server's queue.
   /\ \E cmd \in dispatchedOps[s]:
+       \* Command must be an OPEN command.
        /\ cmd.type = "OPEN"
+       \* Command must target region r.
        /\ cmd.region = r
        \* Consume the command — but produce NO report.
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
        \* All other state unchanged: no report, no rsOnlineRegions change.
        /\ UNCHANGED << scpVars,
              serverVars,
+             peVars,
              procVars,
              rsVars,
              masterVars,
@@ -342,8 +374,11 @@ RSRestart(s) ==
   /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = {}]
   \* Reset SCP state for the restarting server.
   /\ scpState' = [scpState EXCEPT ![s] = "NONE"]
+  \* Clear SCP region set for the restarting server.
   /\ scpRegions' = [scpRegions EXCEPT ![s] = {}]
+  \* Clear WAL fencing state for the restarting server.
   /\ walFenced' = [walFenced EXCEPT ![s] = FALSE]
+  \* Clear carryingMeta flag for the restarting server.
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
   \* Clear ServerStateNode tracking for the restarting server.
   \* In the implementation, SCP.removeServer() calls
@@ -353,6 +388,6 @@ RSRestart(s) ==
   \* Source: HRegionServer.run() -> createMyEphemeralNode().
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
   \* Region state and META unchanged.
-  /\ UNCHANGED << procVars, masterVars, regionState, metaTable >>
+  /\ UNCHANGED << procVars, masterVars, peVars, regionState, metaTable >>
 
 ============================================================================
