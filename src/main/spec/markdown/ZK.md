@@ -36,7 +36,16 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
+```
+
+### Shorthands
+
+```tla
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
 ---
@@ -80,6 +89,7 @@ ZKSessionExpire(s) ==
         carryingMeta,
         serverRegions,
         procStore,
-        masterAlive
+        masterAlive,
+        peVars
      >>
 ```

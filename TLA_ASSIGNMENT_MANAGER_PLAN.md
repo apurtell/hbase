@@ -348,7 +348,7 @@ The following table documents what is modeled concretely vs. abstracted:
 | RS crash / zombie window | **Concrete** (Iter 14) | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
 | RS epoch / ServerName | **Omitted** (resolved) | Not needed: `serverState` ONLINE/CRASHED flag (Iter 10) plus atomic crash/restart provides equivalent fencing without an explicit epoch counter. |
 | TRSPGetCandidate guard (walFenced) | **Corrected** (Iter 15) ✅ | Iter 15 removed the model-specific `walFenced` guard; `serverState[s]="ONLINE"` suffices, matching the implementation's `createDestinationServersList()`. |
-| `isMatchingRegionLocation()` in SCP | **Configurable** (Iter 16) | Controlled by `UseLocationCheck` BOOLEAN constant. When TRUE, `SCPAssignRegion` skips regions whose location changed since `SCPGetRegions` — matching the implementation (SCP.java L529-538). When FALSE, every region is processed unconditionally (correct protocol). The implementation's check is a known source of bugs (HBASE-24293, HBASE-21623); setting TRUE may expose `NoLostRegions` violations confirming those bugs. |
+| `isMatchingRegionLocation()` in SCP | **Concrete** (Iter 16) | `SCPAssignRegion` models the implementation's `isMatchingRegionLocation()` check (SCP.java L498-500, L529-538): regions whose location changed since `SCPGetRegions` are skipped — matching the implementation behavior that is a known source of bugs (HBASE-24293, HBASE-21623) and may expose `NoLostRegions` violations confirming those bugs. |
 | Coprocessor hooks | **Omitted** | Not relevant to correctness of assignment protocol |
 | Replication queues | **Omitted** | Orthogonal concern |
 | Table enable/disable | **Deferred** | Can be added as a constraint on assignment |
@@ -446,101 +446,28 @@ VARIABLES
 - Familiarity with PlusCal (optional, for algorithmic notation before
   translating to TLA+)
 
-### Running TLC via the TLA+ MCP Server (Preferred)
-
-The TLA+ extension exposes an MCP server
-(`user-tlaplus.vscode-ide-extension-TLA_MCP_Server`) with tools that
-handle Java selection, classpath, and worker configuration automatically.
-**This is the recommended method for AI agents and interactive use.**
-
-**Required setting** (already configured in Cursor user `settings.json`):
-
-```json
-"tlaplus.java.home": "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
-```
-
-Without this, the extension uses the default `java` on PATH (temurin-8),
-which fails with `UnsupportedClassVersionError` (class file version 55.0
-requires Java 11+).
-
-| MCP Tool | Purpose |
-|----------|---------|
-| `tlaplus_mcp_sany_parse` | Syntax/level check only (no model checking). Fast. |
-| `tlaplus_mcp_tlc_check` | **Exhaustive model check** — verifies all invariants and properties. Use with primary config at every iteration. |
-| `tlaplus_mcp_tlc_smoke` | **Simulation model check** — random deep traces, time-limited. Use with sim config (300s per-iteration, 900s post-iteration). |
-| `tlaplus_mcp_tlc_explore` | Generate and print a random behavior of a given length. Useful for understanding the spec. |
-| `tlaplus_mcp_tlc_trace` | Replay a previously generated TLC counterexample trace file. |
-
-**Primary — fast, for development**:
-
-```
-CallMcpTool:
-  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
-  toolName: tlaplus_mcp_tlc_check
-  arguments:
-    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
-    cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.cfg
-    extraOpts: ["-workers", "auto", "-cleanup"]
-```
-
-**Simulation — per-iteration (300s / 5 min)**:
-
-```
-CallMcpTool:
-  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
-  toolName: tlaplus_mcp_tlc_smoke
-  arguments:
-    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
-    cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager-sim.cfg
-    extraJavaOpts: ["-Dtlc2.TLC.stopAfter=300"]
-```
-
-**Simulation — post-iteration validation (900s / 15 min)**:
-
-```
-CallMcpTool:
-  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
-  toolName: tlaplus_mcp_tlc_smoke
-  arguments:
-    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
-    cfgFile: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager-sim.cfg
-    extraJavaOpts: ["-Dtlc2.TLC.stopAfter=900"]
-```
-
-**Parse check only** (verify syntax before running TLC):
-
-```
-CallMcpTool:
-  server: user-tlaplus.vscode-ide-extension-TLA_MCP_Server
-  toolName: tlaplus_mcp_sany_parse
-  arguments:
-    fileName: /Users/apurtell/src/hbase/src/main/spec/AssignmentManager.tla
-```
-
 ### Running TLC via Command Line
 
 The MCP tools handle per-iteration and post-iteration simulation checks.
 Use the command line for the full exhaustive config (ad hoc,
 user-requested) or extended post-phase simulation runs.
 
-**Full exhaustive check** (3r/3s, ad hoc on-demand only):
+**Exhaustive check** (2r/2s, per-iteration):
 
 ```bash
-cd /Users/apurtell/src/hbase/src/main/spec
-JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
-$JAVA_HOME/bin/java -XX:+UseParallelGC -Xmx8g \
-  -cp "$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager-full.cfg -workers auto -cleanup
+/usr/bin/java -XX:+UseParallelGC \
+-cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" \
+tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg \
+-workers auto -cleanup
 ```
 
 **Post-phase simulation** (1 hour, high-confidence sweep after completing a phase):
 
 ```bash
-cd /Users/apurtell/src/hbase/src/main/spec
-JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
-$JAVA_HOME/bin/java -XX:+UseParallelGC -Dtlc2.TLC.stopAfter=3600 \
-  -cp "$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/tla2tools.jar:$HOME/.cursor/extensions/tlaplus.vscode-ide-2026.2.250046-universal/tools/CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate -workers auto
+/usr/bin/java -XX:+UseParallelGC \
+-cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" -Dtlc2.TLC.stopAfter=3600 \
+tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg \
+-simulate -workers auto
 ```
 
 Run in background (Shell `block_until_ms: 0`) and monitor the terminal
@@ -557,7 +484,7 @@ TLC can verify, and is small enough to review and debug in isolation.
 Iterations are grouped into phases for readability, but the unit of work
 is the individual iteration.
 
-### Phase 1: Master-Side Foundation
+### Phase 1: Master-Side Foundation ✅ COMPLETE
 
 #### Iteration 1 — Region states and valid transitions ✅ COMPLETE
 
@@ -598,7 +525,7 @@ TLC: 1,441,599 distinct, ~6s.
 
 ---
 
-### Phase 2: RPC Channels and RegionServer Side
+### Phase 2: RPC Channels and RegionServer Side ✅ COMPLETE
 
 #### Iteration 6 — RPC channels (data structures only) ✅ COMPLETE
 
@@ -644,7 +571,7 @@ TLC primary: 35,856 distinct, <1s.
 
 ---
 
-### Phase 3: MOVE and Failures
+### Phase 3: MOVE and Failures ✅ COMPLETE
 
 #### Iteration 11 — MOVE transition type ✅ COMPLETE
 
@@ -676,7 +603,7 @@ TLC primary: 35,726 distinct, <1s.
 
 ---
 
-### Phase 4: RegionServer Crash and Recovery
+### Phase 4: RegionServer Crash and Recovery ✅ COMPLETE
 
 #### Iteration 14 — ServerCrashProcedure with WAL lease fencing ✅ COMPLETE
 
@@ -712,26 +639,22 @@ TLC primary: 74,500,838 distinct, ~19min.
 
 ---
 
-#### Iteration 16 — `isMatchingRegionLocation` in SCP (code-analysis grounded)
+#### Iteration 16 — `isMatchingRegionLocation` in SCP (code-analysis grounded) ✅ COMPLETE
 
-`UseLocationCheck` BOOLEAN constant added, controlling
-`isMatchingRegionLocation()` (SCP.java L498-500, L529-538).
 `SCPAssignRegion(s, r)` restructured from 2-way IF/THEN/ELSE to 3-way
-disjunction: Skip (location changed, `UseLocationCheck=TRUE`), Path A
-(proc attached → ABNORMALLY_CLOSED, `TRSPServerCrashed` converts),
-Path B (no proc → ABNORMALLY_CLOSED + fresh ASSIGN).  Skip path
-removes `r` from `scpRegions` with no state change.  Path A/B guard
-`¬UseLocationCheck ∨ location=s`.  All configs default
-`UseLocationCheck=TRUE` (matching implementation); `FALSE` models
-violations (needs ≥3 servers; 2r/2s skip path never fires because the
+disjunction modelling `isMatchingRegionLocation()` (SCP.java L498-500,
+L529-538): Skip (location changed), Path A (proc attached →
+ABNORMALLY_CLOSED, `TRSPServerCrashed` converts), Path B (no proc →
+ABNORMALLY_CLOSED + fresh ASSIGN).  Skip path removes `r` from
+`scpRegions` with no state change; Path A/B guard requires
+`location=s`.  The skip path needs ≥3 servers to fire (with 2r/2s the
 only assignment target during SCP is the surviving server).
-TLC primary (TRUE): 1,527,546 distinct, 14s. TLC primary (FALSE):
-74,500,838 distinct, ~12min.
+TLC primary: 1,527,546 distinct, 14s.
 
-#### Iteration 16.5 — Simulation fidelity: race-window and guard audit
+#### Iteration 16.5 — Simulation fidelity: race-window and guard audit ✅ COMPLETE
 
-Guard audit to make the `SCPAssignRegion` skip path reachable with
-`UseLocationCheck=TRUE`.  `TRSPCreate`: SCP-active guard added,
+Guard audit to make the `SCPAssignRegion` skip path reachable.
+`TRSPCreate`: SCP-active guard added,
 `WF` removed (lost regions need manual intervention).
 `TRSPConfirmClosed` Path 1 / `TRSPConfirmOpened`: removed
 `serverState ONLINE` guard on reports (models race with crash
@@ -753,9 +676,9 @@ SCP snapshot.  TLC 2r/2s: 3,157,489 distinct, 28s, clean.
 
 ---
 
-### Phase 5: Procedure Persistence and Master Recovery
+### Phase 5: Procedure Persistence and Master Recovery ✅ COMPLETE
 
-#### Iteration 17 — Procedure store
+#### Iteration 17 — Procedure store ✅ COMPLETE
 
 `procStore` variable (`[Regions → ProcStoreRecord ∪ {NoneRecord}]`):
 models the WALProcedureStore / RegionProcedureStore persistence layer.
@@ -771,7 +694,7 @@ TRSPConfirmClosed Path 1 UNASSIGN).  DispatchFail actions use UNCHANGED
 and `procStore[r] ≠ NoneRecord`.  TLC 2r/2s: 3,465,621 distinct, 31s,
 clean.
 
-#### Iteration 17.5 — Cross-variable consistency invariants
+#### Iteration 17.5 — Cross-variable consistency invariants ✅ COMPLETE
 
 Eight new invariants (no new variables or actions) tightening
 cross-variable correlations.  `ProcStepConsistency`: procStep
@@ -794,155 +717,66 @@ with converse holding only when master is alive.
 TLC 2r/2s: 3,339,614 distinct, 41s, clean.  Simulation 3r/3s
 (300s): 48,540,636 states, 427,311 traces, clean.
 
-#### Iteration 18 — Master crash and recovery
+#### Iteration 18 — Master crash and recovery ✅ COMPLETE
 
-Added `masterAlive` (BOOLEAN), `procStore` (durable procedure
+New variables/constants: `masterAlive` (BOOLEAN), `procStore` (durable
 store), `NewProcRecord` constructor, `NoServer`/`NoProcedure`/
 `NoTransition` sentinels (renamed from `None`/`NoneRecord`),
-`UseRestoreSucceedQuirk` and `UseRSOpenDuplicateQuirk` toggles.
-New modules: `ProcStore.tla` (invariants + `RestoreSucceedState`
-operator), `Master.tla` (extracted from `ExternalEvents.tla`:
-`GoOffline`, `MasterDetectCrash`, `MasterCrash`, `MasterRecover`);
-`RSRestart` moved to `RegionServer.tla`; `ExternalEvents.tla` deleted.
-Decomposed `TRSPConfirmOpened`/`TRSPConfirmClosed` into two-phase
-report processing modeling `RegionRemoteProcedureBase`:
+`UseRestoreSucceedQuirk`/`UseRSOpenDuplicateQuirk` toggles.  Module
+restructure: new `ProcStore.tla` (invariants + `RestoreSucceedState`),
+`Master.tla` (extracted `GoOffline`/`MasterDetectCrash`/`MasterCrash`/
+`MasterRecover` from `ExternalEvents.tla`, deleted); `RSRestart` →
+`RegionServer.tla`.
+Two-phase TRSP report processing (models `RegionRemoteProcedureBase`):
 Phase 1 (`TRSPReportSucceedOpen`/`Close`) consumes report, updates
-in-memory state, persists procedure with `transitionCode`;
-Phase 2 (`TRSPPersistToMetaOpen`/`Close`) writes meta.  FAILED_OPEN
-faithfully keeps state as OPENING during Phase 1
-(`regionFailedOpen(giveUp=false)` does not change state).
-`MasterCrash` clears all in-memory state; `MasterRecover` rebuilds
-from `metaTable` + `procStore`, applying `RestoreSucceedState`
-(branches on `transitionCode`, not type) for REPORT_SUCCEED
-procedures.  Invariant adjustments: `LockExclusivity` widened
-(OPEN in ASSIGN, CLOSED in UNASSIGN for REPORT_SUCCEED window);
-`MetaConsistency` relaxed for any active procedure;
-`ProcStepConsistency` allows OPENING at REPORT_SUCCEED;
+in-memory state, persists `transitionCode`; Phase 2
+(`TRSPPersistToMetaOpen`/`Close`) writes meta.  FAILED_OPEN faithfully
+keeps OPENING during Phase 1.
+`MasterCrash` clears all in-memory state; `MasterRecover` rebuilds from
+`metaTable`+`procStore` via `RestoreSucceedState` (branches on
+`transitionCode`, not type).  Invariant adjustments: `LockExclusivity`
+widened for REPORT_SUCCEED window; `MetaConsistency` relaxed for active
+procedures; `ProcStepConsistency` allows OPENING at REPORT_SUCCEED;
 `ProcStoreConsistency` allows CLOSED for MOVE/REOPEN close-phase.
-Added minimal ZK-based server liveness model: new `ZK.tla` module
-with `zkNode[s] ∈ BOOLEAN` variable and `ZKSessionExpire(s)` action.
-ZK is modeled as the ground truth for RS liveness, independent of
-master state.  Correct causal chain: `ZKSessionExpire` (ZK detects
-RS death, deletes ephemeral node) → `MasterDetectCrash` (master
-watcher fires, guards on `zkNode[s]=FALSE`) → SCP.  `RSAbort` now
-guards on `zkNode[s]=FALSE` (RS detects own session expiry) instead
-of `serverState[s]="CRASHED"`.  RS-side actions (`RSOpen`, `RSClose`,
-`RSFailOpen`, `RSOpenDuplicate`) guard on `zkNode[s]=TRUE`.
-`MasterRecover` reads `zkNode` to determine server liveness during
-recovery, replacing the inaccurate `isDead(s)` proxy.  `RSRestart`
-creates a fresh ZK ephemeral node.  `RSMasterAgreement` and
-`RSMasterAgreementConverse` updated to exempt the ZK session expiry
-window (between `ZKSessionExpire` and `MasterDetectCrash`).
+ZK liveness model: new `ZK.tla` with `zkNode[s] ∈ BOOLEAN` and
+`ZKSessionExpire(s)`.  Causal chain: `ZKSessionExpire` → 
+`MasterDetectCrash` (guards `zkNode[s]=FALSE`) → SCP.  `RSAbort`
+guards on `zkNode[s]=FALSE`; RS actions guard `zkNode[s]=TRUE`.
+`MasterRecover` reads `zkNode` for liveness (replaces `isDead`).
+`RSRestart` creates fresh ZK node.  `RSMasterAgreement`/Converse
+exempt ZK-session-expiry→crash-detect window.
 `RestoreSucceedState` FAILED_OPEN location fixed to `NoServer`.
 TLC 2r/2s: 17,430,108 distinct, 63,165,534 generated, 20m26s, clean.
 
 ---
 
-### Phase 6: PEWorker Pool and Meta-Blocking Semantics
+### Phase 6: PEWorker Pool and Meta-Blocking Semantics ✅ COMPLETE
 
-#### Iteration 19 — PEWorker pool and meta-blocking semantics
+#### Iteration 19 — PEWorker pool and meta-blocking semantics ✅ COMPLETE
 
-This iteration faithfully models the ProcedureExecutor's finite worker
-thread pool as it exists in the branch-2.6 implementation.  The
-ProcedureExecutor uses a fixed pool of `PEWorker` threads (default 16,
-configurable via `hbase.procedure.worker.count`) to execute all
-procedures.  In branch-2.6, when a procedure performs a synchronous
-write to `hbase:meta` via `RegionStateStore.updateRegionLocation()`, the
-calling PEWorker thread blocks until the RPC completes.  If meta is
-unavailable (e.g., the meta RS has crashed and meta is being
-reassigned), the thread blocks indefinitely.
-
-The model captures this synchronous blocking behavior using a
-counting-semaphore abstraction for the worker pool.  A
-`UseSuspendOnMetaBlock` constant enables comparative analysis against
-the alternative async implementation in branch-3, where procedures
-suspend and release the PEWorker thread when meta is unavailable.
-
-**What to add**:
-
-1. **New constants**:
-   - `MaxWorkers ∈ Nat \ {0}` — PEWorker thread pool size.
-   - `UseSuspendOnMetaBlock ∈ BOOLEAN` — `FALSE` = branch-2.6
-     behavior (synchronous meta writes hold the PEWorker thread),
-     `TRUE` = branch-3 behavior (procedure suspends and releases the
-     PEWorker; re-enqueued when meta becomes available).
-
-2. **New variables**:
-   - `availableWorkers ∈ 0..MaxWorkers` — counting semaphore for
-     idle PEWorker threads.
-   - `blockedOnMeta ⊆ Regions` — regions whose procedures are
-     blocked on a synchronous meta write (holds PEWorker thread).
-   - `suspendedOnMeta ⊆ Regions` — regions whose procedures have
-     yielded and released the PEWorker thread while waiting for meta.
-
-3. **Modified actions** (guard with `availableWorkers > 0`):
-   All TRSP and SCP procedure-step actions acquire a PEWorker at the
-   start and release it at the end.  Since TLA+ steps are atomic,
-   non-blocking actions have a net-zero change on `availableWorkers`
-   (the guard enforces availability, but the step finishes immediately).
-   The interesting case is meta-writing actions when meta is unavailable.
-
-4. **Meta-blocking semantics** (faithful to `RegionStateStore`):
-   - `MetaIsAvailable` predicate: `TRUE` when no server is in
-     `ASSIGN_META` scpState (reuses existing `carryingMeta` / `scpState`).
-   - Modified `TRSPDispatchOpen(r)` and `SCPAssignRegion(s, r)`: when
-     the action attempts a meta write and `¬MetaIsAvailable`:
-     - **Branch-2.6** (`UseSuspendOnMetaBlock = FALSE`): add `r` to
-       `blockedOnMeta`, decrement `availableWorkers`.  The PEWorker is
-       held — faithfully modeling the synchronous
-       `RegionStateStore.updateRegionLocation()` call blocking on an
-       unavailable meta table.
-     - **Branch-3 comparison** (`UseSuspendOnMetaBlock = TRUE`): add
-       `r` to `suspendedOnMeta`.  `availableWorkers` is NOT
-       decremented.  Models the `CompletableFuture`-based async path.
-   - `TRSPResumeFromMeta(r)` / `SCPResumeFromMeta(r)`: when
-     `MetaIsAvailable` becomes `TRUE`, remove `r` from
-     `blockedOnMeta` / `suspendedOnMeta` and allow the procedure to
-     continue.  Branch-2.6: increment `availableWorkers` (worker
-     released).  Branch-3: procedure re-enters the scheduler normally.
-
-5. **New invariant** — `NoPEWorkerDeadlock`:
-   ```tla
-   NoPEWorkerDeadlock ==
-     (availableWorkers = 0 /\ ~MetaIsAvailable)
-       => \E r \in Regions:
-            /\ regionState[r].procType = "ASSIGN"
-            /\ r \notin blockedOnMeta
-            /\ r \notin suspendedOnMeta
-   ```
-   This invariant checks that when all PEWorker threads are consumed
-   and meta is unavailable, at least one free worker remains available
-   to execute the meta assignment procedure.  Any violation represents
-   a worker-pool deadlock in the implementation.
-
-6. **New liveness property** — `MetaEventuallyAssigned`:
-   ```tla
-   MetaEventuallyAssigned ==
-     \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
-   ```
-   Checks that the meta assignment procedure eventually completes
-   despite concurrent procedure load on the PEWorker pool.
-
-**Verify**:
-- `TypeOK` with new variables.
-- All existing invariants hold with `UseSuspendOnMetaBlock = FALSE`
-  (branch-2.6 faithful model).
-- Check `NoPEWorkerDeadlock` and `MetaEventuallyAssigned` with the
-  branch-2.6 configuration.  If violations are found, analyze the
-  counterexample traces — they represent genuine thread-pool exhaustion
-  scenarios in the implementation.
-- Compare results with `UseSuspendOnMetaBlock = TRUE` (branch-3
-  comparison) to understand whether the async suspension path
-  eliminates the deadlock class.
-- TLC primary config: 2r/2s (or 3r/2s), MaxWorkers=2, MaxRetries=1.
-
-**Source**: `ProcedureExecutor.WorkerThread.run()` L1986-2030;
-`TransitRegionStateProcedure.executeFromState()`;
-`RegionStateStore.updateRegionLocation()` L158-240 (synchronous
-`Table.put()` in branch-2.6; async `CompletableFuture` in branch-3).
-For context on known thread-pool exhaustion scenarios: HBASE-24526,
-HBASE-24673.  Branch-3 async path: HBASE-28196, HBASE-28199,
-HBASE-28240.
+New constants (`MaxWorkers`, `UseBlockOnMetaWrite`) in `Types.tla`;
+new variables `availableWorkers` (counting semaphore),
+`suspendedOnMeta`/`blockedOnMeta` (region sets) with `MetaIsAvailable`
+predicate and `peVars` shorthand in `AssignmentManager.tla`; variable
+declarations and `UNCHANGED peVars` in all 7 modules.
+`availableWorkers > 0` guard on all 22 procedure-step actions (17
+TRSP + 5 SCP).  Meta-blocking disjuncts on all 5 meta-writing actions
+(`TRSPPersistToMetaOpen`, `TRSPDispatchOpen`, `TRSPDispatchClose`,
+`TRSPPersistToMetaClose`, `SCPAssignRegion` Paths A/B); `SCPAssignRegion`
+Skip path exempted (no meta write).  `ResumeFromMeta(r)` action wired
+into `Next`/`Fairness` clears `suspendedOnMeta` (async) or
+`blockedOnMeta` (sync).  Bugfix: `SCPAssignRegion` Paths A/B and
+`TRSPServerCrashed` must clear pe-state when resetting procedures.
+`NoPEWorkerDeadlock` invariant passes with `UseBlockOnMetaWrite=FALSE`.
+`MetaEventuallyAssigned` liveness property added; liveness checking
+incompatible with TLC `SYMMETRY`; separate `AssignmentManager-liveness.cfg`
+(no symmetry) provided for overnight runs. New precondition
+`serverState[regionState[r].targetServer] = "ONLINE"` for `DispatchFail`
+and `DispatchFailClose` in `TRSP.tla` matching `RRPB.remoteCallFailed()`.
+Added guard `∀ s ∈ Servers: scpState[s] ∈ {"NONE", "DONE"}` to
+`GoOffline` in `Master.tla`. `DropStaleReport` in `RegionServer.tla`
+guards on `masterAlive = TRUE`.
+TLC 2r/2s: 25,959,400 distinct, 90,478,387 generated, 6m08s, clean.
 
 ---
 
