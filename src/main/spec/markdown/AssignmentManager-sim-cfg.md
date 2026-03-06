@@ -35,6 +35,8 @@ SPECIFICATION Spec
 | `UseReopen` | `TRUE` | Models branch-2's REOPEN procedure |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | Disable silent-drop |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery |
+| `MaxWorkers` | `2` | PEWorker thread pool size |
+| `UseBlockOnMetaWrite` | `FALSE` | Async meta writes |
 
 ```cfg
 CONSTANTS
@@ -47,13 +49,15 @@ CONSTANTS
     UseReopen = TRUE
     UseRSOpenDuplicateQuirk = FALSE
     UseRestoreSucceedQuirk = FALSE
+    MaxWorkers = 2
+    UseBlockOnMetaWrite = FALSE
 ```
 
 ---
 
 ## Invariants
 
-All 20 safety invariants (same as primary config):
+All 21 safety invariants (same as primary config):
 
 ```cfg
 INVARIANT
@@ -77,6 +81,7 @@ INVARIANT
     ServerRegionsTrackLocation
     DispatchCorrespondance
     NoOrphanedProcedures
+    NoPEWorkerDeadlock
 ```
 
 ---
@@ -88,6 +93,12 @@ ACTION_CONSTRAINT
     TransitionValid
     SCPMonotonicity
 ```
+
+---
+
+## Liveness
+
+Liveness properties (`PROPERTY MetaEventuallyAssigned`) require symmetry to be disabled. Use [`AssignmentManager-liveness.cfg`](../AssignmentManager-liveness.cfg) for overnight liveness checking.
 
 ---
 

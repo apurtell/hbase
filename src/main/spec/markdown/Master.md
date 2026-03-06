@@ -24,7 +24,8 @@ EXTENDS Types
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
          walFenced, locked, carryingMeta, serverRegions,
-         procStore, masterAlive, zkNode
+         procStore, masterAlive, zkNode,
+         availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
 
 ### Variable Group Shorthands
@@ -38,6 +39,7 @@ scpVars    == << scpState, scpRegions, walFenced, carryingMeta >>
 masterVars == << masterAlive >>
 procVars   == << procStore, locked >>
 serverVars == << serverState, serverRegions >>
+peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
 ---
@@ -48,7 +50,7 @@ serverVars == << serverState, serverRegions >>
 
 Transition from CLOSED back to OFFLINE. Used by `RegionStateNode.offline()` when a region is being taken fully offline (e.g., table disable).
 
-**Pre:** Region is CLOSED with no procedure attached, master is alive.
+**Pre:** Region is CLOSED with no procedure attached, master is alive, no SCP is actively processing on any server.
 
 **Post:** `regionState` set to OFFLINE with cleared location (in-memory only — `metaTable` is NOT updated). META retains CLOSED; divergence is resolved on master restart.
 
@@ -59,10 +61,11 @@ GoOffline(r) ==
   /\ masterAlive = TRUE
   /\ regionState[r].state = "CLOSED"
   /\ regionState[r].procType = "NONE"
+  /\ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
   /\ regionState' =
        [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
   /\ UNCHANGED << scpVars, rpcVars, serverVars, procVars,
-                   rsVars, masterVars, metaTable, zkNode >>
+                   rsVars, masterVars, metaTable, peVars, zkNode >>
 ```
 
 ---
@@ -87,15 +90,15 @@ MasterDetectCrash(s) ==
   /\ serverState[s] = "ONLINE"
   /\ zkNode[s] = FALSE
   /\ serverState' = [serverState EXCEPT ![s] = "CRASHED"]
-  \* Non-deterministic: crashed server may or may not have been
-  \* hosting hbase:meta.
   /\ \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
         /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
      \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
-  /\ UNCHANGED << rpcVars, procVars, rsVars, masterVars,
-                   regionState, metaTable, scpRegions,
-                   walFenced, serverRegions, zkNode >>
+  /\ UNCHANGED << rpcVars,
+        peVars,
+        procVars, rsVars, masterVars,
+        regionState, metaTable, scpRegions,
+        walFenced, serverRegions, zkNode >>
 ```
 
 ---
@@ -125,17 +128,13 @@ The regions are still open on their RegionServers and `hbase:meta` is still vali
 MasterCrash ==
   /\ masterAlive = TRUE
   /\ masterAlive' = FALSE
-  \* In-memory master state becomes stale (gated on masterAlive).
   /\ UNCHANGED << regionState, serverState, dispatchedOps,
                    pendingReports, scpState, scpRegions,
-                   locked, serverRegions, carryingMeta >>
-  \* Durable state survives.
+                   locked, serverRegions, carryingMeta,
+                   availableWorkers, suspendedOnMeta, blockedOnMeta >>
   /\ UNCHANGED << metaTable, procStore >>
-  \* RS-side state survives.
   /\ UNCHANGED rsOnlineRegions
-  \* WAL fencing survives (HDFS-level).
   /\ UNCHANGED walFenced
-  \* ZK ephemeral nodes survive (external to master).
   /\ UNCHANGED zkNode
 ```
 
@@ -228,12 +227,9 @@ Read ZK ephemeral nodes to determine server liveness. On startup the master conn
        [s \in Servers |-> IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"]
   /\ scpRegions' = [s \in Servers |-> {}]
   /\ carryingMeta' = [s \in Servers |-> FALSE]
-  \* Clear in-flight RPCs and reports (stale from pre-crash master).
   /\ dispatchedOps' = [s \in Servers |-> {}]
   /\ pendingReports' = {}
-  \* Reset locks.
   /\ locked' = [r \in Regions |-> FALSE]
-  \* Rebuild serverRegions from recovered regionState.
   /\ serverRegions' =
        [s \in Servers |->
          {r \in Regions:
@@ -252,5 +248,8 @@ Read ZK ephemeral nodes to determine server liveness. On startup the master conn
          }
        ]
   /\ masterAlive' = TRUE
+  /\ availableWorkers' = MaxWorkers
+  /\ suspendedOnMeta' = {}
+  /\ blockedOnMeta' = {}
   /\ UNCHANGED << metaTable, procStore, rsOnlineRegions, walFenced, zkNode >>
 ```

@@ -32,7 +32,13 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
+
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 
 ---------------------------------------------------------------------------
 
@@ -78,7 +84,8 @@ ZKSessionExpire(s) ==
         carryingMeta,
         serverRegions,
         procStore,
-        masterAlive
+        masterAlive,
+        peVars
      >>
 
 ============================================================================
