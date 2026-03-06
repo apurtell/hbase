@@ -24,7 +24,8 @@ EXTENDS Types
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
          walFenced, locked, carryingMeta, serverRegions,
-         procStore, masterAlive, zkNode
+         procStore, masterAlive, zkNode,
+         availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
 
 ### Variable Group Shorthands
@@ -38,6 +39,7 @@ scpVars    == << scpState, scpRegions, walFenced, carryingMeta >>
 masterVars == << masterAlive >>
 procVars   == << procStore, locked >>
 serverVars == << serverState, serverRegions >>
+peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
 ---
@@ -62,7 +64,7 @@ GoOffline(r) ==
   /\ regionState' =
        [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
   /\ UNCHANGED << scpVars, rpcVars, serverVars, procVars,
-                   rsVars, masterVars, metaTable, zkNode >>
+                   rsVars, masterVars, metaTable, peVars, zkNode >>
 ```
 
 ---
@@ -93,9 +95,11 @@ MasterDetectCrash(s) ==
         /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
      \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
-  /\ UNCHANGED << rpcVars, procVars, rsVars, masterVars,
-                   regionState, metaTable, scpRegions,
-                   walFenced, serverRegions, zkNode >>
+  /\ UNCHANGED << rpcVars,
+        peVars,
+        procVars, rsVars, masterVars,
+        regionState, metaTable, scpRegions,
+        walFenced, serverRegions, zkNode >>
 ```
 
 ---
@@ -128,7 +132,8 @@ MasterCrash ==
   \* In-memory master state becomes stale (gated on masterAlive).
   /\ UNCHANGED << regionState, serverState, dispatchedOps,
                    pendingReports, scpState, scpRegions,
-                   locked, serverRegions, carryingMeta >>
+                   locked, serverRegions, carryingMeta,
+                   availableWorkers, suspendedOnMeta, blockedOnMeta >>
   \* Durable state survives.
   /\ UNCHANGED << metaTable, procStore >>
   \* RS-side state survives.
@@ -252,5 +257,9 @@ Read ZK ephemeral nodes to determine server liveness. On startup the master conn
          }
        ]
   /\ masterAlive' = TRUE
+  \* Reset PEWorker pool state on recovery.
+  /\ availableWorkers' = MaxWorkers
+  /\ suspendedOnMeta' = {}
+  /\ blockedOnMeta' = {}
   /\ UNCHANGED << metaTable, procStore, rsOnlineRegions, walFenced, zkNode >>
 ```

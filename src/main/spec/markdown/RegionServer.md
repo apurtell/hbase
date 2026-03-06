@@ -19,7 +19,8 @@ EXTENDS Types
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
          walFenced, locked, carryingMeta, serverRegions,
-         procStore, masterAlive, zkNode
+         procStore, masterAlive, zkNode,
+         availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
 
 ### Variable Group Shorthands
@@ -30,6 +31,7 @@ scpVars    == << scpState, scpRegions, walFenced, carryingMeta >>
 masterVars == << masterAlive >>
 procVars   == << procStore, locked >>
 serverVars == << serverState, serverRegions >>
+peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
 ---
@@ -55,7 +57,7 @@ RSAbort(s) ==
   /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = {}]
   /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = {}]
   /\ UNCHANGED << scpVars, serverVars, procVars, masterVars,
-                   regionState, metaTable, pendingReports, zkNode >>
+                   regionState, metaTable, pendingReports, peVars, zkNode >>
 ```
 
 ---
@@ -77,9 +79,13 @@ DropStaleReport ==
     \E rpt \in pendingReports:
     /\ serverState[rpt.server] = "CRASHED"
     /\ pendingReports' = pendingReports \ { rpt }
-    /\ UNCHANGED << scpVars, serverVars, procVars, rsVars,
-                     masterVars, regionState, metaTable,
-                     dispatchedOps, zkNode >>
+    /\ UNCHANGED << scpVars,
+        peVars,
+          serverVars,
+          procVars,
+          rsVars,
+          masterVars, regionState, metaTable,
+          dispatchedOps, zkNode >>
 ```
 
 ---
@@ -111,8 +117,12 @@ RSOpen(s, r) ==
        /\ pendingReports' =
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "OPENED" ] }
-       /\ UNCHANGED << scpVars, serverVars, procVars, masterVars,
-                        regionState, metaTable, zkNode >>
+       /\ UNCHANGED << scpVars,
+              peVars,
+             serverVars,
+             procVars,
+             masterVars,
+             regionState, metaTable, zkNode >>
 ```
 
 ---
@@ -138,8 +148,12 @@ RSFailOpen(s, r) ==
        /\ pendingReports' =
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "FAILED_OPEN" ] }
-       /\ UNCHANGED << scpVars, serverVars, procVars, rsVars,
-                        masterVars, regionState, metaTable, zkNode >>
+       /\ UNCHANGED << scpVars,
+              peVars,
+             serverVars,
+             procVars,
+             rsVars,
+             masterVars, regionState, metaTable, zkNode >>
 ```
 
 ---
@@ -168,8 +182,12 @@ RSClose(s, r) ==
        /\ pendingReports' =
             pendingReports \cup
               { [ server |-> s, region |-> r, code |-> "CLOSED" ] }
-       /\ UNCHANGED << scpVars, serverVars, procVars, masterVars,
-                        regionState, metaTable, zkNode >>
+       /\ UNCHANGED << scpVars,
+              peVars,
+             serverVars,
+             procVars,
+             masterVars,
+             regionState, metaTable, zkNode >>
 ```
 
 ---
@@ -199,9 +217,14 @@ RSOpenDuplicate(s, r) ==
        /\ cmd.type = "OPEN"
        /\ cmd.region = r
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
-       /\ UNCHANGED << scpVars, serverVars, procVars, rsVars,
-                        masterVars, regionState, metaTable,
-                        pendingReports, zkNode >>
+       /\ UNCHANGED << scpVars,
+             serverVars,
+              peVars,
+             procVars,
+             rsVars,
+             masterVars,
+             regionState, metaTable,
+             pendingReports, zkNode >>
 ```
 
 ---
@@ -235,5 +258,5 @@ RSRestart(s) ==
   /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
   \* Register a fresh ZK ephemeral node for the restarted server.
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
-  /\ UNCHANGED << procVars, masterVars, regionState, metaTable >>
+  /\ UNCHANGED << procVars, masterVars, peVars, regionState, metaTable >>
 ```

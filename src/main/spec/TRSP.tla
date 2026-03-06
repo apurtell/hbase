@@ -58,7 +58,10 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -80,6 +83,14 @@ procVars == << procStore, locked >>
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
 
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+
+\* MetaIsAvailable is TRUE when no server is in ASSIGN_META scpState,
+\* meaning hbase:meta is online and accessible for read/write.
+\* Reuses the existing waitMetaLoaded guard from SCP actions.
+MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
+
 ---------------------------------------------------------------------------
 
 (* Actions -- TRSP ASSIGN path *)
@@ -97,6 +108,7 @@ TRSPCreate(r) ==
   \* Region is in an assignable state and has no active procedure.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].state \in
        { "OFFLINE", "CLOSED", "ABNORMALLY_CLOSED", "FAILED_OPEN" }
   /\ regionState[r].procType = "NONE"
@@ -130,6 +142,7 @@ TRSPCreate(r) ==
         serverVars,
         rsVars,
         masterVars,
+        peVars,
         metaTable,
         locked
      >>
@@ -162,6 +175,7 @@ TRSPGetCandidate(r, s) ==
   \* For REOPEN, s may equal regionState[r].location (same server OK).
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "GET_ASSIGN_CANDIDATE"
   /\ serverState[s] = "ONLINE"
@@ -180,6 +194,7 @@ TRSPGetCandidate(r, s) ==
         serverVars,
         rsVars,
         masterVars,
+        peVars,
         metaTable,
         locked
      >>
@@ -204,47 +219,71 @@ TRSPDispatchOpen(r) ==
   \* Procedure is ASSIGN or MOVE, in OPEN step, with a target server.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
   \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
-  \* Transition region to OPENING, record server, advance to CONFIRM_OPENED.
-  /\ LET s == regionState[r].targetServer
-     IN /\ regionState' =
-             [regionState EXCEPT
-             ![r].state =
-             "OPENING",
-             ![r].location =
-             s,
-             ![r].procStep =
-             "CONFIRM_OPENED"]
-        \* Persist the OPENING state and server assignment in META.
-        /\ metaTable' =
-             [metaTable EXCEPT ![r] = [ state |-> "OPENING", location |-> s ]]
-        \* Enqueue an OPEN command to the target server's dispatched ops.
-        /\ dispatchedOps' =
-             [dispatchedOps EXCEPT
-             ![s] =
-             @ \cup { [ type |-> "OPEN", region |-> r ] }]
-        \* ServerStateNode tracking: AM.regionOpening() adds r to the
-        \* new target server's set.  It does NOT remove r from the old
-        \* server's set — that removal happens only in regionFailedOpen,
-        \* regionClosedWithoutPersistingToMeta, or regionClosedAbnormally.
-        \* This means r may appear on two servers' ServerStateNode
-        \* simultaneously (old and new) during the OPENING window.
-        \* Source: AM.regionOpening().
-        /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \cup { r }]
-        \* Update persisted procedure step.
-        /\ procStore' = [procStore EXCEPT ![r].step = "CONFIRM_OPENED"]
-        \* Pending reports, RS-side state, and server liveness unchanged.
+  /\ \/ \* --- Meta unavailable: suspend or block ---
+        /\ ~MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ IF UseBlockOnMetaWrite = FALSE
+           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                /\ availableWorkers' = availableWorkers - 1
+                /\ UNCHANGED suspendedOnMeta
         /\ UNCHANGED << scpVars,
+              rpcVars,
+              serverVars,
               rsVars,
               masterVars,
-              pendingReports,
-              serverState,
+              regionState,
+              metaTable,
+              procStore,
               locked
            >>
+     \/ \* --- Meta available: dispatch open ---
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        \* Transition region to OPENING, record server, advance to CONFIRM_OPENED.
+        /\ LET s == regionState[r].targetServer
+           IN /\ regionState' =
+                   [regionState EXCEPT
+                   ![r].state =
+                   "OPENING",
+                   ![r].location =
+                   s,
+                   ![r].procStep =
+                   "CONFIRM_OPENED"]
+              \* Persist the OPENING state and server assignment in META.
+              /\ metaTable' =
+                   [metaTable EXCEPT
+                   ![r] =
+                   [ state |-> "OPENING", location |-> s ]]
+              \* Enqueue an OPEN command to the target server's dispatched ops.
+              /\ dispatchedOps' =
+                   [dispatchedOps EXCEPT
+                   ![s] =
+                   @ \cup { [ type |-> "OPEN", region |-> r ] }]
+              \* ServerStateNode tracking: AM.regionOpening() adds r to the
+              \* new target server's set.
+              \* Source: AM.regionOpening().
+              /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \cup { r }]
+              \* Update persisted procedure step.
+              /\ procStore' = [procStore EXCEPT ![r].step = "CONFIRM_OPENED"]
+              \* Pending reports, RS-side state, and server liveness unchanged.
+              /\ UNCHANGED << scpVars,
+                    rsVars,
+                    masterVars,
+                    peVars,
+                    pendingReports,
+                    serverState,
+                    locked
+                 >>
 
 
 \* --- Report-succeed for OPEN path ---
@@ -268,6 +307,7 @@ TRSPDispatchOpen(r) ==
 TRSPReportSucceedOpen(r) ==
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].state = "OPENING"
@@ -316,6 +356,7 @@ TRSPReportSucceedOpen(r) ==
        /\ UNCHANGED << scpVars,
              rsVars,
              masterVars,
+             peVars,
              metaTable,
              dispatchedOps,
              serverState,
@@ -340,11 +381,48 @@ TRSPReportSucceedOpen(r) ==
 TRSPPersistToMetaOpen(r) ==
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "REPORT_SUCCEED"
   /\ locked[r] = FALSE
   /\ LET tc == procStore[r].transitionCode
-     IN \/ \* --- OPENED branch ---
+     IN \/ \* --- Meta unavailable: suspend or block ---
+           \* When meta is unavailable and the procedure attempts a meta
+           \* write, two behaviors are modeled:
+           \*   Default (UseBlockOnMetaWrite=FALSE, master/branch-3+):
+           \*     Procedure suspends via ProcedureFutureUtil.
+           \*     suspendIfNecessary(), releasing the PEWorker thread.
+           \*   Branch-2.6 (UseBlockOnMetaWrite=TRUE):
+           \*     Synchronous Table.put() blocks the PEWorker thread.
+           \*
+           \* Source: RegionRemoteProcedureBase.execute() REPORT_SUCCEED
+           \*         branch; RegionStateStore.updateRegionLocation().
+           /\ ~MetaIsAvailable
+           /\ r \notin suspendedOnMeta
+           /\ r \notin blockedOnMeta
+           /\ IF UseBlockOnMetaWrite = FALSE
+              THEN \* Async: suspend procedure, release PEWorker.
+                   /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                   /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+              ELSE \* Sync: block PEWorker thread on meta write.
+                   /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                   /\ availableWorkers' = availableWorkers - 1
+                   /\ UNCHANGED suspendedOnMeta
+           \* No state changes: procedure paused before the write.
+           /\ UNCHANGED << scpVars,
+                 rpcVars,
+                 serverVars,
+                 rsVars,
+                 masterVars,
+                 regionState,
+                 metaTable,
+                 procStore,
+                 locked
+              >>
+        \/ \* --- OPENED branch ---
+           /\ MetaIsAvailable
+           /\ r \notin suspendedOnMeta
+           /\ r \notin blockedOnMeta
            /\ tc = "OPENED"
            /\ regionState[r].state = "OPEN"
            \* Clear procedure (ASSIGN), or advance to GET_ASSIGN_CANDIDATE (MOVE/REOPEN — this shouldn't normally happen for OPENED on MOVE, but handle uniformly).
@@ -370,9 +448,13 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
+                 peVars,
                  locked
               >>
         \/ \* --- FAILED_OPEN, retry branch ---
+           /\ MetaIsAvailable
+           /\ r \notin suspendedOnMeta
+           /\ r \notin blockedOnMeta
            /\ tc = "FAILED_OPEN"
            /\ regionState[r].retries < MaxRetries
            \* Reset to GET_ASSIGN_CANDIDATE for retry with a new server.
@@ -400,11 +482,15 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
+                 peVars,
                  metaTable,
                  pendingReports,
                  locked
               >>
         \/ \* --- FAILED_OPEN, give-up branch ---
+           /\ MetaIsAvailable
+           /\ r \notin suspendedOnMeta
+           /\ r \notin blockedOnMeta
            /\ tc = "FAILED_OPEN"
            /\ regionState[r].retries >= MaxRetries
            \* Move region to FAILED_OPEN, clear procedure.
@@ -430,6 +516,7 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
+                 peVars,
                  locked
               >>
 
@@ -458,6 +545,7 @@ DispatchFail(r) ==
   \* target server, and the OPEN command is still in dispatchedOps.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   \* Region is not locked by an in-progress procedure step.
@@ -483,6 +571,7 @@ DispatchFail(r) ==
               procVars,
               rsVars,
               masterVars,
+              peVars,
               metaTable,
               pendingReports
            >>
@@ -506,6 +595,7 @@ DispatchFailClose(r) ==
   \* target server, and the CLOSE command is still in dispatchedOps.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
   \* Region is not locked by an in-progress procedure step.
@@ -526,6 +616,7 @@ DispatchFailClose(r) ==
               procVars,
               rsVars,
               masterVars,
+              peVars,
               metaTable,
               pendingReports
            >>
@@ -550,6 +641,7 @@ TRSPCreateUnassign(r) ==
   \* Region is OPEN, has a location, and has no active procedure.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # NoServer
   /\ regionState[r].procType = "NONE"
@@ -577,6 +669,7 @@ TRSPCreateUnassign(r) ==
         serverVars,
         rsVars,
         masterVars,
+        peVars,
         metaTable,
         locked
      >>
@@ -603,6 +696,7 @@ TRSPCreateMove(r) ==
   \* and at least one other ONLINE server exists as a destination.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # NoServer
   /\ regionState[r].procType = "NONE"
@@ -631,6 +725,7 @@ TRSPCreateMove(r) ==
         serverVars,
         rsVars,
         masterVars,
+        peVars,
         metaTable,
         locked
      >>
@@ -654,6 +749,7 @@ TRSPCreateReopen(r) ==
   \* no active procedure.  No requirement that another ONLINE server exists.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ UseReopen = TRUE
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # NoServer
@@ -683,6 +779,7 @@ TRSPCreateReopen(r) ==
         serverVars,
         rsVars,
         masterVars,
+        peVars,
         metaTable,
         locked
      >>
@@ -704,41 +801,66 @@ TRSPDispatchClose(r) ==
   \* server, and region is OPEN or CLOSING (CLOSING on retry).
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CLOSE"
   /\ regionState[r].targetServer # NoServer
   \* Region is not locked by an in-progress procedure step.
   /\ locked[r] = FALSE
-  \* Bind the target server for readability.
-  /\ LET s == regionState[r].targetServer
-     IN /\ regionState[r].state \in { "OPEN", "CLOSING" }
-        \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
-        /\ regionState' =
-             [regionState EXCEPT
-             ![r].state =
-             "CLOSING",
-             ![r].procStep =
-             "CONFIRM_CLOSED"]
-        \* Persist CLOSING state in META, preserving the location.
-        /\ metaTable' =
-             [metaTable EXCEPT
-             ![r] =
-             [ state |-> "CLOSING", location |-> metaTable[r].location ]]
-        \* Enqueue a CLOSE command to the target server's dispatched ops.
-        /\ dispatchedOps' =
-             [dispatchedOps EXCEPT
-             ![s] =
-             @ \cup { [ type |-> "CLOSE", region |-> r ] }]
-        \* Pending reports, RS-side state, and server liveness unchanged.
-        \* Update persisted procedure step.
-        /\ procStore' = [procStore EXCEPT ![r].step = "CONFIRM_CLOSED"]
+  /\ \/ \* --- Meta unavailable: suspend or block ---
+        /\ ~MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ IF UseBlockOnMetaWrite = FALSE
+           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                /\ availableWorkers' = availableWorkers - 1
+                /\ UNCHANGED suspendedOnMeta
         /\ UNCHANGED << scpVars,
+              rpcVars,
               serverVars,
               rsVars,
               masterVars,
-              pendingReports,
+              regionState,
+              metaTable,
+              procStore,
               locked
            >>
+     \/ \* --- Meta available: dispatch close ---
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        \* Bind the target server for readability.
+        /\ LET s == regionState[r].targetServer
+           IN /\ regionState[r].state \in { "OPEN", "CLOSING" }
+              \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
+              /\ regionState' =
+                   [regionState EXCEPT
+                   ![r].state =
+                   "CLOSING",
+                   ![r].procStep =
+                   "CONFIRM_CLOSED"]
+              \* Persist CLOSING state in META, preserving the location.
+              /\ metaTable' =
+                   [metaTable EXCEPT
+                   ![r] =
+                   [ state |-> "CLOSING", location |-> metaTable[r].location ]]
+              \* Enqueue a CLOSE command to the target server's dispatched ops.
+              /\ dispatchedOps' =
+                   [dispatchedOps EXCEPT
+                   ![s] =
+                   @ \cup { [ type |-> "CLOSE", region |-> r ] }]
+              \* Update persisted procedure step.
+              /\ procStore' = [procStore EXCEPT ![r].step = "CONFIRM_CLOSED"]
+              /\ UNCHANGED << scpVars,
+                    serverVars,
+                    rsVars,
+                    masterVars,
+                    peVars,
+                    pendingReports,
+                    locked
+                 >>
 
 
 \* --- Report-succeed for CLOSE path ---
@@ -755,6 +877,7 @@ TRSPDispatchClose(r) ==
 TRSPReportSucceedClose(r) ==
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
   /\ regionState[r].state = "CLOSING"
@@ -794,6 +917,7 @@ TRSPReportSucceedClose(r) ==
        \* MetaTable NOT updated yet.
        /\ UNCHANGED << scpVars,
              rsVars,
+             peVars,
              masterVars,
              metaTable,
              dispatchedOps,
@@ -813,41 +937,75 @@ TRSPReportSucceedClose(r) ==
 TRSPPersistToMetaClose(r) ==
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "REPORT_SUCCEED"
   /\ procStore[r].transitionCode = "CLOSED"
   /\ locked[r] = FALSE
-  \* Persist CLOSED to metaTable.
-  /\ metaTable' =
-       [metaTable EXCEPT ![r] = [ state |-> "CLOSED", location |-> NoServer ]]
-  \* Branch on procedure type.
-  /\ IF regionState[r].procType = "UNASSIGN"
-     THEN \* UNASSIGN complete: clear procedure.
-          /\ regionState' =
-               [regionState EXCEPT
-               ![r] =
-               [ state |-> "CLOSED",
-                 location |-> NoServer,
-                 procType |-> "NONE",
-                 procStep |-> "IDLE",
-                 targetServer |-> NoServer,
-                 retries |-> 0
-               ]]
-          /\ procStore' = [procStore EXCEPT ![r] = NoProcedure]
-     ELSE \* MOVE/REOPEN: advance to GET_ASSIGN_CANDIDATE.
-          /\ regionState' =
-               [regionState EXCEPT
-               ![r].procStep =
-               "GET_ASSIGN_CANDIDATE",
-               ![r].targetServer =
-               NoServer,
-               ![r].retries =
-               0]
-          /\ procStore' =
-               [procStore EXCEPT
-               ![r] =
-               NewProcRecord(regionState[r].procType, "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
-  /\ UNCHANGED << scpVars, rpcVars, serverVars, rsVars, masterVars, locked >>
+  /\ \/ \* --- Meta unavailable: suspend or block ---
+        /\ ~MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ IF UseBlockOnMetaWrite = FALSE
+           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                /\ availableWorkers' = availableWorkers - 1
+                /\ UNCHANGED suspendedOnMeta
+        /\ UNCHANGED << scpVars,
+              rpcVars,
+              serverVars,
+              rsVars,
+              masterVars,
+              regionState,
+              metaTable,
+              procStore,
+              locked
+           >>
+     \/ \* --- Meta available: persist close to meta ---
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        \* Persist CLOSED to metaTable.
+        /\ metaTable' =
+             [metaTable EXCEPT
+             ![r] =
+             [ state |-> "CLOSED", location |-> NoServer ]]
+        \* Branch on procedure type.
+        /\ IF regionState[r].procType = "UNASSIGN"
+           THEN \* UNASSIGN complete: clear procedure.
+                /\ regionState' =
+                     [regionState EXCEPT
+                     ![r] =
+                     [ state |-> "CLOSED",
+                       location |-> NoServer,
+                       procType |-> "NONE",
+                       procStep |-> "IDLE",
+                       targetServer |-> NoServer,
+                       retries |-> 0
+                     ]]
+                /\ procStore' = [procStore EXCEPT ![r] = NoProcedure]
+           ELSE \* MOVE/REOPEN: advance to GET_ASSIGN_CANDIDATE.
+                /\ regionState' =
+                     [regionState EXCEPT
+                     ![r].procStep =
+                     "GET_ASSIGN_CANDIDATE",
+                     ![r].targetServer =
+                     NoServer,
+                     ![r].retries =
+                     0]
+                /\ procStore' =
+                     [procStore EXCEPT
+                     ![r] =
+                     NewProcRecord(regionState[r].procType, "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
+        /\ UNCHANGED << scpVars,
+              rpcVars,
+              serverVars,
+              rsVars,
+              masterVars,
+              peVars,
+              locked
+           >>
 
 \* --- Path 2: Crash during close (ABNORMALLY_CLOSED) ---
 \* The target server crashed while the close was in flight.
@@ -864,6 +1022,7 @@ TRSPPersistToMetaClose(r) ==
 TRSPConfirmClosedCrash(r) ==
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
   /\ locked[r] = FALSE
@@ -896,6 +1055,7 @@ TRSPConfirmClosedCrash(r) ==
   /\ UNCHANGED << scpVars,
         rsVars,
         masterVars,
+        peVars,
         metaTable,
         pendingReports,
         serverState,
@@ -938,6 +1098,7 @@ TRSPServerCrashed(r) ==
   \* GET_ASSIGN_CANDIDATE by SCPAssignRegion Path A.
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ regionState[r].procType # "NONE"
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
   /\ regionState[r].procStep # "GET_ASSIGN_CANDIDATE"
@@ -974,5 +1135,48 @@ TRSPServerCrashed(r) ==
        ![r] =
        NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
   /\ UNCHANGED << scpVars, serverVars, rsVars, masterVars, metaTable, locked >>
+  \* Clear r from suspended/blocked sets if it was waiting on meta.
+  /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+  /\ blockedOnMeta' = blockedOnMeta \ { r }
+  /\ availableWorkers' =
+       IF r \in blockedOnMeta THEN availableWorkers + 1 ELSE availableWorkers
+
+---------------------------------------------------------------------------
+
+(* Actions -- PEWorker meta-resume *)
+\* Resume a procedure that was suspended or blocked on a meta write.
+\* When MetaIsAvailable becomes TRUE (SCP completes meta assignment),
+\* suspended procedures are woken and blocked workers are unblocked.
+\*
+\* Pre: masterAlive = TRUE, r in suspendedOnMeta or blockedOnMeta,
+\*      MetaIsAvailable.
+\* Post: r removed from suspendedOnMeta or blockedOnMeta;
+\*       availableWorkers incremented if blocked.
+\*
+\* Source: ProcedureFutureUtil.wakeIfSuspended() for async case;
+\*         Table.put() returning for sync case.
+ResumeFromMeta(r) ==
+  /\ masterAlive = TRUE
+  /\ MetaIsAvailable
+  /\ \/ \* --- Async resume: procedure was suspended ---
+        /\ r \in suspendedOnMeta
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+     \/ \* --- Sync resume: PEWorker was blocked ---
+        /\ r \in blockedOnMeta
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        /\ availableWorkers' = availableWorkers + 1
+        /\ UNCHANGED suspendedOnMeta
+  \* No state changes -- just remove from suspended/blocked set.
+  /\ UNCHANGED << scpVars,
+        rpcVars,
+        serverVars,
+        rsVars,
+        masterVars,
+        regionState,
+        metaTable,
+        procStore,
+        locked
+     >>
 
 ============================================================================

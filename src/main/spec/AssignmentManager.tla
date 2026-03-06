@@ -291,6 +291,38 @@ VARIABLE masterAlive
 \*         RegionServerTracker.getRegionServers().
 VARIABLE zkNode
 
+\* availableWorkers is the number of idle PEWorker threads.
+\* All procedure-step actions require availableWorkers > 0 to execute.
+\* Non-blocking actions have net-zero effect (acquire + release within
+\* the same atomic step).  Meta-writing actions when meta is unavailable
+\* may hold a worker (UseBlockOnMetaWrite=TRUE, decrement) or suspend
+\* and release (UseBlockOnMetaWrite=FALSE, no decrement).
+\*
+\* Source: ProcedureExecutor.workerThreadCount.
+VARIABLE availableWorkers
+
+\* suspendedOnMeta is the set of regions whose procedures have been
+\* suspended (released the PEWorker thread) while waiting for meta
+\* to become available.  Default path (master/branch-3+,
+\* UseBlockOnMetaWrite=FALSE): models ProcedureFutureUtil.
+\* suspendIfNecessary() suspending the procedure and releasing the
+\* PEWorker thread when AssignmentManager.persistToMeta() returns
+\* a pending future.
+\*
+\* Source: ProcedureFutureUtil.suspendIfNecessary();
+\*         RegionRemoteProcedureBase.execute() REPORT_SUCCEED branch.
+VARIABLE suspendedOnMeta
+
+\* blockedOnMeta is the set of regions whose procedures are blocked
+\* on a synchronous meta write, holding the PEWorker thread.
+\* Branch-2.6 only (UseBlockOnMetaWrite=TRUE): models the synchronous
+\* Table.put() call in RegionStateStore.updateRegionLocation() blocking
+\* on an unavailable meta table.
+\*
+\* Source: RegionStateStore.updateRegionLocation() L158-240 uses
+\*         synchronous Table.put() (L237-239) in branch-2.6.
+VARIABLE blockedOnMeta
+
 vars ==
   << regionState,
      metaTable,
@@ -306,10 +338,24 @@ vars ==
      serverRegions,
      procStore,
      masterAlive,
-     zkNode
+     zkNode,
+     availableWorkers,
+     suspendedOnMeta,
+     blockedOnMeta
   >>
 
 ---------------------------------------------------------------------------
+
+(* Predicates *)
+\* MetaIsAvailable is TRUE when no server is in ASSIGN_META scpState,
+\* meaning hbase:meta is online and accessible for read/write.
+\* Reuses the existing waitMetaLoaded guard from SCP actions.
+\*
+\* Source: SCP.waitMetaLoaded().
+MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
+
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 
 (* Module instantiation *)
 \* Instantiate action modules.  Each sub-module declares its shared
@@ -382,6 +428,12 @@ TypeOK ==
   /\ masterAlive \in BOOLEAN
   \* ZK ephemeral node liveness per server.
   /\ zkNode \in [Servers -> BOOLEAN]
+  \* PEWorker pool: available workers bounded by MaxWorkers.
+  /\ availableWorkers \in 0 .. MaxWorkers
+  \* Regions suspended on meta (async, worker released).
+  /\ suspendedOnMeta \subseteq Regions
+  \* Regions blocked on meta (sync, worker held).
+  /\ blockedOnMeta \subseteq Regions
 
 ---------------------------------------------------------------------------
 
@@ -783,6 +835,24 @@ NoOrphanedProcedures ==
           regionState[r].procType = "ASSIGN"
     )
 
+\* NoPEWorkerDeadlock: When the master is alive and all PEWorkers are
+\* consumed while meta is unavailable, there must exist at least one
+\* active procedure that is neither suspended nor blocked on meta.
+\* If this invariant fails, all workers are tied up on meta writes and
+\* no progress can be made — a thread-pool exhaustion deadlock.
+\*
+\* With UseBlockOnMetaWrite = FALSE (default), this should always hold
+\* because async suspension releases the PEWorker immediately.
+\* With UseBlockOnMetaWrite = TRUE (branch-2.6), violations are EXPECTED
+\* and represent genuine deadlock scenarios.
+NoPEWorkerDeadlock ==
+  masterAlive = TRUE =>
+    ( ( availableWorkers = 0 /\ ~MetaIsAvailable ) =>
+        \E r \in Regions: /\ regionState[r].procType # "NONE"
+                          /\ r \notin blockedOnMeta
+                          /\ r \notin suspendedOnMeta
+    )
+
 \* Action constraint: SCP state machine transitions are strictly monotonic.
 \* The SCP never moves backward; only forward along the defined sequence,
 \* plus the DONE->NONE reset on ServerRestart.
@@ -857,6 +927,11 @@ Init ==
   /\ masterAlive = TRUE
   \* All servers have live ZK ephemeral nodes at startup.
   /\ zkNode = [s \in Servers |-> TRUE]
+  \* All PEWorker threads are available at startup.
+  /\ availableWorkers = MaxWorkers
+  \* No procedures are suspended or blocked on meta.
+  /\ suspendedOnMeta = {}
+  /\ blockedOnMeta = {}
 
 ---------------------------------------------------------------------------
 
@@ -885,6 +960,8 @@ Next == \* -- ASSIGN path --
         \/ \E s \in Servers: rs!RSRestart(s)
         \* -- Crash recovery --
         \/ \E r \in Regions: trsp!TRSPServerCrashed(r)
+        \* -- PEWorker meta-resume --
+        \/ \E r \in Regions: trsp!ResumeFromMeta(r)
         \* -- RS abort (zombie shutdown) --
         \/ \E s \in Servers: rs!RSAbort(s)
         \* -- SCP state machine --
@@ -937,6 +1014,8 @@ Fairness ==
   /\ \A r \in Regions: WF_vars(trsp!TRSPConfirmClosedCrash(r))
   \* Crash recovery
   /\ \A r \in Regions: WF_vars(trsp!TRSPServerCrashed(r))
+  \* PEWorker meta-resume
+  /\ \A r \in Regions: WF_vars(trsp!ResumeFromMeta(r))
   /\ WF_vars(rs!DropStaleReport)
   \* RS abort (zombie eventually shuts down)
   /\ \A s \in Servers: WF_vars(rs!RSAbort(s))
@@ -960,6 +1039,16 @@ Fairness ==
 
 (* Specification *)
 Spec == Init /\ [][Next]_vars /\ Fairness
+
+\* Liveness: when meta becomes unavailable (a server enters ASSIGN_META),
+\* the SCP eventually completes meta assignment and MetaIsAvailable
+\* becomes TRUE again.  This ensures suspended/blocked procedures
+\* are eventually able to resume.
+\*
+\* Source: The SCP state machine has WF on all steps including
+\*         SCPAssignMeta, so meta assignment always completes.
+MetaEventuallyAssigned ==
+  \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
 
 ---------------------------------------------------------------------------
 

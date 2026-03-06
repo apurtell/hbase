@@ -19,7 +19,8 @@ EXTENDS Types
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
          walFenced, locked, carryingMeta, serverRegions,
-         procStore, masterAlive, zkNode
+         procStore, masterAlive, zkNode,
+         availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
 
 ### Variable Group Shorthands
@@ -30,6 +31,15 @@ rsVars     == << rsOnlineRegions >>
 masterVars == << masterAlive >>
 procVars   == << procStore, locked >>
 serverVars == << serverState, serverRegions >>
+peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+```
+
+### MetaIsAvailable
+
+TRUE when no server is in the `ASSIGN_META` scpState (meta is online and available for writes).
+
+```tla
+MetaIsAvailable == \A t \in Servers: scpState[t] # "ASSIGN_META"
 ```
 
 ---
@@ -56,7 +66,7 @@ The implementation's `ServerCrashState` enum (`MasterProcedure.proto`) has 13 va
 
 SCP meta-reassignment step: when the crashed server was hosting `hbase:meta`, the SCP must reassign meta before proceeding to the normal crash-recovery path. Meta reassignment is abstracted as a single atomic step (the actual implementation creates a TRSP for the meta region and waits for it to complete).
 
-**Pre:** `scpState[s] = "ASSIGN_META"`, `carryingMeta[s] = TRUE`.
+**Pre:** `scpState[s] = "ASSIGN_META"`, `carryingMeta[s] = TRUE`, `availableWorkers > 0`.
 
 **Post:** `scpState[s] = "GET_REGIONS"` (meta is now online, SCP proceeds to the normal path).
 
@@ -65,12 +75,13 @@ SCP meta-reassignment step: when the crashed server was hosting `hbase:meta`, th
 ```tla
 SCPAssignMeta(s) ==
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ scpState[s] = "ASSIGN_META"
   /\ carryingMeta[s] = TRUE
   /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
   /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
-                   masterVars, regionState, metaTable,
+                   masterVars, peVars, regionState, metaTable,
                    scpRegions, walFenced, zkNode >>
 ```
 
@@ -78,11 +89,11 @@ SCPAssignMeta(s) ==
 
 ### SCPGetRegions(s)
 
-**SCP step 1:** Snapshot the set of regions assigned to the crashed server. This snapshot can go stal between `GET_REGIONS` and `ASSIGN`, concurrent TRSPs may move regions, causing `isMatchingRegionLocation()` to skip them (HBASE-24293).
+**SCP step 1:** Snapshot the set of regions assigned to the crashed server. This snapshot can go stale between `GET_REGIONS` and `ASSIGN`, concurrent TRSPs may move regions, causing `isMatchingRegionLocation()` to skip them (HBASE-24293).
 
 **Implementation note (branch-2.6):** At this step, the implementation also calls `AM.markRegionsAsCrashed()`, which updates internal bookkeeping (RIT tracking, crash timestamps) to mark the regions as unavailable. This does NOT change the `RegionState.State` enum — the actual transition to `ABNORMALLY_CLOSED` happens later in `assignRegions()` (`SERVER_CRASH_ASSIGN`). The model's abstraction (no region state change at `GET_REGIONS`, state change only at `SCPAssignRegion`) remains valid.
 
-**Pre:** `scpState[s] = "GET_REGIONS"`.
+**Pre:** `scpState[s] = "GET_REGIONS"`, `availableWorkers > 0`.
 
 **Post:** `scpRegions[s]` = snapshot of regions from `serverRegions[s]`, `scpState` advances to `"FENCE_WALS"`.
 
@@ -91,6 +102,7 @@ SCPAssignMeta(s) ==
 ```tla
 SCPGetRegions(s) ==
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ scpState[s] = "GET_REGIONS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
@@ -98,7 +110,7 @@ SCPGetRegions(s) ==
   /\ scpRegions' = [scpRegions EXCEPT ![s] = serverRegions[s]]
   /\ scpState' = [scpState EXCEPT ![s] = "FENCE_WALS"]
   /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
-                   masterVars, regionState, metaTable,
+                   masterVars, peVars, regionState, metaTable,
                    walFenced, carryingMeta, zkNode >>
 ```
 
@@ -108,7 +120,7 @@ SCPGetRegions(s) ==
 
 **SCP step 2:** Revoke WAL leases for the crashed server. After this step, the zombie RS cannot write to its WALs. Any write attempt will fail with an HDFS lease exception, triggering RS self-abort. This is the fencing mechanism that prevents write-side split-brain.
 
-**Pre:** `scpState[s] = "FENCE_WALS"`.
+**Pre:** `scpState[s] = "FENCE_WALS"`, `availableWorkers > 0`.
 
 **Post:** `walFenced[s] = TRUE`, `scpState` advances to `"ASSIGN"`.
 
@@ -117,12 +129,13 @@ SCPGetRegions(s) ==
 ```tla
 SCPFenceWALs(s) ==
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ scpState[s] = "FENCE_WALS"
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   /\ walFenced' = [walFenced EXCEPT ![s] = TRUE]
   /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN"]
   /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
-                   masterVars, regionState, metaTable,
+                   masterVars, peVars, regionState, metaTable,
                    scpRegions, carryingMeta, zkNode >>
 ```
 
@@ -130,33 +143,37 @@ SCPFenceWALs(s) ==
 
 ### SCPAssignRegion(s, r)
 
-**SCP step 3:** Process ONE region from the SCP's region snapshot. Each invocation handles a single region and removes it from `scpRegions[s]`. Three sub-paths:
+**SCP step 3:** Process ONE region from the SCP's region snapshot. Each invocation handles a single region and removes it from `scpRegions[s]`. Four sub-paths:
 
 #### Skip — `isMatchingRegionLocation` fails
 
-Between `SCPGetRegions` and now, a concurrent TRSP may have moved this region to another server. The implementation skips such regions. If the concurrent TRSP subsequently fails, the region may be lost without manual intervention (HBASE-24293).
+Between `SCPGetRegions` and now, a concurrent TRSP may have moved this region to another server. The implementation skips such regions. If the concurrent TRSP subsequently fails, the region may be lost without manual intervention (HBASE-24293). Skip does not require meta availability.
+
+#### Meta Unavailable — suspend or block
+
+Paths A and B write to meta. If meta is unavailable (`¬MetaIsAvailable`), the procedure suspends (`UseBlockOnMetaWrite=FALSE`, adds `r` to `suspendedOnMeta`) or blocks (`UseBlockOnMetaWrite=TRUE`, adds `r` to `blockedOnMeta`, decrements `availableWorkers`).
 
 #### Path A — TRSP already attached
 
-Location matches; procedure exists. Transition region to `ABNORMALLY_CLOSED` and atomically convert the existing TRSP to `ASSIGN`/`GET_ASSIGN_CANDIDATE`. This models the implementation's `serverCrashed()` callback firing under the same `RegionStateNode` lock as the state transition — they are a single atomic step.
+Location matches; procedure exists. Transition region to `ABNORMALLY_CLOSED` and atomically convert the existing TRSP to `ASSIGN`/`GET_ASSIGN_CANDIDATE`. Requires `MetaIsAvailable`. Clears `r` from `suspendedOnMeta`/`blockedOnMeta` when resetting procedures.
 
 *Source: `ServerCrashProcedure.assignRegions()` acquires `RegionStateNode.lock()`, then calls `regionNode.getProcedure().serverCrashed(env, ...)`; `TRSP.serverCrashed()` → `AM.regionClosedAbnormally()` all execute under that same lock.*
 
 #### Path B — No TRSP attached
 
-Location matches; no procedure. Transition to `ABNORMALLY_CLOSED` and attach a fresh `ASSIGN`/`GET_ASSIGN_CANDIDATE` procedure.
+Location matches; no procedure. Transition to `ABNORMALLY_CLOSED` and attach a fresh `ASSIGN`/`GET_ASSIGN_CANDIDATE` procedure. Requires `MetaIsAvailable`. Clears `r` from `suspendedOnMeta`/`blockedOnMeta`.
 
-**Pre:** `scpState[s] = "ASSIGN"`, `r ∈ scpRegions[s]`, `walFenced[s] = TRUE`.
+**Pre:** `scpState[s] = "ASSIGN"`, `r ∈ scpRegions[s]`, `walFenced[s] = TRUE`, `availableWorkers > 0`.
 
-**Post:** `r` removed from `scpRegions[s]`, region transitioned (or skipped).
+**Post:** `r` removed from `scpRegions[s]`, region transitioned (or skipped/suspended/blocked).
 
 *Source: `ServerCrashProcedure.assignRegions()`; `ServerCrashProcedure.isMatchingRegionLocation()`.*
 
 ```tla
 SCPAssignRegion(s, r) ==
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ scpState[s] = "ASSIGN"
-  /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   /\ r \in scpRegions[s]
   /\ walFenced[s] = TRUE
   /\ locked[r] = FALSE
@@ -165,8 +182,28 @@ SCPAssignRegion(s, r) ==
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
                          masterVars, regionState, metaTable,
-                         scpState, walFenced, carryingMeta, zkNode >>
+                         scpState, walFenced, carryingMeta,
+                         peVars, zkNode >>
+     \/ \* --- Meta unavailable: suspend or block ---
+        /\ regionState[r].location = s
+        /\ ~MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ IF UseBlockOnMetaWrite = FALSE
+           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                /\ availableWorkers' = availableWorkers - 1
+                /\ UNCHANGED suspendedOnMeta
+        /\ UNCHANGED << regionState, metaTable, dispatchedOps,
+              pendingReports, rsOnlineRegions, serverState,
+              scpState, scpRegions, walFenced, locked,
+              carryingMeta, serverRegions, procStore,
+              masterVars, zkNode >>
      \/ \* --- Path A: TRSP already attached ---
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
         /\ regionState[r].location = s
         /\ regionState[r].procType # "NONE"
         /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
@@ -191,8 +228,18 @@ SCPAssignRegion(s, r) ==
              NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
         /\ UNCHANGED << masterVars, serverState, scpState,
-                         walFenced, locked, carryingMeta, zkNode >>
+              walFenced, locked, carryingMeta, zkNode >>
+        \* Clear r from suspended/blocked sets if it was waiting on meta.
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        /\ availableWorkers' =
+             IF r \in blockedOnMeta
+             THEN availableWorkers + 1
+             ELSE availableWorkers
      \/ \* --- Path B: No TRSP attached ---
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
         /\ regionState[r].location = s
         /\ regionState[r].procType = "NONE"
         /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
@@ -216,8 +263,14 @@ SCPAssignRegion(s, r) ==
              NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
         /\ UNCHANGED << masterVars, dispatchedOps, serverState,
-                         scpState, walFenced, locked,
-                         carryingMeta, zkNode >>
+              scpState, walFenced, locked, carryingMeta, zkNode >>
+        \* Clear r from suspended/blocked sets if it was waiting on meta.
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        /\ availableWorkers' =
+             IF r \in blockedOnMeta
+             THEN availableWorkers + 1
+             ELSE availableWorkers
 ```
 
 ---
@@ -226,7 +279,7 @@ SCPAssignRegion(s, r) ==
 
 **SCP step 4:** All regions processed. Mark SCP as complete.
 
-**Pre:** `scpState[s] = "ASSIGN"`, `scpRegions[s] = {}` (all processed).
+**Pre:** `scpState[s] = "ASSIGN"`, `scpRegions[s] = {}` (all processed), `availableWorkers > 0`.
 
 **Post:** `scpState[s] = "DONE"`.
 
@@ -235,10 +288,11 @@ SCPAssignRegion(s, r) ==
 ```tla
 SCPDone(s) ==
   /\ masterAlive = TRUE
+  /\ availableWorkers > 0
   /\ scpState[s] = "ASSIGN"
   /\ scpRegions[s] = {}
   /\ scpState' = [scpState EXCEPT ![s] = "DONE"]
   /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
-                   masterVars, regionState, metaTable,
+                   masterVars, peVars, regionState, metaTable,
                    scpRegions, walFenced, carryingMeta, zkNode >>
 ```

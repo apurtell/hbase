@@ -55,6 +55,32 @@ ASSUME UseRSOpenDuplicateQuirk \in BOOLEAN
 CONSTANTS UseRestoreSucceedQuirk
 ASSUME UseRestoreSucceedQuirk \in BOOLEAN
 
+\* MaxWorkers: ProcedureExecutor worker thread pool size.
+\* All procedure-step actions require an available worker to execute.
+\* Non-blocking actions acquire and release within the same atomic step
+\* (net-zero effect).  Meta-writing actions when meta is unavailable
+\* may hold a worker (UseBlockOnMetaWrite=TRUE) or suspend and release
+\* (UseBlockOnMetaWrite=FALSE).
+\*
+\* Source: ProcedureExecutor.workerThreadCount;
+\*         hbase.procedure.threads (conf, default=# CPUs / 4).
+CONSTANTS MaxWorkers
+ASSUME MaxWorkers \in Nat /\ MaxWorkers > 0
+
+\* UseBlockOnMetaWrite: when FALSE (default, master/branch-3+),
+\* RegionStateStore.updateRegionLocation() returns CompletableFuture<Void>
+\* via AsyncTable.put() and the calling procedure suspends via
+\* ProcedureFutureUtil.suspendIfNecessary(), releasing the PEWorker thread.
+\* When TRUE (branch-2.6), RegionStateStore uses synchronous Table.put(),
+\* blocking the PEWorker thread until the RPC completes.
+\*
+\* Source: master/branch-3+: RegionStateStore.updateRegionLocation()
+\*         via AsyncTable.put(); ProcedureFutureUtil.suspendIfNecessary().
+\*         branch-2.6: RegionStateStore.updateRegionLocation() L158-240
+\*         uses synchronous Table.put() (L237-239).
+CONSTANTS UseBlockOnMetaWrite
+ASSUME UseBlockOnMetaWrite \in BOOLEAN
+
 ---------------------------------------------------------------------------
 
 (* State definitions *)

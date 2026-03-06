@@ -25,7 +25,10 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
 
 \* Shorthand for the RS-side variable (used in UNCHANGED clauses).
 rsVars == << rsOnlineRegions >>
@@ -41,6 +44,9 @@ procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
+
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 
 ---------------------------------------------------------------------------
 
@@ -79,6 +85,7 @@ RSAbort(s) ==
         regionState,
         metaTable,
         pendingReports,
+        peVars,
         zkNode
      >>
 
@@ -106,6 +113,7 @@ DropStaleReport ==
     /\ pendingReports' = pendingReports \ { rpt }
     \* All other state variables unchanged.
     /\ UNCHANGED << scpVars,
+        peVars,
           serverVars,
           procVars,
           rsVars,
@@ -162,6 +170,7 @@ RSOpen(s, r) ==
               { [ server |-> s, region |-> r, code |-> "OPENED" ] }
        \* Master-side state and server liveness unchanged.
        /\ UNCHANGED << scpVars,
+              peVars,
              serverVars,
              procVars,
              masterVars,
@@ -197,6 +206,7 @@ RSFailOpen(s, r) ==
               { [ server |-> s, region |-> r, code |-> "FAILED_OPEN" ] }
        \* Master-side state, online regions, and server liveness unchanged.
        /\ UNCHANGED << scpVars,
+              peVars,
              serverVars,
              procVars,
              rsVars,
@@ -240,6 +250,7 @@ RSClose(s, r) ==
               { [ server |-> s, region |-> r, code |-> "CLOSED" ] }
        \* Master-side state and server liveness unchanged.
        /\ UNCHANGED << scpVars,
+              peVars,
              serverVars,
              procVars,
              masterVars,
@@ -285,6 +296,7 @@ RSOpenDuplicate(s, r) ==
        \* All other state unchanged: no report, no rsOnlineRegions change.
        /\ UNCHANGED << scpVars,
              serverVars,
+              peVars,
              procVars,
              rsVars,
              masterVars,
@@ -353,6 +365,6 @@ RSRestart(s) ==
   \* Source: HRegionServer.run() -> createMyEphemeralNode().
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
   \* Region state and META unchanged.
-  /\ UNCHANGED << procVars, masterVars, regionState, metaTable >>
+  /\ UNCHANGED << procVars, masterVars, peVars, regionState, metaTable >>
 
 ============================================================================

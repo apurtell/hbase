@@ -26,7 +26,10 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -45,6 +48,9 @@ procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
+
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 
 ---------------------------------------------------------------------------
 
@@ -79,6 +85,7 @@ GoOffline(r) ==
         rsVars,
         masterVars,
         metaTable,
+        peVars,
         zkNode
      >>
 
@@ -119,6 +126,7 @@ MasterDetectCrash(s) ==
      \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ UNCHANGED << rpcVars,
+        peVars,
         procVars,
         rsVars,
         masterVars,
@@ -165,7 +173,10 @@ MasterCrash ==
         scpRegions,
         locked,
         serverRegions,
-        carryingMeta
+        carryingMeta,
+        availableWorkers,
+        suspendedOnMeta,
+        blockedOnMeta
      >>
   \* Durable state survives.
   /\ UNCHANGED << metaTable, procStore >>
@@ -317,6 +328,10 @@ MasterRecover ==
        ]
   \* Master is now alive.
   /\ masterAlive' = TRUE
+  \* Reset PEWorker pool state on recovery.
+  /\ availableWorkers' = MaxWorkers
+  /\ suspendedOnMeta' = {}
+  /\ blockedOnMeta' = {}
   \* Durable state unchanged.
   /\ UNCHANGED << metaTable, procStore, rsOnlineRegions, walFenced, zkNode >>
 

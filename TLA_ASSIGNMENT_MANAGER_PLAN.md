@@ -796,43 +796,32 @@ TLC 2r/2s: 3,339,614 distinct, 41s, clean.  Simulation 3r/3s
 
 #### Iteration 18 — Master crash and recovery
 
-Added `masterAlive` (BOOLEAN), `procStore` (durable procedure
+New variables/constants: `masterAlive` (BOOLEAN), `procStore` (durable
 store), `NewProcRecord` constructor, `NoServer`/`NoProcedure`/
 `NoTransition` sentinels (renamed from `None`/`NoneRecord`),
-`UseRestoreSucceedQuirk` and `UseRSOpenDuplicateQuirk` toggles.
-New modules: `ProcStore.tla` (invariants + `RestoreSucceedState`
-operator), `Master.tla` (extracted from `ExternalEvents.tla`:
-`GoOffline`, `MasterDetectCrash`, `MasterCrash`, `MasterRecover`);
-`RSRestart` moved to `RegionServer.tla`; `ExternalEvents.tla` deleted.
-Decomposed `TRSPConfirmOpened`/`TRSPConfirmClosed` into two-phase
-report processing modeling `RegionRemoteProcedureBase`:
+`UseRestoreSucceedQuirk`/`UseRSOpenDuplicateQuirk` toggles.  Module
+restructure: new `ProcStore.tla` (invariants + `RestoreSucceedState`),
+`Master.tla` (extracted `GoOffline`/`MasterDetectCrash`/`MasterCrash`/
+`MasterRecover` from `ExternalEvents.tla`, deleted); `RSRestart` →
+`RegionServer.tla`.
+Two-phase TRSP report processing (models `RegionRemoteProcedureBase`):
 Phase 1 (`TRSPReportSucceedOpen`/`Close`) consumes report, updates
-in-memory state, persists procedure with `transitionCode`;
-Phase 2 (`TRSPPersistToMetaOpen`/`Close`) writes meta.  FAILED_OPEN
-faithfully keeps state as OPENING during Phase 1
-(`regionFailedOpen(giveUp=false)` does not change state).
-`MasterCrash` clears all in-memory state; `MasterRecover` rebuilds
-from `metaTable` + `procStore`, applying `RestoreSucceedState`
-(branches on `transitionCode`, not type) for REPORT_SUCCEED
-procedures.  Invariant adjustments: `LockExclusivity` widened
-(OPEN in ASSIGN, CLOSED in UNASSIGN for REPORT_SUCCEED window);
-`MetaConsistency` relaxed for any active procedure;
-`ProcStepConsistency` allows OPENING at REPORT_SUCCEED;
+in-memory state, persists `transitionCode`; Phase 2
+(`TRSPPersistToMetaOpen`/`Close`) writes meta.  FAILED_OPEN faithfully
+keeps OPENING during Phase 1.
+`MasterCrash` clears all in-memory state; `MasterRecover` rebuilds from
+`metaTable`+`procStore` via `RestoreSucceedState` (branches on
+`transitionCode`, not type).  Invariant adjustments: `LockExclusivity`
+widened for REPORT_SUCCEED window; `MetaConsistency` relaxed for active
+procedures; `ProcStepConsistency` allows OPENING at REPORT_SUCCEED;
 `ProcStoreConsistency` allows CLOSED for MOVE/REOPEN close-phase.
-Added minimal ZK-based server liveness model: new `ZK.tla` module
-with `zkNode[s] ∈ BOOLEAN` variable and `ZKSessionExpire(s)` action.
-ZK is modeled as the ground truth for RS liveness, independent of
-master state.  Correct causal chain: `ZKSessionExpire` (ZK detects
-RS death, deletes ephemeral node) → `MasterDetectCrash` (master
-watcher fires, guards on `zkNode[s]=FALSE`) → SCP.  `RSAbort` now
-guards on `zkNode[s]=FALSE` (RS detects own session expiry) instead
-of `serverState[s]="CRASHED"`.  RS-side actions (`RSOpen`, `RSClose`,
-`RSFailOpen`, `RSOpenDuplicate`) guard on `zkNode[s]=TRUE`.
-`MasterRecover` reads `zkNode` to determine server liveness during
-recovery, replacing the inaccurate `isDead(s)` proxy.  `RSRestart`
-creates a fresh ZK ephemeral node.  `RSMasterAgreement` and
-`RSMasterAgreementConverse` updated to exempt the ZK session expiry
-window (between `ZKSessionExpire` and `MasterDetectCrash`).
+ZK liveness model: new `ZK.tla` with `zkNode[s] ∈ BOOLEAN` and
+`ZKSessionExpire(s)`.  Causal chain: `ZKSessionExpire` → 
+`MasterDetectCrash` (guards `zkNode[s]=FALSE`) → SCP.  `RSAbort`
+guards on `zkNode[s]=FALSE`; RS actions guard `zkNode[s]=TRUE`.
+`MasterRecover` reads `zkNode` for liveness (replaces `isDead`).
+`RSRestart` creates fresh ZK node.  `RSMasterAgreement`/Converse
+exempt ZK-session-expiry→crash-detect window.
 `RestoreSucceedState` FAILED_OPEN location fixed to `NoServer`.
 TLC 2r/2s: 17,430,108 distinct, 63,165,534 generated, 20m26s, clean.
 
@@ -842,107 +831,24 @@ TLC 2r/2s: 17,430,108 distinct, 63,165,534 generated, 20m26s, clean.
 
 #### Iteration 19 — PEWorker pool and meta-blocking semantics
 
-This iteration faithfully models the ProcedureExecutor's finite worker
-thread pool as it exists in the branch-2.6 implementation.  The
-ProcedureExecutor uses a fixed pool of `PEWorker` threads (default 16,
-configurable via `hbase.procedure.worker.count`) to execute all
-procedures.  In branch-2.6, when a procedure performs a synchronous
-write to `hbase:meta` via `RegionStateStore.updateRegionLocation()`, the
-calling PEWorker thread blocks until the RPC completes.  If meta is
-unavailable (e.g., the meta RS has crashed and meta is being
-reassigned), the thread blocks indefinitely.
-
-The model captures this synchronous blocking behavior using a
-counting-semaphore abstraction for the worker pool.  A
-`UseSuspendOnMetaBlock` constant enables comparative analysis against
-the alternative async implementation in branch-3, where procedures
-suspend and release the PEWorker thread when meta is unavailable.
-
-**What to add**:
-
-1. **New constants**:
-   - `MaxWorkers ∈ Nat \ {0}` — PEWorker thread pool size.
-   - `UseSuspendOnMetaBlock ∈ BOOLEAN` — `FALSE` = branch-2.6
-     behavior (synchronous meta writes hold the PEWorker thread),
-     `TRUE` = branch-3 behavior (procedure suspends and releases the
-     PEWorker; re-enqueued when meta becomes available).
-
-2. **New variables**:
-   - `availableWorkers ∈ 0..MaxWorkers` — counting semaphore for
-     idle PEWorker threads.
-   - `blockedOnMeta ⊆ Regions` — regions whose procedures are
-     blocked on a synchronous meta write (holds PEWorker thread).
-   - `suspendedOnMeta ⊆ Regions` — regions whose procedures have
-     yielded and released the PEWorker thread while waiting for meta.
-
-3. **Modified actions** (guard with `availableWorkers > 0`):
-   All TRSP and SCP procedure-step actions acquire a PEWorker at the
-   start and release it at the end.  Since TLA+ steps are atomic,
-   non-blocking actions have a net-zero change on `availableWorkers`
-   (the guard enforces availability, but the step finishes immediately).
-   The interesting case is meta-writing actions when meta is unavailable.
-
-4. **Meta-blocking semantics** (faithful to `RegionStateStore`):
-   - `MetaIsAvailable` predicate: `TRUE` when no server is in
-     `ASSIGN_META` scpState (reuses existing `carryingMeta` / `scpState`).
-   - Modified `TRSPDispatchOpen(r)` and `SCPAssignRegion(s, r)`: when
-     the action attempts a meta write and `¬MetaIsAvailable`:
-     - **Branch-2.6** (`UseSuspendOnMetaBlock = FALSE`): add `r` to
-       `blockedOnMeta`, decrement `availableWorkers`.  The PEWorker is
-       held — faithfully modeling the synchronous
-       `RegionStateStore.updateRegionLocation()` call blocking on an
-       unavailable meta table.
-     - **Branch-3 comparison** (`UseSuspendOnMetaBlock = TRUE`): add
-       `r` to `suspendedOnMeta`.  `availableWorkers` is NOT
-       decremented.  Models the `CompletableFuture`-based async path.
-   - `TRSPResumeFromMeta(r)` / `SCPResumeFromMeta(r)`: when
-     `MetaIsAvailable` becomes `TRUE`, remove `r` from
-     `blockedOnMeta` / `suspendedOnMeta` and allow the procedure to
-     continue.  Branch-2.6: increment `availableWorkers` (worker
-     released).  Branch-3: procedure re-enters the scheduler normally.
-
-5. **New invariant** — `NoPEWorkerDeadlock`:
-   ```tla
-   NoPEWorkerDeadlock ==
-     (availableWorkers = 0 /\ ~MetaIsAvailable)
-       => \E r \in Regions:
-            /\ regionState[r].procType = "ASSIGN"
-            /\ r \notin blockedOnMeta
-            /\ r \notin suspendedOnMeta
-   ```
-   This invariant checks that when all PEWorker threads are consumed
-   and meta is unavailable, at least one free worker remains available
-   to execute the meta assignment procedure.  Any violation represents
-   a worker-pool deadlock in the implementation.
-
-6. **New liveness property** — `MetaEventuallyAssigned`:
-   ```tla
-   MetaEventuallyAssigned ==
-     \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
-   ```
-   Checks that the meta assignment procedure eventually completes
-   despite concurrent procedure load on the PEWorker pool.
-
-**Verify**:
-- `TypeOK` with new variables.
-- All existing invariants hold with `UseSuspendOnMetaBlock = FALSE`
-  (branch-2.6 faithful model).
-- Check `NoPEWorkerDeadlock` and `MetaEventuallyAssigned` with the
-  branch-2.6 configuration.  If violations are found, analyze the
-  counterexample traces — they represent genuine thread-pool exhaustion
-  scenarios in the implementation.
-- Compare results with `UseSuspendOnMetaBlock = TRUE` (branch-3
-  comparison) to understand whether the async suspension path
-  eliminates the deadlock class.
-- TLC primary config: 2r/2s (or 3r/2s), MaxWorkers=2, MaxRetries=1.
-
-**Source**: `ProcedureExecutor.WorkerThread.run()` L1986-2030;
-`TransitRegionStateProcedure.executeFromState()`;
-`RegionStateStore.updateRegionLocation()` L158-240 (synchronous
-`Table.put()` in branch-2.6; async `CompletableFuture` in branch-3).
-For context on known thread-pool exhaustion scenarios: HBASE-24526,
-HBASE-24673.  Branch-3 async path: HBASE-28196, HBASE-28199,
-HBASE-28240.
+New constants (`MaxWorkers`, `UseBlockOnMetaWrite`) in `Types.tla`;
+new variables `availableWorkers` (counting semaphore),
+`suspendedOnMeta`/`blockedOnMeta` (region sets) with `MetaIsAvailable`
+predicate and `peVars` shorthand in `AssignmentManager.tla`; variable
+declarations and `UNCHANGED peVars` in all 7 modules.
+`availableWorkers > 0` guard on all 22 procedure-step actions (17
+TRSP + 5 SCP).  Meta-blocking disjuncts on all 5 meta-writing actions
+(`TRSPPersistToMetaOpen`, `TRSPDispatchOpen`, `TRSPDispatchClose`,
+`TRSPPersistToMetaClose`, `SCPAssignRegion` Paths A/B); `SCPAssignRegion`
+Skip path exempted (no meta write).  `ResumeFromMeta(r)` action wired
+into `Next`/`Fairness` clears `suspendedOnMeta` (async) or
+`blockedOnMeta` (sync).  Bugfix: `SCPAssignRegion` Paths A/B and
+`TRSPServerCrashed` must clear pe-state when resetting procedures.
+`NoPEWorkerDeadlock` invariant passes with `UseBlockOnMetaWrite=FALSE`.
+`MetaEventuallyAssigned` liveness property added; liveness checking
+incompatible with TLC `SYMMETRY`; separate `AssignmentManager-liveness.cfg`
+(no symmetry) provided for overnight runs.
+TLC 2r/2s: 36,896,874 distinct, 130,733,461 generated, 9m22s, clean.
 
 ---
 
