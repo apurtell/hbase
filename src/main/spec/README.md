@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-15 state variables capturing:
+18 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -111,13 +111,19 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **Crash recovery** — multi-step ServerCrashProcedure (detect → assign meta →
   snapshot regions → fence WALs → reassign) and master crash/recovery (volatile
   state lost, durable state replayed).
+- **PEWorker thread pool** — available worker count (`availableWorkers`), async
+  suspension (`suspendedOnMeta`), and sync blocking (`blockedOnMeta`) when
+  `hbase:meta` is unavailable during SCP meta-reassignment.
 
 The specification defines 21 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
-`FencingOrder` (WALs fenced before reassignment), and `NoLostRegions` (no region
-stuck without a procedure after crash recovery). Two action constraints enforce
-transition validity and SCP monotonicity.
+`FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
+stuck without a procedure after crash recovery), and `NoPEWorkerDeadlock`
+(thread pool exhaustion detection). One liveness property
+(`MetaEventuallyAssigned`) verifies that `hbase:meta` is eventually
+reassigned after a crash. Two action constraints enforce transition validity
+and SCP monotonicity.
 
 The model checker runs in three tiers: fast exhaustive verification at 2
 regions / 2 servers, full exhaustive at 3r/3s, and deep random simulation at
@@ -138,16 +144,16 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 
 | Module | Lines | Description |
 |--------|------:|-------------|
-| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1037 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants |
-| [Types.tla](markdown/Types.md) | 213 | Constants, type sets, state definitions, `ValidTransition` |
-| [TRSP.tla](markdown/TRSP.md) | 979 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery) |
-| [SCP.tla](markdown/SCP.md) | 403 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done) |
-| [RegionServer.tla](markdown/RegionServer.md) | 359 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
-| [Master.tla](markdown/Master.md) | 324 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover) |
-| [ProcStore.tla](markdown/ProcStore.md) | 138 | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
-| [ZK.tla](markdown/ZK.md) | 85 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
+| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1125 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants, liveness |
+| [Types.tla](markdown/Types.md) | 238 | Constants, type sets, state definitions, `ValidTransition` |
+| [TRSP.tla](markdown/TRSP.md) | 1182 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
+| [SCP.tla](markdown/SCP.md) | 470 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done, with meta-blocking) |
+| [RegionServer.tla](markdown/RegionServer.md) | 370 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
+| [Master.tla](markdown/Master.md) | 338 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset) |
+| [ProcStore.tla](markdown/ProcStore.md) | 137 | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
+| [ZK.tla](markdown/ZK.md) | 91 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
 
-## State Variables (15 total)
+## State Variables (18 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
 - **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
@@ -164,6 +170,9 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 - **`procStore`** — persisted procedure records (survives master crash)
 - **`masterAlive`** — master JVM liveness
 - **`zkNode`** — ZK ephemeral node liveness per server
+- **`availableWorkers`** — number of idle PEWorker threads
+- **`suspendedOnMeta`** — regions whose procedures are async-suspended on meta unavailability
+- **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
 
 ## Configurable Behaviors
 
@@ -173,6 +182,8 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 | `UseRSOpenDuplicateQuirk` | `TRUE` models `AssignRegionHandler.process()` silent-drop bug (causes deadlock) |
 | `UseRestoreSucceedQuirk` | `TRUE` reproduces `OpenRegionProcedure.restoreSucceedState()` bug where FAILED_OPEN reports replay as OPENED (causes constraint violations) |
 | `MaxRetries` | Maximum open-retry count per procedure |
+| `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
+| `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
 
 ## Verification Configurations
 
@@ -186,25 +197,12 @@ verification pass.
 | Regions | `{r1, r2}` |
 | Servers | `{s1, s2}` |
 | MaxRetries | 1 |
+| MaxWorkers | 2 |
 | UseReopen | TRUE |
 | Symmetry | Yes |
 | Mode | Exhaustive |
 
-### 2. Extended Exhaustive — 3 Regions / 3 Servers ([AssignmentManager-full.cfg](markdown/AssignmentManager-full-cfg.md))
-
-Full exhaustive 3r/3s check. Reserved for ad hoc on-demand verification at
-major checkpoints — the state space is large.
-
-| Parameter | Value |
-|-----------|-------|
-| Regions | `{r1, r2, r3}` |
-| Servers | `{s1, s2, s3}` |
-| MaxRetries | 1 |
-| UseReopen | TRUE |
-| Symmetry | Yes |
-| Mode | Exhaustive |
-
-### 3. Simulation — 3 Regions / 3 Servers ([AssignmentManager-sim.cfg](markdown/AssignmentManager-sim-cfg.md))
+### 2. Simulation — 3 Regions / 3 Servers ([AssignmentManager-sim.cfg](markdown/AssignmentManager-sim-cfg.md))
 
 Deep random-trace simulation at 3r/3s with `MaxRetries = 2`.  Probabilistic
 coverage of the full state space including cascading crashes, master
@@ -230,7 +228,7 @@ the only tier that verifies deeper retry behavior (`MaxRetries = 2`).
 
 ## Invariants
 
-All configurations check the same set of invariants:
+All configurations check the same 21 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -254,6 +252,17 @@ All configurations check the same set of invariants:
 | `ServerRegionsTrackLocation` | `serverRegions` tracks location for stable regions |
 | `DispatchCorrespondance` | Dispatched commands have corresponding procedures |
 | `NoOrphanedProcedures` | OFFLINE procedure-bearing regions are ASSIGN only |
+| `NoPEWorkerDeadlock` | When all PEWorkers are consumed and meta is unavailable, at least one active procedure is not blocked/suspended |
+
+## Liveness Properties
+
+| Property | Description |
+|----------|-------------|
+| `MetaEventuallyAssigned` | When meta becomes unavailable (`ASSIGN_META`), the SCP eventually reassigns it |
+
+> Liveness properties are incompatible with TLC's `SYMMETRY` reduction.
+> Use [`AssignmentManager-liveness.cfg`](markdown/AssignmentManager-liveness-cfg.md)
+> (no symmetry) for sound liveness checking.
 
 ## Action Constraints
 
@@ -268,24 +277,12 @@ All configurations check the same set of invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-04 |
+| **Date** | 2026-03-06 |
 | **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager.cfg` |
 | **Mode** | Exhaustive with symmetry reduction |
-| **Result** | ✅ All invariants and action constraints passed |
-| **States checked** | 17,430,108 |
-
-### 3r/3s Simulation
-
-| Detail | Value |
-|--------|-------|
-| **Date** | 2026-03-04 |
-| **TLC version** | 2026.03.02.213938 |
-| **Config** | `AssignmentManager-sim.cfg` |
-| **Mode** | Simulation |
-| **Duration** | 600 seconds (10 min) |
-| **Result** | ✅ All invariants and action constraints passed |
-| **States checked** | 56,033,075 |
+| **Result** | ✅ All 21 invariants and action constraints passed |
+| **States checked** | 36,896,874 distinct |
 
 ## Running the Spec
 
@@ -294,13 +291,6 @@ All configurations check the same set of invariants:
 ```sh
 java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
-```
-
-### Exhaustive (3r/3s)
-
-```sh
-java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager-full.cfg -workers auto -cleanup
 ```
 
 ### Simulation (3r/3s, configurable duration)
@@ -324,7 +314,9 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (300, 900, 3600
 - WAL fencing to prevent write-side split-brain
 - `hbase:meta` persistence and divergence resolution
 - Procedure store persistence and recovery
+- PEWorker thread pool (worker availability, meta-blocking, async suspension vs sync blocking)
 - Configurable implementation quirks (duplicate open, restore succeed)
+- Configurable meta-write behavior
 
 **Deferred:**
 - Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW, MERGING_NEW)

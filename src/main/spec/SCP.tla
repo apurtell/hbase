@@ -23,7 +23,10 @@ VARIABLE regionState,
          serverRegions,
          procStore,
          masterAlive,
-         zkNode
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -39,6 +42,12 @@ procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
+
+\* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+
+\* MetaIsAvailable is TRUE when no server is in ASSIGN_META scpState.
+MetaIsAvailable == \A t \in Servers: scpState[t] # "ASSIGN_META"
 
 ---------------------------------------------------------------------------
 
@@ -94,6 +103,8 @@ serverVars == << serverState, serverRegions >>
 SCPAssignMeta(s) ==
   \* Master must be alive for SCP to execute.
   /\ masterAlive = TRUE
+  \* A PEWorker thread must be available to execute this SCP step.
+  /\ availableWorkers > 0
   \* SCP is in the meta-recovery sub-path.
   /\ scpState[s] = "ASSIGN_META"
   \* Only servers that were hosting hbase:meta enter this path.
@@ -107,6 +118,7 @@ SCPAssignMeta(s) ==
         procVars,
         rsVars,
         masterVars,
+        peVars,
         regionState,
         metaTable,
         scpRegions,
@@ -141,6 +153,8 @@ SCPAssignMeta(s) ==
 SCPGetRegions(s) ==
   \* Master must be alive for SCP to execute.
   /\ masterAlive = TRUE
+  \* A PEWorker thread must be available to execute this SCP step.
+  /\ availableWorkers > 0
   \* SCP is in GET_REGIONS state for this crashed server.
   /\ scpState[s] = "GET_REGIONS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
@@ -159,6 +173,7 @@ SCPGetRegions(s) ==
         procVars,
         rsVars,
         masterVars,
+        peVars,
         regionState,
         metaTable,
         walFenced,
@@ -179,6 +194,8 @@ SCPGetRegions(s) ==
 SCPFenceWALs(s) ==
   \* Master must be alive for SCP to execute.
   /\ masterAlive = TRUE
+  \* A PEWorker thread must be available to execute this SCP step.
+  /\ availableWorkers > 0
   \* SCP is in FENCE_WALS state for this crashed server.
   /\ scpState[s] = "FENCE_WALS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
@@ -193,6 +210,7 @@ SCPFenceWALs(s) ==
         procVars,
         rsVars,
         masterVars,
+        peVars,
         regionState,
         metaTable,
         scpRegions,
@@ -221,10 +239,10 @@ SCPFenceWALs(s) ==
 SCPAssignRegion(s, r) ==
   \* Master must be alive for SCP to execute.
   /\ masterAlive = TRUE
+  \* A PEWorker thread must be available to execute this SCP step.
+  /\ availableWorkers > 0
   \* SCP is in ASSIGN state for this crashed server.
   /\ scpState[s] = "ASSIGN"
-  \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
-  /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   \* Region is in this SCP's snapshot (collected at GET_REGIONS).
   /\ r \in scpRegions[s]
   \* WAL leases for the crashed server must already be revoked
@@ -251,9 +269,43 @@ SCPAssignRegion(s, r) ==
               scpState,
               walFenced,
               carryingMeta,
+              peVars,
+              zkNode
+           >>
+     \/ \* --- Meta unavailable: suspend or block ---
+        \* Paths A/B write to meta; if meta is unavailable,
+        \* suspend (async) or block (sync) the procedure.
+        /\ regionState[r].location = s
+        /\ ~MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ IF UseBlockOnMetaWrite = FALSE
+           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                /\ availableWorkers' = availableWorkers - 1
+                /\ UNCHANGED suspendedOnMeta
+        /\ UNCHANGED << regionState,
+              metaTable,
+              dispatchedOps,
+              pendingReports,
+              rsOnlineRegions,
+              serverState,
+              scpState,
+              scpRegions,
+              walFenced,
+              locked,
+              carryingMeta,
+              serverRegions,
+              procStore,
+              masterVars,
               zkNode
            >>
      \/ \* --- Path A: TRSP already attached ---
+        \* Meta must be available for Path A (writes to meta).
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
         \* Location matches; procedure exists.
         \* Transition region to ABNORMALLY_CLOSED and atomically
         \* convert the existing TRSP to ASSIGN/GET_ASSIGN_CANDIDATE.
@@ -298,10 +350,12 @@ SCPAssignRegion(s, r) ==
              NoServer,
              ![r].retries =
              0]
+        \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
         /\ metaTable' =
              [metaTable EXCEPT
              ![r] =
              [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
+        \* Remove r from the SCP snapshot (processed).
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Update persisted procedure: convert to ASSIGN.
         /\ procStore' =
@@ -320,7 +374,22 @@ SCPAssignRegion(s, r) ==
               carryingMeta,
               zkNode
            >>
+        \* Clear r from suspended/blocked sets if it was waiting on meta.
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        \* Clear r from blocked set if it was blocked on meta.
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        \* Recover the PEWorker thread if r was blocking one.
+        /\ availableWorkers' =
+             IF r \in blockedOnMeta
+             THEN availableWorkers + 1
+             ELSE availableWorkers
      \/ \* --- Path B: No TRSP attached ---
+        \* Meta must be available for Path B (writes to meta).
+        /\ MetaIsAvailable
+        \* Region is not suspended waiting for meta.
+        /\ r \notin suspendedOnMeta
+        \* Region is not blocking a PEWorker on meta.
+        /\ r \notin blockedOnMeta
         \* Location matches; no procedure.
         \* Transition to ABNORMALLY_CLOSED and attach a fresh
         \* ASSIGN procedure at GET_ASSIGN_CANDIDATE.
@@ -331,6 +400,7 @@ SCPAssignRegion(s, r) ==
         \* Drop stale OPENED reports for r.
         /\ pendingReports' =
              {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
+        \* Mark ABNORMALLY_CLOSED, clear location, attach fresh ASSIGN procedure.
         /\ regionState' =
              [regionState EXCEPT
              ![r].state =
@@ -345,10 +415,12 @@ SCPAssignRegion(s, r) ==
              NoServer,
              ![r].retries =
              0]
+        \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
         /\ metaTable' =
              [metaTable EXCEPT
              ![r] =
              [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
+        \* Remove r from the SCP snapshot (processed).
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Insert a fresh ASSIGN procedure into the store.
         /\ procStore' =
@@ -368,6 +440,13 @@ SCPAssignRegion(s, r) ==
               carryingMeta,
               zkNode
            >>
+        \* Clear r from suspended/blocked sets if it was waiting on meta.
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        /\ availableWorkers' =
+             IF r \in blockedOnMeta
+             THEN availableWorkers + 1
+             ELSE availableWorkers
 
 \* SCP step 4: All regions processed.  Mark SCP as complete.
 \*
@@ -380,6 +459,8 @@ SCPAssignRegion(s, r) ==
 SCPDone(s) ==
   \* Master must be alive for SCP to execute.
   /\ masterAlive = TRUE
+  \* A PEWorker thread must be available to execute this SCP step.
+  /\ availableWorkers > 0
   \* SCP is in ASSIGN state and all regions have been processed.
   /\ scpState[s] = "ASSIGN"
   /\ scpRegions[s] = {}
@@ -391,6 +472,7 @@ SCPDone(s) ==
         procVars,
         rsVars,
         masterVars,
+        peVars,
         regionState,
         metaTable,
         scpRegions,
