@@ -18,7 +18,7 @@ EXTENDS Types
 ```tla
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
-         walFenced, locked, carryingMeta, serverRegions,
+         walFenced, carryingMeta, serverRegions,
          procStore, masterAlive, zkNode,
          availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
@@ -29,7 +29,7 @@ VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
 rpcVars    == << dispatchedOps, pendingReports >>
 rsVars     == << rsOnlineRegions >>
 masterVars == << masterAlive >>
-procVars   == << procStore, locked >>
+procStore   == << procStore >>
 serverVars == << serverState, serverRegions >>
 peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
@@ -80,7 +80,7 @@ SCPAssignMeta(s) ==
   /\ carryingMeta[s] = TRUE
   /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
-  /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
+  /\ UNCHANGED << rpcVars, serverVars, procStore, rsVars,
                    masterVars, peVars, regionState, metaTable,
                    scpRegions, walFenced, zkNode >>
 ```
@@ -109,7 +109,7 @@ SCPGetRegions(s) ==
   \* Snapshot from ServerStateNode tracking (NOT regionState.location).
   /\ scpRegions' = [scpRegions EXCEPT ![s] = serverRegions[s]]
   /\ scpState' = [scpState EXCEPT ![s] = "FENCE_WALS"]
-  /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
+  /\ UNCHANGED << rpcVars, serverVars, procStore, rsVars,
                    masterVars, peVars, regionState, metaTable,
                    walFenced, carryingMeta, zkNode >>
 ```
@@ -134,7 +134,7 @@ SCPFenceWALs(s) ==
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
   /\ walFenced' = [walFenced EXCEPT ![s] = TRUE]
   /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN"]
-  /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
+  /\ UNCHANGED << rpcVars, serverVars, procStore, rsVars,
                    masterVars, peVars, regionState, metaTable,
                    scpRegions, carryingMeta, zkNode >>
 ```
@@ -176,11 +176,10 @@ SCPAssignRegion(s, r) ==
   /\ scpState[s] = "ASSIGN"
   /\ r \in scpRegions[s]
   /\ walFenced[s] = TRUE
-  /\ locked[r] = FALSE
   /\ \/ \* --- Skip: isMatchingRegionLocation fails ---
         /\ regionState[r].location # s
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
-        /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
+        /\ UNCHANGED << rpcVars, serverVars, procStore, rsVars,
                          masterVars, regionState, metaTable,
                          scpState, walFenced, carryingMeta,
                          peVars, zkNode >>
@@ -197,7 +196,7 @@ SCPAssignRegion(s, r) ==
                 /\ UNCHANGED suspendedOnMeta
         /\ UNCHANGED << regionState, metaTable, dispatchedOps,
               pendingReports, rsOnlineRegions, serverState,
-              scpState, scpRegions, walFenced, locked,
+              scpState, scpRegions, walFenced,
               carryingMeta, serverRegions, procStore,
               masterVars, zkNode >>
      \/ \* --- Path A: TRSP already attached ---
@@ -228,7 +227,7 @@ SCPAssignRegion(s, r) ==
              NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
         /\ UNCHANGED << masterVars, serverState, scpState,
-              walFenced, locked, carryingMeta, zkNode >>
+              walFenced, carryingMeta, zkNode >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
         /\ suspendedOnMeta' = suspendedOnMeta \ { r }
         /\ blockedOnMeta' = blockedOnMeta \ { r }
@@ -263,7 +262,7 @@ SCPAssignRegion(s, r) ==
              NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
         /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
         /\ UNCHANGED << masterVars, dispatchedOps, serverState,
-              scpState, walFenced, locked, carryingMeta, zkNode >>
+              scpState, walFenced, carryingMeta, zkNode >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
         /\ suspendedOnMeta' = suspendedOnMeta \ { r }
         /\ blockedOnMeta' = blockedOnMeta \ { r }
@@ -292,7 +291,7 @@ SCPDone(s) ==
   /\ scpState[s] = "ASSIGN"
   /\ scpRegions[s] = {}
   /\ scpState' = [scpState EXCEPT ![s] = "DONE"]
-  /\ UNCHANGED << rpcVars, serverVars, procVars, rsVars,
+  /\ UNCHANGED << rpcVars, serverVars, procStore, rsVars,
                    masterVars, peVars, regionState, metaTable,
                    scpRegions, walFenced, carryingMeta, zkNode >>
 ```

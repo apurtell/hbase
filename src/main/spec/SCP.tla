@@ -18,7 +18,6 @@ VARIABLE regionState,
          scpState,
          scpRegions,
          walFenced,
-         locked,
          carryingMeta,
          serverRegions,
          procStore,
@@ -36,9 +35,6 @@ rsVars == << rsOnlineRegions >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
-
-\* Shorthand for procedure/lock variables (used in UNCHANGED clauses).
-procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
@@ -115,7 +111,7 @@ SCPAssignMeta(s) ==
   /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
   /\ UNCHANGED << rpcVars,
         serverVars,
-        procVars,
+        procStore,
         rsVars,
         masterVars,
         peVars,
@@ -170,7 +166,7 @@ SCPGetRegions(s) ==
   \* Region state, meta, RPCs, RS-side state, and WAL fencing unchanged.
   /\ UNCHANGED << rpcVars,
         serverVars,
-        procVars,
+        procStore,
         rsVars,
         masterVars,
         peVars,
@@ -207,7 +203,7 @@ SCPFenceWALs(s) ==
   \* Region state, meta, RPCs, RS-side state, and region snapshot unchanged.
   /\ UNCHANGED << rpcVars,
         serverVars,
-        procVars,
+        procStore,
         rsVars,
         masterVars,
         peVars,
@@ -248,9 +244,6 @@ SCPAssignRegion(s, r) ==
   \* WAL leases for the crashed server must already be revoked
   \* before reassigning any of its regions.
   /\ walFenced[s] = TRUE
-  \* Region must not be locked by an in-progress procedure step
-  \* (e.g., a concurrent meta write).
-  /\ locked[r] = FALSE
   /\ \/ \* --- Skip: isMatchingRegionLocation fails ---
         \* Between SCPGetRegions and now, a concurrent TRSP may have moved
         \* this region to another server.  The implementation skips such
@@ -261,7 +254,7 @@ SCPAssignRegion(s, r) ==
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         /\ UNCHANGED << rpcVars,
               serverVars,
-              procVars,
+              procStore,
               rsVars,
               masterVars,
               regionState,
@@ -294,7 +287,6 @@ SCPAssignRegion(s, r) ==
               scpState,
               scpRegions,
               walFenced,
-              locked,
               carryingMeta,
               serverRegions,
               procStore,
@@ -370,7 +362,6 @@ SCPAssignRegion(s, r) ==
               serverState,
               scpState,
               walFenced,
-              locked,
               carryingMeta,
               zkNode
            >>
@@ -436,7 +427,6 @@ SCPAssignRegion(s, r) ==
               serverState,
               scpState,
               walFenced,
-              locked,
               carryingMeta,
               zkNode
            >>
@@ -469,7 +459,7 @@ SCPDone(s) ==
   \* All other state unchanged — region reassignments already applied.
   /\ UNCHANGED << rpcVars,
         serverVars,
-        procVars,
+        procStore,
         rsVars,
         masterVars,
         peVars,

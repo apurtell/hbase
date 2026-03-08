@@ -53,7 +53,6 @@ VARIABLE regionState,
          scpState,
          scpRegions,
          walFenced,
-         locked,
          carryingMeta,
          serverRegions,
          procStore,
@@ -76,9 +75,6 @@ scpVars == << scpState, scpRegions, walFenced, carryingMeta, zkNode >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
-
-\* Shorthand for procedure/lock variables (used in UNCHANGED clauses).
-procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
@@ -121,8 +117,6 @@ TRSPCreate(r) ==
   \* crashed regions during the SCP assign loop.
   /\ \/ regionState[r].state # "ABNORMALLY_CLOSED"
      \/ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Initialize embedded ASSIGN procedure at GET_ASSIGN_CANDIDATE step.
   /\ regionState' =
        [regionState EXCEPT
@@ -146,8 +140,7 @@ TRSPCreate(r) ==
         rsVars,
         masterVars,
         peVars,
-        metaTable,
-        locked
+        metaTable
      >>
 
 \* Choose a target server for the ASSIGN, MOVE, or REOPEN procedure.
@@ -189,8 +182,6 @@ TRSPGetCandidate(r, s) ==
   \* Zombie window must be closed: no CRASHED server still holds r.
   /\ \A sZombie \in Servers:
        serverState[sZombie] = "CRASHED" => r \notin rsOnlineRegions[sZombie]
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Record the chosen server and advance the procedure to the OPEN step.
   /\ regionState' =
        [regionState EXCEPT ![r].targetServer = s, ![r].procStep = "OPEN"]
@@ -203,8 +194,7 @@ TRSPGetCandidate(r, s) ==
         rsVars,
         masterVars,
         peVars,
-        metaTable,
-        locked
+        metaTable
      >>
 
 \* Dispatch the open command to the target server via RPC.
@@ -231,8 +221,6 @@ TRSPDispatchOpen(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   /\ \/ \* --- Meta unavailable: suspend or block ---
         /\ ~MetaIsAvailable
         \* Region is not already suspended waiting for meta.
@@ -256,8 +244,7 @@ TRSPDispatchOpen(r) ==
               masterVars,
               regionState,
               metaTable,
-              procStore,
-              locked
+              procStore
            >>
      \/ \* --- Meta available: dispatch open ---
         /\ MetaIsAvailable
@@ -297,8 +284,7 @@ TRSPDispatchOpen(r) ==
                     masterVars,
                     peVars,
                     pendingReports,
-                    serverState,
-                    locked
+                    serverState
                  >>
 
 
@@ -331,8 +317,6 @@ TRSPReportSucceedOpen(r) ==
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   \* Region must be in OPENING state (dispatch already happened).
   /\ regionState[r].state = "OPENING"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* A matching report exists for this region.
   /\ \E rpt \in pendingReports:
        \* Report must be for region r.
@@ -382,8 +366,7 @@ TRSPReportSucceedOpen(r) ==
              peVars,
              metaTable,
              dispatchedOps,
-             serverState,
-             locked
+             serverState
           >>
 
 \* --- Persist-to-meta for OPEN path ---
@@ -410,8 +393,6 @@ TRSPPersistToMetaOpen(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be at the report-succeed (persist-to-meta) step.
   /\ regionState[r].procStep = "REPORT_SUCCEED"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Bind the transition code from the persisted procedure record.
   /\ LET tc == procStore[r].transitionCode
      IN \/ \* --- Meta unavailable: suspend or block ---
@@ -446,8 +427,7 @@ TRSPPersistToMetaOpen(r) ==
                  masterVars,
                  regionState,
                  metaTable,
-                 procStore,
-                 locked
+                 procStore
               >>
         \/ \* --- OPENED branch ---
            \* Meta must be available to persist the state.
@@ -483,8 +463,7 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
-                 peVars,
-                 locked
+                 peVars
               >>
         \/ \* --- FAILED_OPEN, retry branch ---
            \* Meta must be available to persist the state.
@@ -524,8 +503,7 @@ TRSPPersistToMetaOpen(r) ==
                  masterVars,
                  peVars,
                  metaTable,
-                 pendingReports,
-                 locked
+                 pendingReports
               >>
         \/ \* --- FAILED_OPEN, give-up branch ---
            \* Meta must be available to persist the state.
@@ -561,12 +539,10 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
-                 peVars,
-                 locked
+                 peVars
               >>
 
 ---------------------------------------------------------------------------
-
 
 (* Actions -- failure path *)
 \* Open command dispatch failed (non-deterministic RPC failure).
@@ -601,8 +577,6 @@ DispatchFail(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the open confirmation.
   /\ regionState[r].procStep = "CONFIRM_OPENED"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Bind the target server; it must have been set by TRSPGetCandidate.
   /\ LET s == regionState[r].targetServer
      IN /\ s # NoServer
@@ -624,7 +598,7 @@ DispatchFail(r) ==
         \* META, pending reports, RS-side state, and server liveness unchanged.
         /\ UNCHANGED << scpVars,
               serverVars,
-              procVars,
+              procStore,
               rsVars,
               masterVars,
               peVars,
@@ -660,8 +634,6 @@ DispatchFailClose(r) ==
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the close confirmation.
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Bind the target server; it must have been set by TRSPGetCandidate.
   /\ LET s == regionState[r].targetServer
      IN /\ s # NoServer
@@ -677,7 +649,7 @@ DispatchFailClose(r) ==
         \* META, pending reports, RS-side state, and server liveness unchanged.
         /\ UNCHANGED << scpVars,
               serverVars,
-              procVars,
+              procStore,
               rsVars,
               masterVars,
               peVars,
@@ -686,7 +658,6 @@ DispatchFailClose(r) ==
            >>
 
 ---------------------------------------------------------------------------
-
 
 (* Actions -- TRSP UNASSIGN path *)
 \* Create a TRSP UNASSIGN procedure for an OPEN region.
@@ -713,8 +684,6 @@ TRSPCreateUnassign(r) ==
   /\ regionState[r].location # NoServer
   \* No procedure is currently attached to this region.
   /\ regionState[r].procType = "NONE"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Initialize embedded UNASSIGN procedure at CLOSE step, targeting current server.
   /\ regionState' =
        [regionState EXCEPT
@@ -738,8 +707,7 @@ TRSPCreateUnassign(r) ==
         rsVars,
         masterVars,
         peVars,
-        metaTable,
-        locked
+        metaTable
      >>
 
 \* Create a TRSP MOVE procedure for an OPEN region.
@@ -774,8 +742,6 @@ TRSPCreateMove(r) ==
   /\ regionState[r].procType = "NONE"
   \* At least one other ONLINE server must exist as a move destination.
   /\ \E s \in Servers: s # regionState[r].location /\ serverState[s] = "ONLINE"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Initialize embedded MOVE procedure at CLOSE step, targeting current server.
   /\ regionState' =
        [regionState EXCEPT
@@ -799,8 +765,7 @@ TRSPCreateMove(r) ==
         rsVars,
         masterVars,
         peVars,
-        metaTable,
-        locked
+        metaTable
      >>
 
 \* Create a TRSP REOPEN procedure for an OPEN region.
@@ -832,8 +797,6 @@ TRSPCreateReopen(r) ==
   /\ regionState[r].location # NoServer
   \* No procedure is currently attached to this region.
   /\ regionState[r].procType = "NONE"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Initialize embedded REOPEN procedure at CLOSE step, targeting the
   \* region's current server (assignCandidate pinning).
   /\ regionState' =
@@ -858,8 +821,7 @@ TRSPCreateReopen(r) ==
         rsVars,
         masterVars,
         peVars,
-        metaTable,
-        locked
+        metaTable
      >>
 
 \* Dispatch the close command to the target server via RPC.
@@ -887,8 +849,6 @@ TRSPDispatchClose(r) ==
   /\ regionState[r].procStep = "CLOSE"
   \* A target server must be set for the close dispatch.
   /\ regionState[r].targetServer # NoServer
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   /\ \/ \* --- Meta unavailable: suspend or block ---
         /\ ~MetaIsAvailable
         \* Region is not already suspended waiting for meta.
@@ -911,8 +871,7 @@ TRSPDispatchClose(r) ==
               masterVars,
               regionState,
               metaTable,
-              procStore,
-              locked
+              procStore
            >>
      \/ \* --- Meta available: dispatch close ---
         /\ MetaIsAvailable
@@ -945,8 +904,7 @@ TRSPDispatchClose(r) ==
                     rsVars,
                     masterVars,
                     peVars,
-                    pendingReports,
-                    locked
+                    pendingReports
                  >>
 
 
@@ -972,8 +930,6 @@ TRSPReportSucceedClose(r) ==
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
   \* Region must be in CLOSING state (dispatch already happened).
   /\ regionState[r].state = "CLOSING"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* A matching CLOSED report exists for this region.
   /\ \E rpt \in pendingReports:
        \* Report must be for region r.
@@ -1017,8 +973,7 @@ TRSPReportSucceedClose(r) ==
              masterVars,
              metaTable,
              dispatchedOps,
-             serverState,
-             locked
+             serverState
           >>
 
 \* --- Persist-to-meta for CLOSE path ---
@@ -1041,8 +996,6 @@ TRSPPersistToMetaClose(r) ==
   /\ regionState[r].procStep = "REPORT_SUCCEED"
   \* Transition code must be CLOSED.
   /\ procStore[r].transitionCode = "CLOSED"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   /\ \/ \* --- Meta unavailable: suspend or block ---
         /\ ~MetaIsAvailable
         \* Region is not already suspended waiting for meta.
@@ -1065,8 +1018,7 @@ TRSPPersistToMetaClose(r) ==
               masterVars,
               regionState,
               metaTable,
-              procStore,
-              locked
+              procStore
            >>
      \/ \* --- Meta available: persist close to meta ---
         /\ MetaIsAvailable
@@ -1111,8 +1063,7 @@ TRSPPersistToMetaClose(r) ==
               serverVars,
               rsVars,
               masterVars,
-              peVars,
-              locked
+              peVars
            >>
 
 \* --- Path 2: Crash during close (ABNORMALLY_CLOSED) ---
@@ -1136,8 +1087,6 @@ TRSPConfirmClosedCrash(r) ==
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the close confirmation.
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* Region was marked ABNORMALLY_CLOSED by SCP (server crashed).
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
   \* Convert procedure to ASSIGN at GET_ASSIGN_CANDIDATE for reassignment.
@@ -1172,8 +1121,7 @@ TRSPConfirmClosedCrash(r) ==
         peVars,
         metaTable,
         pendingReports,
-        serverState,
-        locked
+        serverState
      >>
 
 ---------------------------------------------------------------------------
@@ -1220,8 +1168,6 @@ TRSPServerCrashed(r) ==
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
   \* Procedure must not already be at GET_ASSIGN_CANDIDATE (already converted).
   /\ regionState[r].procStep # "GET_ASSIGN_CANDIDATE"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   \* ABNORMALLY_CLOSED is only set by SCP (AM.regionClosedAbnormally()),
   \* so at least one SCP must have reached the ASSIGN phase.
   /\ \E s \in Servers: scpState[s] \in { "ASSIGN", "DONE" }
@@ -1255,7 +1201,7 @@ TRSPServerCrashed(r) ==
        [procStore EXCEPT
        ![r] =
        NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
-  /\ UNCHANGED << scpVars, serverVars, rsVars, masterVars, metaTable, locked >>
+  /\ UNCHANGED << scpVars, serverVars, rsVars, masterVars, metaTable >>
   \* Clear r from suspended/blocked sets if it was waiting on meta.
   /\ suspendedOnMeta' = suspendedOnMeta \ { r }
   /\ blockedOnMeta' = blockedOnMeta \ { r }
@@ -1303,8 +1249,7 @@ ResumeFromMeta(r) ==
         masterVars,
         regionState,
         metaTable,
-        procStore,
-        locked
+        procStore
      >>
 
 ============================================================================

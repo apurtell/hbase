@@ -23,7 +23,7 @@ EXTENDS Types
 ```tla
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
-         walFenced, locked, carryingMeta, serverRegions,
+         walFenced, carryingMeta, serverRegions,
          procStore, masterAlive, zkNode,
          availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
@@ -37,7 +37,7 @@ rpcVars    == << dispatchedOps, pendingReports >>
 rsVars     == << rsOnlineRegions >>
 scpVars    == << scpState, scpRegions, walFenced, carryingMeta >>
 masterVars == << masterAlive >>
-procVars   == << procStore, locked >>
+procStore   == << procStore >>
 serverVars == << serverState, serverRegions >>
 peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
@@ -64,7 +64,7 @@ GoOffline(r) ==
   /\ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
   /\ regionState' =
        [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
-  /\ UNCHANGED << scpVars, rpcVars, serverVars, procVars,
+  /\ UNCHANGED << scpVars, rpcVars, serverVars, procStore,
                    rsVars, masterVars, metaTable, peVars, zkNode >>
 ```
 
@@ -96,7 +96,7 @@ MasterDetectCrash(s) ==
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ UNCHANGED << rpcVars,
         peVars,
-        procVars, rsVars, masterVars,
+        procStore, rsVars, masterVars,
         regionState, metaTable, scpRegions,
         walFenced, serverRegions, zkNode >>
 ```
@@ -109,7 +109,7 @@ MasterDetectCrash(s) ==
 
 The active master JVM crashes. All in-memory state is lost. Durable state (`metaTable`, `procStore`) and RS-side state (`rsOnlineRegions`) survive. WAL fencing (`walFenced`) survives because fencing is an HDFS-level operation, not master-level.
 
-In-memory variables (`regionState`, `serverState`, `dispatchedOps`, `pendingReports`, `scpState`, `scpRegions`, `locked`, `serverRegions`, `carryingMeta`) become stale but are left `UNCHANGED` because:
+In-memory variables (`regionState`, `serverState`, `dispatchedOps`, `pendingReports`, `scpState`, `scpRegions`, `serverRegions`, `carryingMeta`) become stale but are left `UNCHANGED` because:
 
 1. All invariants referencing them are gated on `masterAlive = TRUE`.
 2. All actions using them require `masterAlive = TRUE` as a guard.
@@ -130,7 +130,7 @@ MasterCrash ==
   /\ masterAlive' = FALSE
   /\ UNCHANGED << regionState, serverState, dispatchedOps,
                    pendingReports, scpState, scpRegions,
-                   locked, serverRegions, carryingMeta,
+                   serverRegions, carryingMeta,
                    availableWorkers, suspendedOnMeta, blockedOnMeta >>
   /\ UNCHANGED << metaTable, procStore >>
   /\ UNCHANGED rsOnlineRegions
@@ -229,7 +229,7 @@ Read ZK ephemeral nodes to determine server liveness. On startup the master conn
   /\ carryingMeta' = [s \in Servers |-> FALSE]
   /\ dispatchedOps' = [s \in Servers |-> {}]
   /\ pendingReports' = {}
-  /\ locked' = [r \in Regions |-> FALSE]
+
   /\ serverRegions' =
        [s \in Servers |->
          {r \in Regions:
