@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-18 state variables capturing:
+17 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -125,11 +125,11 @@ stuck without a procedure after crash recovery), and `NoPEWorkerDeadlock`
 reassigned after a crash. Two action constraints enforce transition validity
 and SCP monotonicity.
 
-The model checker runs in three tiers: fast exhaustive verification at 2
-regions / 2 servers, full exhaustive at 3r/3s, and deep random simulation at
-3r/3s with extended retries. Configurable "quirk" flags allow toggling known
-implementation bugs to correctly adhere to implementation semantics, reproduce
-failures and validate fixes.
+The model checker runs in two tiers: fast exhaustive verification at 2
+regions / 2 servers, and deep random simulation at 3r/3s with extended
+retries. Configurable "quirk" flags allow toggling known implementation bugs
+to correctly adhere to implementation semantics, reproduce failures and
+validate fixes.
 
 ---
 
@@ -144,16 +144,16 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 
 | Module | Lines | Description |
 |--------|------:|-------------|
-| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1125 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants, liveness |
-| [Types.tla](markdown/Types.md) | 238 | Constants, type sets, state definitions, `ValidTransition` |
-| [TRSP.tla](markdown/TRSP.md) | 1182 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
-| [SCP.tla](markdown/SCP.md) | 470 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done, with meta-blocking) |
-| [RegionServer.tla](markdown/RegionServer.md) | 370 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
-| [Master.tla](markdown/Master.md) | 338 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset) |
+| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1110 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants, liveness |
+| [Types.tla](markdown/Types.md) | 236 | Constants, type sets, state definitions, `ValidTransition` |
+| [TRSP.tla](markdown/TRSP.md) | 1255 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
+| [SCP.tla](markdown/SCP.md) | 474 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done, with meta-blocking) |
+| [RegionServer.tla](markdown/RegionServer.md) | 391 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
+| [Master.tla](markdown/Master.md) | 342 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset) |
 | [ProcStore.tla](markdown/ProcStore.md) | 137 | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
-| [ZK.tla](markdown/ZK.md) | 91 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
+| [ZK.tla](markdown/ZK.md) | 89 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
 
-## State Variables (18 total)
+## State Variables (17 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
 - **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
@@ -164,7 +164,6 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 - **`scpState`** — ServerCrashProcedure progress per server
 - **`scpRegions`** — SCP region snapshot per server
 - **`walFenced`** — WAL lease revocation state per server
-- **`locked`** — per-region write lock
 - **`carryingMeta`** — whether a crashed server was hosting `hbase:meta`
 - **`serverRegions`** — per-server region tracking (ServerStateNode)
 - **`procStore`** — persisted procedure records (survives master crash)
@@ -198,7 +197,7 @@ verification pass.
 | Servers | `{s1, s2}` |
 | MaxRetries | 1 |
 | MaxWorkers | 2 |
-| UseReopen | TRUE |
+| UseReopen | FALSE |
 | Symmetry | Yes |
 | Mode | Exhaustive |
 
@@ -237,7 +236,7 @@ All configurations check the same 21 safety invariants:
 | `OfflineImpliesNoLocation` | Offline-like regions have no location |
 | `NoDoubleAssignment` | Region writable on at most one server (WAL-fencing–aware) |
 | `MetaConsistency` | `hbase:meta` matches in-memory state (with allowed divergences) |
-| `LockExclusivity` | Procedure type correlates with valid region states |
+| `LockExclusivity` | Procedure type correlates with valid region lifecycle states |
 | `RSMasterAgreement` | Stably OPEN region is online on its RS |
 | `RSMasterAgreementConverse` | RS-online region is acknowledged by master |
 | `FencingOrder` | SCP does not reassign until WAL leases are revoked |
@@ -277,12 +276,12 @@ All configurations check the same 21 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-06 |
+| **Date** | 2026-03-07 |
 | **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager.cfg` |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Result** | ✅ All 21 invariants and action constraints passed |
-| **States checked** | 36,896,874 distinct |
+| **States checked** | 12,412,690 distinct |
 
 ## Running the Spec
 

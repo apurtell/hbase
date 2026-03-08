@@ -20,7 +20,6 @@ VARIABLE regionState,
          scpState,
          scpRegions,
          walFenced,
-         locked,
          carryingMeta,
          serverRegions,
          procStore,
@@ -40,7 +39,6 @@ scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
 masterVars == << masterAlive >>
 
 \* Shorthand for procedure/lock variables (used in UNCHANGED clauses).
-procVars == << procStore, locked >>
 
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
@@ -80,7 +78,7 @@ RSAbort(s) ==
   \* Master-side state, meta, reports, and SCP state are unaffected.
   /\ UNCHANGED << scpVars,
         serverVars,
-        procVars,
+        procStore,
         masterVars,
         regionState,
         metaTable,
@@ -117,7 +115,7 @@ DropStaleReport ==
     /\ UNCHANGED << scpVars,
           peVars,
           serverVars,
-          procVars,
+          procStore,
           rsVars,
           masterVars,
           regionState,
@@ -179,7 +177,7 @@ RSOpen(s, r) ==
        /\ UNCHANGED << scpVars,
              peVars,
              serverVars,
-             procVars,
+             procStore,
              masterVars,
              regionState,
              metaTable,
@@ -219,7 +217,7 @@ RSFailOpen(s, r) ==
        /\ UNCHANGED << scpVars,
              peVars,
              serverVars,
-             procVars,
+             procStore,
              rsVars,
              masterVars,
              regionState,
@@ -267,7 +265,7 @@ RSClose(s, r) ==
        /\ UNCHANGED << scpVars,
              peVars,
              serverVars,
-             procVars,
+             procStore,
              masterVars,
              regionState,
              metaTable,
@@ -317,7 +315,7 @@ RSOpenDuplicate(s, r) ==
        /\ UNCHANGED << scpVars,
              serverVars,
              peVars,
-             procVars,
+             procStore,
              rsVars,
              masterVars,
              regionState,
@@ -388,6 +386,6 @@ RSRestart(s) ==
   \* Source: HRegionServer.run() -> createMyEphemeralNode().
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
   \* Region state and META unchanged.
-  /\ UNCHANGED << procVars, masterVars, peVars, regionState, metaTable >>
+  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable >>
 
 ============================================================================

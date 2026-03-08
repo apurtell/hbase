@@ -781,34 +781,19 @@ Added guard `∀ s ∈ Servers: scpState[s] ∈ {"NONE", "DONE"}` to
 guards on `masterAlive = TRUE`.
 TLC 2r/2s: 25,959,400 distinct, 90,478,387 generated, 6m08s, clean.
 
-#### Iteration 19.5 — State space reduction
+#### Iteration 19.5 — State space reduction ✅ COMPLETE
 
-Two changes to reduce the state space before Phase 7 adds split/merge
-complexity.
-
-1. **Remove `locked` variable.** The per-region write lock `locked[r]`
-   is acquired and released within every atomic TLA+ action — it is
-   always `FALSE` at rest. The guard `locked[r] = FALSE` never prunes
-   any behavior because TLC only observes inter-step states. The mutual
-   exclusion property that `locked` documents is already enforced by
-   `procType ≠ NONE` guards on every region-mutating action, matching
-   the implementation where `RegionStateNode.setProcedure()` is the
-   true serialization mechanism.
-   - Remove `locked` from `vars`, `TypeOK`, `Init`, and all `UNCHANGED`
-     clauses across all 7 modules.
-   - Remove `locked[r] = FALSE` guards from all 15 guarded actions.
-   - Reduces variable tuple width from 18 to 17.
-2. **Default `UseReopen` to `FALSE`.** The `REOPEN` proc type follows
-   the same TRSP state machine as `MOVE` (close-then-open with pinned
-   assignCandidate). It does not interact with split/merge child TRSPs
-   (which are always ASSIGN or UNASSIGN). Defaulting to `FALSE` in the
-   primary 2r/2s config eliminates REOPEN-related state space while
-   retaining it for simulation runs via `UseReopen = TRUE`.
-   - Update `AssignmentManager.cfg` to set `UseReopen = FALSE`.
-   - No spec changes needed — `UseReopen` is already a constant toggle.
-
-**Verify**: All existing invariants pass. TLC state count should
-decrease significantly from the Iter 19 baseline (25.9M distinct).
+Removed `locked` variable (per-region write lock always `FALSE` at rest;
+`locked[r] = FALSE` guard never prunes TLC behavior since lock is
+acquired+released within each atomic step; mutual exclusion already
+enforced by `procType ≠ NONE` guards matching `RegionStateNode.setProcedure()`).
+Removed from `vars`, `TypeOK`, `Init`, `UNCHANGED` clauses across all 7
+modules; removed `locked[r] = FALSE` guards from 16 actions (15 TRSP +
+1 SCP); eliminated `procVars` shorthand (replaced with direct `procStore`
+references). Variable tuple width 18 → 17. Defaulted `UseReopen = FALSE`
+in primary 2r/2s config (`AssignmentManager.cfg`); simulation and liveness
+configs retain `UseReopen = TRUE`.
+TLC 2r/2s: 12,412,690 distinct, 43,093,199 generated, 2m57s, clean.
 
 ---
 

@@ -41,7 +41,7 @@ EXTENDS Types
 ```tla
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
-         walFenced, locked, carryingMeta, serverRegions,
+         walFenced, carryingMeta, serverRegions,
          procStore, masterAlive, zkNode,
          availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
@@ -53,7 +53,6 @@ rpcVars    == << dispatchedOps, pendingReports >>
 rsVars     == << rsOnlineRegions >>
 scpVars    == << scpState, scpRegions, walFenced, carryingMeta, zkNode >>
 masterVars == << masterAlive >>
-procVars   == << procStore, locked >>
 serverVars == << serverState, serverRegions >>
 peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
@@ -91,7 +90,6 @@ TRSPCreate(r) ==
   /\ regionState[r].procType = "NONE"
   /\ \/ regionState[r].state # "ABNORMALLY_CLOSED"
      \/ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
-  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType = "ASSIGN",
@@ -103,7 +101,7 @@ TRSPCreate(r) ==
        ![r] =
        NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
   /\ UNCHANGED << scpVars, rpcVars, serverVars, rsVars,
-                   masterVars, peVars, metaTable, locked >>
+                   masterVars, peVars, metaTable >>
 ```
 
 ---
@@ -129,12 +127,11 @@ TRSPGetCandidate(r, s) ==
   /\ serverState[s] = "ONLINE"
   /\ \A sZombie \in Servers:
        serverState[sZombie] = "CRASHED" => r \notin rsOnlineRegions[sZombie]
-  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT ![r].targetServer = s, ![r].procStep = "OPEN"]
   /\ procStore' = [procStore EXCEPT ![r].step = "OPEN", ![r].targetServer = s]
   /\ UNCHANGED << scpVars, rpcVars, serverVars, rsVars,
-                   masterVars, peVars, metaTable, locked >>
+                   masterVars, peVars, metaTable >>
 ```
 
 ---
@@ -162,8 +159,6 @@ TRSPDispatchOpen(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   /\ \/ \* --- Meta unavailable: suspend or block ---
         /\ ~MetaIsAvailable
         /\ r \notin suspendedOnMeta
@@ -181,8 +176,7 @@ TRSPDispatchOpen(r) ==
               masterVars,
               regionState,
               metaTable,
-              procStore,
-              locked
+              procStore
            >>
      \/ \* --- Meta available: dispatch open ---
         /\ MetaIsAvailable
@@ -220,8 +214,7 @@ TRSPDispatchOpen(r) ==
                     masterVars,
                     peVars,
                     pendingReports,
-                    serverState,
-                    locked
+                    serverState
                  >>
 ```
 
@@ -250,7 +243,6 @@ TRSPReportSucceedOpen(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
   /\ regionState[r].state = "OPENING"
-  /\ locked[r] = FALSE
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
        /\ rpt.code \in { "OPENED", "FAILED_OPEN" }
@@ -273,7 +265,7 @@ TRSPReportSucceedOpen(r) ==
                 THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
                 ELSE serverRegions
        /\ UNCHANGED << scpVars, peVars, rsVars, masterVars, metaTable,
-                        dispatchedOps, serverState, locked >>
+                        dispatchedOps, serverState >>
 ```
 
 ---
@@ -303,7 +295,6 @@ TRSPPersistToMetaOpen(r) ==
   /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "REPORT_SUCCEED"
-  /\ locked[r] = FALSE
   /\ LET tc == procStore[r].transitionCode
      IN \/ \* --- Meta unavailable: suspend or block ---
            \* When meta is unavailable and the procedure attempts a meta
@@ -335,8 +326,7 @@ TRSPPersistToMetaOpen(r) ==
                  masterVars,
                  regionState,
                  metaTable,
-                 procStore,
-                 locked
+                 procStore
               >>
         \/ \* --- OPENED branch ---
            /\ MetaIsAvailable
@@ -367,8 +357,7 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
-                 peVars,
-                 locked
+                 peVars
               >>
         \/ \* --- FAILED_OPEN, retry branch ---
            /\ MetaIsAvailable
@@ -403,8 +392,7 @@ TRSPPersistToMetaOpen(r) ==
                  masterVars,
                  peVars,
                  metaTable,
-                 pendingReports,
-                 locked
+                 pendingReports
               >>
         \/ \* --- FAILED_OPEN, give-up branch ---
            /\ MetaIsAvailable
@@ -435,8 +423,7 @@ TRSPPersistToMetaOpen(r) ==
                  serverVars,
                  rsVars,
                  masterVars,
-                 peVars,
-                 locked
+                 peVars
               >>
 
 ---------------------------------------------------------------------------
@@ -462,7 +449,6 @@ DispatchFail(r) ==
   /\ availableWorkers > 0
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_OPENED"
-  /\ locked[r] = FALSE
   /\ LET s == regionState[r].targetServer
      IN /\ s # NoServer
         /\ LET cmd == [ type |-> "OPEN", region |-> r ]
@@ -472,7 +458,7 @@ DispatchFail(r) ==
              [regionState EXCEPT
              ![r].procStep = "GET_ASSIGN_CANDIDATE",
              ![r].targetServer = NoServer]
-        /\ UNCHANGED << scpVars, peVars, serverVars, procVars, rsVars,
+        /\ UNCHANGED << scpVars, peVars, serverVars, procStore, rsVars,
                          masterVars, metaTable, pendingReports >>
 ```
 
@@ -494,14 +480,13 @@ DispatchFailClose(r) ==
   /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
-  /\ locked[r] = FALSE
   /\ LET s == regionState[r].targetServer
      IN /\ s # NoServer
         /\ LET cmd == [ type |-> "CLOSE", region |-> r ]
            IN /\ cmd \in dispatchedOps[s]
               /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
         /\ regionState' = [regionState EXCEPT ![r].procStep = "CLOSE"]
-        /\ UNCHANGED << scpVars, peVars, serverVars, procVars, rsVars,
+        /\ UNCHANGED << scpVars, peVars, serverVars, procStore, rsVars,
                          masterVars, metaTable, pendingReports >>
 ```
 
@@ -526,7 +511,6 @@ TRSPCreateUnassign(r) ==
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # NoServer
   /\ regionState[r].procType = "NONE"
-  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType = "UNASSIGN",
@@ -538,7 +522,7 @@ TRSPCreateUnassign(r) ==
        ![r] =
        NewProcRecord("UNASSIGN", "CLOSE", regionState[r].location, NoTransition)]
   /\ UNCHANGED << scpVars, peVars, rpcVars, serverVars, rsVars,
-                   masterVars, metaTable, locked >>
+                   masterVars, metaTable >>
 ```
 
 ---
@@ -563,7 +547,6 @@ TRSPCreateMove(r) ==
   /\ regionState[r].location # NoServer
   /\ regionState[r].procType = "NONE"
   /\ \E s \in Servers: s # regionState[r].location /\ serverState[s] = "ONLINE"
-  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType = "MOVE",
@@ -575,7 +558,7 @@ TRSPCreateMove(r) ==
        ![r] =
        NewProcRecord("MOVE", "CLOSE", regionState[r].location, NoTransition)]
   /\ UNCHANGED << scpVars, peVars, rpcVars, serverVars, rsVars,
-                   masterVars, metaTable, locked >>
+                   masterVars, metaTable >>
 ```
 
 ---
@@ -600,7 +583,6 @@ TRSPCreateReopen(r) ==
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].location # NoServer
   /\ regionState[r].procType = "NONE"
-  /\ locked[r] = FALSE
   /\ regionState' =
        [regionState EXCEPT
        ![r].procType = "REOPEN",
@@ -612,7 +594,7 @@ TRSPCreateReopen(r) ==
        ![r] =
        NewProcRecord("REOPEN", "CLOSE", regionState[r].location, NoTransition)]
   /\ UNCHANGED << scpVars, peVars, rpcVars, serverVars, rsVars,
-                   masterVars, metaTable, locked >>
+                   masterVars, metaTable >>
 ```
 
 ---
@@ -639,8 +621,6 @@ TRSPDispatchClose(r) ==
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CLOSE"
   /\ regionState[r].targetServer # NoServer
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   /\ \/ \* --- Meta unavailable: suspend or block ---
         /\ ~MetaIsAvailable
         /\ r \notin suspendedOnMeta
@@ -658,8 +638,7 @@ TRSPDispatchClose(r) ==
               masterVars,
               regionState,
               metaTable,
-              procStore,
-              locked
+              procStore
            >>
      \/ \* --- Meta available: dispatch close ---
         /\ MetaIsAvailable
@@ -692,8 +671,7 @@ TRSPDispatchClose(r) ==
                     rsVars,
                     masterVars,
                     peVars,
-                    pendingReports,
-                    locked
+                    pendingReports
                  >>
 ```
 
@@ -716,7 +694,6 @@ TRSPReportSucceedClose(r) ==
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
   /\ regionState[r].state = "CLOSING"
-  /\ locked[r] = FALSE
   /\ \E rpt \in pendingReports:
        /\ rpt.region = r
        /\ rpt.code = "CLOSED"
@@ -738,7 +715,7 @@ TRSPReportSucceedClose(r) ==
                 THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
                 ELSE serverRegions
        /\ UNCHANGED << scpVars, peVars, rsVars, masterVars, metaTable,
-                        dispatchedOps, serverState, locked >>
+                        dispatchedOps, serverState >>
 ```
 
 ---
@@ -764,7 +741,6 @@ TRSPPersistToMetaClose(r) ==
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "REPORT_SUCCEED"
   /\ procStore[r].transitionCode = "CLOSED"
-  /\ locked[r] = FALSE
   /\ \/ \* --- Meta unavailable: suspend or block ---
         /\ ~MetaIsAvailable
         /\ r \notin suspendedOnMeta
@@ -782,8 +758,7 @@ TRSPPersistToMetaClose(r) ==
               masterVars,
               regionState,
               metaTable,
-              procStore,
-              locked
+              procStore
            >>
      \/ \* --- Meta available: persist close to meta ---
         /\ MetaIsAvailable
@@ -826,8 +801,7 @@ TRSPPersistToMetaClose(r) ==
               serverVars,
               rsVars,
               masterVars,
-              peVars,
-              locked
+              peVars
            >>
 ```
 
@@ -849,7 +823,6 @@ TRSPConfirmClosedCrash(r) ==
   /\ availableWorkers > 0
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "CONFIRM_CLOSED"
-  /\ locked[r] = FALSE
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
   /\ regionState' =
        [regionState EXCEPT
@@ -869,7 +842,7 @@ TRSPConfirmClosedCrash(r) ==
            THEN [serverRegions EXCEPT ![loc] = @ \ { r }]
            ELSE serverRegions
   /\ UNCHANGED << scpVars, peVars, rsVars, masterVars, metaTable,
-                   pendingReports, serverState, locked >>
+                   pendingReports, serverState >>
 ```
 
 ---
@@ -899,8 +872,6 @@ TRSPServerCrashed(r) ==
   /\ regionState[r].procType # "NONE"
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
   /\ regionState[r].procStep # "GET_ASSIGN_CANDIDATE"
-  \* Region is not locked by an in-progress procedure step.
-  /\ locked[r] = FALSE
   /\ \E s \in Servers: scpState[s] \in { "ASSIGN", "DONE" }
   \* Convert the procedure to ASSIGN at GET_ASSIGN_CANDIDATE, clear target.
   /\ regionState' =
@@ -932,7 +903,7 @@ TRSPServerCrashed(r) ==
        [procStore EXCEPT
        ![r] =
        NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
-  /\ UNCHANGED << scpVars, serverVars, rsVars, masterVars, metaTable, locked >>
+  /\ UNCHANGED << scpVars, serverVars, rsVars, masterVars, metaTable >>
   \* Clear r from suspended/blocked sets if it was waiting on meta.
   /\ suspendedOnMeta' = suspendedOnMeta \ { r }
   /\ blockedOnMeta' = blockedOnMeta \ { r }
@@ -975,7 +946,6 @@ ResumeFromMeta(r) ==
         masterVars,
         regionState,
         metaTable,
-        procStore,
-        locked
+        procStore
      >>
 ```

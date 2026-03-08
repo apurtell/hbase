@@ -221,18 +221,6 @@ VARIABLE scpRegions
 \*         case; MasterWalManager.splitLogs().
 VARIABLE walFenced
 
-\* locked[r] is TRUE while a region-state-mutating action holds the
-\* per-region write lock for region r.  Mirrors the RegionStateNode
-\* write lock acquired by TRSP.beforeExec() / TRSP.afterExec() and
-\* by SCP.assignRegions().  In TLA+ each action is atomic so locked
-\* is acquired and released within the same step (locked'[r]=FALSE
-\* after the step).  The guard locked[r]=FALSE enforces mutual
-\* exclusion between concurrent actions on the same region.
-\*
-\* Source: TRSP.beforeExec()/afterExec();
-\*         SCP.assignRegions() regionNode.lock().
-VARIABLE locked
-
 \* carryingMeta[s] is TRUE when server s was hosting hbase:meta at
 \* the time it crashed.  Set non-deterministically by MasterDetectCrash
 \* (one case per invocation: either TRUE or FALSE).  When TRUE, the
@@ -333,7 +321,6 @@ vars ==
      scpState,
      scpRegions,
      walFenced,
-     locked,
      carryingMeta,
      serverRegions,
      procStore,
@@ -418,8 +405,7 @@ TypeOK ==
   /\ walFenced \in [Servers -> BOOLEAN]
   \* Whether crashed server was hosting hbase:meta.
   /\ carryingMeta \in [Servers -> BOOLEAN]
-  \* Per-region write lock for mutual exclusion.
-  /\ locked \in [Regions -> BOOLEAN]
+
   \* Per-server region tracking (ServerStateNode).
   /\ serverRegions \in [Servers -> SUBSET Regions]
   \* Persisted procedure store: record per region or NoProcedure.
@@ -919,7 +905,7 @@ Init ==
   \* No server has been WAL-fenced.
   /\ walFenced = [s \in Servers |-> FALSE]
   /\ carryingMeta = [s \in Servers |-> FALSE]
-  /\ locked = [r \in Regions |-> FALSE]
+
   /\ serverRegions = [s \in Servers |-> {}]
   \* No procedures are persisted initially.
   /\ procStore = [r \in Regions |-> NoProcedure]
@@ -1051,7 +1037,6 @@ MetaEventuallyAssigned ==
   \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
 
 ---------------------------------------------------------------------------
-
 
 (* Theorems / properties to check *)
         \* Safety: every step preserves the type invariant.
