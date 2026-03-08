@@ -67,7 +67,7 @@ CLOSED           — Server closed region and updated meta
 SPLITTING        — Server started split
 SPLIT            — Server completed split (terminal for parent)
 MERGING          — Server started merge
-MERGED           — Server completed merge (terminal for parents)
+MERGED           — Server completed merge (terminal for targets)
 SPLITTING_NEW    — Daughter region being created by split
 MERGING_NEW      — Merged region being created by merge
 FAILED_OPEN      — Open failed, no more retries
@@ -202,27 +202,18 @@ Combined with `onlineRegions` membership, the RS-side region lifecycle is:
 3. **Meta Consistency**: The persistent state in `hbase:meta` eventually matches in-memory state.
    - After a procedure completes, `meta[r].state = inMemory[r].state`.
 
-4. **No Lost Regions** (Iteration 14): After SCP completes for a
-   crashed server, every region that was in the SCP's region snapshot
-   must either have a procedure attached (recovery is in progress) or
-   be OPEN on some server.  A region left in ABNORMALLY_CLOSED (or
-   any non-OPEN state) with no procedure after SCP is done is "lost"
+4. **No Lost Regions**: After SCP completes for a crashed server, every
+   region that was in the SCP's region snapshot must either have a
+   procedure attached (recovery is in progress) or be OPEN on some server.
+   A region left in ABNORMALLY_CLOSED (or any non-OPEN state) with no
+   procedure after SCP is done is "lost"
    — it will never be reassigned without manual intervention.
-   - Liveness form: `□(serverCrashed(s) ∧ regionOn(r, s) ⇒ ◇ regionState[r].state = OPEN)`
-   - Safety form (invariant, checked at each state):
-     ```tla
-     NoLostRegions ==
-         \A s \in Servers : \A r \in Regions :
-             \* After SCP has finished processing all its regions...
-             (scpState[s] = "DONE"
-             \* ...if r was on server s at crash detection time
-             \* (implicitly: r was in the original scpRegions snapshot)
-              \* ...then r must either have a procedure handling it
-             \* or already be OPEN.
-             /\ regionState[r].location = None
-             /\ regionState[r].state # "OPEN")
-             => regionState[r].procType # "NONE"
-     ```
+   - Liveness form: if a server crashes and a region was on that
+     server, eventually that region reaches OPEN again.
+   - Safety form (invariant, checked at each state): for every server
+     and every region, once SCP reaches DONE, if the region has no
+     location and is not OPEN, then it must have a procedure attached
+     (i.e. recovery is still in progress).
    - This invariant PASSES because the model processes every region
      in the SCP snapshot unconditionally.  Code analysis at each
      iteration compares this correct protocol behavior against the
@@ -337,18 +328,17 @@ The following table documents what is modeled concretely vs. abstracted:
 | hbase:meta | **Abstract** | Model as a function `Region → (State, Server)` |
 | ZooKeeper crash detection | **Abstract** | Model as non-deterministic crash detection with delay |
 | Network/RPC | **Abstract** | Model as unreliable async message channels (can lose, reorder, duplicate) |
-| RegionStateNode locking | **Concrete** (Iter 15) ✅ | Per-region `locked[r]` boolean serializes all TRSP and SCP per-region actions under `regionNode.lock()`. |
+| RegionStateNode locking | **Removed** | Per-region `locked[r]` was always FALSE at rest (acquired+released within each atomic step). Mutual exclusion enforced by `procType ≠ NONE` guards instead. |
 | ServerStateNode locking | **Abstract** | Modeled as `serverState` ONLINE/CRASHED flag; read/write lock semantics are implicit in action guards |
 | Load balancer | **Abstract** | Non-deterministic choice of move targets |
-| REOPEN vs MOVE | **Concrete** (Iter 15) ✅ | `TRSPCreateReopen` pins `assignCandidate` to the region's current server; `TRSPCreateMove` forces a new plan. Separate `REOPEN` ProcType added. |
-| SCP carryingMeta path | **Concrete** (Iter 15) ✅ | `carryingMeta` variable, `SCPAssignMeta` action (`ASSIGN_META` → `GET_REGIONS`), all non-meta SCP steps gated on `∀ t: scpState[t] ≠ "ASSIGN_META"` (`waitMetaLoaded`). `MetaAvailableForRecovery` invariant. |
-| Split/Merge procedures | **Deferred** (Phase 7) | Complex; build after core model is validated |
+| REOPEN vs MOVE | **Concrete** | `TRSPCreateReopen` pins `assignCandidate` to the region's current server; `TRSPCreateMove` forces a new plan. Separate `REOPEN` ProcType added. |
+| SCP carryingMeta path | **Concrete** | `carryingMeta` variable, `SCPAssignMeta` action (`ASSIGN_META` → `GET_REGIONS`), all non-meta SCP steps gated on `∀ t: scpState[t] ≠ "ASSIGN_META"` (`waitMetaLoaded`). `MetaAvailableForRecovery` invariant. |
+| Split/Merge procedures | **Concrete** | Keyspace-aware model: `regionKeyRange`, `MaxKey`, `RegionPool`, `Adjacent` predicate, `KeyspaceCoverage`/`SplitMergeMutualExclusion` invariants, `RequestSplit`/`RequestMerge` initiation. See C.6, C.10, C.11. |
 | ServerCrashProcedure | **Concrete** | Critical failure recovery path |
 | WAL lease revocation (fencing) | **Abstract** | Modeled as per-server Boolean (`walFenced`); fencing property only, no HDFS lease or log-splitting details |
-| RS crash / zombie window | **Concrete** (Iter 14) | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
-| RS epoch / ServerName | **Omitted** (resolved) | Not needed: `serverState` ONLINE/CRASHED flag (Iter 10) plus atomic crash/restart provides equivalent fencing without an explicit epoch counter. |
-| TRSPGetCandidate guard (walFenced) | **Corrected** (Iter 15) ✅ | Iter 15 removed the model-specific `walFenced` guard; `serverState[s]="ONLINE"` suffices, matching the implementation's `createDestinationServersList()`. |
-| `isMatchingRegionLocation()` in SCP | **Concrete** (Iter 16) | `SCPAssignRegion` models the implementation's `isMatchingRegionLocation()` check (SCP.java L498-500, L529-538): regions whose location changed since `SCPGetRegions` are skipped — matching the implementation behavior that is a known source of bugs (HBASE-24293, HBASE-21623) and may expose `NoLostRegions` violations confirming those bugs. |
+| RS crash / zombie window | **Concrete** | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
+| RS epoch / ServerName | **Omitted** | Not needed: `serverState` ONLINE/CRASHED flag (Iter 10) plus atomic crash/restart provides equivalent fencing without an explicit epoch counter. |
+| `isMatchingRegionLocation()` in SCP | **Concrete** | `SCPAssignRegion` models the implementation's `isMatchingRegionLocation()` check (SCP.java L498-500, L529-538): regions whose location changed since `SCPGetRegions` are skipped — matching the implementation behavior that is a known source of bugs (HBASE-24293, HBASE-21623) and may expose `NoLostRegions` violations confirming those bugs. |
 | Coprocessor hooks | **Omitted** | Not relevant to correctness of assignment protocol |
 | Replication queues | **Omitted** | Orthogonal concern |
 | Table enable/disable | **Deferred** | Can be added as a constraint on assignment |
@@ -365,6 +355,8 @@ CONSTANTS
     Servers,          \* Set of regionserver identifiers               ✅ (Iter 1)
     None              \* Sentinel for "no server assigned"             ✅ (Iter 1)
     MaxRetries        \* Maximum open retries before giving up         ✅ (Iter 12)
+    MaxKey            \* Keyspace upper bound (integer); keyspace is   ⏳ (Iter 20)
+                      \* 0..(MaxKey-1). E.g. MaxKey=8 gives [0,8).
 
 VARIABLES
     \* --- Master-side state ---
@@ -431,6 +423,17 @@ VARIABLES
     masterAlive       \* BOOLEAN                                      ⏳ (Iter 18)
     \* Note: serverAlive was originally planned for Iter 14 but was
     \* superseded by serverState (above), implemented in Iter 10.
+
+    \* --- Split/merge keyspace ---
+    regionKeyRange    \* [Regions → [startKey: 0..MaxKey,             ⏳ (Iter 20)
+                      \*              endKey: 0..MaxKey]
+                      \*            ∪ {NoRange}]
+                      \* A region "exists" iff regionKeyRange[r] ≠
+                      \* NoRange.  Primary regions tile [0, MaxKey)
+                      \* in Init; RegionPool regions start as NoRange.
+                      \* Split materializes daughter keyspaces at PONR;
+                      \* merge materializes the union keyspace at PONR;
+                      \* parent/target deletion clears to NoRange.
 ```
 
 ---
@@ -750,7 +753,7 @@ TLC 2r/2s: 17,430,108 distinct, 63,165,534 generated, 20m26s, clean.
 
 ---
 
-### Phase 6: PEWorker Pool and Meta-Blocking Semantics ✅ COMPLETE
+### Phase 6: PEWorker Pool and Meta-Blocking Semantics
 
 #### Iteration 19 — PEWorker pool and meta-blocking semantics ✅ COMPLETE
 
@@ -778,112 +781,208 @@ Added guard `∀ s ∈ Servers: scpState[s] ∈ {"NONE", "DONE"}` to
 guards on `masterAlive = TRUE`.
 TLC 2r/2s: 25,959,400 distinct, 90,478,387 generated, 6m08s, clean.
 
+#### Iteration 19.5 — State space reduction
+
+Two changes to reduce the state space before Phase 7 adds split/merge
+complexity.
+
+1. **Remove `locked` variable.** The per-region write lock `locked[r]`
+   is acquired and released within every atomic TLA+ action — it is
+   always `FALSE` at rest. The guard `locked[r] = FALSE` never prunes
+   any behavior because TLC only observes inter-step states. The mutual
+   exclusion property that `locked` documents is already enforced by
+   `procType ≠ NONE` guards on every region-mutating action, matching
+   the implementation where `RegionStateNode.setProcedure()` is the
+   true serialization mechanism.
+   - Remove `locked` from `vars`, `TypeOK`, `Init`, and all `UNCHANGED`
+     clauses across all 7 modules.
+   - Remove `locked[r] = FALSE` guards from all 15 guarded actions.
+   - Reduces variable tuple width from 18 to 17.
+2. **Default `UseReopen` to `FALSE`.** The `REOPEN` proc type follows
+   the same TRSP state machine as `MOVE` (close-then-open with pinned
+   assignCandidate). It does not interact with split/merge child TRSPs
+   (which are always ASSIGN or UNASSIGN). Defaulting to `FALSE` in the
+   primary 2r/2s config eliminates REOPEN-related state space while
+   retaining it for simulation runs via `UseReopen = TRUE`.
+   - Update `AssignmentManager.cfg` to set `UseReopen = FALSE`.
+   - No spec changes needed — `UseReopen` is already a constant toggle.
+
+**Verify**: All existing invariants pass. TLC state count should
+decrease significantly from the Iter 19 baseline (25.9M distinct).
+
 ---
 
 ### Phase 7: Split and Merge
 
-#### Iteration 20 — Split/merge region states and region pool
+#### Iteration 20 — Keyspace infrastructure (no split/merge actions)
 
 **What to add**: Extend `State` with `SPLITTING`, `SPLIT`,
 `SPLITTING_NEW`, `MERGING`, `MERGED`, `MERGING_NEW`. Extend
 `ValidTransition` with the split/merge transitions from Appendix C.4.
-Add `DaughterPool` constant and `regionExists` variable to model
-dynamic region creation/deletion (see Appendix C.6). Regions in the
-`DaughterPool` start with `regionExists = FALSE` and `state = OFFLINE`.
-All actions guard on `regionExists[r] = TRUE`.
-**Verify**: `TypeOK` and `TransitionValid` with the extended state space.
-TLC with 2 primary regions, 4 daughter pool slots, 2 servers.
+Add `MaxKey` constant, `regionKeyRange` variable, and `RegionPool`
+constant (pre-allocated region identifiers for dynamic creation;
+see Appendix C.6).
+A region "exists" iff `regionKeyRange[r] ≠ NoRange`. Regions in
+`RegionPool` start with `regionKeyRange = NoRange` and `state = OFFLINE`.
+All existing actions guard on `regionKeyRange[r] ≠ NoRange`.
+Primary regions tile the full keyspace `[0, MaxKey)` in the initial
+state with no gaps or overlaps.
+New predicates: `Adjacent(r1, r2)`.
+New invariants: `KeyspaceCoverage` — live, non-terminal regions'
+keyspaces cover `[0, MaxKey)` with no gaps or overlaps.
+`SplitMergeMutualExclusion` (trivially holds — no split/merge yet).
+**No split/merge actions in this iteration.** The new states and
+variables are added but no procedure can enter them. This guarantees
+backward compatibility: all existing assign/unassign/move/crash
+behavior is unaffected. `KeyspaceCoverage` holds trivially (primary
+regions tile the full keyspace, no operations change it).
+**Why not add initiation actions here**: `RequestSplit` would
+transition a region to SPLITTING and attach a procedure, but no
+split procedure steps exist yet — the procedure would be stuck in
+its initial state with no enabled successor action → TLC deadlock.
+**Verify**: `TypeOK`, `TransitionValid`, `KeyspaceCoverage`,
+`SplitMergeMutualExclusion` with the extended state space. Confirm
+all existing invariants still pass (regression check).
+TLC with 2 primary regions (keyspace `[0,8)` as `[0,4)` and `[4,8)` —
+each width 4, satisfying the split precondition `width ≥ 2` and
+leaving daughters with `width = 2`, still splittable),
+4 region pool slots, 2 servers.
+**Symmetry**: `Permutations(RegionPool)` — pool slots are
+interchangeable; which slot becomes daughter A vs B is irrelevant.
+With 4 pool slots this provides up to 24× reduction.
+**State constraint**: Bound concurrent split/merge procedures:
+`Cardinality({r ∈ Regions : procType ∈ {SPLIT, MERGE}}) ≤ 1`.
+This explores one-at-a-time split/merge while leaving concurrent
+assign/unassign/move/crash unconstrained. Can be relaxed for
+deeper simulation runs.
 
-#### Iteration 21 — Split procedure: PREPARE through CLOSE_PARENT
+#### Iteration 21 — Complete split forward path
 
-**What to add**: Split procedure state machine, initially covering only
-the pre-PONR states: `SPLIT_PREPARE → SPLIT_CLOSE_PARENT →
-SPLIT_CHECK_CLOSED`.
-- `SplitPrepare(parent, dA, dB)`: Pre: parent is OPEN, no procedure on
-  parent/dA/dB, dA and dB are in DaughterPool with `regionExists = FALSE`.
+**What to add**: The *entire* split procedure forward path in one
+iteration, including the initiation action. Every split procedure
+state has a defined successor, so TLC cannot deadlock.
+- `RequestSplit(r)`: Non-deterministic. Models admin API RPC or
+  RS-autonomous split (we don't model *why* — only eligibility).
+  Pre: `r` is OPEN, no procedure attached, keyspace width ≥ 2,
+  pool slots available. If accepted → enters `SplitPrepare`. If any
+  precondition fails → rejected (action does not fire).
+- `SplitPrepare(parent, dA, dB)`: Triggered by `RequestSplit`.
+  Pre: parent is OPEN, no procedure on parent/dA/dB, dA and dB are
+  in `RegionPool` with `regionKeyRange = NoRange`.
+  **Keyspace halving**: compute `mid = (startKey + endKey) ÷ 2` from
+  parent's keyspace. Record daughter keyspaces in the split procedure
+  state (daughters remain non-existent, i.e. `NoRange`, until PONR).
+  Guard: `endKey - startKey ≥ 2` (keyspace must be splittable).
   Set parent to SPLITTING, attach split procedure to parent, dA, dB.
 - `SplitCloseParent(p)`: Create child TRSP(UNASSIGN) for parent.
   Parent transitions: SPLITTING → CLOSING → CLOSED (via TRSP).
-- `SplitCheckClosed(p)`: Verify parent is CLOSED. Advance to
-  SPLIT_UPDATE_META (added in next iteration).
-Multi-region locking: split procedure is attached to all three regions.
-**Verify**: Parent reaches CLOSED. `LockExclusivity` holds.
-No daughters exist yet (`regionExists` still FALSE).
-**Source**: `SplitTableRegionProcedure.java` `prepareSplitRegion()` L509-593,
-`createUnassignProcedures()` L950-954.
-
-#### Iteration 22 — Split PONR: atomic meta update creates daughters
-
-**What to add**: The PONR step:
-- `SplitUpdateMeta(p)`: Atomically:
-  - Set parent to SPLIT in both memory and meta.
-  - Set `regionExists[dA] = TRUE`, `regionExists[dB] = TRUE`.
-  - Set daughters to SPLITTING_NEW in memory.
-  - Set daughters to CLOSED in meta (intentional discrepancy, see C.8).
+- `SplitCheckClosed(p)`: Verify parent is CLOSED.
+- `SplitUpdateMeta(p)`: **PONR.** Atomically:
+  set parent to SPLIT in both memory and meta;
+  set `regionKeyRange[dA] = [startKey, mid)`,
+  `regionKeyRange[dB] = [mid, endKey)` (daughters now exist);
+  set daughters to SPLITTING_NEW in memory, CLOSED in meta
+  (intentional discrepancy, see C.8).
   After this action, rollback is forbidden.
-**Relax invariant**: `MetaConsistency` must allow
-`regionState = SPLITTING_NEW` while `metaTable = CLOSED`.
-**Verify**: `TypeOK`. Daughters now exist. Parent is SPLIT.
-`SplitAtomicity`: pre-PONR states have no daughter entries in meta.
-**Source**: `AssignmentManager.markRegionAsSplit()` L2364-2390,
-`RegionStateStore.splitRegion()` L367-410.
-
-#### Iteration 23 — Split post-PONR: open daughters
-
-**What to add**:
 - `SplitOpenChildren(p)`: Create child TRSP(ASSIGN) for each daughter.
   Daughters transition: SPLITTING_NEW → OPENING → OPEN (via TRSP).
-- `SplitDone(p)`: All child TRSPs complete. Detach split procedure from
-  parent, dA, dB.
-**Verify**: `SplitCompleteness` — after `SplitDone`, both daughters are
-OPEN and parent is SPLIT. `NoOrphanedDaughters` — every SPLITTING_NEW
-region has a parent split procedure.
-**Source**: `SplitTableRegionProcedure.java` `createAssignProcedures()` L956-963.
+- `SplitDone(p)`: All child TRSPs complete. Clear parent keyspace:
+  `regionKeyRange[parent] = NoRange` (deletion after compaction,
+  modeled as atomic). Detach split procedure from parent, dA, dB.
+Multi-region locking: split procedure is attached to all three regions
+(parent + 2 daughters), enforcing mutual exclusion.
+**Relax invariant**: `MetaConsistency` must allow
+`regionState = SPLITTING_NEW` while `metaTable = CLOSED`.
+`KeyspaceCoverage` relaxed during in-flight split: parent is SPLIT
+(excluded) and daughters are SPLITTING_NEW (included, covering
+parent's former keyspace).
+**No rollback in this iteration.** `SplitFail` is not yet modeled,
+so splits always succeed. This is safe: the forward path is complete
+and every procedure state has a successor. Rollback is added in
+Iteration 22.
+**Verify**: `TypeOK`, `TransitionValid`, `KeyspaceCoverage`,
+`SplitMergeMutualExclusion`, `SplitCompleteness` (after `SplitDone`,
+both daughters are OPEN with correct keyspaces, parent deleted),
+`NoOrphanedDaughters`, `SplitAtomicity` (pre-PONR states have no
+daughter entries in meta). All existing invariants still pass.
+**Source**: `SplitTableRegionProcedure.java` `prepareSplitRegion()` L509-593,
+`createUnassignProcedures()` L950-954,
+`AssignmentManager.markRegionAsSplit()` L2364-2390,
+`createAssignProcedures()` L956-963.
 
-#### Iteration 24 — Split pre-PONR rollback
+#### Iteration 22 — Split pre-PONR rollback
 
-**What to add**: Non-deterministic failure action for pre-PONR states:
+**What to add**: Non-deterministic failure action for pre-PONR states.
+Now TLC explores both success and failure paths for splits.
 - `SplitFail(p)`: Pre: split procedure is in a pre-PONR state
   (PREPARE, CLOSE_PARENT, CHECK_CLOSED). Triggers rollback.
 - `SplitRollback(p)`: Revert parent from SPLITTING to OPEN (if in
   PREPARE) or create TRSP(ASSIGN) to reopen parent (if parent was
-  already CLOSED). Set `regionExists[dA] = FALSE`,
-  `regionExists[dB] = FALSE`. Detach procedure from all regions.
+  already CLOSED). Set `regionKeyRange[dA] = NoRange`,
+  `regionKeyRange[dB] = NoRange` (daughters were never materialized
+  pre-PONR, but this is defense in depth). Detach procedure from all
+  regions.
+**Why this is safe**: `SplitFail` only fires in pre-PONR states.
+`SplitRollback` always transitions to a terminal state (parent OPEN
+or being reassigned, procedure detached). No procedure is left in a
+state without a successor.
 **Verify**: After rollback, parent is OPEN (or being reassigned), no
-daughters exist, no procedures attached. All safety invariants hold.
+daughters exist, no procedures attached. `KeyspaceCoverage` restored.
+All safety invariants hold under both success and failure paths.
 **Source**: `SplitTableRegionProcedure.java` `rollbackState()` L368-411.
 
-#### Iteration 25 — Merge procedure (full lifecycle)
+#### Iteration 23 — Complete merge forward path with rollback
 
-**What to add**: Complete merge procedure following the same pattern as
-split:
-- `MergePrepare(r1, r2, m)`: Pre: r1, r2 OPEN, no procedures attached,
-  m in DaughterPool with `regionExists = FALSE`. Set r1, r2 to MERGING.
-- `MergeCloseRegions(p)`: Create child TRSP(UNASSIGN) for each parent.
-- `MergeCheckClosed(p)`: Verify all parents CLOSED.
-- `MergeCreateMerged(p)`: Set `regionExists[m] = TRUE`, set m to
-  MERGING_NEW in memory.
-- `MergeUpdateMeta(p)`: **PONR**: Set parents to MERGED (terminal),
-  create merged region as CLOSED in meta, MERGING_NEW in memory.
+**What to add**: The *entire* merge procedure (forward path + rollback)
+in one iteration, following the same pattern as split. Rollback is
+included from the start so that TLC can explore both success and
+failure paths without requiring a separate iteration.
+- `RequestMerge(r1, r2)`: Non-deterministic. Models admin API RPC
+  or master merge chore. Pre: both OPEN, no procedures attached,
+  `Adjacent(r1, r2)` (i.e. `regionKeyRange[r1].endKey =
+  regionKeyRange[r2].startKey`), pool slot available.
+  If accepted → enters `MergePrepare`. Non-adjacent pairs rejected.
+- `MergePrepare(r1, r2, m)`: Triggered by `RequestMerge`.
+  Pre: r1, r2 OPEN, no procedures attached,
+  m in `RegionPool` with `regionKeyRange = NoRange`.
+  **Adjacency guard**: `Adjacent(r1, r2)`.
+  Merged region will get keyspace `[r1.startKey, r2.endKey)`.
+  Set r1, r2 to MERGING. Attach merge procedure to r1, r2, m
+  (enforcing mutual exclusion on all three regions).
+- `MergeCloseRegions(p)`: Create child TRSP(UNASSIGN) for each target.
+- `MergeCheckClosed(p)`: Verify all targets CLOSED.
+- `MergeCreateMerged(p)`: Set m to MERGING_NEW in memory.
+- `MergeUpdateMeta(p)`: **PONR**: Set targets to MERGED (terminal),
+  set `regionKeyRange[m] = [r1.startKey, r2.endKey)` (merged region
+  now exists with the union keyspace). Create merged region as CLOSED
+  in meta, MERGING_NEW in memory.
 - `MergeOpenMerged(p)`: Create child TRSP(ASSIGN) for merged region.
-- `MergeDone(p)`: Detach procedure from all regions.
-- `MergeRollback(p)`: Pre-PONR only: revert parents to OPEN, delete
-  merged, detach procedure.
-**Verify**: `MergeCompleteness` — after done, merged region is OPEN,
-parents are MERGED. All safety invariants hold.
+- `MergeDone(p)`: Merged region is OPEN. Clear target keyspaces:
+  `regionKeyRange[r1] = NoRange`, `regionKeyRange[r2] = NoRange`
+  (modeling deletion after compaction — atomic data copy).
+  Detach procedure from all regions.
+- `MergeFail(p)`: Pre: merge procedure is in a pre-PONR state.
+  Triggers rollback.
+- `MergeRollback(p)`: Pre-PONR only: revert targets to OPEN, set
+  `regionKeyRange[m] = NoRange`, detach procedure.
+**Verify**: `MergeCompleteness` — after done, merged region is OPEN
+with keyspace `[r1.startKey, r2.endKey)`, targets have `NoRange`
+(deleted). `KeyspaceCoverage` restored under both success and failure
+paths. All safety invariants hold.
 **Source**: `MergeTableRegionsProcedure.java` `executeFromState()` L189-255.
 
-#### Iteration 26 — Crash during split/merge
+#### Iteration 24 — Crash during split/merge
 
 **What to add**: No new actions — this is a **verification-only** iteration.
 Configure TLC to allow RS crash and master crash during active
 split/merge procedures. Verify:
-- Pre-PONR crash → rollback succeeds, parent reopens.
+- Pre-PONR crash → rollback succeeds, parent/targets reopen.
 - Post-PONR crash → procedure resumes and completes.
 - SCP interaction: SCP calls `serverCrashed()` on child TRSPs of the
   split/merge procedure; child TRSPs reassign to new server.
 - `NoLostRegions`, `NoDoubleAssignment`, `SplitCompleteness`,
-  `MergeCompleteness` all hold under crash scenarios.
+  `MergeCompleteness`, `KeyspaceCoverage`, `SplitMergeMutualExclusion`
+  all hold under crash scenarios.
 **Source**: See Appendix C.9 for crash interaction analysis.
 
 ---
@@ -899,10 +998,7 @@ on message delivery. Check temporal properties:
 
 #### Iteration 28 — TLC optimization
 
-**Already done** (from Iteration 7): Symmetry sets for Regions and
-Servers (`Permutations(Regions) \union Permutations(Servers)`). This
-provided up to 36× reduction for 3r/3s.
-**Remaining work**: State constraints to bound message queue sizes.
+**What to add**: State constraints to bound message queue sizes.
 Action constraints to limit crash frequency. Measure cumulative state
 space reduction across all phases.
 
@@ -1370,7 +1466,7 @@ to be `None` before a new procedure can be attached.
 regions:
 
 - **Split**: Locks parent + both daughters.
-- **Merge**: Locks all parents + the merged child.
+- **Merge**: Locks all targets + the merged region.
 
 These Level 1 locks prevent any other procedure from being scheduled for the
 same regions while split/merge is in progress. The actual state mutations
@@ -1946,7 +2042,7 @@ states:
                             │ ├──┤ SPLITTING ──► CLOSING               │
                             │ │  │                                     │
                             │ │  └────────────────┐                    │
-                            │ │                    │                   │
+                            │ │                   │                    │
                             │ └──► MERGING ──► CLOSING                 │
                             │                                          │
                             v                                          │
@@ -1956,9 +2052,9 @@ states:
   (Created by split)                    (Created by merge)
   SPLITTING_NEW ──► OPENING ──► OPEN    MERGING_NEW ──► OPENING ──► OPEN
 
-  (Terminal states for parents)
-  CLOSED ──► SPLIT (split parent; stays in meta until GC)
-  CLOSED ──► (deleted)  (merge parents; removed from meta at PONR)
+  (Terminal states)
+  CLOSED ──► SPLIT (split parent; keyspace cleared to NoRange at SplitDone)
+  CLOSED ──► MERGED (merge targets; keyspace cleared to NoRange at MergeDone)
 ```
 
 ### C.4 Extended ValidTransition Set
@@ -1989,8 +2085,9 @@ ValidTransition ==
 
       \* --- Merge-specific ---
       <<"OPEN",               "MERGING">>,          \* prepareMergeRegion()
-      <<"MERGING",            "CLOSING">>,          \* TRSP unassign of parent
+      <<"MERGING",            "CLOSING">>,          \* TRSP unassign of target
       <<"MERGING",            "OPEN">>,             \* rollback: revert to OPEN
+      <<"CLOSED",             "MERGED">>,           \* markRegionAsMerged() at PONR
       <<"MERGING_NEW",        "OPENING">> }         \* child TRSP assigns merged
 ```
 
@@ -2009,11 +2106,14 @@ ValidTransition ==
 - `CLOSED → SPLIT`: Only happens at PONR, not during normal unassignment.
   The split procedure drives this transition after the parent is closed.
 
-- **MERGED is absent**: The code never transitions a region to `MERGED`.
-  Merge parents are deleted from `regionStates` and meta. For TLA+
-  modeling, we can either model deletion (remove from the `Regions` set)
-  or introduce `MERGED` as an abstract terminal state representing
-  deletion. The latter is simpler for TLC.
+- **MERGED**: The code never directly transitions a region to `MERGED`
+  state — merge targets are deleted from `regionStates` and meta via
+  `markRegionAsMerged()`. For TLA+ modeling, we use `MERGED` as an
+  abstract terminal state representing deletion, and add a
+  `CLOSED → MERGED` transition at PONR. The `MERGED` state is
+  simpler for TLC than dynamic set membership. The corresponding
+  `CLOSED → MERGED` transition is included above in the merge-specific
+  section of `ValidTransition`.
 
 - `SPLITTING_NEW → OPENING` and `MERGING_NEW → OPENING`: These are the
   initial transitions for newly created regions. The daughter/merged
@@ -2044,9 +2144,9 @@ Both split and merge have a Point of No Return at `UPDATE_META`:
 |---------------------|--------|
 | CREATE_MERGED / WRITE_SEQ_ID | Delete merged region from filesystem |
 | CHECK_CLOSED | No-op |
-| CLOSE_REGIONS | Reopen parent regions |
+| CLOSE_REGIONS | Reopen target regions |
 | PRE_MERGE | Coprocessor rollback hook |
-| PREPARE | Revert parents from MERGING to OPEN |
+| PREPARE | Revert targets from MERGING to OPEN |
 
 **Post-PONR**: Rollback is forbidden — `isRollbackSupported()` returns
 `false`. The procedure must retry until it completes. On master crash,
@@ -2062,35 +2162,106 @@ action that triggers rollback. Post-PONR states should have no rollback
 path — only forward progress. The PONR itself is an atomic action that
 commits the meta update.
 
-### C.6 Dynamic Region Creation and Deletion
+### C.6 Dynamic Region Creation and Deletion (Keyspace Model)
 
-Split creates 2 new regions; merge deletes N parent regions. This poses
-a modeling challenge since TLC works with finite, pre-defined constants.
+Split creates 2 new regions; merge deletes 2 parent/target regions. This
+poses a modeling challenge since TLC works with finite, pre-defined
+constants.
 
-**Recommended approach: Pre-allocated region pool with existence flag.**
+**Approach: Pre-allocated region pool with keyspace-range identity.**
+
+Regions are identified by their keyspace range rather than a boolean
+existence flag. A region "exists" iff it has a keyspace.
 
 ```tla
 CONSTANTS
-    PrimaryRegions,      \* {r1, r2, r3} — initially existing regions
-    DaughterPool         \* {d1, d2, d3, d4, d5, d6} — pre-allocated slots
+    PrimaryRegions,      \* {r1, r2} — initially existing regions
+    RegionPool,          \* {p1, p2, p3, p4} — pre-allocated slots
+    MaxKey               \* Integer; keyspace is 0..(MaxKey-1)
 
-Regions == PrimaryRegions \cup DaughterPool
+Regions == PrimaryRegions \cup RegionPool
 
-VARIABLE regionExists   \* [Regions → BOOLEAN]
+VARIABLE regionKeyRange  \* [Regions → [startKey: 0..MaxKey,
+                         \*              endKey: 0..MaxKey]
+                         \*            ∪ {NoRange}]
 ```
 
-- `PrimaryRegions` start with `regionExists = TRUE`.
-- `DaughterPool` regions start with `regionExists = FALSE`.
-- Split's `UPDATE_META` action sets `regionExists[daughter] = TRUE` for
-  two unused slots from `DaughterPool`.
-- Merge's `UPDATE_META` action sets `regionExists[parent] = FALSE` for
-  each parent (modeling deletion). Alternatively, set state to `MERGED`
-  as a terminal marker.
-- All actions guard on `regionExists[r] = TRUE` before operating on `r`.
+- `PrimaryRegions` tile the full keyspace `[0, MaxKey)` in Init.
+  E.g. with `MaxKey = 8`: r1 has `[0, 4)`, r2 has `[4, 8)`.
+- `RegionPool` regions start with `regionKeyRange = NoRange` (non-existent).
+- All existing actions guard on `regionKeyRange[r] ≠ NoRange`.
 
-**State space implications**: With 3 primary regions and 6 daughter slots,
-the pool is large enough for 3 splits. TLC feasibility depends on
-bounding the number of concurrent split/merge operations.
+**Minimum keyspace width constraint**: Every region in the initial
+tiling must have `endKey - startKey ≥ 2` so that it satisfies the
+split precondition (keyspace wide enough to halve). This also applies
+transitively: after a split, each daughter gets half the parent's
+width, so a parent must have width ≥ 4 to produce daughters that are
+themselves splittable, width ≥ 8 for granddaughters, etc. After a
+merge, the merged region's width is the sum of its two targets' widths.
+`MaxKey` and the number of primary regions must be chosen so that
+`MaxKey / |PrimaryRegions| ≥ 2^d` where `d` is the maximum split
+depth to be explored.  For example, `MaxKey = 8` with 2 primary
+regions gives width 4 each, allowing one level of splits (daughters
+have width 2, still splittable) or two levels if `MaxKey = 16`.
+
+**Split keyspace halving**: `SplitPrepare` computes
+`mid = (startKey + endKey) ÷ 2`. At PONR (`SplitUpdateMeta`),
+daughters are materialized: `dA = [startKey, mid)`, `dB = [mid, endKey)`.
+At `SplitDone`, the parent's keyspace is cleared to `NoRange` (deletion
+after compaction — modeled as atomic).
+
+**Merge keyspace union**: `MergePrepare` requires `Adjacent(r1, r2)` —
+i.e. `r1.endKey = r2.startKey`. At PONR (`MergeUpdateMeta`), merged
+region is materialized: `m = [r1.startKey, r2.endKey)`. At `MergeDone`,
+targets' keyspaces are cleared to `NoRange`.
+
+**Adjacency predicate**:
+
+```tla
+Adjacent(r1, r2) ==
+    regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
+```
+
+**Coverage invariant**:
+
+```tla
+KeyspaceCoverage ==
+    \* Every key in [0, MaxKey) is covered by exactly one live region.
+    \A k \in 0..(MaxKey-1) :
+        \E! r \in Regions :
+            /\ regionKeyRange[r] # NoRange
+            /\ regionKeyRange[r].startKey <= k
+            /\ k < regionKeyRange[r].endKey
+            /\ regionState[r].state \notin {"SPLIT", "MERGED"}
+```
+
+`KeyspaceCoverage` is relaxed during in-flight split/merge (between PONR
+and daughters/merged reaching OPEN) — the SPLITTING_NEW/MERGING_NEW
+regions are included as covering their keyspaces even though they are
+not yet OPEN.
+
+**State space implications**: With `MaxKey = 8`, 2 primary regions, and
+4 pool slots, the model supports 2 splits (4 daughters fill the pool).
+TLC feasibility depends on bounding the number of concurrent split/merge
+operations via `SplitMergeMutualExclusion`.
+
+**Modeling abstractions** (see C.11 for full analysis):
+
+- *Split point*: The model uses `mid = (start + end) ÷ 2`. In the
+  implementation, the split row comes from the RegionServer
+  (`GetRegionInfoResponse.bestSplitRow`) or a user-specified row. The
+  exact byte chosen is data-dependent and irrelevant to assignment safety;
+  what matters is that daughters partition the parent's keyspace.
+- *N-way merge*: The implementation supports merging ≥2 regions
+  (`RegionInfo[]`). The model restricts to 2-way merge, which is
+  sufficient for exercising all state transitions, locking, PONR, and
+  crash recovery paths.
+- *Force merge*: When `force=true`, the implementation bypasses the
+  adjacency/overlap check and computes a `min(startKey)..max(endKey)`
+  envelope that may overlap existing regions. Force-merge is a
+  repair tool for broken region state; the model intentionally excludes
+  it. The `KeyspaceCoverage` invariant is exactly what force-merge is
+  designed to fix.
 
 ### C.7 Multi-Region Locking
 
@@ -2099,8 +2270,8 @@ for ALL involved regions before any state changes:
 
 | Procedure | Regions Locked |
 |-----------|---------------|
-| Split | Parent + DaughterA + DaughterB |
-| Merge | All parents + merged child |
+| Split | Parent + 2 daughter pool slots |
+| Merge | All targets + merged region |
 
 Locks are held for the entire procedure lifetime (`holdLock() == true`).
 
@@ -2147,7 +2318,7 @@ in `SPLITTING_NEW` or `MERGING_NEW` state:
 ```tla
 MetaConsistency ==
     \A r \in Regions :
-        regionExists[r] =>
+        regionKeyRange[r] # NoRange =>
             \/ regionState[r].state \in {"SPLITTING_NEW", "MERGING_NEW"}
                \* meta says CLOSED while memory says SPLITTING_NEW/MERGING_NEW
             \/ regionState[r].state = metaTable[r].state
@@ -2236,65 +2407,139 @@ MergeProcState == { "MERGE_PREPARE", "MERGE_CLOSE_REGIONS",
 
 ```tla
 VARIABLES
-    regionExists,      \* [Regions → BOOLEAN]
-    splitProcState,     \* [ProcId → SplitProcState]
-    mergeProcState,     \* [ProcId → MergeProcState]
-    daughters,          \* [ProcId → {dA: Region, dB: Region}]
-    mergedRegion        \* [ProcId → Region]
+    regionKeyRange      \* [Regions → [startKey: 0..MaxKey,
+                        \*              endKey: 0..MaxKey]
+                        \*            ∪ {NoRange}]
+                        \* Region "exists" iff regionKeyRange[r] ≠ NoRange.
 ```
+
+**New constants**:
+
+```tla
+CONSTANTS
+    MaxKey              \* Integer; keyspace is 0..(MaxKey-1)
+    RegionPool          \* Pre-allocated region identifiers for
+                        \* dynamic creation
+```
+
+**New initiation actions** (only entry points into split/merge):
+
+| Action | What it does |
+|--------|-------------|
+| `RequestSplit(r)` | Non-deterministic. Models admin RPC or RS-autonomous split. Pre: OPEN, no proc, keyspace width ≥ 2, pool slots available. Transitions into `SplitPrepare`. |
+| `RequestMerge(r1, r2)` | Non-deterministic. Models admin RPC or merge chore. Pre: both OPEN, no procs, `Adjacent(r1, r2)`, pool slot available. Transitions into `MergePrepare`. |
 
 **New actions (split)**:
 
 | Action | What it does |
 |--------|-------------|
-| `SplitPrepare(r, dA, dB)` | Pre: r is OPEN, no procedure attached to r/dA/dB. Set r to SPLITTING, attach split proc to r, dA, dB. |
+| `SplitPrepare(r, dA, dB)` | Compute `mid`, record daughter keyspaces. Set r to SPLITTING, attach split proc to r, dA, dB. Daughters stay `NoRange` until PONR. |
 | `SplitCloseParent(p)` | Create child TRSP(UNASSIGN) for parent. |
 | `SplitCheckClosed(p)` | Verify parent is CLOSED. |
-| `SplitUpdateMeta(p)` | **PONR**: Atomically set parent to SPLIT, create daughters as SPLITTING_NEW (mem) / CLOSED (meta), set regionExists for daughters. |
+| `SplitUpdateMeta(p)` | **PONR**: Set parent to SPLIT, materialize daughter keyspaces (`[start,mid)`, `[mid,end)`), set daughters to SPLITTING_NEW (mem) / CLOSED (meta). |
 | `SplitOpenChildren(p)` | Create child TRSP(ASSIGN) for each daughter. |
-| `SplitDone(p)` | Detach procedure from all regions. |
-| `SplitRollback(p)` | Pre-PONR only: revert parent to OPEN, delete daughters, detach procedure. |
+| `SplitDone(p)` | Clear parent keyspace (`NoRange` — deletion after compaction). Detach procedure. |
+| `SplitRollback(p)` | Pre-PONR only: revert parent to OPEN, clear daughter keyspaces, detach procedure. |
 
 **New actions (merge)**:
 
 | Action | What it does |
 |--------|-------------|
-| `MergePrepare(r1, r2, m)` | Pre: r1, r2 OPEN, no procedures attached. Set r1, r2 to MERGING, attach merge proc. |
-| `MergeCloseRegions(p)` | Create child TRSP(UNASSIGN) for each parent. |
-| `MergeCheckClosed(p)` | Verify all parents are CLOSED. |
-| `MergeCreateMerged(p)` | Set merged region to MERGING_NEW, set regionExists. |
-| `MergeUpdateMeta(p)` | **PONR**: Delete parents from meta, create merged as CLOSED in meta. Set parents to MERGED (or mark non-existent). |
+| `MergePrepare(r1, r2, m)` | Pre: `Adjacent(r1, r2)`. Set r1, r2 to MERGING, attach merge proc to r1, r2, m. |
+| `MergeCloseRegions(p)` | Create child TRSP(UNASSIGN) for each target. |
+| `MergeCheckClosed(p)` | Verify all targets are CLOSED. |
+| `MergeCreateMerged(p)` | Set merged region to MERGING_NEW in memory. |
+| `MergeUpdateMeta(p)` | **PONR**: Set targets to MERGED, materialize merged keyspace (`[r1.start, r2.end)`), create merged as CLOSED in meta. |
 | `MergeOpenMerged(p)` | Create child TRSP(ASSIGN) for merged region. |
-| `MergeDone(p)` | Detach procedure from all regions. |
-| `MergeRollback(p)` | Pre-PONR only: revert parents to OPEN, delete merged, detach procedure. |
+| `MergeDone(p)` | Clear target keyspaces (`NoRange` — deletion after compaction). Detach procedure. |
+| `MergeRollback(p)` | Pre-PONR only: revert targets to OPEN, clear merged keyspace, detach procedure. |
 
 **New invariants**:
 
 ```tla
+KeyspaceCoverage ==
+    \A k \in 0..(MaxKey-1) :
+        \E! r \in Regions :
+            /\ regionKeyRange[r] # NoRange
+            /\ regionKeyRange[r].startKey <= k
+            /\ k < regionKeyRange[r].endKey
+            /\ regionState[r].state \notin {"SPLIT", "MERGED"}
+
+SplitMergeMutualExclusion ==
+    \* No region participates in more than one split/merge at a time.
+    \A r \in Regions :
+        regionKeyRange[r] # NoRange =>
+            regionState[r].procType \in {"SPLIT", "MERGE"}
+                => \A r2 \in Regions \ {r} :
+                    regionState[r2].procType \in {"SPLIT", "MERGE"}
+                    => r \notin participants(r2)
+
 SplitCompleteness ==
-    \A p \in SplitProcs :
-        splitProcState[p] = "SPLIT_DONE" =>
-            /\ regionState[daughters[p].dA].state = "OPEN"
-            /\ regionState[daughters[p].dB].state = "OPEN"
-            /\ regionState[parent[p]].state = "SPLIT"
+    \* After SplitDone: daughters OPEN with correct keyspaces,
+    \* parent deleted (NoRange).
 
 MergeCompleteness ==
-    \A p \in MergeProcs :
-        mergeProcState[p] = "MERGE_DONE" =>
-            /\ regionState[mergedRegion[p]].state = "OPEN"
-            /\ \A r \in parents[p] : regionState[r].state = "MERGED"
+    \* After MergeDone: merged OPEN with union keyspace,
+    \* targets deleted (NoRange).
 
 SplitAtomicity ==
-    \A p \in SplitProcs :
-        splitProcState[p] \in {"SPLIT_PREPARE", "SPLIT_CLOSE_PARENT",
-                               "SPLIT_CHECK_CLOSED"}
-            => \* rollback is possible; daughters don't exist in meta
+    \* Pre-PONR: daughters don't exist (NoRange) and have no
+    \* meta entries.
 
 NoOrphanedDaughters ==
     \A r \in Regions :
         regionState[r].state = "SPLITTING_NEW"
-            => \E p \in SplitProcs : r \in {daughters[p].dA, daughters[p].dB}
+            => \E p : r is a daughter of split procedure p
 ```
+
+### C.11 Implementation Fidelity Analysis
+
+Code analysis of `SplitTableRegionProcedure.java` (985 lines) and
+`MergeTableRegionsProcedure.java` (802 lines) confirms that the
+keyspace-aware model adequately captures all normal-path split/merge
+operations. Prior to this phase, region keys were not considered at all
+in the model; the keyspace model closes this gap.
+
+**Adequately modeled** (see source references in C.5–C.9):
+
+| Aspect | Verdict | Notes |
+|--------|:-------:|-------|
+| Daughter keyspace construction | ✅ | Midpoint vs RS-chosen split row is a sound abstraction |
+| Split state machine | ✅ | Model collapses CP hooks + FS ops; no safety impact |
+| Merge state machine | ✅ | Same collapsing rationale |
+| PONR boundary | ✅ | Exact match — `UPDATE_META` and beyond are irreversible |
+| Region-level locking | ✅ | `acquireLock` on all involved regions; faithful |
+| Rollback behavior | ✅ | Structurally equivalent |
+| Adjacency check (normal path) | ✅ | `RegionInfo.isAdjacent()` ↔ model's `Adjacent(r1, r2)` |
+| `KeyspaceCoverage` | ✅ | New — major improvement over the no-keyspace model |
+| Mutual exclusion | ✅ | Procedure attachment + state guards |
+| Parent/target deletion | ✅ | SPLIT/MERGED terminal states; GC is async, no safety impact |
+
+**Intentional modeling exclusions**:
+
+1. **N-way merge**: Implementation accepts `RegionInfo[]` (≥2).
+   Model restricts to 2-way. The 2-way case exercises all state
+   transitions, locking, PONR, and crash recovery — N-way is
+   structurally identical but for more regions.
+
+2. **Force merge** (`force=true`): Bypasses `isAdjacent()`/`isOverlap()`
+   check in `checkRegionsToMerge()` (L138). The merged region's
+   keyspace is computed as the `min(startKey)..max(endKey)` envelope,
+   which can overlap existing regions or leave gaps. This is an admin
+   repair tool, not normal operation. `KeyspaceCoverage` would be
+   intentionally violated — the invariant is what force-merge fixes.
+
+3. **State machine steps collapsed**: The implementation has additional
+   states for coprocessor hooks (`PRE_OPERATION`, `PRE_OPERATION_
+   BEFORE_META`, `POST_MERGE_COMMIT_OPERATION`, etc.) and filesystem
+   operations (`CREATE_DAUGHTER_REGIONS`, `WRITE_MAX_SEQUENCE_ID_FILE`).
+   These are collapsed in the model because they do not affect
+   region state transitions or assignment safety properties.
+
+4. **Split point source**: Implementation obtains `bestSplitRow` from
+   the RS via `GetRegionInfoResponse` or from a user-specified row.
+   The model computes `mid = (start + end) ÷ 2`. Both produce valid
+   keyspace partitions; the exact byte is irrelevant to safety.
 
 ---
 
