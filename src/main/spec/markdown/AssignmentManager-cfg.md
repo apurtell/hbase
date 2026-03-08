@@ -24,7 +24,7 @@ SPECIFICATION Spec
 | `NoProcedure` | `NoProcedure` | Sentinel: no persisted procedure |
 | `NoTransition` | `NoTransition` | Sentinel: no transition code |
 | `MaxRetries` | `1` | Max FAILED_OPEN retries before give-up |
-| `UseReopen` | `TRUE` | Models branch-2's REOPEN procedure |
+| `UseReopen` | `FALSE` | Models branch-2's REOPEN procedure (disabled in primary config for state-space reduction) |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | Disable RS duplicate-open silent-drop (avoids deadlock) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery behavior (disable bug reproduction) |
 | `MaxWorkers` | `2` | PEWorker thread pool size |
@@ -38,7 +38,7 @@ CONSTANTS
     NoProcedure = NoProcedure
     NoTransition = NoTransition
     MaxRetries = 1
-    UseReopen = TRUE
+    UseReopen = FALSE
     UseRSOpenDuplicateQuirk = FALSE
     UseRestoreSucceedQuirk = FALSE
     MaxWorkers = 2

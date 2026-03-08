@@ -2,7 +2,7 @@
 
 **Source:** [`AssignmentManager.tla`](../AssignmentManager.tla)
 
-Root orchestrator module for the HBase AssignmentManager TLA+ specification. Declares all 18 state variables, instantiates action sub-modules (TRSP, SCP, RegionServer, Master, ProcStore, ZK), defines 21 safety invariants, 2 action constraints, Init, Next, Fairness, and the top-level Spec.
+Root orchestrator module for the HBase AssignmentManager TLA+ specification. Declares all 17 state variables, instantiates action sub-modules (TRSP, SCP, RegionServer, Master, ProcStore, ZK), defines 21 safety invariants, 2 action constraints, Init, Next, Fairness, and the top-level Spec.
 
 ## Design Overview
 
@@ -118,13 +118,6 @@ VARIABLE scpRegions
 VARIABLE walFenced
 ```
 
-### locked
-
-Per-region write lock. `TRUE` while a region-state-mutating action holds the lock. Since TLA+ actions are atomic, locked is acquired and released within the same step.
-
-```tla
-VARIABLE locked
-```
 
 ### carryingMeta
 
@@ -202,7 +195,7 @@ VARIABLE blockedOnMeta
 vars ==
   << regionState, metaTable, dispatchedOps, pendingReports,
      rsOnlineRegions, serverState, scpState, scpRegions,
-     walFenced, locked, carryingMeta, serverRegions,
+     walFenced, carryingMeta, serverRegions,
      procStore, masterAlive, zkNode,
      availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
@@ -250,7 +243,7 @@ zk     == INSTANCE ZK
 
 ### TypeOK
 
-Validates all 18 state variables have correct types and structural consistency.
+Validates all 17 state variables have correct types and structural consistency.
 
 ```tla
 TypeOK ==
@@ -278,7 +271,7 @@ TypeOK ==
   /\ scpRegions \in [Servers -> SUBSET Regions]
   /\ walFenced \in [Servers -> BOOLEAN]
   /\ carryingMeta \in [Servers -> BOOLEAN]
-  /\ locked \in [Regions -> BOOLEAN]
+
   /\ serverRegions \in [Servers -> SUBSET Regions]
   /\ procStore \in [Regions -> ProcStoreRecord \cup { NoProcedure }]
   /\ masterAlive \in BOOLEAN
@@ -673,7 +666,7 @@ Init ==
   /\ scpRegions = [s \in Servers |-> {}]
   /\ walFenced = [s \in Servers |-> FALSE]
   /\ carryingMeta = [s \in Servers |-> FALSE]
-  /\ locked = [r \in Regions |-> FALSE]
+
   /\ serverRegions = [s \in Servers |-> {}]
   /\ procStore = [r \in Regions |-> NoProcedure]
   /\ masterAlive = TRUE

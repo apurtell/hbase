@@ -21,7 +21,6 @@ VARIABLE regionState,
          scpState,
          scpRegions,
          walFenced,
-         locked,
          carryingMeta,
          serverRegions,
          procStore,
@@ -43,9 +42,6 @@ scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
 
-\* Shorthand for procedure/lock variables (used in UNCHANGED clauses).
-procVars == << procStore, locked >>
-
 \* Shorthand for server tracking variables (used in UNCHANGED clauses).
 serverVars == << serverState, serverRegions >>
 
@@ -53,7 +49,6 @@ serverVars == << serverState, serverRegions >>
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 
 ---------------------------------------------------------------------------
-
 
 (* Actions -- master-side events *)
 \* Transition from CLOSED back to OFFLINE.
@@ -87,7 +82,7 @@ GoOffline(r) ==
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
-        procVars,
+        procStore,
         rsVars,
         masterVars,
         metaTable,
@@ -133,7 +128,7 @@ MasterDetectCrash(s) ==
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ UNCHANGED << rpcVars,
         peVars,
-        procVars,
+        procStore,
         rsVars,
         masterVars,
         regionState,
@@ -153,7 +148,7 @@ MasterDetectCrash(s) ==
 \* because fencing is an HDFS-level operation, not master-level.
 \*
 \* In-memory variables (regionState, serverState, dispatchedOps,
-\* pendingReports, scpState, scpRegions, locked, serverRegions,
+\* pendingReports, scpState, scpRegions, serverRegions,
 \* carryingMeta) become stale but are left UNCHANGED because:
 \*   1. All invariants referencing them are gated on masterAlive=TRUE.
 \*   2. All actions using them require masterAlive=TRUE as a guard.
@@ -168,6 +163,7 @@ MasterDetectCrash(s) ==
 \*
 \* Source: Master JVM crash — all in-memory state is lost.
 MasterCrash ==
+  \* Master must be alive to crash
   /\ masterAlive = TRUE
   /\ masterAlive' = FALSE
   \* In-memory master state becomes stale (gated on masterAlive).
@@ -177,7 +173,6 @@ MasterCrash ==
         pendingReports,
         scpState,
         scpRegions,
-        locked,
         serverRegions,
         carryingMeta,
         availableWorkers,
@@ -313,8 +308,6 @@ MasterRecover ==
   /\ dispatchedOps' = [s \in Servers |-> {}]
   \* Clear pending reports (stale from pre-crash master).
   /\ pendingReports' = {}
-  \* Reset locks.
-  /\ locked' = [r \in Regions |-> FALSE]
   \* Rebuild serverRegions from recovered regionState.
   /\ serverRegions' =
        [s \in Servers |->
