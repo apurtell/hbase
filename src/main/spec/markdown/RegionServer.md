@@ -18,7 +18,7 @@ EXTENDS Types
 ```tla
 VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
          rsOnlineRegions, serverState, scpState, scpRegions,
-         walFenced, locked, carryingMeta, serverRegions,
+         walFenced, carryingMeta, serverRegions,
          procStore, masterAlive, zkNode,
          availableWorkers, suspendedOnMeta, blockedOnMeta
 ```
@@ -29,7 +29,7 @@ VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
 rsVars     == << rsOnlineRegions >>
 scpVars    == << scpState, scpRegions, walFenced, carryingMeta >>
 masterVars == << masterAlive >>
-procVars   == << procStore, locked >>
+procStore   == << procStore >>
 serverVars == << serverState, serverRegions >>
 peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
@@ -56,7 +56,7 @@ RSAbort(s) ==
   /\ rsOnlineRegions[s] # {} \/ dispatchedOps[s] # {}
   /\ rsOnlineRegions' = [rsOnlineRegions EXCEPT ![s] = {}]
   /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = {}]
-  /\ UNCHANGED << scpVars, serverVars, procVars, masterVars,
+  /\ UNCHANGED << scpVars, serverVars, procStore, masterVars,
                    regionState, metaTable, pendingReports, peVars, zkNode >>
 ```
 
@@ -83,7 +83,7 @@ DropStaleReport ==
     /\ UNCHANGED << scpVars,
         peVars,
           serverVars,
-          procVars,
+          procStore,
           rsVars,
           masterVars, regionState, metaTable,
           dispatchedOps, zkNode >>
@@ -121,7 +121,7 @@ RSOpen(s, r) ==
        /\ UNCHANGED << scpVars,
               peVars,
              serverVars,
-             procVars,
+             procStore,
              masterVars,
              regionState, metaTable, zkNode >>
 ```
@@ -152,7 +152,7 @@ RSFailOpen(s, r) ==
        /\ UNCHANGED << scpVars,
               peVars,
              serverVars,
-             procVars,
+             procStore,
              rsVars,
              masterVars, regionState, metaTable, zkNode >>
 ```
@@ -186,7 +186,7 @@ RSClose(s, r) ==
        /\ UNCHANGED << scpVars,
               peVars,
              serverVars,
-             procVars,
+             procStore,
              masterVars,
              regionState, metaTable, zkNode >>
 ```
@@ -221,7 +221,7 @@ RSOpenDuplicate(s, r) ==
        /\ UNCHANGED << scpVars,
              serverVars,
               peVars,
-             procVars,
+             procStore,
              rsVars,
              masterVars,
              regionState, metaTable,
@@ -259,5 +259,5 @@ RSRestart(s) ==
   /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
   \* Register a fresh ZK ephemeral node for the restarted server.
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
-  /\ UNCHANGED << procVars, masterVars, peVars, regionState, metaTable >>
+  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable >>
 ```
