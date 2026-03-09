@@ -6,89 +6,141 @@ Pure-definition module: constants, type sets, and state definitions for the HBas
 
 ---
 
-## Module Declaration
-
 ```tla
 ---------------------- MODULE Types ---------------------------
-EXTENDS Naturals, FiniteSets, TLC
 ```
 
----
-
-## Constants
-
-### Regions and Servers
-
-The finite sets of region and RegionServer identifiers. Both must be non-empty.
+Pure-definition module: constants, type sets, and state definitions
+for the HBase AssignmentManager specification.
 
 ```tla
-CONSTANTS Regions, Servers
+EXTENDS Naturals, FiniteSets, TLC
+
+CONSTANTS Regions,    \* The finite set of region identifiers
+         Servers
+```
+
+The finite set of regionserver identifiers
+
+```tla
 ASSUME Regions # {}
 ASSUME Servers # {}
 ```
 
-### Sentinel Values
+DeployedRegions: the table regions that exist at system start.
+They tile the full keyspace [0, MaxKey) in Init.
+Regions \ DeployedRegions are unused identifiers available for
+split/merge to materialize as new regions.
 
 ```tla
-CONSTANTS NoServer      \* "no server assigned"
-ASSUME NoServer \notin Servers
-
-CONSTANTS NoTransition  \* "no transition code recorded" (used except at REPORT_SUCCEED)
-CONSTANTS NoProcedure   \* "no persisted procedure"
+CONSTANTS DeployedRegions
+ASSUME DeployedRegions \subseteq Regions
+ASSUME DeployedRegions # {}
 ```
 
-### MaxRetries
+MaxKey: the keyspace is 0..(MaxKey-1).
 
-Maximum open-retry attempts before giving up (`FAILED_OPEN`).
+```tla
+CONSTANTS MaxKey
+ASSUME MaxKey \in Nat /\ MaxKey > 0
+```
+
+NoRange: sentinel model value for unused region identifiers
+whose keyspace has not been assigned (region does not exist).
+
+```tla
+CONSTANTS NoRange
+```
+
+Sentinel model value for "no server assigned"
+
+```tla
+CONSTANTS NoServer
+ASSUME NoServer \notin Servers
+```
+
+Sentinel model value for "no transition code recorded".
+Used in ProcStoreRecord.transitionCode for all procedure steps
+except REPORT_SUCCEED.
+
+```tla
+CONSTANTS NoTransition
+```
+
+Sentinel model value for "no persisted procedure".
+
+```tla
+CONSTANTS NoProcedure
+```
+
+Maximum open-retry attempts before giving up (FAILED_OPEN)
 
 ```tla
 CONSTANTS MaxRetries
 ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
 ```
 
-### UseReopen
-
-When `TRUE`, `TRSPCreateReopen` is enabled, modeling the branch-2.6 REOPEN transition type (close then reopen on the same server). `master` (branch-3+) does not have REOPEN, only MOVE. Setting `FALSE` disables REOPEN, reducing the state space.
+UseReopen: when TRUE, TRSPCreateReopen is enabled, modeling the
+branch-2.6 REOPEN transition type (close then reopen on the same
+server).  master (branch-3+) does not have REOPEN, only MOVE.
+Setting FALSE disables REOPEN, reducing the state space.
 
 ```tla
 CONSTANTS UseReopen
 ASSUME UseReopen \in BOOLEAN
 ```
 
-### UseRSOpenDuplicateQuirk
-
-When `TRUE`, the `RSOpenDuplicate` action is enabled, modeling `AssignRegionHandler.process()` L107-115 where the RS silently drops OPEN requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
+UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
+enabled, modeling AssignRegionHandler.process() L107-115 where the
+RS silently drops OPEN requests for already-online regions without
+reporting back.  This can cause TRSP deadlock (stuck at
+CONFIRM_OPENED).  Default FALSE to avoid deadlock in model checking;
+set TRUE to surface the implementation quirk and generate traces.
 
 ```tla
 CONSTANTS UseRSOpenDuplicateQuirk
 ASSUME UseRSOpenDuplicateQuirk \in BOOLEAN
 ```
 
-### UseRestoreSucceedQuirk
-
-When `TRUE`, `RestoreSucceedState` faithfully reproduces the `OpenRegionProcedure.restoreSucceedState()` L128-136 bug where OPEN-type procedures always replay as OPENED regardless of the persisted `transitionCode` (even `FAILED_OPEN`). Default `FALSE` so that recovery correctly checks `transitionCode` and branches; set `TRUE` to demonstrate the violation and generate counterexample traces.
+UseRestoreSucceedQuirk: when TRUE, RestoreSucceedState faithfully
+reproduces the OpenRegionProcedure.restoreSucceedState() L128-136
+bug where OPEN-type procedures always replay as OPENED regardless
+of the persisted transitionCode (even FAILED_OPEN).  Default FALSE
+so that recovery correctly checks transitionCode and branches;
+set TRUE to demonstrate the violation and generate counterexample
+traces.
 
 ```tla
 CONSTANTS UseRestoreSucceedQuirk
 ASSUME UseRestoreSucceedQuirk \in BOOLEAN
 ```
 
-### MaxWorkers
+MaxWorkers: ProcedureExecutor worker thread pool size.
+All procedure-step actions require an available worker to execute.
+Non-blocking actions acquire and release within the same atomic step
+(net-zero effect).  Meta-writing actions when meta is unavailable
+may hold a worker (UseBlockOnMetaWrite=TRUE) or suspend and release
+(UseBlockOnMetaWrite=FALSE).
 
-ProcedureExecutor worker thread pool size. All procedure-step actions require an available worker to execute. Non-blocking actions acquire and release within the same atomic step (net-zero effect). Meta-writing actions when meta is unavailable may hold a worker (`UseBlockOnMetaWrite=TRUE`) or suspend and release (`UseBlockOnMetaWrite=FALSE`).
-
-**Source:** `ProcedureExecutor.workerThreadCount`; `hbase.procedure.threads` (conf, default=# CPUs / 4).
+*Source:* ProcedureExecutor.workerThreadCount;
+hbase.procedure.threads (conf, default=# CPUs / 4).
 
 ```tla
 CONSTANTS MaxWorkers
 ASSUME MaxWorkers \in Nat /\ MaxWorkers > 0
 ```
 
-### UseBlockOnMetaWrite
+UseBlockOnMetaWrite: when FALSE (default, master/branch-3+),
+RegionStateStore.updateRegionLocation() returns CompletableFuture<Void>
+via AsyncTable.put() and the calling procedure suspends via
+ProcedureFutureUtil.suspendIfNecessary(), releasing the PEWorker thread.
+When TRUE (branch-2.6), RegionStateStore uses synchronous Table.put(),
+blocking the PEWorker thread until the RPC completes.
 
-When `FALSE` (default, master/branch-3+), `RegionStateStore.updateRegionLocation()` returns `CompletableFuture<Void>` via `AsyncTable.put()` and the calling procedure suspends via `ProcedureFutureUtil.suspendIfNecessary()`, releasing the PEWorker thread. When `TRUE` (branch-2.6), `RegionStateStore` uses synchronous `Table.put()`, blocking the PEWorker thread until the RPC completes.
-
-**Source:** master/branch-3+: `RegionStateStore.updateRegionLocation()` via `AsyncTable.put()`; `ProcedureFutureUtil.suspendIfNecessary()`. branch-2.6: `RegionStateStore.updateRegionLocation()` L158-240 uses synchronous `Table.put()` (L237-239).
+*Source:* master/branch-3+: RegionStateStore.updateRegionLocation()
+via AsyncTable.put(); ProcedureFutureUtil.suspendIfNecessary().
+branch-2.6: RegionStateStore.updateRegionLocation() L158-240
+uses synchronous Table.put() (L237-239).
 
 ```tla
 CONSTANTS UseBlockOnMetaWrite
@@ -97,25 +149,25 @@ ASSUME UseBlockOnMetaWrite \in BOOLEAN
 
 ---
 
-## State Definitions
+State definitions
 
-### State
+Region lifecycle states.
 
-Core assignment lifecycle states. Mirrors `RegionState.State` (`HBase.proto` / `RegionState.java`) for the assign/unassign/move path.
-
-| Modeled | Impl Enum Value |
-|---------|-----------------|
-| `"OFFLINE"` | OFFLINE (=0) |
-| `"OPENING"` | OPENING (=1) |
-| `"OPEN"` | OPEN (=2) |
-| `"CLOSING"` | CLOSING (=3) |
-| `"CLOSED"` | CLOSED (=4) |
-| `"FAILED_OPEN"` | FAILED_OPEN (=8) |
-| `"ABNORMALLY_CLOSED"` | ABNORMALLY_CLOSED (=10) |
-
-**Deferred:** SPLITTING (=5), SPLIT (=6), MERGING (=9), MERGED (=11), SPLITTING_NEW (=7), MERGING_NEW (=12)
-
-**Omitted:** FAILED_CLOSE (not in proto; RS aborts on close failure, resolved through ABNORMALLY_CLOSED instead)
+Modeled             | Impl enum value
+--------------------+---------------------------------------------
+"OFFLINE"           | OFFLINE (=0)
+"OPENING"           | OPENING (=1)
+"OPEN"              | OPEN (=2)
+"CLOSING"           | CLOSING (=3)
+"CLOSED"            | CLOSED (=4)
+"SPLITTING"         | SPLITTING (=5)
+"SPLIT"             | SPLIT (=6)
+"SPLITTING_NEW"     | SPLITTING_NEW (=7)
+"FAILED_OPEN"       | FAILED_OPEN (=8)
+"MERGING"           | MERGING (=9)
+"ABNORMALLY_CLOSED" | ABNORMALLY_CLOSED (=10)
+"MERGED"            | MERGED (=11)
+"MERGING_NEW"       | MERGING_NEW (=12)
 
 ```tla
 State ==
@@ -124,37 +176,23 @@ State ==
     "OPEN",
     "CLOSING",
     "CLOSED",
+    "SPLITTING",
+    "SPLIT",
+    "SPLITTING_NEW",
     "FAILED_OPEN",
-    "ABNORMALLY_CLOSED"
+    "MERGING",
+    "ABNORMALLY_CLOSED",
+    "MERGED",
+    "MERGING_NEW"
   }
 ```
 
----
-
-### ValidTransition
-
-The set of valid `<<from, to>>` state transitions. Derived from `AssignmentManager.java` expected-state arrays and the actual `transitionState()` / `setState()` call sites.
-
-| Transition | Source |
-|------------|--------|
-| OFFLINE → OPENING | `AM.regionOpening()` |
-| OPENING → OPEN | `AM.regionOpenedWithoutPersistingToMeta()` (STATES_EXPECTED_ON_OPEN) |
-| OPENING → FAILED_OPEN | `AM.regionFailedOpen()` |
-| OPEN → CLOSING | `AM.regionClosing()` (STATES_EXPECTED_ON_CLOSING) |
-| CLOSING → CLOSED | `AM.regionClosedWithoutPersistingToMeta()` (STATES_EXPECTED_ON_CLOSED) |
-| CLOSED → OPENING | `AM.regionOpening()` via assign (STATES_EXPECTED_ON_ASSIGN) |
-| CLOSED → OFFLINE | `RegionStateNode.offline()` |
-| OPEN → ABNORMALLY_CLOSED | `AM.regionClosedAbnormally()` |
-| OPENING → ABNORMALLY_CLOSED | `AM.regionClosedAbnormally()` (server crash during open) |
-| CLOSING → ABNORMALLY_CLOSED | `AM.regionClosedAbnormally()` (server crash during close) |
-| ABNORMALLY_CLOSED → OPENING | `AM.regionOpening()` (no expected states) |
-| FAILED_OPEN → OPENING | `AM.regionOpening()` (no expected states) |
-
-The `regionOpening()` transition accepts ANY prior state (no `expectedStates` parameter) because SCP may need to reassign a region from any state after a crash. In the model we restrict this to the states that legitimately precede an assignment: OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN.
+The set of valid (from, to) state transitions.
 
 ```tla
 ValidTransition ==
-  { << "OFFLINE", "OPENING" >>,
+  { \* --- Core assign/unassign/move ---
+    << "OFFLINE", "OPENING" >>,
     << "OPENING", "OPEN" >>,
     << "OPENING", "FAILED_OPEN" >>,
     << "OPEN", "CLOSING" >>,
@@ -165,25 +203,39 @@ ValidTransition ==
     << "OPENING", "ABNORMALLY_CLOSED" >>,
     << "CLOSING", "ABNORMALLY_CLOSED" >>,
     << "ABNORMALLY_CLOSED", "OPENING" >>,
-    << "FAILED_OPEN", "OPENING" >>
+    << "FAILED_OPEN", "OPENING" >>,
+```
+
+--- Split-specific ---
+
+```tla
+    << "OPEN", "SPLITTING" >>,
+    << "SPLITTING", "CLOSING" >>,
+    << "SPLITTING", "OPEN" >>,
+    << "CLOSED", "SPLIT" >>,
+    << "SPLITTING_NEW", "OPENING" >>,
+```
+
+--- Merge-specific ---
+
+```tla
+    << "OPEN", "MERGING" >>,
+    << "MERGING", "CLOSING" >>,
+    << "MERGING", "OPEN" >>,
+    << "CLOSED", "MERGED" >>,
+    << "MERGING_NEW", "OPENING" >>
   }
 ```
 
----
+TRSP internal states used in the procStep field of regionState.
+ASSIGN path:   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (cleared)
+UNASSIGN path: CLOSE -> CONFIRM_CLOSED -> (cleared)
+MOVE path:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
+-> CONFIRM_OPENED -> (cleared)
+REPORT_SUCCEED: intermediate state
 
-### TRSPState
-
-TRSP internal states used in the `procStep` field of `regionState`.
-
-| Path | State Machine |
-|------|---------------|
-| ASSIGN | GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED → (cleared) |
-| UNASSIGN | CLOSE → CONFIRM_CLOSED → (cleared) |
-| MOVE | CLOSE → CONFIRM_CLOSED → GET_ASSIGN_CANDIDATE → OPEN → CONFIRM_OPENED → (cleared) |
-
-`REPORT_SUCCEED` is an intermediate state after `RegionRemoteProcedureBase` has consumed the RS report and updated in-memory state, but before the final state has been persisted to `metaTable`. This exposes the crash-vulnerable window for master crash and recovery modeling.
-
-1:1 match with `RegionStateTransitionState` enum (`MasterProcedure.proto`). See `TRSP.tla` header for the full traceability table.
+Matches the RegionStateTransitionState enum (MasterProcedure.proto).
+See TRSP.tla header for the full traceability table.
 
 ```tla
 TRSPState ==
@@ -196,57 +248,33 @@ TRSPState ==
   }
 ```
 
----
+Procedure types.  "NONE" means no procedure is attached.
+REOPEN: close on current server then reopen preferring the same server
+(assignCandidate pinning); no other ONLINE server required.
 
-### ProcType
-
-Procedure types. `"NONE"` means no procedure is attached. REOPEN: close on current server then reopen preferring the same server (assignCandidate pinning); no other ONLINE server required.
-
-| TLA+ | Protobuf (`RegionTransitionType`) |
-|------|-----------------------------------|
-| `"ASSIGN"` | ASSIGN (=1) |
-| `"UNASSIGN"` | UNASSIGN (=2) |
-| `"MOVE"` | MOVE (=3) |
-| `"REOPEN"` | REOPEN (=4) |
-| `"NONE"` | (model-only sentinel) |
+Maps to RegionTransitionType enum (MasterProcedure.proto).
 
 ```tla
-ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN", "NONE" }
+ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN", "SPLIT", "MERGE", "NONE" }
 ```
 
----
-
-### CommandType
-
-RPC command types dispatched from master to RegionServer. Maps to `RegionRemoteProcedureBase` subclasses: `OpenRegionProcedure` and `CloseRegionProcedure` (dispatched via `executeProcedures()` RPC through `RSProcedureDispatcher`).
+RPC command types dispatched from master to RegionServer.
+Maps to RegionRemoteProcedureBase subclasses.
 
 ```tla
 CommandType == { "OPEN", "CLOSE" }
 ```
 
----
-
-### ReportCode
-
-Transition codes reported from RegionServer back to master. Maps to `RegionServerStatusService.RegionStateTransition.TransitionCode` (`RegionServerStatus.proto`).
-
-| TLA+ | Protobuf |
-|------|----------|
-| `"OPENED"` | OPENED (=0) |
-| `"FAILED_OPEN"` | FAILED_OPEN (=1) |
-| `"CLOSED"` | CLOSED (=3) |
-
-**Omitted:** READY_TO_SPLIT (=4), SPLIT (=5), SPLIT_REVERTED (=7), READY_TO_MERGE (=8), MERGED (=9), MERGE_REVERTED (=10)
+Transition codes reported from RegionServer back to master.
+Maps to RegionServerStatusService.RegionStateTransition.TransitionCode
 
 ```tla
 ReportCode == { "OPENED", "FAILED_OPEN", "CLOSED" }
 ```
 
----
-
-### ProcStoreRecord
-
-Type definition for persisted procedure records. `transitionCode` records the RS report outcome when `step = REPORT_SUCCEED`; set to `NoTransition` for all other steps.
+Type definition for persisted procedure records.
+transitionCode records the RS report outcome when step = REPORT_SUCCEED;
+set to NoTransition for all other steps.
 
 ```tla
 ProcStoreRecord ==
@@ -259,11 +287,11 @@ ProcStoreRecord ==
 
 ---
 
-## Helpers
+Helpers
 
-### NewProcRecord
-
-Constructor for `procStore` records. All sites that write to `procStore` must call this instead of constructing an inline record literal, ensuring the 4-field shape is maintained in one place.
+Constructor for procStore records.  All sites that write to procStore
+must call this instead of constructing an inline record literal,
+ensuring the 4-field shape is maintained in one place.
 
 ```tla
 NewProcRecord(type, step, server, tc) ==

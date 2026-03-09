@@ -27,13 +27,14 @@ VARIABLE regionState,
          zkNode,
          availableWorkers,
          suspendedOnMeta,
-         blockedOnMeta
+         blockedOnMeta,
+         regionKeyRange
 
 \* Shorthand for the RS-side variable (used in UNCHANGED clauses).
 rsVars == << rsOnlineRegions >>
 
 \* Shorthand for the SCP-related variables (used in UNCHANGED clauses).
-scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
+scpVars == << scpState, scpRegions, walFenced, carryingMeta, regionKeyRange >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
@@ -386,6 +387,6 @@ RSRestart(s) ==
   \* Source: HRegionServer.run() -> createMyEphemeralNode().
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
   \* Region state and META unchanged.
-  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable >>
+  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable, regionKeyRange >>
 
 ============================================================================

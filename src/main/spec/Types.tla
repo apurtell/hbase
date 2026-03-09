@@ -12,6 +12,22 @@ CONSTANTS Regions,    \* The finite set of region identifiers
 ASSUME Regions # {}
 ASSUME Servers # {}
 
+\* DeployedRegions: the table regions that exist at system start.
+\* They tile the full keyspace [0, MaxKey) in Init.
+\* Regions \ DeployedRegions are unused identifiers available for
+\* split/merge to materialize as new regions.
+CONSTANTS DeployedRegions
+ASSUME DeployedRegions \subseteq Regions
+ASSUME DeployedRegions # {}
+
+\* MaxKey: the keyspace is 0..(MaxKey-1).
+CONSTANTS MaxKey
+ASSUME MaxKey \in Nat /\ MaxKey > 0
+
+\* NoRange: sentinel model value for unused region identifiers
+\* whose keyspace has not been assigned (region does not exist).
+CONSTANTS NoRange
+
 \* Sentinel model value for "no server assigned"
 CONSTANTS NoServer
 ASSUME NoServer \notin Servers
@@ -83,9 +99,7 @@ ASSUME UseBlockOnMetaWrite \in BOOLEAN
 ---------------------------------------------------------------------------
 
 (* State definitions *)
-\* Core assignment lifecycle states.
-\* Mirrors RegionState.State (HBase.proto / RegionState.java) for the
-\* assign/unassign/move path.
+\* Region lifecycle states.
 \*
 \*   Modeled             | Impl enum value
 \*   --------------------+---------------------------------------------
@@ -94,50 +108,34 @@ ASSUME UseBlockOnMetaWrite \in BOOLEAN
 \*   "OPEN"              | OPEN (=2)
 \*   "CLOSING"           | CLOSING (=3)
 \*   "CLOSED"            | CLOSED (=4)
+\*   "SPLITTING"         | SPLITTING (=5)
+\*   "SPLIT"             | SPLIT (=6)
+\*   "SPLITTING_NEW"     | SPLITTING_NEW (=7)
 \*   "FAILED_OPEN"       | FAILED_OPEN (=8)
+\*   "MERGING"           | MERGING (=9)
 \*   "ABNORMALLY_CLOSED" | ABNORMALLY_CLOSED (=10)
-\*
-\* Deferred:
-\*   SPLITTING (=5), SPLIT (=6), MERGING (=9), MERGED (=11),
-\*   SPLITTING_NEW (=7), MERGING_NEW (=12)
-\*
-\* Omitted:
-\*   FAILED_CLOSE (not in proto; RS aborts on close failure,
-\*   resolved through ABNORMALLY_CLOSED instead)
+\*   "MERGED"            | MERGED (=11)
+\*   "MERGING_NEW"       | MERGING_NEW (=12)
 State ==
   { "OFFLINE",
     "OPENING",
     "OPEN",
     "CLOSING",
     "CLOSED",
+    "SPLITTING",
+    "SPLIT",
+    "SPLITTING_NEW",
     "FAILED_OPEN",
-    "ABNORMALLY_CLOSED"
+    "MERGING",
+    "ABNORMALLY_CLOSED",
+    "MERGED",
+    "MERGING_NEW"
   }
 
 \* The set of valid (from, to) state transitions.
-\* Derived from AssignmentManager.java expected-state arrays and
-\* the actual transitionState() / setState() call sites.
-\*
-\* Source references:
-\*   OFFLINE  -> OPENING : AM.regionOpening()
-\*   OPENING  -> OPEN    : AM.regionOpenedWithoutPersistingToMeta() (STATES_EXPECTED_ON_OPEN)
-\*   OPENING  -> FAILED_OPEN : AM.regionFailedOpen()
-\*   OPEN     -> CLOSING : AM.regionClosing() (STATES_EXPECTED_ON_CLOSING)
-\*   CLOSING  -> CLOSED  : AM.regionClosedWithoutPersistingToMeta() (STATES_EXPECTED_ON_CLOSED)
-\*   CLOSED   -> OPENING : AM.regionOpening() via assign (STATES_EXPECTED_ON_ASSIGN)
-\*   CLOSED   -> OFFLINE : RegionStateNode.offline()
-\*   OPEN     -> ABNORMALLY_CLOSED : AM.regionClosedAbnormally()
-\*   OPENING  -> ABNORMALLY_CLOSED : AM.regionClosedAbnormally() (server crash during open)
-\*   CLOSING  -> ABNORMALLY_CLOSED : AM.regionClosedAbnormally() (server crash during close)
-\*   ABNORMALLY_CLOSED -> OPENING : AM.regionOpening() (no expected states)
-\*   FAILED_OPEN -> OPENING : AM.regionOpening() (no expected states)
-\*
-\* The regionOpening() transition accepts ANY prior state (no expectedStates
-\* parameter) because SCP may need to reassign a region from any state after
-\* a crash. In the model we restrict this to the states that legitimately
-\* precede an assignment: OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN.
 ValidTransition ==
-  { << "OFFLINE", "OPENING" >>,
+  { \* --- Core assign/unassign/move ---
+    << "OFFLINE", "OPENING" >>,
     << "OPENING", "OPEN" >>,
     << "OPENING", "FAILED_OPEN" >>,
     << "OPEN", "CLOSING" >>,
@@ -148,7 +146,19 @@ ValidTransition ==
     << "OPENING", "ABNORMALLY_CLOSED" >>,
     << "CLOSING", "ABNORMALLY_CLOSED" >>,
     << "ABNORMALLY_CLOSED", "OPENING" >>,
-    << "FAILED_OPEN", "OPENING" >>
+    << "FAILED_OPEN", "OPENING" >>,
+    \* --- Split-specific ---
+    << "OPEN", "SPLITTING" >>,
+    << "SPLITTING", "CLOSING" >>,
+    << "SPLITTING", "OPEN" >>,
+    << "CLOSED", "SPLIT" >>,
+    << "SPLITTING_NEW", "OPENING" >>,
+    \* --- Merge-specific ---
+    << "OPEN", "MERGING" >>,
+    << "MERGING", "CLOSING" >>,
+    << "MERGING", "OPEN" >>,
+    << "CLOSED", "MERGED" >>,
+    << "MERGING_NEW", "OPENING" >>
   }
 
 \* TRSP internal states used in the procStep field of regionState.
@@ -156,15 +166,10 @@ ValidTransition ==
 \* UNASSIGN path: CLOSE -> CONFIRM_CLOSED -> (cleared)
 \* MOVE path:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
 \*                   -> CONFIRM_OPENED -> (cleared)
+\* REPORT_SUCCEED: intermediate state
 \*
-\* REPORT_SUCCEED: intermediate state after RegionRemoteProcedureBase
-\*   has consumed the RS report and updated in-memory state, but before
-\*   the final state has been persisted to metaTable.  Exposes the
-\*   crash-vulnerable window for master crash and recovery modeling.
-\*
-\* 1:1 match with RegionStateTransitionState enum
-\* (MasterProcedure.proto).  See TRSP.tla header for the full
-\* traceability table.
+\* Matches the RegionStateTransitionState enum (MasterProcedure.proto).
+\* See TRSP.tla header for the full traceability table.
 TRSPState ==
   { "GET_ASSIGN_CANDIDATE",
     "OPEN",
@@ -178,36 +183,15 @@ TRSPState ==
 \* REOPEN: close on current server then reopen preferring the same server
 \* (assignCandidate pinning); no other ONLINE server required.
 \*
-\* Maps to RegionTransitionType enum (MasterProcedure.proto):
-\*   "ASSIGN"   -> ASSIGN (=1)
-\*   "UNASSIGN" -> UNASSIGN (=2)
-\*   "MOVE"     -> MOVE (=3)
-\*   "REOPEN"   -> REOPEN (=4)
-\*   "NONE"     -> (no protobuf equivalent; model-only sentinel)
-ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN", "NONE" }
+\* Maps to RegionTransitionType enum (MasterProcedure.proto).
+ProcType == { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN", "SPLIT", "MERGE", "NONE" }
 
 \* RPC command types dispatched from master to RegionServer.
-\* Maps to RegionRemoteProcedureBase subclasses:
-\*   "OPEN"  -> OpenRegionProcedure (dispatches via executeProcedures() RPC)
-\*   "CLOSE" -> CloseRegionProcedure (dispatches via executeProcedures() RPC)
-\*
-\* Source: RSProcedureDispatcher dispatches OpenRegionProcedure /
-\*         CloseRegionProcedure via executeProcedures() RPC.
+\* Maps to RegionRemoteProcedureBase subclasses.
 CommandType == { "OPEN", "CLOSE" }
 
 \* Transition codes reported from RegionServer back to master.
 \* Maps to RegionServerStatusService.RegionStateTransition.TransitionCode
-\* (RegionServerStatus.proto):
-\*   "OPENED"      -> OPENED (=0)
-\*   "FAILED_OPEN" -> FAILED_OPEN (=1)
-\*   "CLOSED"      -> CLOSED (=3)
-\*
-\* Omitted:
-\*   READY_TO_SPLIT (=4), SPLIT (=5), SPLIT_REVERTED (=7),
-\*   READY_TO_MERGE (=8), MERGED (=9), MERGE_REVERTED (=10)
-\*
-\* Source: RegionServerStatusService.reportRegionStateTransition()
-\*         with TransitionCode enum values.
 ReportCode == { "OPENED", "FAILED_OPEN", "CLOSED" }
 
 \* Type definition for persisted procedure records.

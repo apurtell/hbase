@@ -1,65 +1,79 @@
-# AssignmentManager.cfg — Primary (2r/2s) Exhaustive Config
+# AssignmentManager.cfg — Primary Exhaustive Config
 
 **Source:** [`AssignmentManager.cfg`](../AssignmentManager.cfg)
 
-Primary (fast) TLC model configuration: **2 regions, 2 servers**. The state space is naturally finite with region-keyed procedures — no `StateConstraint` is needed.
-
 ---
 
-## Specification
+TLC model configuration for AssignmentManager.tla
+
+Primary (fast) model: 6 regions (2 deployed + 4 unused), 2 servers.
+
+DeployedRegions tile [0, MaxKey) at Init.
+Regions \ DeployedRegions are unused identifiers for future splits/merges.
+
+Preferred: run via MCP tool tlaplus_mcp_tlc_check (handles Java/classpath).
+Fallback:
+/usr/bin/java -XX:+UseParallelGC \
+-cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" \
+tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
 
 ```cfg
 SPECIFICATION Spec
 ```
 
----
-
-## Constants
-
-| Constant | Value | Notes |
-|----------|-------|-------|
-| `Regions` | `{r1, r2}` | 2 model-value regions |
-| `Servers` | `{s1, s2}` | 2 model-value servers |
-| `NoServer` | `NoServer` | Sentinel: no server assigned |
-| `NoProcedure` | `NoProcedure` | Sentinel: no persisted procedure |
-| `NoTransition` | `NoTransition` | Sentinel: no transition code |
-| `MaxRetries` | `1` | Max FAILED_OPEN retries before give-up |
-| `UseReopen` | `FALSE` | Models branch-2's REOPEN procedure (disabled in primary config for state-space reduction) |
-| `UseRSOpenDuplicateQuirk` | `FALSE` | Disable RS duplicate-open silent-drop (avoids deadlock) |
-| `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery behavior (disable bug reproduction) |
-| `MaxWorkers` | `2` | PEWorker thread pool size |
-| `UseBlockOnMetaWrite` | `FALSE` | Async meta writes (master/branch-3+ behavior) |
+Model values
 
 ```cfg
 CONSTANTS
-    Regions = {r1, r2}
-    Servers = {s1, s2}
-    NoServer = NoServer
     NoProcedure = NoProcedure
     NoTransition = NoTransition
+    NoRange = NoRange
+    NoServer = NoServer
+    Servers = {s1, s2}
+    Regions = {r1, r2, r3}
+    DeployedRegions = {r1, r2}
+    MaxKey = 8
     MaxRetries = 1
-    UseReopen = FALSE
-    UseRSOpenDuplicateQuirk = FALSE
-    UseRestoreSucceedQuirk = FALSE
     MaxWorkers = 2
+```
+
+UseReopen = TRUE models branch-2's additional REOPEN procedure
+
+```cfg
+    UseReopen = FALSE
+```
+
+UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
+silent-drop behavior to avoid deadlock.  Set TRUE to model the
+implementation quirk (AssignRegionHandler.process()).
+
+```cfg
+    UseRSOpenDuplicateQuirk = FALSE
+```
+
+UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
+Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
+bug where FAILED_OPEN reports are replayed as OPENED.
+
+```cfg
+    UseRestoreSucceedQuirk = FALSE
+```
+
+UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
+procedures suspend and release the PEWorker on async meta writes.
+
+```cfg
     UseBlockOnMetaWrite = FALSE
 ```
 
----
-
-## Symmetry Reduction
-
-Regions and servers are interchangeable — TLC explores one representative per equivalence class.
+Symmetry reduction: unused region identifiers and servers are interchangeable.
+DeployedRegions have distinct keyspaces and cannot be permuted.
 
 ```cfg
 SYMMETRY Symmetry
 ```
 
----
-
-## Invariants
-
-All 21 safety invariants are checked:
+Invariants to check
 
 ```cfg
 INVARIANT
@@ -84,11 +98,12 @@ INVARIANT
     DispatchCorrespondance
     NoOrphanedProcedures
     NoPEWorkerDeadlock
+    KeyspaceCoverage
+    SplitMergeMutualExclusion
 ```
 
----
-
-## Action Constraints
+Action property: every state change follows ValidTransition
+and SCP progress is monotonic
 
 ```cfg
 ACTION_CONSTRAINT
@@ -96,20 +111,12 @@ ACTION_CONSTRAINT
     SCPMonotonicity
 ```
 
----
+State constraint: bound concurrent split/merge procedures
 
-## Liveness
-
-Liveness properties (`PROPERTY MetaEventuallyAssigned`) require symmetry to be disabled. Use [`AssignmentManager-liveness.cfg`](AssignmentManager-liveness.cfg) for overnight liveness checking.
-
----
-
-## Running
-
-```bash
-# Preferred: via MCP tool tlaplus_mcp_tlc_check
-# Fallback:
-/usr/bin/java -XX:+UseParallelGC \
-  -cp "tla2tools.jar:CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+```cfg
+CONSTRAINT
+    SplitMergeConstraint
 ```
+
+Liveness properties require symmetry to be disabled.
+Use AssignmentManager-liveness.cfg for liveness checking.
