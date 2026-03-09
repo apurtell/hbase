@@ -28,13 +28,14 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange
+         regionKeyRange,
+         parentProc
 
 \* Shorthand for the RS-side variable (used in UNCHANGED clauses).
 rsVars == << rsOnlineRegions >>
 
 \* Shorthand for the SCP-related variables (used in UNCHANGED clauses).
-scpVars == << scpState, scpRegions, walFenced, carryingMeta, regionKeyRange >>
+scpVars == << scpState, scpRegions, walFenced, carryingMeta, regionKeyRange, parentProc >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
@@ -310,7 +311,7 @@ RSOpenDuplicate(s, r) ==
        /\ cmd.type = "OPEN"
        \* Command must target region r.
        /\ cmd.region = r
-       \* Consume the command — but produce NO report.
+       \* Consume the command -- but produce NO report.
        /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
        \* All other state unchanged: no report, no rsOnlineRegions change.
        /\ UNCHANGED << scpVars,
@@ -387,6 +388,6 @@ RSRestart(s) ==
   \* Source: HRegionServer.run() -> createMyEphemeralNode().
   /\ zkNode' = [zkNode EXCEPT ![s] = TRUE]
   \* Region state and META unchanged.
-  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable, regionKeyRange >>
+  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable, regionKeyRange, parentProc >>
 
 ============================================================================

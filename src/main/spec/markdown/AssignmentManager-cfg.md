@@ -1,29 +1,24 @@
-# AssignmentManager.cfg — Primary Exhaustive Config
+# AssignmentManager Configuration
 
 **Source:** [`AssignmentManager.cfg`](../AssignmentManager.cfg)
 
----
+```tla
+\* TLC model configuration for AssignmentManager.tla
+\*
+\* Primary (fast) model: 3 regions (1 deployed + 2 unused), 2 servers.
+\*
+\* DeployedRegions tile [0, MaxKey) at Init.
+\* Regions \ DeployedRegions are unused identifiers for future splits/merges.
+\*
+\* Preferred: run via MCP tool tlaplus_mcp_tlc_check (handles Java/classpath).
+\* Fallback:
+\*   /usr/bin/java -XX:+UseParallelGC \
+\*     -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+\*     tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
 
-TLC model configuration for AssignmentManager.tla
-
-Primary (fast) model: 6 regions (2 deployed + 4 unused), 2 servers.
-
-DeployedRegions tile [0, MaxKey) at Init.
-Regions \ DeployedRegions are unused identifiers for future splits/merges.
-
-Preferred: run via MCP tool tlaplus_mcp_tlc_check (handles Java/classpath).
-Fallback:
-/usr/bin/java -XX:+UseParallelGC \
--cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" \
-tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
-
-```cfg
 SPECIFICATION Spec
-```
 
-Model values
-
-```cfg
+\* Model values
 CONSTANTS
     NoProcedure = NoProcedure
     NoTransition = NoTransition
@@ -31,51 +26,29 @@ CONSTANTS
     NoServer = NoServer
     Servers = {s1, s2}
     Regions = {r1, r2, r3}
-    DeployedRegions = {r1, r2}
-    MaxKey = 8
+    DeployedRegions = {r1}
+    MaxKey = 2
     MaxRetries = 1
     MaxWorkers = 2
-```
-
-UseReopen = TRUE models branch-2's additional REOPEN procedure
-
-```cfg
+    \* UseReopen = TRUE models branch-2's additional REOPEN procedure
     UseReopen = FALSE
-```
-
-UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
-silent-drop behavior to avoid deadlock.  Set TRUE to model the
-implementation quirk (AssignRegionHandler.process()).
-
-```cfg
+    \* UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
+    \* silent-drop behavior to avoid deadlock.  Set TRUE to model the
+    \* implementation quirk (AssignRegionHandler.process()).
     UseRSOpenDuplicateQuirk = FALSE
-```
-
-UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
-Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
-bug where FAILED_OPEN reports are replayed as OPENED.
-
-```cfg
+    \* UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
+    \* Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
+    \* bug where FAILED_OPEN reports are replayed as OPENED.
     UseRestoreSucceedQuirk = FALSE
-```
-
-UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
-procedures suspend and release the PEWorker on async meta writes.
-
-```cfg
+    \* UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
+    \* procedures suspend and release the PEWorker on async meta writes.
     UseBlockOnMetaWrite = FALSE
-```
 
-Symmetry reduction: unused region identifiers and servers are interchangeable.
-DeployedRegions have distinct keyspaces and cannot be permuted.
-
-```cfg
+\* Symmetry reduction: unused region identifiers and servers are interchangeable.
+\* DeployedRegions have distinct keyspaces and cannot be permuted.
 SYMMETRY Symmetry
-```
 
-Invariants to check
-
-```cfg
+\* Invariants to check
 INVARIANT
     TypeOK
     OpenImpliesLocation
@@ -100,23 +73,21 @@ INVARIANT
     NoPEWorkerDeadlock
     KeyspaceCoverage
     SplitMergeMutualExclusion
-```
+    SplitAtomicity
+    NoOrphanedDaughters
+    SplitCompleteness
+    AtMostOneCarryingMeta
 
-Action property: every state change follows ValidTransition
-and SCP progress is monotonic
-
-```cfg
+\* Action property: every state change follows ValidTransition
+\* and SCP progress is monotonic
 ACTION_CONSTRAINT
     TransitionValid
     SCPMonotonicity
-```
 
-State constraint: bound concurrent split/merge procedures
-
-```cfg
+\* State constraint: bound concurrent split/merge procedures
 CONSTRAINT
     SplitMergeConstraint
-```
 
-Liveness properties require symmetry to be disabled.
-Use AssignmentManager-liveness.cfg for liveness checking.
+\* Liveness properties require symmetry to be disabled.
+\* Use AssignmentManager-liveness.cfg for liveness checking.
+```

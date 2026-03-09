@@ -3,10 +3,10 @@
  * Master-side actions for the HBase AssignmentManager.
  *
  * Contains actions for master-driven events:
- *   GoOffline — table disable (CLOSED → OFFLINE)
- *   MasterDetectCrash — ZK expiry → server marked CRASHED, SCP started
- *   MasterCrash — master JVM crash, in-memory state lost
- *   MasterRecover — master restart, rebuild from metaTable + procStore
+ *   GoOffline -- table disable (CLOSED -> OFFLINE)
+ *   MasterDetectCrash -- ZK expiry -> server marked CRASHED, SCP started
+ *   MasterCrash -- master JVM crash, in-memory state lost
+ *   MasterRecover -- master restart, rebuild from metaTable + procStore
  *)
 EXTENDS Types
 
@@ -29,7 +29,8 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange
+         regionKeyRange,
+         parentProc
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -71,6 +72,9 @@ GoOffline(r) ==
   \* Guards: region is CLOSED and has no active procedure.
   /\ regionState[r].state = "CLOSED"
   /\ regionState[r].procType = "NONE"
+  \* No split in progress on this region (models table-level locking
+  \* between DisableTableProcedure and SplitTableRegionProcedure).
+  /\ parentProc[r].type = "NONE"
   \* Guard: no SCP is actively processing on any server.
   \* In the implementation, GoOffline runs as part of DisableTableProcedure,
   \* which is not created during crash recovery.  This prevents GoOffline
@@ -91,7 +95,8 @@ GoOffline(r) ==
         metaTable,
         peVars,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 \* The master detects that a RegionServer has crashed.  The master's
@@ -120,13 +125,17 @@ MasterDetectCrash(s) ==
   /\ masterAlive = TRUE
   \* Master still considers this server ONLINE.
   /\ serverState[s] = "ONLINE"
-  \* ZK ephemeral node is gone — ZK has detected the RS death.
+  \* ZK ephemeral node is gone -- ZK has detected the RS death.
   /\ zkNode[s] = FALSE
   /\ serverState' = [serverState EXCEPT ![s] = "CRASHED"]
   \* Non-deterministic: crashed server may or may not have been
   \* hosting hbase:meta.  If carryingMeta, SCP must reassign meta
   \* first (ASSIGN_META state); otherwise proceed to GET_REGIONS.
-  /\ \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
+  \* Guard: only one server can be carrying meta at a time.
+  \* hbase:meta is hosted on exactly one server, so at most one
+  \* crashed server's SCP can enter the ASSIGN_META sub-path.
+  /\ \/ /\ \A t \in Servers \ { s }: carryingMeta[t] = FALSE
+        /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
         /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
      \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
@@ -141,7 +150,8 @@ MasterDetectCrash(s) ==
         walFenced,
         serverRegions,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 ---------------------------------------------------------------------------
@@ -161,12 +171,12 @@ MasterDetectCrash(s) ==
 \*   4. Mutating them here would create spurious action-constraint
 \*      violations (TransitionValid, SCPMonotonicity).
 \* The regions are still open on their RegionServers and hbase:meta
-\* is still valid — only the master's in-memory view vanishes.
+\* is still valid -- only the master's in-memory view vanishes.
 \*
 \* Pre: masterAlive = TRUE.
 \* Post: masterAlive = FALSE.
 \*
-\* Source: Master JVM crash — all in-memory state is lost.
+\* Source: Master JVM crash -- all in-memory state is lost.
 MasterCrash ==
   \* Master must be alive to crash
   /\ masterAlive = TRUE
@@ -183,10 +193,11 @@ MasterCrash ==
         availableWorkers,
         suspendedOnMeta,
         blockedOnMeta,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
   \* Durable state survives.
-  /\ UNCHANGED << metaTable, procStore >>
+  /\ UNCHANGED << metaTable, procStore, parentProc >>
   \* RS-side state survives.
   /\ UNCHANGED rsOnlineRegions
   \* WAL fencing survives (HDFS-level).
@@ -204,7 +215,7 @@ MasterCrash ==
 \* Recovery steps:
 \*   1. Rebuild regionState from metaTable (state and location only;
 \*      procedure fields initially NONE/IDLE).
-\*   2. Reload procedures from procStore — for each region with a
+\*   2. Reload procedures from procStore -- for each region with a
 \*      persisted procedure, set procType/procStep/targetServer from
 \*      the record.
 \*   3. For procedures at REPORT_SUCCEED, apply restoreSucceedState
@@ -216,8 +227,8 @@ MasterCrash ==
 \* Pre: masterAlive = FALSE.
 \* Post: masterAlive = TRUE, regionState rebuilt, procedures reattached.
 \*
-\* Source: HMaster.finishActiveMasterInitialization() →
-\*         ProcedureExecutor.start() → recovery of WALProcedureStore →
+\* Source: HMaster.finishActiveMasterInitialization() ->
+\*         ProcedureExecutor.start() -> recovery of WALProcedureStore ->
 \*         restoreSucceedState() callbacks.
 MasterRecover ==
   /\ masterAlive = FALSE
@@ -227,7 +238,7 @@ MasterRecover ==
              procRec == procStore[r]
          IN \* Step 1: Base state from metaTable.
              IF procRec = NoProcedure
-             THEN \* No procedure — just restore from meta.
+             THEN \* No procedure -- just restore from meta.
                [ state |-> metaRec.state,
                  location |-> metaRec.location,
                  procType |-> "NONE",
@@ -235,7 +246,7 @@ MasterRecover ==
                  targetServer |-> NoServer,
                  retries |-> 0
                ]
-             ELSE \* Step 2: Procedure exists — attach it.
+             ELSE \* Step 2: Procedure exists -- attach it.
                LET baseState == metaRec.state
                    baseLoc == metaRec.location
                IN \* Step 3: If procedure was at REPORT_SUCCEED,
@@ -262,7 +273,7 @@ MasterRecover ==
                                   THEN [ state |-> "OPEN",
                                       location |-> procRec.targetServer
                                     ]
-                                  ELSE \* FAILED_OPEN — keep in failed state.
+                                  ELSE \* FAILED_OPEN -- keep in failed state.
                                     \* Location cleared: regionFailedOpen() calls
                                     \* removeRegionFromServer(); the give-up path
                                     \* (TRSPPersistToMetaOpen) sets location=NoServer.
@@ -280,7 +291,7 @@ MasterRecover ==
                            targetServer |-> procRec.targetServer,
                            retries |-> 0
                          ]
-                   ELSE \* Procedure not at REPORT_SUCCEED — just re-attach
+                   ELSE \* Procedure not at REPORT_SUCCEED -- just re-attach
                      \* with state from metaTable.
                      [ state |-> baseState,
                        location |-> baseLoc,
@@ -324,7 +335,7 @@ MasterRecover ==
                THEN \* Use restored location
                  IF procRec.transitionCode = "CLOSED"
                  THEN FALSE
-                 \* CLOSED — no server
+                 \* CLOSED -- no server
                  ELSE IF UseRestoreSucceedQuirk
                    THEN procRec.targetServer = s
                    ELSE IF procRec.transitionCode = "OPENED"
@@ -348,7 +359,8 @@ MasterRecover ==
         rsOnlineRegions,
         walFenced,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 ============================================================================

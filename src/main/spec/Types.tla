@@ -179,6 +179,44 @@ TRSPState ==
     "REPORT_SUCCEED"
   }
 
+\* Parent procedure step states.  These track the progress of a
+\* parent procedure (SplitTableRegionProcedure, future merge) that
+\* owns one or more child TRSPs via addChildProcedure().
+\*
+\* The parent yields by spawning child TRSPs (SPAWNED_CLOSE,
+\* SPAWNED_OPEN) and resumes when all children complete.
+\* parentProc[r] persists across the child TRSP lifecycle.
+\*
+\* Maps to SplitTableRegionState enum (MasterProcedure.proto),
+\* collapsed from 11 states to 5 (filesystem + coprocessor ops
+\* abstracted).  Generalizes to MergeTableRegionsState later.
+\* PREPARE: PREPARE -> PRE_OP (set SPLITTING/MERGING)
+\* SPAWNED_CLOSE: CLOSE_PARENT: addChildProcedure(unassign)
+\* PONR: CHECK_CLOSED -> CREATE_DAUGHTERS -> WRITE_SEQ
+\*   -> PRE_BEFORE_META -> UPDATE_META (PONR)
+\* SPAWNED_OPEN:OPEN_CHILD_REGIONS: addChildProcedure(assign)
+\* COMPLETING: POST_OPERATION
+ParentProcStep ==
+  { "SPAWNED_CLOSE", \* CLOSE_PARENT: addChildProcedure(unassign)
+    "PONR", \* CHECK_CLOSED -> CREATE_DAUGHTERS -> WRITE_SEQ
+    \*   -> PRE_BEFORE_META -> UPDATE_META (PONR)
+    "SPAWNED_OPEN", \* OPEN_CHILD_REGIONS: addChildProcedure(assign)
+    "COMPLETING" \* POST_OPERATION
+  }
+
+\* Parent procedure types.  "NONE" means no parent procedure is
+\* attached.  Extensible: "MERGE" will be added in a future iteration.
+ParentProcType == { "SPLIT" }
+
+\* Sentinel: no parent procedure attached.
+NoParentProc == [ type |-> "NONE", step |-> "NONE" ]
+
+\* Type definition for parentProc records (used in TypeOK).
+ParentProcRecord ==
+  [type:ParentProcType \cup { "NONE" },
+    step:ParentProcStep \cup { "NONE" }
+  ]
+
 \* Procedure types.  "NONE" means no procedure is attached.
 \* REOPEN: close on current server then reopen preferring the same server
 \* (assignCandidate pinning); no other ONLINE server required.
@@ -199,7 +237,7 @@ ReportCode == { "OPENED", "FAILED_OPEN", "CLOSED" }
 \* set to NoTransition for all other steps.
 ProcStoreRecord ==
   [type:ProcType \ { "NONE" },
-    step:TRSPState,
+    step:TRSPState \cup { "IDLE" },
     targetServer:Servers \cup { NoServer },
     transitionCode:ReportCode \cup { NoTransition }
   ]
