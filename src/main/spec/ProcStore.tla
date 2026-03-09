@@ -8,9 +8,9 @@
  * MasterRecover reads it back to reconstruct in-memory procedure state.
  *
  * This module provides:
- *   ProcStoreConsistency — intra-record correlation invariant
- *   ProcStoreBijection — procType ↔ procStore presence (masterAlive-gated)
- *   RestoreSucceedState — recovery operator for REPORT_SUCCEED procedures
+ *   ProcStoreConsistency -- intra-record correlation invariant
+ *   ProcStoreBijection -- procType ↔ procStore presence (masterAlive-gated)
+ *   RestoreSucceedState -- recovery operator for REPORT_SUCCEED procedures
  *)
 EXTENDS Types
 
@@ -23,7 +23,7 @@ VARIABLE regionState, masterAlive, procStore
 (* Invariants *)
 \* Intra-record correlation invariant for persisted procedure records.
 \* Validates structural properties of procStore entries regardless of
-\* masterAlive — procStore survives master crash.
+\* masterAlive -- procStore survives master crash.
 \*
 \* Checks:
 \*   1. transitionCode is recorded iff step is REPORT_SUCCEED
@@ -83,8 +83,8 @@ ProcStoreConsistency ==
 
 \* Bijection between in-memory procedures and persisted records.
 \* Only meaningful when masterAlive = TRUE; when master is down,
-\* in-memory state (regionState) does not exist — the active master
-\* does not exist — so both directions are vacuously true.
+\* in-memory state (regionState) does not exist -- the active master
+\* does not exist -- so both directions are vacuously true.
 ProcStoreBijection ==
   masterAlive = TRUE =>
     \A r \in Regions:
@@ -100,13 +100,13 @@ ProcStoreBijection ==
 \* ProcedureExecutor recovery.
 \*
 \* Branches on UseRestoreSucceedQuirk:
-\*   TRUE  — faithfully reproduces OpenRegionProcedure.restoreSucceedState()
+\*   TRUE  -- faithfully reproduces OpenRegionProcedure.restoreSucceedState()
 \*           L128-136 bug: procedures with OPENED or FAILED_OPEN transition
 \*           codes unconditionally replay as OPENED (ignoring FAILED_OPEN).
-\*   FALSE — correct behavior: checks transitionCode and branches.
-\*           OPENED      → region marked OPEN at targetServer.
-\*           FAILED_OPEN → region stays in FAILED_OPEN state.
-\*           CLOSED      → region marked CLOSED with no location.
+\*   FALSE -- correct behavior: checks transitionCode and branches.
+\*           OPENED      -> region marked OPEN at targetServer.
+\*           FAILED_OPEN -> region stays in FAILED_OPEN state.
+\*           CLOSED      -> region marked CLOSED with no location.
 \*
 \* Returns a record [state, location] for updating regionState[r].
 \*
@@ -115,7 +115,7 @@ ProcStoreBijection ==
 RestoreSucceedState(r) ==
   LET rec == procStore[r]
   IN IF rec.transitionCode = "CLOSED"
-      THEN \* Close-path result — always CLOSED, no location.
+      THEN \* Close-path result -- always CLOSED, no location.
         \* Applies to UNASSIGN directly and to MOVE/REOPEN close phase.
         [ state |-> "CLOSED", location |-> NoServer ]
       ELSE \* Open-path result (OPENED or FAILED_OPEN).
@@ -129,9 +129,9 @@ RestoreSucceedState(r) ==
         ELSE \* Correct behavior: check transitionCode.
           IF rec.transitionCode = "OPENED"
           THEN [ state |-> "OPEN", location |-> rec.targetServer ]
-          ELSE \* FAILED_OPEN — region failed to open on the RS.
+          ELSE \* FAILED_OPEN -- region failed to open on the RS.
             \* Keep it in FAILED_OPEN state so retry can occur.
-            \* No location — the region is not online anywhere.
+            \* No location -- the region is not online anywhere.
             [ state |-> "FAILED_OPEN", location |-> NoServer ]
 
 ============================================================================

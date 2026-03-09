@@ -1,78 +1,54 @@
-# AssignmentManager-liveness.cfg — Liveness Config
+# AssignmentManager-liveness Configuration
 
 **Source:** [`AssignmentManager-liveness.cfg`](../AssignmentManager-liveness.cfg)
 
----
+```tla
+\* TLC model configuration for liveness checking.
+\*
+\* Liveness properties (temporal PROPERTY clauses) are INCOMPATIBLE with
+\* TLC's SYMMETRY reduction.  Symmetry can create false lasso cycles that
+\* don't exist in the real state graph.  This config OMITS SYMMETRY so
+\* that liveness checking is sound.
+\*
+\* Trade-off: the state space is much larger without symmetry.
+\* This config is intended for overnight / batch runs.
+\*
+\* Run:
+\*   /usr/bin/java -XX:+UseParallelGC \
+\*     -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+\*     tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
 
-TLC model configuration for liveness checking.
-
-Liveness properties (temporal PROPERTY clauses) are INCOMPATIBLE with
-TLC's SYMMETRY reduction.  Symmetry can create false lasso cycles that
-don't exist in the real state graph.  This config OMITS SYMMETRY so
-that liveness checking is sound.
-
-Trade-off: the state space is much larger without symmetry.
-This config is intended for overnight / batch runs.
-
-Run:
-/usr/bin/java -XX:+UseParallelGC \
--cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
-tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
-
-```cfg
 SPECIFICATION Spec
-```
 
-Model values
-
-```cfg
+\* Model values
 CONSTANTS
-    NoServer = NoServer
     NoProcedure = NoProcedure
     NoTransition = NoTransition
     NoRange = NoRange
+    NoServer = NoServer
     Servers = {s1, s2}
     Regions = {r1, r2, r3}
-    DeployedRegions = {r1, r2}
-    MaxKey = 8
+    DeployedRegions = {r1}
+    MaxKey = 2
     MaxRetries = 1
     MaxWorkers = 2
-```
-
-UseReopen = TRUE models branch-2's additional REOPEN procedure
-
-```cfg
-    UseReopen = TRUE
-```
-
-UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
-silent-drop behavior to avoid deadlock.  Set TRUE to model the
-implementation quirk (AssignRegionHandler.process()).
-
-```cfg
+    \* UseReopen = TRUE models branch-2's additional REOPEN procedure
+    UseReopen = FALSE
+    \* UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
+    \* silent-drop behavior to avoid deadlock.  Set TRUE to model the
+    \* implementation quirk (AssignRegionHandler.process()).
     UseRSOpenDuplicateQuirk = FALSE
-```
-
-UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
-Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
-bug where FAILED_OPEN reports are replayed as OPENED.
-
-```cfg
+    \* UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
+    \* Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
+    \* bug where FAILED_OPEN reports are replayed as OPENED.
     UseRestoreSucceedQuirk = FALSE
-```
-
-UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
-procedures suspend and release the PEWorker on async meta writes.
-
-```cfg
+    \* UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
+    \* procedures suspend and release the PEWorker on async meta writes.
     UseBlockOnMetaWrite = FALSE
-```
 
-NO SYMMETRY -- required for sound liveness checking.
+\* NO SYMMETRY -- required for sound liveness checking.
 
-Safety invariants (checked alongside liveness)
-
-```cfg
+\* Safety invariants (checked alongside liveness)
 INVARIANT
     TypeOK
     OpenImpliesLocation
@@ -97,26 +73,21 @@ INVARIANT
     NoPEWorkerDeadlock
     KeyspaceCoverage
     SplitMergeMutualExclusion
-```
+    SplitAtomicity
+    NoOrphanedDaughters
+    SplitCompleteness
+    AtMostOneCarryingMeta
 
-Action properties
-
-```cfg
+\* Action properties
 ACTION_CONSTRAINT
     TransitionValid
     SCPMonotonicity
-```
 
-State constraint: bound concurrent split/merge procedures
-
-```cfg
+\* State constraint: bound concurrent split/merge procedures
 CONSTRAINT
     SplitMergeConstraint
-```
 
-Liveness properties (the reason this config exists)
-
-```cfg
+\* Liveness properties (the reason this config exists)
 PROPERTY
     MetaEventuallyAssigned
 ```

@@ -1,8 +1,8 @@
-# ZK — ZooKeeper
+# ZK
 
 **Source:** [`ZK.tla`](../ZK.tla)
 
-Minimal ZooKeeper model for the HBase AssignmentManager. Models ZK ephemeral nodes for RegionServer liveness detection.
+Minimal ZooKeeper model for the HBase AssignmentManager. Models ZK ephemeral nodes for RegionServer liveness.
 
 ---
 
@@ -10,26 +10,18 @@ Minimal ZooKeeper model for the HBase AssignmentManager. Models ZK ephemeral nod
 ------------------------------- MODULE ZK -------------------------------------
 ```
 
-Minimal ZooKeeper model for the HBase AssignmentManager.
+Each live RS holds an ephemeral node; when the RS process dies, ZK detects the session expiry and deletes the node. The master reads these nodes to determine which servers are alive.
 
-Models ZK ephemeral nodes for RegionServer liveness.  Each live RS
-holds an ephemeral node; when the RS process dies, ZK detects the
-session expiry and deletes the node.  The master reads these nodes
-to determine which servers are alive.
+ZK is the **ground truth** about RS liveness, independent of master state. A RS can die at any time and ZK will detect it regardless of whether the master is alive or not.
 
-ZK is the ground truth about RS liveness, independent of master
-state.  A RS can die at any time and ZK will detect it regardless
-of whether the master is alive or not.
-
-Contains one action:
-ZKSessionExpire(s) — RS dies, ZK deletes its ephemeral node
+This module contains one action:
+- **`ZKSessionExpire(s)`** — RS dies, ZK deletes its ephemeral node
 
 ```tla
 EXTENDS Types
 ```
 
-All shared variables are declared as VARIABLE parameters so that
-the root module can substitute its own variables via INSTANCE.
+All shared variables are declared as `VARIABLE` parameters so that the root module can substitute its own variables via `INSTANCE`.
 
 ```tla
 VARIABLE regionState,
@@ -49,40 +41,36 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange
+         regionKeyRange,
+         parentProc
 ```
 
-Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+Shorthand for PEWorker pool variables (used in `UNCHANGED` clauses).
 
 ```tla
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Actions -- ZK ephemeral node lifecycle
+## ZK Ephemeral Node Lifecycle
 
-ZK detects that a RegionServer's session has expired (the RS
-process is dead) and deletes its ephemeral node.
+### `ZKSessionExpire(s)`
 
-This is a ZK-side action, independent of both master and RS.
-ZK is the ground truth about RS liveness.  Any live RS can die
-at any time — this action is non-deterministic, like MasterCrash.
+ZK detects that a RegionServer's session has expired (the RS process is dead) and deletes its ephemeral node.
 
-After ZKSessionExpire fires:
-- MasterDetectCrash (if master is alive) will observe
-zkNode[s] = FALSE and mark the server as CRASHED.
-- MasterRecover (if master restarts) will read zkNode[s] = FALSE
-and mark the server as CRASHED during recovery.
-- RSAbort will eventually clean up the zombie RS state.
+This is a **ZK-side action**, independent of both master and RS. ZK is the ground truth about RS liveness. Any live RS can die at any time — this action is non-deterministic, like `MasterCrash`.
 
-The RS process may still be a zombie briefly after ZK session
-expiry (rsOnlineRegions is NOT cleared here — RSAbort handles
-that).  This preserves the zombie window that makes WAL fencing
-necessary for correctness.
+After `ZKSessionExpire` fires:
+- `MasterDetectCrash` (if master is alive) will observe `zkNode[s] = FALSE` and mark the server as `CRASHED`.
+- `MasterRecover` (if master restarts) will read `zkNode[s] = FALSE` and mark the server as `CRASHED` during recovery.
+- `RSAbort` will eventually clean up the zombie RS state.
 
-*Source:* ZooKeeper session timeout; ephemeral node under /hbase/rs
-is deleted when the RS's ZK session expires.
+The RS process may still be a **zombie** briefly after ZK session expiry — `rsOnlineRegions` is *not* cleared here (that's `RSAbort`'s job). This preserves the zombie window that makes WAL fencing necessary for correctness.
+
+> *Source:* ZooKeeper session timeout; ephemeral node under `/hbase/rs` is deleted when the RS's ZK session expires.
 
 ```tla
 ZKSessionExpire(s) ==
@@ -100,8 +88,7 @@ Delete the ephemeral node. ZK now considers this RS dead.
   /\ zkNode' = [zkNode EXCEPT ![s] = FALSE]
 ```
 
-Everything else is unchanged.  The zombie RS may still hold
-regions in rsOnlineRegions until RSAbort fires.
+Everything else is unchanged. The zombie RS may still hold regions in `rsOnlineRegions` until `RSAbort` fires.
 
 ```tla
   /\ UNCHANGED << regionState,
@@ -118,6 +105,11 @@ regions in rsOnlineRegions until RSAbort fires.
         procStore,
         masterAlive,
         peVars,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
+```
+
+```tla
+============================================================================
 ```
