@@ -333,7 +333,7 @@ The following table documents what is modeled concretely vs. abstracted:
 | Load balancer | **Abstract** | Non-deterministic choice of move targets |
 | REOPEN vs MOVE | **Concrete** | `TRSPCreateReopen` pins `assignCandidate` to the region's current server; `TRSPCreateMove` forces a new plan. Separate `REOPEN` ProcType added. |
 | SCP carryingMeta path | **Concrete** | `carryingMeta` variable, `SCPAssignMeta` action (`ASSIGN_META` → `GET_REGIONS`), all non-meta SCP steps gated on `∀ t: scpState[t] ≠ "ASSIGN_META"` (`waitMetaLoaded`). `MetaAvailableForRecovery` invariant. |
-| Split/Merge procedures | **Concrete** | Keyspace-aware model: `regionKeyRange`, `MaxKey`, `RegionPool`, `Adjacent` predicate, `KeyspaceCoverage`/`SplitMergeMutualExclusion` invariants, `RequestSplit`/`RequestMerge` initiation. See C.6, C.10, C.11. |
+| Split/Merge procedures | **Concrete** | Keyspace-aware model: `regionKeyRange`, `MaxKey`, `DeployedRegions`, `Adjacent` predicate, `KeyspaceCoverage`/`SplitMergeMutualExclusion` invariants, `RequestSplit`/`RequestMerge` initiation. `DeployedRegions ⊆ Regions` are the initially deployed table regions; `Regions \ DeployedRegions` are unused identifiers available for split/merge to materialize new regions. See C.6, C.10, C.11. |
 | ServerCrashProcedure | **Concrete** | Critical failure recovery path |
 | WAL lease revocation (fencing) | **Abstract** | Modeled as per-server Boolean (`walFenced`); fencing property only, no HDFS lease or log-splitting details |
 | RS crash / zombie window | **Concrete** | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
@@ -351,10 +351,19 @@ for future iterations. Names reflect the actual spec where implemented.
 
 ```tla
 CONSTANTS
-    Regions,          \* Set of region identifiers                     ✅ (Iter 1)
+    Regions,          \* Finite universe of all region identifiers     ✅ (Iter 1)
+                      \* in the model. Includes both deployed table
+                      \* regions and unused identifiers available
+                      \* for split/merge to create new regions.
     Servers,          \* Set of regionserver identifiers               ✅ (Iter 1)
     None              \* Sentinel for "no server assigned"             ✅ (Iter 1)
     MaxRetries        \* Maximum open retries before giving up         ✅ (Iter 12)
+    DeployedRegions   \* ⊆ Regions. The table regions that exist at    ⏳ (Iter 20)
+                      \* system start with assigned keyspaces (they
+                      \* tile [0, MaxKey) in Init). Regions not in
+                      \* DeployedRegions start with regionKeyRange =
+                      \* NoRange and are available for split/merge
+                      \* to materialize as daughters or merged regions.
     MaxKey            \* Keyspace upper bound (integer); keyspace is   ⏳ (Iter 20)
                       \* 0..(MaxKey-1). E.g. MaxKey=8 gives [0,8).
 
@@ -428,9 +437,12 @@ VARIABLES
     regionKeyRange    \* [Regions → [startKey: 0..MaxKey,             ⏳ (Iter 20)
                       \*              endKey: 0..MaxKey]
                       \*            ∪ {NoRange}]
-                      \* A region "exists" iff regionKeyRange[r] ≠
-                      \* NoRange.  Primary regions tile [0, MaxKey)
-                      \* in Init; RegionPool regions start as NoRange.
+                      \* Maps each region identifier to its keyspace
+                      \* range, or NoRange if the identifier is not
+                      \* currently in use. A region "exists" iff
+                      \* regionKeyRange[r] ≠ NoRange.
+                      \* At Init: DeployedRegions tile [0, MaxKey);
+                      \* all other identifiers are NoRange.
                       \* Split materializes daughter keyspaces at PONR;
                       \* merge materializes the union keyspace at PONR;
                       \* parent/target deletion clears to NoRange.
@@ -799,47 +811,23 @@ TLC 2r/2s: 12,412,690 distinct, 43,093,199 generated, 2m57s, clean.
 
 ### Phase 7: Split and Merge
 
-#### Iteration 20 — Keyspace infrastructure (no split/merge actions)
+#### Iteration 20 — Keyspace infrastructure (no split/merge actions) ✅ COMPLETE
 
-**What to add**: Extend `State` with `SPLITTING`, `SPLIT`,
-`SPLITTING_NEW`, `MERGING`, `MERGED`, `MERGING_NEW`. Extend
-`ValidTransition` with the split/merge transitions from Appendix C.4.
-Add `MaxKey` constant, `regionKeyRange` variable, and `RegionPool`
-constant (pre-allocated region identifiers for dynamic creation;
-see Appendix C.6).
-A region "exists" iff `regionKeyRange[r] ≠ NoRange`. Regions in
-`RegionPool` start with `regionKeyRange = NoRange` and `state = OFFLINE`.
-All existing actions guard on `regionKeyRange[r] ≠ NoRange`.
-Primary regions tile the full keyspace `[0, MaxKey)` in the initial
-state with no gaps or overlaps.
-New predicates: `Adjacent(r1, r2)`.
-New invariants: `KeyspaceCoverage` — live, non-terminal regions'
-keyspaces cover `[0, MaxKey)` with no gaps or overlaps.
-`SplitMergeMutualExclusion` (trivially holds — no split/merge yet).
-**No split/merge actions in this iteration.** The new states and
-variables are added but no procedure can enter them. This guarantees
-backward compatibility: all existing assign/unassign/move/crash
-behavior is unaffected. `KeyspaceCoverage` holds trivially (primary
-regions tile the full keyspace, no operations change it).
-**Why not add initiation actions here**: `RequestSplit` would
-transition a region to SPLITTING and attach a procedure, but no
-split procedure steps exist yet — the procedure would be stuck in
-its initial state with no enabled successor action → TLC deadlock.
-**Verify**: `TypeOK`, `TransitionValid`, `KeyspaceCoverage`,
-`SplitMergeMutualExclusion` with the extended state space. Confirm
-all existing invariants still pass (regression check).
-TLC with 2 primary regions (keyspace `[0,8)` as `[0,4)` and `[4,8)` —
-each width 4, satisfying the split precondition `width ≥ 2` and
-leaving daughters with `width = 2`, still splittable),
-4 region pool slots, 2 servers.
-**Symmetry**: `Permutations(RegionPool)` — pool slots are
-interchangeable; which slot becomes daughter A vs B is irrelevant.
-With 4 pool slots this provides up to 24× reduction.
-**State constraint**: Bound concurrent split/merge procedures:
-`Cardinality({r ∈ Regions : procType ∈ {SPLIT, MERGE}}) ≤ 1`.
-This explores one-at-a-time split/merge while leaving concurrent
-assign/unassign/move/crash unconstrained. Can be relaxed for
-deeper simulation runs.
+New constants `DeployedRegions`, `MaxKey`, `NoRange` in `Types.tla`;
+extended `State` with 6 split/merge states, `ValidTransition` with 10
+transitions (Appendix C.4), `ProcType` with `SPLIT`/`MERGE`.  New
+variable `regionKeyRange` (`[startKey, endKey)` or `NoRange`) with
+`RegionExists(r)` and `Adjacent(r1, r2)` predicates.  `Init` tiles
+`[0, MaxKey)` across `DeployedRegions`; unused identifiers get
+`NoRange`.  Gated 12 existing invariants on `RegionExists(r)`; new
+invariants `KeyspaceCoverage` and `SplitMergeMutualExclusion`;
+`SplitMergeConstraint` state constraint (all vacuously true).
+`Symmetry` now `Permutations(Regions \ DeployedRegions) ∪
+Permutations(Servers)`.  `regionKeyRange` declared and `UNCHANGED`
+in all 7 modules; `regionKeyRange[r] # NoRange` guard on 17
+per-region actions (16 TRSP + `GoOffline`).  Configs: primary 3r/2s,
+sim 7r/3s, liveness 4r/2s with new constants/invariants/constraint.
+TLC 3r/2s: 24,781,202 distinct, 86,037,209 generated, depth 66, 8m08s, clean.
 
 #### Iteration 21 — Complete split forward path
 
@@ -849,11 +837,12 @@ state has a defined successor, so TLC cannot deadlock.
 - `RequestSplit(r)`: Non-deterministic. Models admin API RPC or
   RS-autonomous split (we don't model *why* — only eligibility).
   Pre: `r` is OPEN, no procedure attached, keyspace width ≥ 2,
-  pool slots available. If accepted → enters `SplitPrepare`. If any
-  precondition fails → rejected (action does not fire).
+  unused identifiers available (∃ regions with `regionKeyRange = NoRange`).
+  If accepted → enters `SplitPrepare`. If any precondition fails →
+  rejected (action does not fire).
 - `SplitPrepare(parent, dA, dB)`: Triggered by `RequestSplit`.
-  Pre: parent is OPEN, no procedure on parent/dA/dB, dA and dB are
-  in `RegionPool` with `regionKeyRange = NoRange`.
+  Pre: parent is OPEN, no procedure on parent/dA/dB, dA and dB
+  have `regionKeyRange = NoRange` (unused identifiers).
   **Keyspace halving**: compute `mid = (startKey + endKey) ÷ 2` from
   parent's keyspace. Record daughter keyspaces in the split procedure
   state (daughters remain non-existent, i.e. `NoRange`, until PONR).
@@ -925,11 +914,12 @@ failure paths without requiring a separate iteration.
 - `RequestMerge(r1, r2)`: Non-deterministic. Models admin API RPC
   or master merge chore. Pre: both OPEN, no procedures attached,
   `Adjacent(r1, r2)` (i.e. `regionKeyRange[r1].endKey =
-  regionKeyRange[r2].startKey`), pool slot available.
+  regionKeyRange[r2].startKey`), unused identifier available
+  (∃ region with `regionKeyRange = NoRange`).
   If accepted → enters `MergePrepare`. Non-adjacent pairs rejected.
 - `MergePrepare(r1, r2, m)`: Triggered by `RequestMerge`.
   Pre: r1, r2 OPEN, no procedures attached,
-  m in `RegionPool` with `regionKeyRange = NoRange`.
+  m has `regionKeyRange = NoRange` (unused identifier).
   **Adjacency guard**: `Adjacent(r1, r2)`.
   Merged region will get keyspace `[r1.startKey, r2.endKey)`.
   Set r1, r2 to MERGING. Attach merge procedure to r1, r2, m
@@ -1128,7 +1118,7 @@ For each module, the primary source files and their key line ranges:
 | Phase 4: RS Crash and Recovery | 14-16 | +200 | SCP, TRSP interaction, double crash |
 | Phase 5: Procedure Store + Master Recovery | 17-18 | +150 | Persistence, crash+rebuild |
 | Phase 6: PEWorker Pool + Meta-Blocking | 19 | +100 | Finite worker pool, synchronous meta-blocking semantics |
-| Phase 7: Split and Merge | 20-26 | +350 | Region pool, multi-region locking, PONR, rollback |
+| Phase 7: Split and Merge | 20-26 | +350 | Keyspace modeling, multi-region locking, PONR, rollback |
 | Phase 8: Liveness and Refinement | 27-29 | +50 | Fairness, scenarios (symmetry already done) |
 | **Total** | **29** | **~1860** (est.) | |
 
@@ -2153,28 +2143,35 @@ Split creates 2 new regions; merge deletes 2 parent/target regions. This
 poses a modeling challenge since TLC works with finite, pre-defined
 constants.
 
-**Approach: Pre-allocated region pool with keyspace-range identity.**
+**Approach: Unified region set with keyspace-range identity.**
 
-Regions are identified by their keyspace range rather than a boolean
-existence flag. A region "exists" iff it has a keyspace.
+`Regions` is the finite universe of all region identifiers in the
+model, pre-allocated for TLC. It encompasses both the deployed
+table regions and additional unused identifiers that split/merge
+can materialize as new regions.
+
+- **`DeployedRegions ⊆ Regions`** — the table regions that exist
+  at system start. They tile the full keyspace `[0, MaxKey)` in
+  Init. E.g. with `MaxKey = 8` and `DeployedRegions = {r1, r2}`:
+  r1 gets `[0, 4)`, r2 gets `[4, 8)`.
+- **`Regions \ DeployedRegions`** — unused identifiers. They start
+  with `regionKeyRange = NoRange` (non-existent) and
+  `state = OFFLINE`. When a split or merge needs a daughter or
+  merged region, it picks an identifier from this set and
+  materializes it by assigning a keyspace at the PONR.
+- A region **"exists"** iff `regionKeyRange[r] ≠ NoRange`.
+  All existing actions guard on this predicate.
 
 ```tla
 CONSTANTS
-    PrimaryRegions,      \* {r1, r2} — initially existing regions
-    RegionPool,          \* {p1, p2, p3, p4} — pre-allocated slots
+    Regions,             \* {r1, r2, r3, r4, r5, r6} — all identifiers
+    DeployedRegions,     \* {r1, r2} ⊆ Regions — deployed at start
     MaxKey               \* Integer; keyspace is 0..(MaxKey-1)
-
-Regions == PrimaryRegions \cup RegionPool
 
 VARIABLE regionKeyRange  \* [Regions → [startKey: 0..MaxKey,
                          \*              endKey: 0..MaxKey]
                          \*            ∪ {NoRange}]
 ```
-
-- `PrimaryRegions` tile the full keyspace `[0, MaxKey)` in Init.
-  E.g. with `MaxKey = 8`: r1 has `[0, 4)`, r2 has `[4, 8)`.
-- `RegionPool` regions start with `regionKeyRange = NoRange` (non-existent).
-- All existing actions guard on `regionKeyRange[r] ≠ NoRange`.
 
 **Minimum keyspace width constraint**: Every region in the initial
 tiling must have `endKey - startKey ≥ 2` so that it satisfies the
@@ -2183,9 +2180,9 @@ transitively: after a split, each daughter gets half the parent's
 width, so a parent must have width ≥ 4 to produce daughters that are
 themselves splittable, width ≥ 8 for granddaughters, etc. After a
 merge, the merged region's width is the sum of its two targets' widths.
-`MaxKey` and the number of primary regions must be chosen so that
-`MaxKey / |PrimaryRegions| ≥ 2^d` where `d` is the maximum split
-depth to be explored.  For example, `MaxKey = 8` with 2 primary
+`MaxKey` and the number of initial regions must be chosen so that
+`MaxKey / |DeployedRegions| ≥ 2^d` where `d` is the maximum split
+depth to be explored.  For example, `MaxKey = 8` with 2 initial
 regions gives width 4 each, allowing one level of splits (daughters
 have width 2, still splittable) or two levels if `MaxKey = 16`.
 
@@ -2225,10 +2222,11 @@ and daughters/merged reaching OPEN) — the SPLITTING_NEW/MERGING_NEW
 regions are included as covering their keyspaces even though they are
 not yet OPEN.
 
-**State space implications**: With `MaxKey = 8`, 2 primary regions, and
-4 pool slots, the model supports 2 splits (4 daughters fill the pool).
-TLC feasibility depends on bounding the number of concurrent split/merge
-operations via `SplitMergeMutualExclusion`.
+**State space implications**: With `MaxKey = 8`, 2 deployed regions, and
+4 unused identifiers (6 total in `Regions`), the model supports 2 splits
+(4 daughters consume all unused identifiers). TLC feasibility depends on
+bounding the number of
+concurrent split/merge operations via `SplitMergeMutualExclusion`.
 
 **Modeling abstractions** (see C.11 for full analysis):
 
@@ -2255,7 +2253,7 @@ for ALL involved regions before any state changes:
 
 | Procedure | Regions Locked |
 |-----------|---------------|
-| Split | Parent + 2 daughter pool slots |
+| Split | Parent + 2 daughter identifiers |
 | Merge | All targets + merged region |
 
 Locks are held for the entire procedure lifetime (`holdLock() == true`).
@@ -2402,17 +2400,19 @@ VARIABLES
 
 ```tla
 CONSTANTS
+    DeployedRegions      \* ⊆ Regions. Deployed table regions that
+                        \* tile [0, MaxKey) at Init. Identifiers in
+                        \* Regions \ DeployedRegions are available
+                        \* for split/merge to create new regions.
     MaxKey              \* Integer; keyspace is 0..(MaxKey-1)
-    RegionPool          \* Pre-allocated region identifiers for
-                        \* dynamic creation
 ```
 
 **New initiation actions** (only entry points into split/merge):
 
 | Action | What it does |
 |--------|-------------|
-| `RequestSplit(r)` | Non-deterministic. Models admin RPC or RS-autonomous split. Pre: OPEN, no proc, keyspace width ≥ 2, pool slots available. Transitions into `SplitPrepare`. |
-| `RequestMerge(r1, r2)` | Non-deterministic. Models admin RPC or merge chore. Pre: both OPEN, no procs, `Adjacent(r1, r2)`, pool slot available. Transitions into `MergePrepare`. |
+| `RequestSplit(r)` | Non-deterministic. Models admin RPC or RS-autonomous split. Pre: OPEN, no proc, keyspace width ≥ 2, unused identifiers available. Transitions into `SplitPrepare`. |
+| `RequestMerge(r1, r2)` | Non-deterministic. Models admin RPC or merge chore. Pre: both OPEN, no procs, `Adjacent(r1, r2)`, unused identifier available. Transitions into `MergePrepare`. |
 
 **New actions (split)**:
 
