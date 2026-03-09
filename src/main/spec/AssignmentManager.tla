@@ -113,11 +113,9 @@
  * completes a full lifecycle, the system returns to an already-visited
  * configuration.  No StateConstraint on a procedure counter is needed.
  *
- * Currently scoped to the core assign/unassign lifecycle:
- *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED
- *
- * Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW,
- * MERGING_NEW) are deferred to a later phase.
+ * Region lifecycle states cover the full RegionState.State enum:
+ *   OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED,
+ *   SPLITTING, SPLIT, SPLITTING_NEW, MERGING, MERGED, MERGING_NEW.
  *
  * FAILED_CLOSE is omitted because no code path transitions into it. The RS
  * abort triggers crash detection, so close failures are resolved through
@@ -127,9 +125,8 @@ EXTENDS Types
 
 ---------------------------------------------------------------------------
 
-(* Variables *)
-VARIABLE regionState
 
+(* Variables *)
 \* regionState[r] is a record
 \*   [state        : State,
 \*    location     : Servers \cup {NoServer},
@@ -147,10 +144,7 @@ VARIABLE regionState
 \* than indexed by a global procedure ID counter, because at most
 \* one procedure can be attached per region and region identity is
 \* sufficient for report/command matching.
-\*
-\* Source: RegionStateNode.setProcedure(),
-\*         RegionStateNode.unsetProcedure().
-VARIABLE metaTable
+VARIABLE regionState
 
 \* metaTable[r] is a record [state : State, location : Servers \cup {NoServer}]
 \* for each r in Regions.  This is persistent state in hbase:meta.
@@ -158,7 +152,7 @@ VARIABLE metaTable
 \*
 \* Procedure fields are NOT persisted to meta -- procedures are
 \* master in-memory state, recovered from ProcedureStore on restart.
-VARIABLE dispatchedOps
+VARIABLE metaTable
 
 \* dispatchedOps[s] is a set of command records pending delivery to
 \* server s.  Each record is:
@@ -168,10 +162,7 @@ VARIABLE dispatchedOps
 \* batches open/close commands and sends them via executeProcedures()
 \* RPC.  Commands remain in the set until consumed by RS-side actions
 \* or discarded on dispatch failure / server crash.
-\*
-\* Source: RSProcedureDispatcher.remoteDispatch(),
-\*         RSProcedureDispatcher.ExecuteProceduresRemoteCall.run().
-VARIABLE pendingReports
+VARIABLE dispatchedOps
 
 \* pendingReports is a set of report records from RegionServers
 \* waiting to be processed by the master.  Each record is:
@@ -181,44 +172,32 @@ VARIABLE pendingReports
 \* transition outcomes via reportRegionStateTransition() RPC.
 \* Reports remain in the set until consumed by master-side actions
 \* or discarded if from a crashed server.
-\*
-\* Source: RegionServerStatusService.reportRegionStateTransition().
-VARIABLE rsOnlineRegions
+VARIABLE pendingReports
 
 \* rsOnlineRegions[s] is the set of regions currently online on
 \* server s, from the RS's own perspective.  Updated atomically
 \* by RSOpen (adds region) and RSClose (removes region).
-\*
-\* Source: HRegionServer.getRegions().
-VARIABLE serverState
+VARIABLE rsOnlineRegions
 
 \* serverState[s] is the liveness state of server s as seen by the
 \* master.  "ONLINE" means the server is alive and accepting commands;
 \* "CRASHED" means the master has detected the server's death (ZK
 \* ephemeral node expired).  Reports from CRASHED servers are rejected.
 \* RS-side actions are guarded by serverState = "ONLINE".
-\*
-\* Source: ServerManager.ServerStateNode, ServerState.java.
+VARIABLE serverState
+
 \* scpState[s] tracks the ServerCrashProcedure progress for server s.
 \* "NONE" means no SCP is active for this server.
 \* GET_REGIONS -> FENCE_WALS -> ASSIGN -> DONE is the SCP lifecycle.
-\*
-\* Source: ServerCrashProcedure.executeFromState().
 VARIABLE scpState
 
 \* scpRegions[s] is the snapshot of regions taken at GET_REGIONS time.
-\*
-\* Source: ServerCrashProcedure.getRegionsOnCrashedServer(),
-\*         AssignmentManager.getRegionsOnServer().
 VARIABLE scpRegions
 
 \* walFenced[s] is TRUE after SCP revokes WAL leases for server s.
 \* Reset to FALSE on ServerRestart.  After fencing, the zombie RS
 \* cannot write to its WALs; any write attempt fails with an HDFS
 \* lease exception, triggering RS self-abort.
-\*
-\* Source: ServerCrashProcedure.executeFromState() SERVER_CRASH_SPLIT_LOGS
-\*         case; MasterWalManager.splitLogs().
 VARIABLE walFenced
 
 \* carryingMeta[s] is TRUE when server s was hosting hbase:meta at
@@ -228,10 +207,6 @@ VARIABLE walFenced
 \* modeled by the ASSIGN_META scpState.  All other SCP actions for
 \* ANY server are gated on meta being available (no server in
 \* ASSIGN_META state), faithfully modeling waitMetaLoaded.
-\*
-\* Source: SCP.executeFromState() SERVER_CRASH_START case;
-\*         SCP.isCarryingMeta();
-\*         SCP.waitMetaLoaded().
 VARIABLE carryingMeta
 
 \* serverRegions[s] is the set of regions tracked by server s's
@@ -243,10 +218,6 @@ VARIABLE carryingMeta
 \* desynchronize when a TRSP updates one before the other, providing
 \* the mechanism for the race where SCP snapshots a stale set of
 \* regions for a crashed server.
-\*
-\* Source: RegionStates.addRegionToServer() / removeRegionFromServer();
-\*         ServerStateNode.addRegion() / removeRegion();
-\*         AssignmentManager.getRegionsOnServer().
 VARIABLE serverRegions
 
 \* procStore[r] is the persisted procedure record for region r, or
@@ -256,27 +227,18 @@ VARIABLE serverRegions
 \* explicit delete.  Updated by ProcedureExecutor.store.update()
 \* after each executeFromState step (except when skipPersistence
 \* is called, e.g., DispatchFail).
-\*
-\* Source: ProcedureExecutor.execProcedure() persistence;
-\*         RegionRemoteProcedureBase.persistAndWake();
-\*         WALProcedureStore / RegionProcedureStore.
 VARIABLE procStore
 
 \* masterAlive is TRUE when the active master JVM is running.
 \* When FALSE, all in-memory state (regionState, serverState, etc.)
 \* is invalid — the master does not exist.  Durable state (metaTable,
 \* procStore) and RS-side state (rsOnlineRegions) survive.
-\*
-\* Source: HMaster lifecycle.
 VARIABLE masterAlive
 
 \* zkNode[s] is TRUE when server s has a live ZK ephemeral node.
 \* Created when the RS starts (RSRestart), deleted when ZK detects
 \* session expiry (ZKSessionExpire).  Read by the master to determine
 \* which servers are alive.
-\*
-\* Source: ZooKeeper ephemeral node under /hbase/rs;
-\*         RegionServerTracker.getRegionServers().
 VARIABLE zkNode
 
 \* availableWorkers is the number of idle PEWorker threads.
@@ -285,8 +247,6 @@ VARIABLE zkNode
 \* the same atomic step).  Meta-writing actions when meta is unavailable
 \* may hold a worker (UseBlockOnMetaWrite=TRUE, decrement) or suspend
 \* and release (UseBlockOnMetaWrite=FALSE, no decrement).
-\*
-\* Source: ProcedureExecutor.workerThreadCount.
 VARIABLE availableWorkers
 
 \* suspendedOnMeta is the set of regions whose procedures have been
@@ -296,9 +256,6 @@ VARIABLE availableWorkers
 \* suspendIfNecessary() suspending the procedure and releasing the
 \* PEWorker thread when AssignmentManager.persistToMeta() returns
 \* a pending future.
-\*
-\* Source: ProcedureFutureUtil.suspendIfNecessary();
-\*         RegionRemoteProcedureBase.execute() REPORT_SUCCEED branch.
 VARIABLE suspendedOnMeta
 
 \* blockedOnMeta is the set of regions whose procedures are blocked
@@ -306,10 +263,17 @@ VARIABLE suspendedOnMeta
 \* Branch-2.6 only (UseBlockOnMetaWrite=TRUE): models the synchronous
 \* Table.put() call in RegionStateStore.updateRegionLocation() blocking
 \* on an unavailable meta table.
-\*
-\* Source: RegionStateStore.updateRegionLocation() L158-240 uses
-\*         synchronous Table.put() (L237-239) in branch-2.6.
 VARIABLE blockedOnMeta
+
+\* regionKeyRange[r] is the keyspace range assigned to region r, or
+\* NoRange if the region identifier is not currently in use (does not
+\* exist).  A region "exists" iff regionKeyRange[r] # NoRange.
+\* At Init: DeployedRegions tile [0, MaxKey) with contiguous,
+\* non-overlapping ranges; all other identifiers are NoRange.
+\* Split materializes daughter keyspaces at PONR;
+\* merge materializes the union keyspace at PONR;
+\* parent/target deletion clears to NoRange.
+VARIABLE regionKeyRange
 
 vars ==
   << regionState,
@@ -328,7 +292,8 @@ vars ==
      zkNode,
      availableWorkers,
      suspendedOnMeta,
-     blockedOnMeta
+     blockedOnMeta,
+     regionKeyRange
   >>
 
 ---------------------------------------------------------------------------
@@ -337,9 +302,20 @@ vars ==
 \* MetaIsAvailable is TRUE when no server is in ASSIGN_META scpState,
 \* meaning hbase:meta is online and accessible for read/write.
 \* Reuses the existing waitMetaLoaded guard from SCP actions.
-\*
-\* Source: SCP.waitMetaLoaded().
 MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
+
+\* A region "exists" iff its keyspace range has been assigned.
+\* Unused region identifiers have regionKeyRange = NoRange.
+\* All existing actions guard on this predicate so that only
+\* regions with assigned keyspaces can participate in transitions.
+RegionExists(r) == regionKeyRange[r] # NoRange
+
+\* Two regions are adjacent when the first's endKey equals the
+\* second's startKey.  Both must exist (have assigned keyspaces).
+\* Used as a precondition for merge operations (iterations 23+).
+Adjacent(r1, r2) == /\ RegionExists(r1)
+                    /\ RegionExists(r2)
+                    /\ regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
 
 \* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
@@ -405,7 +381,6 @@ TypeOK ==
   /\ walFenced \in [Servers -> BOOLEAN]
   \* Whether crashed server was hosting hbase:meta.
   /\ carryingMeta \in [Servers -> BOOLEAN]
-
   \* Per-server region tracking (ServerStateNode).
   /\ serverRegions \in [Servers -> SUBSET Regions]
   \* Persisted procedure store: record per region or NoProcedure.
@@ -420,6 +395,9 @@ TypeOK ==
   /\ suspendedOnMeta \subseteq Regions
   \* Regions blocked on meta (sync, worker held).
   /\ blockedOnMeta \subseteq Regions
+  \* Keyspace range: assigned range or NoRange (unused identifier).
+  /\ regionKeyRange \in
+       [Regions -> [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }]
 
 ---------------------------------------------------------------------------
 
@@ -428,7 +406,9 @@ TypeOK ==
 OpenImpliesLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].state = "OPEN" => regionState[r].location # NoServer
+        RegionExists(r) =>
+          ( regionState[r].state = "OPEN" => regionState[r].location # NoServer
+          )
     )
 
 \* A region that is OFFLINE, CLOSED, FAILED_OPEN, or ABNORMALLY_CLOSED
@@ -436,9 +416,11 @@ OpenImpliesLocation ==
 OfflineImpliesNoLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].state \in
-            { "OFFLINE", "CLOSED", "FAILED_OPEN", "ABNORMALLY_CLOSED" } =>
-          regionState[r].location = NoServer
+        RegionExists(r) =>
+          ( regionState[r].state \in
+                { "OFFLINE", "CLOSED", "FAILED_OPEN", "ABNORMALLY_CLOSED" } =>
+              regionState[r].location = NoServer
+          )
     )
 
 \* The persistent state in hbase:meta matches the in-memory state for
@@ -455,20 +437,21 @@ OfflineImpliesNoLocation ==
 \* metaTable survives but regionState is lost and must be rebuilt.
 MetaConsistency ==
   masterAlive = TRUE =>
-    \A r \in Regions: \/ /\ metaTable[r].state = regionState[r].state
-                         /\ metaTable[r].location = regionState[r].location
-                      \/ /\ regionState[r].state = "OFFLINE"
-                         /\ metaTable[r].state = "CLOSED"
-                         /\ regionState[r].location = NoServer
-                         /\ metaTable[r].location = NoServer
-                      \* Active procedure window: in-memory state may
-                      \* diverge from metaTable during TRSP execution.
-                      \* E.g., TRSPReportSucceedOpen sets state to OPEN
-                      \* while meta still shows OPENING; TRSPPersistToMeta
-                      \* retry resets to GET_ASSIGN_CANDIDATE while meta
-                      \* retains OPENING.  Divergence is always resolved
-                      \* when the procedure completes or is cleared.
-                      \/ regionState[r].procType # "NONE"
+    \A r \in Regions:
+      RegionExists(r) => \/ /\ metaTable[r].state = regionState[r].state
+                            /\ metaTable[r].location = regionState[r].location
+                         \/ /\ regionState[r].state = "OFFLINE"
+                            /\ metaTable[r].state = "CLOSED"
+                            /\ regionState[r].location = NoServer
+                            /\ metaTable[r].location = NoServer
+                         \* Active procedure window: in-memory state may
+                         \* diverge from metaTable during TRSP execution.
+                         \* E.g., TRSPReportSucceedOpen sets state to OPEN
+                         \* while meta still shows OPENING; TRSPPersistToMeta
+                         \* retry resets to GET_ASSIGN_CANDIDATE while meta
+                         \* retains OPENING.  Divergence is always resolved
+                         \* when the procedure completes or is cleared.
+                         \/ regionState[r].procType # "NONE"
 
 \* NoDoubleAssignment: HBase term of art for "at most one server per
 \* region."  The precise semantics here are "no double write": a region
@@ -513,47 +496,49 @@ NoDoubleAssignment ==
 LockExclusivity ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].procType # "NONE" =>
-          \/ /\ regionState[r].procType = "ASSIGN"
-             /\ regionState[r].state \in
-                  { "OFFLINE",
-                    "CLOSED",
-                    "ABNORMALLY_CLOSED",
-                    "FAILED_OPEN",
-                    "OPENING",
-                    "OPEN"
-                  \* REPORT_SUCCEED window: RS reported OPENED,
-                  \* in-memory state is OPEN but procedure not
-                  \* yet cleared (meta not yet written).
-                  }
-          \/ /\ regionState[r].procType = "UNASSIGN"
-             /\ regionState[r].state \in
-                  { "OPEN",
-                    "CLOSING",
-                    "ABNORMALLY_CLOSED",
-                    "CLOSED"
-                  \* REPORT_SUCCEED window: RS reported CLOSED,
-                  \* in-memory state is CLOSED but procedure
-                  \* not yet cleared.
-                  }
-          \/ /\ regionState[r].procType = "MOVE"
-             /\ regionState[r].state \in
-                  { "OPEN",
-                    "CLOSING",
-                    "CLOSED",
-                    "ABNORMALLY_CLOSED",
-                    "FAILED_OPEN",
-                    "OPENING"
-                  }
-          \/ /\ regionState[r].procType = "REOPEN"
-             /\ regionState[r].state \in
-                  { "OPEN",
-                    "CLOSING",
-                    "CLOSED",
-                    "ABNORMALLY_CLOSED",
-                    "FAILED_OPEN",
-                    "OPENING"
-                  }
+        RegionExists(r) =>
+          ( regionState[r].procType # "NONE" =>
+              \/ /\ regionState[r].procType = "ASSIGN"
+                 /\ regionState[r].state \in
+                      { "OFFLINE",
+                        "CLOSED",
+                        "ABNORMALLY_CLOSED",
+                        "FAILED_OPEN",
+                        "OPENING",
+                        "OPEN"
+                      \* REPORT_SUCCEED window: RS reported OPENED,
+                      \* in-memory state is OPEN but procedure not
+                      \* yet cleared (meta not yet written).
+                      }
+              \/ /\ regionState[r].procType = "UNASSIGN"
+                 /\ regionState[r].state \in
+                      { "OPEN",
+                        "CLOSING",
+                        "ABNORMALLY_CLOSED",
+                        "CLOSED"
+                      \* REPORT_SUCCEED window: RS reported CLOSED,
+                      \* in-memory state is CLOSED but procedure
+                      \* not yet cleared.
+                      }
+              \/ /\ regionState[r].procType = "MOVE"
+                 /\ regionState[r].state \in
+                      { "OPEN",
+                        "CLOSING",
+                        "CLOSED",
+                        "ABNORMALLY_CLOSED",
+                        "FAILED_OPEN",
+                        "OPENING"
+                      }
+              \/ /\ regionState[r].procType = "REOPEN"
+                 /\ regionState[r].state \in
+                      { "OPEN",
+                        "CLOSING",
+                        "CLOSED",
+                        "ABNORMALLY_CLOSED",
+                        "FAILED_OPEN",
+                        "OPENING"
+                      }
+          )
     )
 
 \* When a region is stably OPEN (no procedure attached) on an ONLINE
@@ -576,12 +561,14 @@ LockExclusivity ==
 RSMasterAgreement ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        ( regionState[r].state = "OPEN" /\ regionState[r].procType = "NONE" /\
-                  regionState[r].location # NoServer /\
-                serverState[regionState[r].location] = "ONLINE" /\
-              zkNode[regionState[r].location] = TRUE
-          ) =>
-          r \in rsOnlineRegions[regionState[r].location]
+        RegionExists(r) =>
+          ( ( regionState[r].state = "OPEN" /\ regionState[r].procType = "NONE" /\
+                      regionState[r].location # NoServer /\
+                    serverState[regionState[r].location] = "ONLINE" /\
+                  zkNode[regionState[r].location] = TRUE
+              ) =>
+              r \in rsOnlineRegions[regionState[r].location]
+          )
     )
 
 \* Converse of RSMasterAgreement: if an RS considers a region online,
@@ -650,13 +637,15 @@ NoLostRegions ==
   masterAlive = TRUE =>
     ( ( \E s \in Servers: scpState[s] = "DONE" ) =>
         \A r \in Regions:
-          /\ ( regionState[r].state = "ABNORMALLY_CLOSED" =>
-                 regionState[r].procType # "NONE"
-             )
-          /\ ( /\ regionState[r].state \in { "OPENING", "CLOSING" }
-               /\ regionState[r].location = NoServer
-               /\ regionState[r].procType = "NONE"
-               => \E s \in Servers: r \in scpRegions[s] )
+          RegionExists(r) =>
+            /\ ( regionState[r].state = "ABNORMALLY_CLOSED" =>
+                   regionState[r].procType # "NONE"
+               )
+            /\ ( ( /\ regionState[r].state \in { "OPENING", "CLOSING" }
+                   /\ regionState[r].location = NoServer
+                   /\ regionState[r].procType = "NONE" ) =>
+                   ( \E s \in Servers: r \in scpRegions[s] )
+               )
     )
 
 \* Every active in-memory procedure has a matching persisted record,
@@ -690,39 +679,41 @@ ProcStoreBijection == ps!ProcStoreBijection
 ProcStepConsistency ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].procType # "NONE" =>
-          /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
-                 regionState[r].state \in
-                   { "OFFLINE",
-                     "CLOSED",
-                     "ABNORMALLY_CLOSED",
-                     "FAILED_OPEN",
-                     "OPENING"
-                   }
-             )
-          /\ ( regionState[r].procStep = "OPEN" =>
-                 regionState[r].state \in
-                   { "OFFLINE",
-                     "CLOSED",
-                     "ABNORMALLY_CLOSED",
-                     "FAILED_OPEN",
-                     "OPENING"
-                   }
-             )
-          /\ ( regionState[r].procStep = "CONFIRM_OPENED" =>
-                 regionState[r].state = "OPENING"
-             )
-          /\ ( regionState[r].procStep = "CLOSE" =>
-                 regionState[r].state \in
-                   { "OPEN", "CLOSING", "ABNORMALLY_CLOSED" }
-             )
-          /\ ( regionState[r].procStep = "CONFIRM_CLOSED" =>
-                 regionState[r].state \in { "CLOSING", "ABNORMALLY_CLOSED" }
-             )
-          /\ ( regionState[r].procStep = "REPORT_SUCCEED" =>
-                 regionState[r].state \in
-                   { "OPEN", "OPENING", "FAILED_OPEN", "CLOSED" }
-             )
+        RegionExists(r) =>
+          ( regionState[r].procType # "NONE" =>
+              /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
+                     regionState[r].state \in
+                       { "OFFLINE",
+                         "CLOSED",
+                         "ABNORMALLY_CLOSED",
+                         "FAILED_OPEN",
+                         "OPENING"
+                       }
+                 )
+              /\ ( regionState[r].procStep = "OPEN" =>
+                     regionState[r].state \in
+                       { "OFFLINE",
+                         "CLOSED",
+                         "ABNORMALLY_CLOSED",
+                         "FAILED_OPEN",
+                         "OPENING"
+                       }
+                 )
+              /\ ( regionState[r].procStep = "CONFIRM_OPENED" =>
+                     regionState[r].state = "OPENING"
+                 )
+              /\ ( regionState[r].procStep = "CLOSE" =>
+                     regionState[r].state \in
+                       { "OPEN", "CLOSING", "ABNORMALLY_CLOSED" }
+                 )
+              /\ ( regionState[r].procStep = "CONFIRM_CLOSED" =>
+                     regionState[r].state \in { "CLOSING", "ABNORMALLY_CLOSED" }
+                 )
+              /\ ( regionState[r].procStep = "REPORT_SUCCEED" =>
+                     regionState[r].state \in
+                       { "OPEN", "OPENING", "FAILED_OPEN", "CLOSED" }
+                 )
+          )
     )
 
 \* targetServer presence/absence correlates with procStep.
@@ -734,18 +725,20 @@ ProcStepConsistency ==
 TargetServerConsistency ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].procType # "NONE" =>
-          /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
-                 regionState[r].targetServer = NoServer
-             )
-          /\ ( regionState[r].procStep \in
-                   { "OPEN",
-                     "CONFIRM_OPENED",
-                     "CONFIRM_CLOSED",
-                     "REPORT_SUCCEED"
-                   } =>
-                 regionState[r].targetServer # NoServer
-             )
+        RegionExists(r) =>
+          ( regionState[r].procType # "NONE" =>
+              /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
+                     regionState[r].targetServer = NoServer
+                 )
+              /\ ( regionState[r].procStep \in
+                       { "OPEN",
+                         "CONFIRM_OPENED",
+                         "CONFIRM_CLOSED",
+                         "REPORT_SUCCEED"
+                       } =>
+                     regionState[r].targetServer # NoServer
+                 )
+          )
     )
 
 \* A region in OPENING state always has a non-None location.
@@ -755,7 +748,10 @@ TargetServerConsistency ==
 OpeningImpliesLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].state = "OPENING" => regionState[r].location # NoServer
+        RegionExists(r) =>
+          ( regionState[r].state = "OPENING" =>
+              regionState[r].location # NoServer
+          )
     )
 
 \* A region in CLOSING state always has a non-None location.
@@ -767,7 +763,10 @@ OpeningImpliesLocation ==
 ClosingImpliesLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        regionState[r].state = "CLOSING" => regionState[r].location # NoServer
+        RegionExists(r) =>
+          ( regionState[r].state = "CLOSING" =>
+              regionState[r].location # NoServer
+          )
     )
 
 \* For a region that has a known location, no active procedure, and whose
@@ -784,10 +783,12 @@ ClosingImpliesLocation ==
 ServerRegionsTrackLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        ( /\ regionState[r].location # NoServer
-          /\ regionState[r].procType = "NONE"
-          /\ serverState[regionState[r].location] # "CRASHED" ) =>
-          r \in serverRegions[regionState[r].location]
+        RegionExists(r) =>
+          ( ( /\ regionState[r].location # NoServer
+              /\ regionState[r].procType = "NONE"
+              /\ serverState[regionState[r].location] # "CRASHED" ) =>
+              r \in serverRegions[regionState[r].location]
+          )
     )
 
 \* Every dispatched command for a region corresponds to an active
@@ -817,8 +818,12 @@ DispatchCorrespondance ==
 NoOrphanedProcedures ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
-        ( regionState[r].state = "OFFLINE" /\ regionState[r].procType # "NONE" ) =>
-          regionState[r].procType = "ASSIGN"
+        RegionExists(r) =>
+          ( ( regionState[r].state = "OFFLINE" /\
+                  regionState[r].procType # "NONE"
+              ) =>
+              regionState[r].procType = "ASSIGN"
+          )
     )
 
 \* NoPEWorkerDeadlock: When the master is alive and all PEWorkers are
@@ -865,17 +870,56 @@ SCPMonotonicity ==
           }
 
 
+\* KeyspaceCoverage: every key in [0, MaxKey) is covered by exactly
+\* one live region.  A region covers a key if:
+\*   1. It exists (regionKeyRange # NoRange)
+\*   2. The key falls within its range [startKey, endKey)
+\*   3. It is not in a terminal split/merge state (SPLIT, MERGED)
+\*
+\* SPLITTING_NEW and MERGING_NEW regions ARE counted as covering
+\* their keyspaces — they have been materialized at PONR and will
+\* become OPEN when their child TRSP completes.
+\*
+\* In this iteration (no split/merge actions), KeyspaceCoverage
+\* holds trivially: DeployedRegions tile the full keyspace and no
+\* operation changes regionKeyRange.
+KeyspaceCoverage ==
+  \A k \in 0 .. ( MaxKey - 1 ):
+    Cardinality({r \in Regions:
+          /\ RegionExists(r)
+          /\ regionKeyRange[r].startKey <= k
+          /\ k < regionKeyRange[r].endKey
+          /\ regionState[r].state \notin { "SPLIT", "MERGED" }
+        }) =
+      1
+
+\* SplitMergeMutualExclusion: no SPLIT or MERGE procedures exist.
+\* Trivially true in this iteration since no action creates them.
+\* Will become non-trivial when split/merge actions are added
+\* (iterations 21+).
+SplitMergeMutualExclusion ==
+  ~\E r \in Regions: regionState[r].procType \in { "SPLIT", "MERGE" }
+
 (* State constraints for TLC *)
-\* Symmetry reduction: regions and servers are interchangeable.
-\* TLC explores one representative per equivalence class, reducing
-\* the state space by up to |Regions|! * |Servers|! (36x for 3r/3s).
-Symmetry == Permutations(Regions) \union Permutations(Servers)
+\* Symmetry reduction: only unused region identifiers are interchangeable
+\* (deployed regions have distinct keyspaces).  Servers remain
+\* interchangeable.  With 4 unused identifiers this provides up to
+\* 24x reduction.
+Symmetry == Permutations(Regions \ DeployedRegions) \union Permutations(Servers)
+
+\* State constraint: bound concurrent split/merge procedures.
+\* In this iteration no split/merge actions exist, so this is
+\* vacuously satisfied.  Included for forward compatibility.
+SplitMergeConstraint ==
+  Cardinality({r \in Regions: regionState[r].procType \in { "SPLIT", "MERGE" }}) <=
+    1
 
 ---------------------------------------------------------------------------
 
 (* Initial state *)
 Init ==
-  \* Every region starts OFFLINE with no server and no procedure.
+  \* DeployedRegions start OFFLINE with assigned keyspaces;
+  \* unused identifiers start OFFLINE with NoRange.
   /\ regionState =
        [r \in Regions |->
          [ state |-> "OFFLINE",
@@ -905,7 +949,6 @@ Init ==
   \* No server has been WAL-fenced.
   /\ walFenced = [s \in Servers |-> FALSE]
   /\ carryingMeta = [s \in Servers |-> FALSE]
-
   /\ serverRegions = [s \in Servers |-> {}]
   \* No procedures are persisted initially.
   /\ procStore = [r \in Regions |-> NoProcedure]
@@ -918,6 +961,28 @@ Init ==
   \* No procedures are suspended or blocked on meta.
   /\ suspendedOnMeta = {}
   /\ blockedOnMeta = {}
+  \* Keyspace tiling: DeployedRegions tile [0, MaxKey) evenly.
+  \* Unused identifiers get NoRange.
+  \* The tiling assigns contiguous, equal-width sub-ranges to deployed
+  \* regions.  Each deployed region r gets [rank * width, (rank+1) * width)
+  \* where rank is its position in an arbitrary bijection and
+  \* width = MaxKey ÷ |DeployedRegions|.
+  /\ LET n == Cardinality(DeployedRegions)
+         width == MaxKey \div n
+         \* Bijection from DeployedRegions to 0..(n-1).  CHOOSE picks
+         \* an arbitrary injective function (TLC-compatible: no ordering
+         \* on model values required).
+         rank ==
+           CHOOSE f \in [DeployedRegions -> 0 .. ( n - 1 )]:
+             \A r1, r2 \in DeployedRegions: r1 # r2 => f[r1] # f[r2]
+     IN regionKeyRange =
+           [r \in Regions |->
+             IF r \in DeployedRegions
+             THEN [ startKey |-> rank[r] * width,
+                 endKey |-> ( rank[r] + 1 ) * width
+               ]
+             ELSE NoRange
+           ]
 
 ---------------------------------------------------------------------------
 
@@ -1096,6 +1161,12 @@ MetaEventuallyAssigned ==
 \* Safety: OFFLINE procedure-bearing regions are ASSIGN only.
         THEOREM Spec => []NoOrphanedProcedures
 
+\* Safety: live regions' keyspaces cover [0, MaxKey) with no gaps or overlaps.
+        THEOREM Spec => []KeyspaceCoverage
+
+\* Safety: no split/merge procedures exist (trivially true this iteration).
+        THEOREM Spec => []SplitMergeMutualExclusion
+
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.
 \* Gated on masterAlive: MasterRecover rebuilds regionState from
@@ -1104,7 +1175,10 @@ MetaEventuallyAssigned ==
 TransitionValid ==
   ( masterAlive /\ masterAlive' ) =>
     \A r \in Regions:
-      regionState'[r].state # regionState[r].state =>
-        << regionState[r].state, regionState'[r].state >> \in ValidTransition
+      RegionExists(r) =>
+        ( regionState'[r].state # regionState[r].state =>
+            << regionState[r].state, regionState'[r].state >> \in
+              ValidTransition
+        )
 
 ============================================================================

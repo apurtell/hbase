@@ -60,7 +60,8 @@ VARIABLE regionState,
          zkNode,
          availableWorkers,
          suspendedOnMeta,
-         blockedOnMeta
+         blockedOnMeta,
+         regionKeyRange
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -71,7 +72,8 @@ rsVars == << rsOnlineRegions >>
 \* Shorthand for variables unchanged by TRSP actions (used in UNCHANGED
 \* clauses).  Includes SCP state and ZK ephemeral nodes — neither is
 \* modified by any TRSP action.
-scpVars == << scpState, scpRegions, walFenced, carryingMeta, zkNode >>
+scpVars ==
+  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
@@ -106,6 +108,8 @@ TRSPCreate(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Region must be in a state eligible for assignment.
   /\ regionState[r].state \in
        { "OFFLINE", "CLOSED", "ABNORMALLY_CLOSED", "FAILED_OPEN" }
@@ -173,6 +177,8 @@ TRSPGetCandidate(r, s) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be ASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be at the candidate selection step.
@@ -218,6 +224,8 @@ TRSPDispatchOpen(r) ==
   \* Master must be alive for procedure execution.
   /\ masterAlive = TRUE
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
@@ -311,6 +319,8 @@ TRSPReportSucceedOpen(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be ASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the open confirmation.
@@ -389,6 +399,8 @@ TRSPPersistToMetaOpen(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be ASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be at the report-succeed (persist-to-meta) step.
@@ -573,6 +585,8 @@ DispatchFail(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be ASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the open confirmation.
@@ -630,6 +644,8 @@ DispatchFailClose(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be UNASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the close confirmation.
@@ -678,6 +694,8 @@ TRSPCreateUnassign(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Region must be in OPEN state.
   /\ regionState[r].state = "OPEN"
   \* Region must have a server location assigned.
@@ -734,6 +752,8 @@ TRSPCreateMove(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Region must be in OPEN state.
   /\ regionState[r].state = "OPEN"
   \* Region must have a server location assigned.
@@ -789,6 +809,8 @@ TRSPCreateReopen(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* REOPEN feature must be enabled.
   /\ UseReopen = TRUE
   \* Region must be in OPEN state.
@@ -843,6 +865,8 @@ TRSPDispatchClose(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be UNASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be at the CLOSE step.
@@ -924,6 +948,8 @@ TRSPReportSucceedClose(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be UNASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the close confirmation.
@@ -990,6 +1016,8 @@ TRSPPersistToMetaClose(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be UNASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be at the report-succeed (persist-to-meta) step.
@@ -1083,6 +1111,8 @@ TRSPConfirmClosedCrash(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Procedure type must be UNASSIGN, MOVE, or REOPEN.
   /\ regionState[r].procType \in { "UNASSIGN", "MOVE", "REOPEN" }
   \* Procedure must be waiting for the close confirmation.
@@ -1162,6 +1192,8 @@ TRSPServerCrashed(r) ==
   /\ masterAlive = TRUE
   \* A PEWorker thread must be available to execute this procedure step.
   /\ availableWorkers > 0
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* A procedure must be attached to this region.
   /\ regionState[r].procType # "NONE"
   \* Region was marked ABNORMALLY_CLOSED by SCP (server crashed).

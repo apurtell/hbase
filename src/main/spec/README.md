@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-17 state variables capturing:
+18 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -114,22 +114,28 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **PEWorker thread pool** — available worker count (`availableWorkers`), async
   suspension (`suspendedOnMeta`), and sync blocking (`blockedOnMeta`) when
   `hbase:meta` is unavailable during SCP meta-reassignment.
+- **Keyspace infrastructure** — per-region key range (`regionKeyRange`) mapping
+  each region to a `[startKey, endKey)` interval or `NoRange` for unused
+  identifiers.  `DeployedRegions` tile `[0, MaxKey)` at Init; unused identifiers
+  are available for future split/merge.
 
-The specification defines 21 safety invariants verified at every reachable
+The specification defines 23 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
-stuck without a procedure after crash recovery), and `NoPEWorkerDeadlock`
-(thread pool exhaustion detection). One liveness property
-(`MetaEventuallyAssigned`) verifies that `hbase:meta` is eventually
-reassigned after a crash. Two action constraints enforce transition validity
-and SCP monotonicity.
+stuck without a procedure after crash recovery), `NoPEWorkerDeadlock`
+(thread pool exhaustion detection), `KeyspaceCoverage` (all keys covered by
+exactly one live region), and `SplitMergeMutualExclusion` (no split/merge
+procedures active — trivially true until split/merge actions are added).
+One liveness property (`MetaEventuallyAssigned`) verifies that `hbase:meta`
+is eventually reassigned after a crash. Two action constraints enforce
+transition validity and SCP monotonicity.
 
-The model checker runs in two tiers: fast exhaustive verification at 2
-regions / 2 servers, and deep random simulation at 3r/3s with extended
-retries. Configurable "quirk" flags allow toggling known implementation bugs
-to correctly adhere to implementation semantics, reproduce failures and
-validate fixes.
+The model checker runs in two tiers: fast exhaustive verification at 3
+regions / 2 servers (2 deployed + 1 unused), and deep random simulation at
+7r/3s with extended retries. Configurable "quirk" flags allow toggling known
+implementation bugs to correctly adhere to implementation semantics, reproduce
+failures and validate fixes.
 
 ---
 
@@ -144,16 +150,16 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 
 | Module | Lines | Description |
 |--------|------:|-------------|
-| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1110 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants, liveness |
-| [Types.tla](markdown/Types.md) | 236 | Constants, type sets, state definitions, `ValidTransition` |
-| [TRSP.tla](markdown/TRSP.md) | 1255 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
-| [SCP.tla](markdown/SCP.md) | 474 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done, with meta-blocking) |
-| [RegionServer.tla](markdown/RegionServer.md) | 391 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
-| [Master.tla](markdown/Master.md) | 342 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset) |
+| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1184 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants, liveness, keyspace predicates |
+| [Types.tla](markdown/Types.md) | 220 | Constants, type sets, state definitions, `ValidTransition`, split/merge states |
+| [TRSP.tla](markdown/TRSP.md) | 1287 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
+| [SCP.tla](markdown/SCP.md) | 483 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done, with meta-blocking) |
+| [RegionServer.tla](markdown/RegionServer.md) | 392 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
+| [Master.tla](markdown/Master.md) | 354 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
 | [ProcStore.tla](markdown/ProcStore.md) | 137 | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
-| [ZK.tla](markdown/ZK.md) | 89 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
+| [ZK.tla](markdown/ZK.md) | 91 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
 
-## State Variables (17 total)
+## State Variables (18 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
 - **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
@@ -172,6 +178,7 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 - **`availableWorkers`** — number of idle PEWorker threads
 - **`suspendedOnMeta`** — regions whose procedures are async-suspended on meta unavailability
 - **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
+- **`regionKeyRange`** — per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
 
 ## Configurable Behaviors
 
@@ -183,38 +190,44 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
+| `DeployedRegions` | Subset of `Regions` that tile the keyspace at Init (remaining are unused identifiers for split/merge) |
+| `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
+| `NoRange` | Sentinel value for regions without an assigned keyspace |
 
 ## Verification Configurations
 
-### 1. Primary Exhaustive — 2 Regions / 2 Servers ([AssignmentManager.cfg](markdown/AssignmentManager-cfg.md))
+### 1. Primary Exhaustive — 3 Regions / 2 Servers ([AssignmentManager.cfg](markdown/AssignmentManager-cfg.md))
 
-Fast exhaustive model check with symmetry reduction. Used as the routine
-verification pass.
-
-| Parameter | Value |
-|-----------|-------|
-| Regions | `{r1, r2}` |
-| Servers | `{s1, s2}` |
-| MaxRetries | 1 |
-| MaxWorkers | 2 |
-| UseReopen | FALSE |
-| Symmetry | Yes |
-| Mode | Exhaustive |
-
-### 2. Simulation — 3 Regions / 3 Servers ([AssignmentManager-sim.cfg](markdown/AssignmentManager-sim-cfg.md))
-
-Deep random-trace simulation at 3r/3s with `MaxRetries = 2`.  Probabilistic
-coverage of the full state space including cascading crashes, master
-crash/recovery, and multi-cycle assign/unassign/move sequences.  Simulation is
-the only tier that verifies deeper retry behavior (`MaxRetries = 2`).
+Fast exhaustive model check with symmetry reduction. 2 deployed regions tile
+`[0, 8)` with 1 unused identifier for future split/merge.
 
 | Parameter | Value |
 |-----------|-------|
 | Regions | `{r1, r2, r3}` |
+| Servers | `{s1, s2}` |
+| DeployedRegions | `{r1, r2}` |
+| MaxKey | 8 |
+| MaxRetries | 1 |
+| MaxWorkers | 2 |
+| UseReopen | FALSE |
+| Symmetry | `Permutations(Regions \ DeployedRegions) ∪ Permutations(Servers)` |
+| Mode | Exhaustive |
+
+### 2. Simulation — 7 Regions / 3 Servers ([AssignmentManager-sim.cfg](markdown/AssignmentManager-sim-cfg.md))
+
+Deep random-trace simulation at 7r/3s (3 deployed + 4 unused) with
+`MaxRetries = 2`.  Probabilistic coverage of the full state space including
+cascading crashes, master crash/recovery, and multi-cycle assign/unassign/move
+sequences.  Simulation is the only tier that verifies deeper retry behavior.
+
+| Parameter | Value |
+|-----------|-------|
+| Regions | `{r1, r2, r3, r4, r5, r6, r7}` |
 | Servers | `{s1, s2, s3}` |
+| DeployedRegions | `{r1, r2, r3}` |
+| MaxKey | 12 |
 | MaxRetries | 2 |
 | UseReopen | TRUE |
-| Symmetry | N/A (simulation mode) |
 | Mode | Random Simulation |
 
 **Recommended simulation durations:**
@@ -227,7 +240,7 @@ the only tier that verifies deeper retry behavior (`MaxRetries = 2`).
 
 ## Invariants
 
-All configurations check the same 21 safety invariants:
+All configurations check the same 23 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -252,6 +265,8 @@ All configurations check the same 21 safety invariants:
 | `DispatchCorrespondance` | Dispatched commands have corresponding procedures |
 | `NoOrphanedProcedures` | OFFLINE procedure-bearing regions are ASSIGN only |
 | `NoPEWorkerDeadlock` | When all PEWorkers are consumed and meta is unavailable, at least one active procedure is not blocked/suspended |
+| `KeyspaceCoverage` | All keys in `[0, MaxKey)` covered by exactly one live region with no gaps or overlaps |
+| `SplitMergeMutualExclusion` | No split/merge procedures active (trivially true until split/merge actions are added) |
 
 ## Liveness Properties
 
@@ -272,16 +287,19 @@ All configurations check the same 21 safety invariants:
 
 ## Latest Verification Results
 
-### 2r/2s Exhaustive (Primary)
+### 3r/2s Exhaustive (Primary)
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-07 |
-| **TLC version** | 2026.03.02.213938 |
-| **Config** | `AssignmentManager.cfg` |
+| **Date** | 2026-03-08 |
+| **TLC version** | 2026.03.05.210854 |
+| **Config** | `AssignmentManager.cfg` (3r/2s: 2 deployed + 1 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
-| **Result** | ✅ All 21 invariants and action constraints passed |
-| **States checked** | 12,412,690 distinct |
+| **Result** | ✅ All 23 invariants, action constraints, and state constraint passed |
+| **States generated** | 86,037,209 |
+| **States checked** | 24,781,202 distinct |
+| **Depth** | 66 |
+| **Duration** | 8m08s |
 
 ## Running the Spec
 
@@ -316,7 +334,9 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (300, 900, 3600
 - PEWorker thread pool (worker availability, meta-blocking, async suspension vs sync blocking)
 - Configurable implementation quirks (duplicate open, restore succeed)
 - Configurable meta-write behavior
+- Keyspace infrastructure (`regionKeyRange`, `DeployedRegions`, `MaxKey`) with `KeyspaceCoverage` invariant
+- Split/merge states and transitions in `State`/`ValidTransition` (infrastructure only — no actions yet)
 
 **Deferred:**
-- Split/merge states (SPLITTING, SPLIT, MERGING, MERGED, SPLITTING_NEW, MERGING_NEW)
+- Split/merge actions (RequestSplit, SplitRegion, RequestMerge, MergeRegions)
 - FAILED_CLOSE (RS abort triggers crash detection instead)
