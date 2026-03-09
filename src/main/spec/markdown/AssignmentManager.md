@@ -2,7 +2,7 @@
 
 **Source:** [`AssignmentManager.tla`](../AssignmentManager.tla)
 
-Root orchestrator module for the HBase AssignmentManager TLA+ specification. Declares all state variables, defines Init and Next, Fairness and Spec, and contains all safety invariants, liveness properties, action constraints, keyspace predicates, and symmetry/state-constraint definitions.
+Root orchestrator module: variables, Init, Next, Fairness, Spec, invariants, liveness, keyspace predicates.
 
 ---
 
@@ -10,335 +10,213 @@ Root orchestrator module for the HBase AssignmentManager TLA+ specification. Dec
 ------------------------ MODULE AssignmentManager -------------------------
 ```
 
-TLA+ specification of the HBase AssignmentManager.
+TLA+ specification of the HBase AssignmentManager. Root orchestrator module: declares variables, instantiates action modules, defines invariants, Init, Next, Fairness, and Spec.
 
-Root orchestrator module: declares variables, instantiates action
-modules, defines invariants, Init, Next, Fairness, and Spec.
+### Sub-Modules
 
 Action logic is factored into sub-modules:
-- Types: constants, type sets, state definitions
-- TRSP:           procedure actions (assign, unassign, move, reopen,
-dispatch, confirm, failure, crash recovery)
-- SCP:            ServerCrashProcedure state machine
-- RegionServer:   RS-side handlers (open, close, abort, stale reports)
-- Master:         master-side actions (offline, crash detect, crash, recover)
-- RegionServer:   RS-side handlers (open, close, abort, stale reports,
-restart, duplicate open)
 
-Models the region assignment lifecycle: state transitions, persistent
-metadata, procedure-driven operations, RPC dispatch, RegionServer-side
-behavior, and crash recovery.  Built iteratively per the plan in
-TLA_ASSIGNMENT_MANAGER_PLAN.md.
+| Module           | Responsibility                                                                 |
+|------------------|-------------------------------------------------------------------------------|
+| **Types**        | Constants, type sets, state definitions                                        |
+| **TRSP**         | Procedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery) |
+| **SCP**          | `ServerCrashProcedure` state machine                                           |
+| **RegionServer** | RS-side handlers (open, close, abort, stale reports, restart, duplicate open)   |
+| **Master**       | Master-side actions (offline, crash detect, crash, recover)                    |
+| **Split**        | `SplitTableRegionProcedure` actions                                            |
 
-Two parallel views of region state are maintained:
-- regionState: volatile in-memory master state (lost on master crash)
-- metaTable:   persistent state in hbase:meta (survives master crash)
-State and location fields are updated atomically (RegionStateNode lock
-held across both writes; see plan Appendix A.8 item 2).
+### Region Assignment Lifecycle
 
-Procedure state is inlined into regionState, keyed by region rather
-than by a global procedure ID counter.  ProcedureConsistency (from
-earlier iterations) proved at most one procedure per region, so
-region identity is sufficient to distinguish procedures.  Procedure
-fields (procType, procStep, targetServer, retries) model the
-RegionStateNode.setProcedure() / unsetProcedure() discipline.
-ASSIGN, UNASSIGN, and MOVE follow TRSP state machines:
-ASSIGN:   GET_ASSIGN_CANDIDATE -> OPEN -> CONFIRM_OPENED -> (cleared)
-UNASSIGN: CLOSE -> CONFIRM_CLOSED -> (cleared)
-MOVE:     CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
--> CONFIRM_OPENED -> (cleared)
-REOPEN:   CLOSE -> CONFIRM_CLOSED -> GET_ASSIGN_CANDIDATE -> OPEN
--> CONFIRM_OPENED -> (cleared)
-MOVE closes on the current server and opens on a different server.
-REOPEN is identical in flow but prefers the same server (assignCandidate
-pinned to current location) and does not require another ONLINE server.
-If a region becomes ABNORMALLY_CLOSED (server crash), the procedure
-converts to ASSIGN/GET_ASSIGN_CANDIDATE via the serverCrashed()
-callback, modeling the TRSP's self-recovery path.
+The specification models the region assignment lifecycle: state transitions, persistent metadata, procedure-driven operations, RPC dispatch, RegionServer-side behavior, and crash recovery. Built iteratively per the plan in `TLA_ASSIGNMENT_MANAGER_PLAN.md`.
+
+**Two parallel views of region state** are maintained:
+- **`regionState`:** volatile in-memory master state (lost on master crash)
+- **`metaTable`:** persistent state in `hbase:meta` (survives master crash)
+
+State and location fields are updated atomically (`RegionStateNode` lock held across both writes; see plan Appendix A.8 item 2).
+
+### Procedure State Model
+
+Procedure state is inlined into `regionState`, keyed by region rather than by a global procedure ID counter. `ProcedureConsistency` (from earlier iterations) proved at most one procedure per region, so region identity is sufficient to distinguish procedures. Procedure fields (`procType`, `procStep`, `targetServer`, `retries`) model the `RegionStateNode.setProcedure()` / `unsetProcedure()` discipline.
+
+TRSP state machines:
+- **`ASSIGN`:** `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` → *(cleared)*
+- **`UNASSIGN`:** `CLOSE` → `CONFIRM_CLOSED` → *(cleared)*
+- **`MOVE`:** `CLOSE` → `CONFIRM_CLOSED` → `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` → *(cleared)*
+- **`REOPEN`:** `CLOSE` → `CONFIRM_CLOSED` → `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` → *(cleared)*
+
+`MOVE` closes on the current server and opens on a different server. `REOPEN` is identical in flow but prefers the same server (`assignCandidate` pinned to current location) and does not require another `ONLINE` server. If a region becomes `ABNORMALLY_CLOSED` (server crash), the procedure converts to `ASSIGN`/`GET_ASSIGN_CANDIDATE` via the `serverCrashed()` callback, modeling the TRSP's self-recovery path.
+
+### RPC Channels
 
 Two RPC channels model the asynchronous communication:
-dispatchedOps:  master->RS command channel (per server)
-pendingReports: RS->master report channel
-Commands and reports are matched by region (not by procedure ID).
-Since at most one procedure can be active per region, region identity
-provides the same discrimination as a procedure ID.
+- **`dispatchedOps`:** master→RS command channel (per server)
+- **`pendingReports`:** RS→master report channel
 
-The implementation processes reports synchronously: reportRegionStateTransition
-is an RPC; each report is handled immediately when it arrives. There is no
-pendingReports queue. The spec's pendingReports set models the possibility
-of reports arriving and being processed in arbitrary order (e.g., OPENED
-and FAILED_OPEN both in flight). The implementation's equivalent of
-"dropping" a report is rejecting it in the handler (e.g., when
-regionNode.getState() = ABNORMALLY_CLOSED).
+Commands and reports are matched by region (not by procedure ID). Since at most one procedure can be active per region, region identity provides the same discrimination as a procedure ID.
 
-The implementation's TRSP executes as a state machine: GET_ASSIGN_CANDIDATE
--> OPEN -> CONFIRM_OPENED. At CONFIRM_OPENED, the procedure suspends until
-a report arrives (OpenRegionProcedure/CloseRegionProcedure wake it via
-reportTransition). The procedure does not advance to the next step until
-the report is processed. Thus TRSPDispatchOpen cannot run "before"
-TRSPReportSucceedOpen for the same retry cycle: we must receive FAILED_OPEN
-(and process it) before we can transition to GET_ASSIGN_CANDIDATE and
-eventually dispatch a new OPEN. The spec allows arbitrary interleaving of
-actions across regions and between TRSP/SCP/RS, which can expose races
-(e.g., TRSPDispatchOpen retry-to-same-server before TRSPReportSucceedOpen)
-that the implementation's procedure serialization may prevent. The spec's
-mitigations (clear OPEN in TRSPReportSucceedOpen, prefer OPENED) are
-conservative guards for these model-exposed races.
+The implementation processes reports synchronously: `reportRegionStateTransition` is an RPC; each report is handled immediately when it arrives. There is no `pendingReports` queue. The spec's `pendingReports` set models the possibility of reports arriving and being processed in arbitrary order (e.g., `OPENED` and `FAILED_OPEN` both in flight). The implementation's equivalent of "dropping" a report is rejecting it in the handler (e.g., when `regionNode.getState() = ABNORMALLY_CLOSED`).
 
-RS-side receive and complete steps are merged into single atomic
-actions because the intermediate RS state (command consumed but not
-yet reported) is not observable by the master and produces the same
-crash-recovery outcome as the pre-receive state.
+The implementation's TRSP executes as a state machine: `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED`. At `CONFIRM_OPENED`, the procedure suspends until a report arrives (`OpenRegionProcedure`/`CloseRegionProcedure` wake it via `reportTransition`). The procedure does not advance to the next step until the report is processed. The spec allows arbitrary interleaving of actions across regions and between TRSP/SCP/RS, which can expose races that the implementation's procedure serialization may prevent. The spec's mitigations (clear `OPEN` in `TRSPReportSucceedOpen`, prefer `OPENED`) are conservative guards for these model-exposed races.
 
-Server liveness is tracked by serverState.  RS crash is decomposed
-into a multi-step ServerCrashProcedure (SCP):
-1. MasterDetectCrash(s): master marks server CRASHED, starts SCP.
-Non-deterministically decides if the server was hosting meta.
-1a. SCPAssignMeta(s): if carryingMeta, reassign meta first.
-2. SCPGetRegions(s): snapshot regions on the crashed server.
-3. SCPFenceWALs(s): revoke WAL leases (prevents zombie writes).
-4. SCPAssignRegion(s, r): process regions one at a time, creating
-ASSIGN procedures or invoking TRSPServerCrashed on existing ones.
-5. SCPDone(s): all regions processed.
-Separately, RSAbort(s) models the zombie RS discovering it is dead
-and clearing its RS-side state (rsOnlineRegions, dispatchedOps).
-RSAbort may fire at any time after MasterDetectCrash.
+### Atomicity and Merging
 
-RS-side actions and report consumption are guarded by server liveness.
-Reports from crashed servers are dropped by DropStaleReport.
-ServerRestart(s) models a process supervisor (Kubernetes, systemd)
-restarting a crashed server after SCP completes; WF on ServerRestart
-ensures crashed servers eventually come back online.
+RS-side receive and complete steps are merged into single atomic actions because the intermediate RS state (command consumed but not yet reported) is not observable by the master and produces the same crash-recovery outcome as the pre-receive state.
 
-When a region fails to open on an RS, the FAILED_OPEN report is
-consumed by TRSPReportSucceedOpen (report phase), and TRSPPersistToMetaOpen
-and resets the procedure to GET_ASSIGN_CANDIDATE for retry on a
-different server.  If the retry counter reaches MaxRetries,
-(persist phase, which increments the retry counter or gives up). (persistent)
-and clears the procedure.
+### Server Crash Recovery
 
-The state space is naturally finite with region-keyed procedures:
-there are finitely many combinations of region state, procedure
-configuration, channel contents, and server state.  When a region
-completes a full lifecycle, the system returns to an already-visited
-configuration.  No StateConstraint on a procedure counter is needed.
+Server liveness is tracked by `serverState`. RS crash is decomposed into a multi-step `ServerCrashProcedure` (SCP):
+1. **`MasterDetectCrash(s)`:** master marks server `CRASHED`, starts SCP. Non-deterministically decides if the server was hosting meta.
+2. **`SCPAssignMeta(s)`:** if `carryingMeta`, reassign meta first.
+3. **`SCPGetRegions(s)`:** snapshot regions on the crashed server.
+4. **`SCPFenceWALs(s)`:** revoke WAL leases (prevents zombie writes).
+5. **`SCPAssignRegion(s, r)`:** process regions one at a time, creating `ASSIGN` procedures or invoking `TRSPServerCrashed` on existing ones.
+6. **`SCPDone(s)`:** all regions processed.
 
-Region lifecycle states cover the full RegionState.State enum:
-OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED,
-SPLITTING, SPLIT, SPLITTING_NEW, MERGING, MERGED, MERGING_NEW.
+Separately, `RSAbort(s)` models the zombie RS discovering it is dead and clearing its RS-side state (`rsOnlineRegions`, `dispatchedOps`). `RSAbort` may fire at any time after `MasterDetectCrash`.
 
-FAILED_CLOSE is omitted because no code path transitions into it. The RS
-abort triggers crash detection, so close failures are resolved through
-ABNORMALLY_CLOSED instead.
+RS-side actions and report consumption are guarded by server liveness. Reports from crashed servers are dropped by `DropStaleReport`. `ServerRestart(s)` models a process supervisor (Kubernetes, systemd) restarting a crashed server after SCP completes; WF on `ServerRestart` ensures crashed servers eventually come back online.
+
+### Failed Open Handling
+
+When a region fails to open on an RS, the `FAILED_OPEN` report is consumed by `TRSPReportSucceedOpen` (report phase), and `TRSPPersistToMetaOpen` resets the procedure to `GET_ASSIGN_CANDIDATE` for retry on a different server. If the retry counter reaches `MaxRetries`, the persist phase moves the region to `FAILED_OPEN` state (persistent) and clears the procedure.
+
+### State Space Finiteness
+
+The state space is naturally finite with region-keyed procedures: there are finitely many combinations of region state, procedure configuration, channel contents, and server state. When a region completes a full lifecycle, the system returns to an already-visited configuration. No `StateConstraint` on a procedure counter is needed.
+
+### Region Lifecycle States
+
+Region lifecycle states cover the full `RegionState.State` enum: `OFFLINE`, `OPENING`, `OPEN`, `CLOSING`, `CLOSED`, `FAILED_OPEN`, `ABNORMALLY_CLOSED`, `SPLITTING`, `SPLIT`, `SPLITTING_NEW`, `MERGING`, `MERGED`, `MERGING_NEW`.
+
+`FAILED_CLOSE` is omitted because no code path transitions into it. The RS abort triggers crash detection, so close failures are resolved through `ABNORMALLY_CLOSED` instead.
 
 ```tla
 EXTENDS Types
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Variables
+## Variables
 
-regionState[r] is a record
-[state        : State,
-location     : Servers \cup {NoServer},
-procType     : ProcType,
-procStep     : TRSPState \cup {"IDLE"},
-targetServer : Servers \cup {NoServer},
-retries      : 0..MaxRetries]
-for each r in Regions.  This is volatile master in-memory state.
+`regionState[r]` is a record `[state: State, location: Servers ∪ {NoServer}, procType: ProcType, procStep: TRSPState ∪ {"IDLE"}, targetServer: Servers ∪ {NoServer}, retries: 0..MaxRetries]` for each `r` in `Regions`. This is volatile master in-memory state.
 
-The procedure fields (procType, procStep, targetServer, retries)
-model the RegionStateNode.setProcedure() / unsetProcedure()
-discipline: at most one procedure per region.  When procType is
-"NONE", the region has no attached procedure and procStep is
-"IDLE".  Procedure state is inlined (keyed by region) rather
-than indexed by a global procedure ID counter, because at most
-one procedure can be attached per region and region identity is
-sufficient for report/command matching.
+The procedure fields (`procType`, `procStep`, `targetServer`, `retries`) model the `RegionStateNode.setProcedure()` / `unsetProcedure()` discipline: at most one procedure per region. When `procType` is `"NONE"`, the region has no attached procedure and `procStep` is `"IDLE"`. Procedure state is inlined (keyed by region) rather than indexed by a global procedure ID counter.
 
 ```tla
 VARIABLE regionState
 ```
 
-metaTable[r] is a record [state : State, location : Servers \cup {NoServer}]
-for each r in Regions.  This is persistent state in hbase:meta.
-Survives master crash; regionState does not.
-
-Procedure fields are NOT persisted to meta -- procedures are
-master in-memory state, recovered from ProcedureStore on restart.
+`metaTable[r]` is a record `[state: State, location: Servers ∪ {NoServer}]` for each `r` in `Regions`. This is persistent state in `hbase:meta`. Survives master crash; `regionState` does not. Procedure fields are **not** persisted to meta — procedures are master in-memory state, recovered from `ProcedureStore` on restart.
 
 ```tla
 VARIABLE metaTable
 ```
 
-dispatchedOps[s] is a set of command records pending delivery to
-server s.  Each record is:
-[type : CommandType, region : Regions]
-
-Models the master->RS command channel: the RSProcedureDispatcher
-batches open/close commands and sends them via executeProcedures()
-RPC.  Commands remain in the set until consumed by RS-side actions
-or discarded on dispatch failure / server crash.
+`dispatchedOps[s]` is a set of command records pending delivery to server `s`. Each record is `[type: CommandType, region: Regions]`. Models the master→RS command channel: the `RSProcedureDispatcher` batches open/close commands and sends them via `executeProcedures()` RPC. Commands remain in the set until consumed by RS-side actions or discarded on dispatch failure/server crash.
 
 ```tla
 VARIABLE dispatchedOps
 ```
 
-pendingReports is a set of report records from RegionServers
-waiting to be processed by the master.  Each record is:
-[server : Servers, region : Regions, code : ReportCode]
-
-Models the RS->master report channel: RegionServers report
-transition outcomes via reportRegionStateTransition() RPC.
-Reports remain in the set until consumed by master-side actions
-or discarded if from a crashed server.
+`pendingReports` is a set of report records from RegionServers waiting to be processed by the master. Each record is `[server: Servers, region: Regions, code: ReportCode]`. Models the RS→master report channel: RegionServers report transition outcomes via `reportRegionStateTransition()` RPC. Reports remain in the set until consumed by master-side actions or discarded if from a crashed server.
 
 ```tla
 VARIABLE pendingReports
 ```
 
-rsOnlineRegions[s] is the set of regions currently online on
-server s, from the RS's own perspective.  Updated atomically
-by RSOpen (adds region) and RSClose (removes region).
+`rsOnlineRegions[s]` is the set of regions currently online on server `s`, from the RS's own perspective. Updated atomically by `RSOpen` (adds region) and `RSClose` (removes region).
 
 ```tla
 VARIABLE rsOnlineRegions
 ```
 
-serverState[s] is the liveness state of server s as seen by the
-master.  "ONLINE" means the server is alive and accepting commands;
-"CRASHED" means the master has detected the server's death (ZK
-ephemeral node expired).  Reports from CRASHED servers are rejected.
-RS-side actions are guarded by serverState = "ONLINE".
+`serverState[s]` is the liveness state of server `s` as seen by the master. `"ONLINE"` means the server is alive and accepting commands; `"CRASHED"` means the master has detected the server's death (ZK ephemeral node expired). Reports from `CRASHED` servers are rejected. RS-side actions are guarded by `serverState = "ONLINE"`.
 
 ```tla
 VARIABLE serverState
 ```
 
-scpState[s] tracks the ServerCrashProcedure progress for server s.
-"NONE" means no SCP is active for this server.
-GET_REGIONS -> FENCE_WALS -> ASSIGN -> DONE is the SCP lifecycle.
+`scpState[s]` tracks the `ServerCrashProcedure` progress for server `s`. `"NONE"` means no SCP is active for this server. `GET_REGIONS` → `FENCE_WALS` → `ASSIGN` → `DONE` is the SCP lifecycle.
 
 ```tla
 VARIABLE scpState
 ```
 
-scpRegions[s] is the snapshot of regions taken at GET_REGIONS time.
+`scpRegions[s]` is the snapshot of regions taken at `GET_REGIONS` time.
 
 ```tla
 VARIABLE scpRegions
 ```
 
-walFenced[s] is TRUE after SCP revokes WAL leases for server s.
-Reset to FALSE on ServerRestart.  After fencing, the zombie RS
-cannot write to its WALs; any write attempt fails with an HDFS
-lease exception, triggering RS self-abort.
+`walFenced[s]` is `TRUE` after SCP revokes WAL leases for server `s`. Reset to `FALSE` on `ServerRestart`. After fencing, the zombie RS cannot write to its WALs; any write attempt fails with an HDFS lease exception, triggering RS self-abort.
 
 ```tla
 VARIABLE walFenced
 ```
 
-carryingMeta[s] is TRUE when server s was hosting hbase:meta at
-the time it crashed.  Set non-deterministically by MasterDetectCrash
-(one case per invocation: either TRUE or FALSE).  When TRUE, the
-SCP must reassign meta before proceeding to GET_REGIONS; this is
-modeled by the ASSIGN_META scpState.  All other SCP actions for
-ANY server are gated on meta being available (no server in
-ASSIGN_META state), faithfully modeling waitMetaLoaded.
+`carryingMeta[s]` is `TRUE` when server `s` was hosting `hbase:meta` at the time it crashed. Set non-deterministically by `MasterDetectCrash` (one case per invocation: either `TRUE` or `FALSE`). When `TRUE`, the SCP must reassign meta before proceeding to `GET_REGIONS`; this is modeled by the `ASSIGN_META` `scpState`. All other SCP actions for *any* server are gated on meta being available (no server in `ASSIGN_META` state), faithfully modeling `waitMetaLoaded`.
 
 ```tla
 VARIABLE carryingMeta
 ```
 
-serverRegions[s] is the set of regions tracked by server s's
-ServerStateNode in the implementation.  This is maintained by
-addRegionToServer/removeRegionFromServer calls in AM.regionOpening(),
-AM.regionClosedWithoutPersistingToMeta(), AM.regionFailedOpen(), and
-AM.regionClosedAbnormally().  SCP's getRegionsOnServer() reads from
-this tracking, NOT from regionState[r].location.  These two can
-desynchronize when a TRSP updates one before the other, providing
-the mechanism for the race where SCP snapshots a stale set of
-regions for a crashed server.
+`serverRegions[s]` is the set of regions tracked by server `s`'s `ServerStateNode` in the implementation. Maintained by `addRegionToServer`/`removeRegionFromServer` calls in `AM.regionOpening()`, `AM.regionClosedWithoutPersistingToMeta()`, `AM.regionFailedOpen()`, and `AM.regionClosedAbnormally()`. SCP's `getRegionsOnServer()` reads from this tracking, **not** from `regionState[r].location`. These two can desynchronize when a TRSP updates one before the other, providing the mechanism for the race where SCP snapshots a stale set of regions for a crashed server.
 
 ```tla
 VARIABLE serverRegions
 ```
 
-procStore[r] is the persisted procedure record for region r, or
-NoProcedure when no procedure is persisted.  Models the
-WALProcedureStore / RegionProcedureStore persistence layer.
-Survives master crash — only cleared by procedure completion or
-explicit delete.  Updated by ProcedureExecutor.store.update()
-after each executeFromState step (except when skipPersistence
-is called, e.g., DispatchFail).
+`procStore[r]` is the persisted procedure record for region `r`, or `NoProcedure` when no procedure is persisted. Models the `WALProcedureStore` / `RegionProcedureStore` persistence layer. Survives master crash — only cleared by procedure completion or explicit delete. Updated by `ProcedureExecutor.store.update()` after each `executeFromState` step (except when `skipPersistence` is called, e.g., `DispatchFail`).
 
 ```tla
 VARIABLE procStore
 ```
 
-masterAlive is TRUE when the active master JVM is running.
-When FALSE, all in-memory state (regionState, serverState, etc.)
-is invalid — the master does not exist.  Durable state (metaTable,
-procStore) and RS-side state (rsOnlineRegions) survive.
+`masterAlive` is `TRUE` when the active master JVM is running. When `FALSE`, all in-memory state (`regionState`, `serverState`, etc.) is invalid — the master does not exist. Durable state (`metaTable`, `procStore`) and RS-side state (`rsOnlineRegions`) survive.
 
 ```tla
 VARIABLE masterAlive
 ```
 
-zkNode[s] is TRUE when server s has a live ZK ephemeral node.
-Created when the RS starts (RSRestart), deleted when ZK detects
-session expiry (ZKSessionExpire).  Read by the master to determine
-which servers are alive.
+`zkNode[s]` is `TRUE` when server `s` has a live ZK ephemeral node. Created when the RS starts (`RSRestart`), deleted when ZK detects session expiry (`ZKSessionExpire`). Read by the master to determine which servers are alive.
 
 ```tla
 VARIABLE zkNode
 ```
 
-availableWorkers is the number of idle PEWorker threads.
-All procedure-step actions require availableWorkers > 0 to execute.
-Non-blocking actions have net-zero effect (acquire + release within
-the same atomic step).  Meta-writing actions when meta is unavailable
-may hold a worker (UseBlockOnMetaWrite=TRUE, decrement) or suspend
-and release (UseBlockOnMetaWrite=FALSE, no decrement).
+`availableWorkers` is the number of idle PEWorker threads. All procedure-step actions require `availableWorkers > 0` to execute. Non-blocking actions have net-zero effect (acquire + release within the same atomic step). Meta-writing actions when meta is unavailable may hold a worker (`UseBlockOnMetaWrite=TRUE`, decrement) or suspend and release (`UseBlockOnMetaWrite=FALSE`, no decrement).
 
 ```tla
 VARIABLE availableWorkers
 ```
 
-suspendedOnMeta is the set of regions whose procedures have been
-suspended (released the PEWorker thread) while waiting for meta
-to become available.  Default path (master/branch-3+,
-UseBlockOnMetaWrite=FALSE): models ProcedureFutureUtil.
-suspendIfNecessary() suspending the procedure and releasing the
-PEWorker thread when AssignmentManager.persistToMeta() returns
-a pending future.
+`suspendedOnMeta` is the set of regions whose procedures have been suspended (released the PEWorker thread) while waiting for meta to become available. Default path (`master/branch-3+`, `UseBlockOnMetaWrite=FALSE`): models `ProcedureFutureUtil.suspendIfNecessary()` suspending the procedure and releasing the PEWorker thread when `AssignmentManager.persistToMeta()` returns a pending future.
 
 ```tla
 VARIABLE suspendedOnMeta
 ```
 
-blockedOnMeta is the set of regions whose procedures are blocked
-on a synchronous meta write, holding the PEWorker thread.
-Branch-2.6 only (UseBlockOnMetaWrite=TRUE): models the synchronous
-Table.put() call in RegionStateStore.updateRegionLocation() blocking
-on an unavailable meta table.
+`blockedOnMeta` is the set of regions whose procedures are blocked on a synchronous meta write, holding the PEWorker thread. Branch-2.6 only (`UseBlockOnMetaWrite=TRUE`): models the synchronous `Table.put()` call in `RegionStateStore.updateRegionLocation()` blocking on an unavailable meta table.
 
 ```tla
 VARIABLE blockedOnMeta
 ```
 
-regionKeyRange[r] is the keyspace range assigned to region r, or
-NoRange if the region identifier is not currently in use (does not
-exist).  A region "exists" iff regionKeyRange[r] # NoRange.
-At Init: DeployedRegions tile [0, MaxKey) with contiguous,
-non-overlapping ranges; all other identifiers are NoRange.
-Split materializes daughter keyspaces at PONR;
-merge materializes the union keyspace at PONR;
-parent/target deletion clears to NoRange.
+`regionKeyRange[r]` is the keyspace range assigned to region `r`, or `NoRange` if the region identifier is not currently in use (does not exist). A region "exists" iff `regionKeyRange[r] ≠ NoRange`. At Init: `DeployedRegions` tile `[0, MaxKey)` with contiguous, non-overlapping ranges; all other identifiers are `NoRange`. Split materializes daughter keyspaces at PONR; merge materializes the union keyspace at PONR; parent/target deletion clears to `NoRange`.
 
 ```tla
 VARIABLE regionKeyRange
+```
+
+`parentProc[r]` tracks the parent procedure (split or merge) whose target region is `r`. `NoParentProc` means no parent procedure is active. During child TRSP execution (close parent, open daughters), the region's `procType` reflects the child TRSP (`UNASSIGN` or `ASSIGN`), while `parentProc` retains the parent's overall progress. `parentProc` is durable (survives master crash): it models the `ProcedureStore` persistence of the parent procedure.
+
+> *Source:* `SplitTableRegionProcedure` / `MergeTableRegionsProcedure` state machines (`MasterProcedure.proto`).
+
+```tla
+VARIABLE parentProc
 
 vars ==
   << regionState,
@@ -358,34 +236,30 @@ vars ==
      availableWorkers,
      suspendedOnMeta,
      blockedOnMeta,
-     regionKeyRange
+     regionKeyRange,
+     parentProc
   >>
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Predicates
+## Predicates
 
-MetaIsAvailable is TRUE when no server is in ASSIGN_META scpState,
-meaning hbase:meta is online and accessible for read/write.
-Reuses the existing waitMetaLoaded guard from SCP actions.
+`MetaIsAvailable` is `TRUE` when no server is in `ASSIGN_META` `scpState`, meaning `hbase:meta` is online and accessible for read/write. Reuses the existing `waitMetaLoaded` guard from SCP actions.
 
 ```tla
 MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
 ```
 
-A region "exists" iff its keyspace range has been assigned.
-Unused region identifiers have regionKeyRange = NoRange.
-All existing actions guard on this predicate so that only
-regions with assigned keyspaces can participate in transitions.
+A region "exists" iff its keyspace range has been assigned. Unused region identifiers have `regionKeyRange = NoRange`. All existing actions guard on this predicate so that only regions with assigned keyspaces can participate in transitions.
 
 ```tla
 RegionExists(r) == regionKeyRange[r] # NoRange
 ```
 
-Two regions are adjacent when the first's endKey equals the
-second's startKey.  Both must exist (have assigned keyspaces).
-Used as a precondition for merge operations (iterations 23+).
+Two regions are **adjacent** when the first's `endKey` equals the second's `startKey`. Both must exist (have assigned keyspaces). Used as a precondition for merge operations (iterations 23+).
 
 ```tla
 Adjacent(r1, r2) == /\ RegionExists(r1)
@@ -393,19 +267,15 @@ Adjacent(r1, r2) == /\ RegionExists(r1)
                     /\ regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
 ```
 
-Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+PEWorker pool variables (used in `UNCHANGED` clauses).
 
 ```tla
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
-Module instantiation
+## Module Instantiation
 
-Instantiate action modules.  Each sub-module declares its shared
-variables as CONSTANTS with the SAME names as the variables declared
-here.  TLA+ INSTANCE without a WITH clause automatically substitutes
-identifiers by name, so no explicit WITH is needed.
-Actions are then referenced as trsp!ActionName(args), etc.
+Instantiate action modules. Each sub-module declares its shared variables as `CONSTANTS` with the **same names** as the variables declared here. TLA+ `INSTANCE` without a `WITH` clause automatically substitutes identifiers by name. Actions are then referenced as `trsp!ActionName(args)`, etc.
 
 ```tla
 trsp == INSTANCE TRSP
@@ -414,11 +284,14 @@ rs == INSTANCE RegionServer
 master == INSTANCE Master
 ps == INSTANCE ProcStore
 zk == INSTANCE ZK
+split == INSTANCE Split
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Type invariant
+## Type Invariant
 
 ```tla
 TypeOK ==
@@ -442,13 +315,13 @@ Region location is either an assigned server or None.
        /\ regionState[r].location \in Servers \cup { NoServer }
 ```
 
-Embedded procedure type must be a valid ProcType.
+Embedded procedure type must be a valid `ProcType`.
 
 ```tla
        /\ regionState[r].procType \in ProcType
 ```
 
-Procedure step is a TRSP state or IDLE (when no procedure).
+Procedure step is a TRSP state or `IDLE`.
 
 ```tla
        /\ regionState[r].procStep \in TRSPState \cup { "IDLE" }
@@ -460,7 +333,7 @@ Procedure's target server is a server or None.
        /\ regionState[r].targetServer \in Servers \cup { NoServer }
 ```
 
-Retry counter is bounded by MaxRetries.
+Retry counter is bounded by `MaxRetries`.
 
 ```tla
        /\ regionState[r].retries \in 0 .. MaxRetries
@@ -475,14 +348,20 @@ Idle procedure fields are consistent.
             /\ regionState[r].retries = 0
 ```
 
-Active procedure has a valid step.
+Active TRSP procedure has a TRSP step.
 
 ```tla
-       /\ regionState[r].procType # "NONE" =>
+       /\ regionState[r].procType \in { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN" } =>
             regionState[r].procStep \in TRSPState
 ```
 
-META table maps every region to a persistent (state, location) record.
+Active `SPLIT` procedure has `IDLE` step (parent lock marker).
+
+```tla
+       /\ regionState[r].procType = "SPLIT" => regionState[r].procStep = "IDLE"
+```
+
+META table maps every region to a persistent `(state, location)` record.
 
 ```tla
   /\ metaTable \in
@@ -507,7 +386,7 @@ Each server tracks its set of locally online regions.
   /\ rsOnlineRegions \in [Servers -> SUBSET Regions]
 ```
 
-Each server is either ONLINE or CRASHED.
+Each server is either `ONLINE` or `CRASHED`.
 
 ```tla
   /\ serverState \in [Servers -> { "ONLINE", "CRASHED" }]
@@ -534,19 +413,19 @@ WAL fencing state per server.
   /\ walFenced \in [Servers -> BOOLEAN]
 ```
 
-Whether crashed server was hosting hbase:meta.
+Whether crashed server was hosting `hbase:meta`.
 
 ```tla
   /\ carryingMeta \in [Servers -> BOOLEAN]
 ```
 
-Per-server region tracking (ServerStateNode).
+Per-server region tracking (`ServerStateNode`).
 
 ```tla
   /\ serverRegions \in [Servers -> SUBSET Regions]
 ```
 
-Persisted procedure store: record per region or NoProcedure.
+Persisted procedure store: record per region or `NoProcedure`.
 
 ```tla
   /\ procStore \in [Regions -> ProcStoreRecord \cup { NoProcedure }]
@@ -564,7 +443,7 @@ ZK ephemeral node liveness per server.
   /\ zkNode \in [Servers -> BOOLEAN]
 ```
 
-PEWorker pool: available workers bounded by MaxWorkers.
+PEWorker pool: available workers bounded by `MaxWorkers`.
 
 ```tla
   /\ availableWorkers \in 0 .. MaxWorkers
@@ -582,18 +461,26 @@ Regions blocked on meta (sync, worker held).
   /\ blockedOnMeta \subseteq Regions
 ```
 
-Keyspace range: assigned range or NoRange (unused identifier).
+Keyspace range: assigned range or `NoRange` (unused identifier). Parent procedure progress per region.
 
 ```tla
   /\ regionKeyRange \in
-       [Regions -> [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }]
+         [Regions
+         ->
+         [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }] \* Parent procedure progress per region.
+       /\
+       parentProc \in [Regions -> ParentProcRecord]
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Safety invariants
+## Safety Invariants
 
-A region that is OPEN must have a location.
+### `OpenImpliesLocation`
+
+A region that is `OPEN` must have a location.
 
 ```tla
 OpenImpliesLocation ==
@@ -605,8 +492,9 @@ OpenImpliesLocation ==
     )
 ```
 
-A region that is OFFLINE, CLOSED, FAILED_OPEN, or ABNORMALLY_CLOSED
-must NOT have a location.
+### `OfflineImpliesNoLocation`
+
+A region that is `OFFLINE`, `CLOSED`, `FAILED_OPEN`, `ABNORMALLY_CLOSED`, `SPLIT`, or `SPLITTING_NEW` must **not** have a location.
 
 ```tla
 OfflineImpliesNoLocation ==
@@ -614,24 +502,25 @@ OfflineImpliesNoLocation ==
     ( \A r \in Regions:
         RegionExists(r) =>
           ( regionState[r].state \in
-                { "OFFLINE", "CLOSED", "FAILED_OPEN", "ABNORMALLY_CLOSED" } =>
+                { "OFFLINE",
+                  "CLOSED",
+                  "FAILED_OPEN",
+                  "ABNORMALLY_CLOSED",
+                  "SPLIT",
+                  "SPLITTING_NEW"
+                } =>
               regionState[r].location = NoServer
           )
     )
 ```
 
-The persistent state in hbase:meta matches the in-memory state for
-the fields that meta tracks (state and location).  Procedure fields
-are master in-memory only and are not compared.
+### `MetaConsistency`
 
-One permitted divergence: GoOffline sets regionState to OFFLINE
-without writing to meta, so metaTable may retain CLOSED while
-regionState shows OFFLINE.  Both are "unassigned" states with no
-location; the divergence is resolved on master restart when
-in-memory state is rebuilt from meta.
+The persistent state in `hbase:meta` matches the in-memory state for the fields that meta tracks (state and location). Procedure fields are master in-memory only and are not compared.
 
-Becomes further non-trivial when master crash is introduced:
-metaTable survives but regionState is lost and must be rebuilt.
+One permitted divergence: `GoOffline` sets `regionState` to `OFFLINE` without writing to meta, so `metaTable` may retain `CLOSED` while `regionState` shows `OFFLINE`. Both are "unassigned" states with no location; the divergence is resolved on master restart when in-memory state is rebuilt from meta.
+
+Becomes further non-trivial when master crash is introduced: `metaTable` survives but `regionState` is lost and must be rebuilt.
 
 ```tla
 MetaConsistency ==
@@ -645,30 +534,30 @@ MetaConsistency ==
                             /\ metaTable[r].location = NoServer
 ```
 
-Active procedure window: in-memory state may
-diverge from metaTable during TRSP execution.
-E.g., TRSPReportSucceedOpen sets state to OPEN
-while meta still shows OPENING; TRSPPersistToMeta
-retry resets to GET_ASSIGN_CANDIDATE while meta
-retains OPENING.  Divergence is always resolved
-when the procedure completes or is cleared.
+Active procedure window: in-memory state may diverge from `metaTable` during TRSP execution. E.g., `TRSPReportSucceedOpen` sets state to `OPEN` while meta still shows `OPENING`; `TRSPPersistToMeta` retry resets to `GET_ASSIGN_CANDIDATE` while meta retains `OPENING`. Divergence is always resolved when the procedure completes or is cleared.
 
 ```tla
                          \/ regionState[r].procType # "NONE"
 ```
 
-NoDoubleAssignment: HBase term of art for "at most one server per
-region."  The precise semantics here are "no double write": a region
-is never writable on two servers simultaneously.  A region is
-writable on server s when r \in rsOnlineRegions[s] /\ walFenced[s] =
-FALSE.  After SCP revokes a crashed RS's WAL leases (walFenced[s] =
-TRUE), the zombie RS can no longer write, preventing write-side
-split-brain.  During the zombie window (MasterDetectCrash before
-RSAbort), rsOnlineRegions may overlap; walFenced disqualifies the
-zombie from the writable set.
+Parent procedure window: `parentProc` tracks the parent; `procType`/`procStep` temporarily reflect child TRSPs. Split is still in progress.
 
-*Source:* HBase region assignment design; HDFS lease recovery on
-crashed RS's WALs.
+```tla
+                         \/ parentProc[r].type # "NONE"
+```
+
+`SPLITTING_NEW` daughters: in-memory is `SPLITTING_NEW` while meta is `CLOSED` (Appendix C.8).
+
+```tla
+                         \/ /\ regionState[r].state = "SPLITTING_NEW"
+                            /\ metaTable[r].state = "CLOSED"
+```
+
+### `NoDoubleAssignment`
+
+HBase term of art for "at most one server per region." The precise semantics here are "no double write": a region is never writable on two servers simultaneously. A region is writable on server `s` when `r ∈ rsOnlineRegions[s] ∧ walFenced[s] = FALSE`. After SCP revokes a crashed RS's WAL leases (`walFenced[s] = TRUE`), the zombie RS can no longer write, preventing write-side split-brain. During the zombie window (`MasterDetectCrash` before `RSAbort`), `rsOnlineRegions` may overlap; `walFenced` disqualifies the zombie from the writable set.
+
+> *Source:* HBase region assignment design; HDFS lease recovery on crashed RS's WALs.
 
 ```tla
 NoDoubleAssignment ==
@@ -679,27 +568,16 @@ NoDoubleAssignment ==
       1
 ```
 
-Correlates procedure type with the set of region states in which that
-procedure may be attached.  Each TRSP type attaches before its first
-state transition (setProcedure precedes regionOpening/regionClosing),
-so the procedure may be present in the pre-transitional state.
+### `LockExclusivity`
 
-ASSIGN attaches during {OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN}
-and the region transitions through OPENING before the procedure is
-cleared at OPEN.  During the REPORT_SUCCEED window the region may
-briefly show OPEN or FAILED_OPEN while the ASSIGN procedure is still
-attached (meta has not been written yet).
-UNASSIGN attaches during OPEN and the region transitions through CLOSING
-before the procedure is cleared at CLOSED.  During REPORT_SUCCEED the
-region may briefly show CLOSED while the UNASSIGN procedure is still
-attached.
-MOVE attaches during OPEN and drives the region through CLOSING, CLOSED,
-OPENING before being cleared at OPEN.
-Any type may be found on an ABNORMALLY_CLOSED region if a server
-crash occurs while the procedure is in flight.
+Correlates procedure type with the set of region states in which that procedure may be attached. Each TRSP type attaches before its first state transition (`setProcedure` precedes `regionOpening`/`regionClosing`), so the procedure may be present in the pre-transitional state.
 
-*Source:* RegionStateNode.setProcedure(),
-RegionStateNode.unsetProcedure().
+- **`ASSIGN`** attaches during `{OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN}` and the region transitions through `OPENING` before being cleared at `OPEN`. During the `REPORT_SUCCEED` window the region may briefly show `OPEN` or `FAILED_OPEN` while the `ASSIGN` procedure is still attached.
+- **`UNASSIGN`** attaches during `OPEN` and the region transitions through `CLOSING` before being cleared at `CLOSED`. During `REPORT_SUCCEED` the region may briefly show `CLOSED` while the `UNASSIGN` procedure is still attached.
+- **`MOVE`** attaches during `OPEN` and drives the region through `CLOSING`, `CLOSED`, `OPENING` before being cleared at `OPEN`.
+- Any type may be found on an `ABNORMALLY_CLOSED` region if a server crash occurs while the procedure is in flight.
+
+> *Source:* `RegionStateNode.setProcedure()`, `RegionStateNode.unsetProcedure()`.
 
 ```tla
 LockExclusivity ==
@@ -714,26 +592,24 @@ LockExclusivity ==
                         "ABNORMALLY_CLOSED",
                         "FAILED_OPEN",
                         "OPENING",
-                        "OPEN"
+                        "OPEN",
+                        "SPLITTING_NEW"
 ```
 
-REPORT_SUCCEED window: RS reported OPENED,
-in-memory state is OPEN but procedure not
-yet cleared (meta not yet written).
+`SPLITTING_NEW`: daughters enter `ASSIGN` via `SplitUpdateMeta`, then `TRSPGetCandidate` picks a server, `TRSPDispatchOpen` transitions to `OPENING`.
 
 ```tla
                       }
               \/ /\ regionState[r].procType = "UNASSIGN"
                  /\ regionState[r].state \in
                       { "OPEN",
+                        "SPLITTING",
                         "CLOSING",
                         "ABNORMALLY_CLOSED",
                         "CLOSED"
 ```
 
-REPORT_SUCCEED window: RS reported CLOSED,
-in-memory state is CLOSED but procedure
-not yet cleared.
+`SPLITTING`: split yields parent to `UNASSIGN` (`SplitPrepare` sets `procType=UNASSIGN` while parent is still in `SPLITTING` state).
 
 ```tla
                       }
@@ -755,27 +631,30 @@ not yet cleared.
                         "FAILED_OPEN",
                         "OPENING"
                       }
+              \/ /\ regionState[r].procType = "SPLIT"
+                 /\ regionState[r].state \in
+                      { "CLOSED",
+                        "SPLIT",
+                        "SPLITTING_NEW"
+```
+
+`CLOSED`: parent after close, before PONR. `SPLIT`: parent after PONR. `SPLITTING_NEW`: daughter lock before open yield.
+
+```tla
+                      }
           )
     )
 ```
 
-When a region is stably OPEN (no procedure attached) on an ONLINE
-server, the RS hosting it must also consider it online.  This
-cross-checks the master's view (regionState) against the RS's view
-(rsOnlineRegions).
+### `RSMasterAgreement`
 
-The invariant holds because TRSPPersistToMetaOpen (which sets OPEN and
-clears the procedure) requires an OPENED report, which is only
-produced by RSOpen after adding the region to rsOnlineRegions.
+When a region is stably `OPEN` (no procedure attached) on an `ONLINE` server, the RS hosting it must also consider it online. This cross-checks the master's view (`regionState`) against the RS's view (`rsOnlineRegions`).
 
-CRASHED servers are exempted: during the zombie window (between
-MasterDetectCrash and SCPAssignRegion), regionState may still show
-OPEN while rsOnlineRegions has been cleared by RSAbort.
+The invariant holds because `TRSPPersistToMetaOpen` (which sets `OPEN` and clears the procedure) requires an `OPENED` report, which is only produced by `RSOpen` after adding the region to `rsOnlineRegions`.
 
-Servers whose ZK ephemeral node has expired (zkNode[s] = FALSE) are
-also exempted: during the window between ZKSessionExpire and
-MasterDetectCrash, the master still thinks the server is ONLINE but
-the RS has already shut down.
+`CRASHED` servers are exempted: during the zombie window (between `MasterDetectCrash` and `SCPAssignRegion`), `regionState` may still show `OPEN` while `rsOnlineRegions` has been cleared by `RSAbort`.
+
+Servers whose ZK ephemeral node has expired (`zkNode[s] = FALSE`) are also exempted: during the window between `ZKSessionExpire` and `MasterDetectCrash`, the master still thinks the server is `ONLINE` but the RS has already shut down.
 
 ```tla
 RSMasterAgreement ==
@@ -792,23 +671,13 @@ RSMasterAgreement ==
     )
 ```
 
-Converse of RSMasterAgreement: if an RS considers a region online,
-the master must agree on both location and lifecycle state.  Catches
-"ghost regions" where an RS believes it hosts a region the master
-has already reassigned or crashed.
+### `RSMasterAgreementConverse`
 
-OPENING is included because RSOpen adds the region to
-rsOnlineRegions before TRSPPersistToMetaOpen transitions the master
-state from OPENING to OPEN.
+Converse of `RSMasterAgreement`: if an RS considers a region online, the master must agree on both location and lifecycle state. Catches "ghost regions" where an RS believes it hosts a region the master has already reassigned or crashed.
 
-CRASHED servers are exempted: during the zombie window (between
-MasterDetectCrash and RSAbort), the master has cleared the crashed
-RS's location but rsOnlineRegions has not yet been wiped.  The
-master no longer considers the crashed server authoritative.
+`OPENING` is included because `RSOpen` adds the region to `rsOnlineRegions` before `TRSPPersistToMetaOpen` transitions the master state from `OPENING` to `OPEN`.
 
-Servers with zkNode[s] = FALSE are also exempted: the RS is dead
-(ZK session expired) but the master may not yet have processed
-the crash notification.
+`CRASHED` servers and servers with `zkNode[s] = FALSE` are exempted (same rationale as `RSMasterAgreement`).
 
 ```tla
 RSMasterAgreementConverse ==
@@ -817,29 +686,23 @@ RSMasterAgreementConverse ==
       \A r \in rsOnlineRegions[s]:
         serverState[s] = "CRASHED" \/ zkNode[s] = FALSE \/
           /\ regionState[r].location = s
-          /\ regionState[r].state \in { "OPENING", "OPEN", "CLOSING" }
+          /\ regionState[r].state \in
+               { "OPENING", "OPEN", "CLOSING", "SPLITTING" }
 ```
 
-SCP does not reassign regions (scpState = "ASSIGN") until WAL
-leases have been revoked (walFenced = TRUE).  Verified by
-construction (SCP state machine: FENCE_WALS precedes ASSIGN)
-but stated explicitly as a safety net.
+### `FencingOrder`
+
+SCP does not reassign regions (`scpState = "ASSIGN"`) until WAL leases have been revoked (`walFenced = TRUE`). Verified by construction (SCP state machine: `FENCE_WALS` precedes `ASSIGN`) but stated explicitly as a safety net.
 
 ```tla
 FencingOrder == \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
 ```
 
-A meta-carrying SCP must reassign meta (complete ASSIGN_META)
-before proceeding to GET_REGIONS.  If carryingMeta[s] is TRUE,
-the SCP should not have progressed past ASSIGN_META.  The
-meta-online guard on SCPGetRegions/SCPFenceWALs/SCPAssignRegion
-prevents any SCP from executing while ASSIGN_META is pending,
-but MasterDetectCrash may set GET_REGIONS for non-meta crashes;
-the key safety property is that the meta-carrying server itself
-cannot skip ASSIGN_META.
+### `MetaAvailableForRecovery`
 
-*Source:* SCP.waitMetaLoaded();
-SCP.executeFromState() ASSIGN_META case.
+A meta-carrying SCP must reassign meta (complete `ASSIGN_META`) before proceeding to `GET_REGIONS`. If `carryingMeta[s]` is `TRUE`, the SCP should not have progressed past `ASSIGN_META`. The meta-online guard on `SCPGetRegions`/`SCPFenceWALs`/`SCPAssignRegion` prevents any SCP from executing while `ASSIGN_META` is pending, but `MasterDetectCrash` may set `GET_REGIONS` for non-meta crashes; the key safety property is that the meta-carrying server itself cannot skip `ASSIGN_META`.
+
+> *Source:* `SCP.waitMetaLoaded()`; `SCP.executeFromState()` `ASSIGN_META` case.
 
 ```tla
 MetaAvailableForRecovery ==
@@ -847,22 +710,23 @@ MetaAvailableForRecovery ==
     carryingMeta[s] = TRUE => scpState[s] \in { "NONE", "ASSIGN_META", "DONE" }
 ```
 
-After any SCP completes, no region is stuck without a procedure and
-without an SCP that will process it.  A region is lost when it is
-in a non-terminal state with no active procedure and no coverage
-from any SCP snapshot.  Two cases:
+### `AtMostOneCarryingMeta`
 
-(1) ABNORMALLY_CLOSED with no procedure: SCP should have
-attached an ASSIGN procedure.  If it skipped the region
-(e.g., due to the isMatchingRegionLocation check), the
-region is lost.
-(2) Non-terminal mid-transition (OPENING, CLOSING) with
-location=None, no procedure, and not in any SCP's snapshot:
-this region is stranded mid-transition with no active owner.
-This can occur when a location-check skip combined with a
-concurrent TRSP clearing the location leaves the region
-untracked.  OFFLINE is excluded: it is a legitimate quiescent
-state (initial state or post-GoOffline).
+`hbase:meta` is hosted on exactly one server, so at most one crashed server can be carrying meta at any time. `MasterDetectCrash` guards the `carryingMeta=TRUE` branch to enforce this; the invariant is an explicit cross-check.
+
+> *Source:* hbase:meta single-assignment semantics.
+
+```tla
+AtMostOneCarryingMeta ==
+  Cardinality({s \in Servers: carryingMeta[s] = TRUE}) <= 1
+```
+
+### `NoLostRegions`
+
+After any SCP completes, no region is stuck without a procedure and without an SCP that will process it. A region is *lost* when it is in a non-terminal state with no active procedure and no coverage from any SCP snapshot. Two cases:
+
+1. **`ABNORMALLY_CLOSED` with no procedure:** SCP should have attached an `ASSIGN` procedure. If it skipped the region (e.g., due to the `isMatchingRegionLocation` check), the region is lost.
+2. **Non-terminal mid-transition** (`OPENING`, `CLOSING`) with `location=None`, no procedure, and not in any SCP's snapshot: this region is stranded mid-transition with no active owner. `OFFLINE` is excluded: it is a legitimate quiescent state (initial state or post-`GoOffline`).
 
 ```tla
 NoLostRegions ==
@@ -881,54 +745,61 @@ NoLostRegions ==
     )
 ```
 
-Every active in-memory procedure has a matching persisted record,
-and every persisted record corresponds to an active in-memory
-procedure.  This invariant will require relaxation in iteration 18
-when MasterCrash clears in-memory state but preserves procStore.
+### `ProcStoreConsistency`
 
-*Source:* ProcedureExecutor lifecycle — insert on creation,
-update on each step, delete on completion.
-Intra-record correlation invariant for procStore records. Defined
-in ProcStore.tla; always checked regardless of masterAlive.
+Every active in-memory procedure has a matching persisted record, and every persisted record corresponds to an active in-memory procedure. This invariant will require relaxation in iteration 18 when `MasterCrash` clears in-memory state but preserves `procStore`.
+
+> *Source:* `ProcedureExecutor` lifecycle — insert on creation, update on each step, delete on completion.
+
+Intra-record correlation invariant for `procStore` records. Defined in `ProcStore.tla`; always checked regardless of `masterAlive`.
 
 ```tla
 ProcStoreConsistency == ps!ProcStoreConsistency
 ```
 
-Bijection: active in-memory procedures <=> persisted records.
-Gated on masterAlive (in-memory state doesn't exist when master is down).
+### `ProcStoreBijection`
+
+Bijection: active in-memory procedures ⟺ persisted records. Gated on `masterAlive` (in-memory state doesn't exist when master is down).
 
 ```tla
 ProcStoreBijection == ps!ProcStoreBijection
 ```
 
-TRSP procStep must correlate with the region's lifecycle state.
+### `ProcStepConsistency`
 
-GET_ASSIGN_CANDIDATE: region is idle or mid-transition
-(OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN, or OPENING
-if DispatchFail reset the step while the region was still OPENING).
-OPEN: target chosen, region not yet transitioned to OPENING
-(same set as GET_ASSIGN_CANDIDATE — TRSPDispatchOpen will move it).
-CONFIRM_OPENED: region is OPENING (TRSPDispatchOpen transitioned it).
-CLOSE: region is OPEN or CLOSING (CLOSING on retry after DispatchFailClose),
-or ABNORMALLY_CLOSED (TRSPConfirmClosed Path 2 re-routes to close).
-CONFIRM_CLOSED: region is CLOSING or ABNORMALLY_CLOSED.
+TRSP `procStep` must correlate with the region's lifecycle state.
 
-*Source:* TRSP.executeFromState() action guards.
+| procStep               | Allowed region states                                                           |
+|------------------------|--------------------------------------------------------------------------------|
+| `GET_ASSIGN_CANDIDATE` | `OFFLINE`, `CLOSED`, `ABNORMALLY_CLOSED`, `FAILED_OPEN`, `OPENING`, `SPLITTING_NEW` |
+| `OPEN`                 | Same as above (target chosen, not yet transitioned to `OPENING`)               |
+| `CONFIRM_OPENED`       | `OPENING`                                                                       |
+| `CLOSE`                | `OPEN`, `SPLITTING`, `CLOSING`, `ABNORMALLY_CLOSED`                             |
+| `CONFIRM_CLOSED`       | `CLOSING`, `ABNORMALLY_CLOSED`                                                  |
+| `REPORT_SUCCEED`       | `OPEN`, `OPENING`, `FAILED_OPEN`, `CLOSED`                                      |
+
+> *Source:* `TRSP.executeFromState()` action guards.
 
 ```tla
 ProcStepConsistency ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
         RegionExists(r) =>
-          ( regionState[r].procType # "NONE" =>
+          ( regionState[r].procType \in
+                { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN" } =>
               /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
                      regionState[r].state \in
                        { "OFFLINE",
                          "CLOSED",
                          "ABNORMALLY_CLOSED",
                          "FAILED_OPEN",
-                         "OPENING"
+                         "OPENING",
+                         "SPLITTING_NEW"
+```
+
+`SPLITTING_NEW`: daughter in `ASSIGN` at `GET_ASSIGN_CANDIDATE` (`SplitUpdateMeta`).
+
+```tla
                        }
                  )
               /\ ( regionState[r].procStep = "OPEN" =>
@@ -937,7 +808,8 @@ ProcStepConsistency ==
                          "CLOSED",
                          "ABNORMALLY_CLOSED",
                          "FAILED_OPEN",
-                         "OPENING"
+                         "OPENING",
+                         "SPLITTING_NEW"
                        }
                  )
               /\ ( regionState[r].procStep = "CONFIRM_OPENED" =>
@@ -945,7 +817,12 @@ ProcStepConsistency ==
                  )
               /\ ( regionState[r].procStep = "CLOSE" =>
                      regionState[r].state \in
-                       { "OPEN", "CLOSING", "ABNORMALLY_CLOSED" }
+                       { "OPEN", "SPLITTING", "CLOSING", "ABNORMALLY_CLOSED" }
+```
+
+`SPLITTING`: split-yielded `UNASSIGN` starts from `SPLITTING`.
+
+```tla
                  )
               /\ ( regionState[r].procStep = "CONFIRM_CLOSED" =>
                      regionState[r].state \in { "CLOSING", "ABNORMALLY_CLOSED" }
@@ -958,19 +835,19 @@ ProcStepConsistency ==
     )
 ```
 
-targetServer presence/absence correlates with procStep.
-At GET_ASSIGN_CANDIDATE, no candidate has been chosen yet.
-At OPEN, CONFIRM_OPENED, and CONFIRM_CLOSED, a target must exist.
+### `TargetServerConsistency`
 
-*Source:* TRSPGetCandidate sets targetServer;
-TRSPCreate/TRSPPersistToMetaOpen/TRSPServerCrashed clear it.
+`targetServer` presence/absence correlates with `procStep`. At `GET_ASSIGN_CANDIDATE`, no candidate has been chosen yet. At `OPEN`, `CONFIRM_OPENED`, and `CONFIRM_CLOSED`, a target must exist.
+
+> *Source:* `TRSPGetCandidate` sets `targetServer`; `TRSPCreate`/`TRSPPersistToMetaOpen`/`TRSPServerCrashed` clear it.
 
 ```tla
 TargetServerConsistency ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
         RegionExists(r) =>
-          ( regionState[r].procType # "NONE" =>
+          ( regionState[r].procType \in
+                { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN" } =>
               /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
                      regionState[r].targetServer = NoServer
                  )
@@ -986,10 +863,9 @@ TargetServerConsistency ==
     )
 ```
 
-A region in OPENING state always has a non-None location.
-TRSPDispatchOpen atomically sets state=OPENING and location=targetServer.
+### `OpeningImpliesLocation`
 
-*Source:* TRSPDispatchOpen — the only action that creates OPENING state.
+A region in `OPENING` state always has a non-`None` location. `TRSPDispatchOpen` atomically sets `state=OPENING` and `location=targetServer`.
 
 ```tla
 OpeningImpliesLocation ==
@@ -1002,12 +878,9 @@ OpeningImpliesLocation ==
     )
 ```
 
-A region in CLOSING state always has a non-None location.
-TRSPDispatchClose transitions to CLOSING while preserving the existing
-location; clearing the location only happens at TRSPConfirmClosed Path 1
-(CLOSING -> CLOSED) or SCPAssignRegion (CLOSING -> ABNORMALLY_CLOSED).
+### `ClosingImpliesLocation`
 
-*Source:* TRSPDispatchClose — preserves location on CLOSING transition.
+A region in `CLOSING` state always has a non-`None` location. `TRSPDispatchClose` transitions to `CLOSING` while preserving the existing location; clearing the location only happens at `TRSPConfirmClosed` Path 1 (`CLOSING` → `CLOSED`) or `SCPAssignRegion` (`CLOSING` → `ABNORMALLY_CLOSED`).
 
 ```tla
 ClosingImpliesLocation ==
@@ -1020,17 +893,13 @@ ClosingImpliesLocation ==
     )
 ```
 
-For a region that has a known location, no active procedure, and whose
-server is not CRASHED, the serverRegions tracking must include it.
-This validates the independent serverRegions variable (which SCP reads
-for its snapshot) against the authoritative regionState.location.
+### `ServerRegionsTrackLocation`
 
-Active procedures are exempt because during TRSP execution,
-serverRegions and location may temporarily desynchronize
-(regionOpening adds to new server without removing from old).
+For a region that has a known location, no active procedure, and whose server is not `CRASHED`, the `serverRegions` tracking must include it. This validates the independent `serverRegions` variable (which SCP reads for its snapshot) against the authoritative `regionState.location`.
 
-*Source:* AM.regionOpening(), AM.regionClosedWithoutPersisting(),
-AM.regionFailedOpen(), AM.regionClosedAbnormally().
+Active procedures are exempt because during TRSP execution, `serverRegions` and location may temporarily desynchronize (`regionOpening` adds to new server without removing from old).
+
+> *Source:* `AM.regionOpening()`, `AM.regionClosedWithoutPersisting()`, `AM.regionFailedOpen()`, `AM.regionClosedAbnormally()`.
 
 ```tla
 ServerRegionsTrackLocation ==
@@ -1045,13 +914,11 @@ ServerRegionsTrackLocation ==
     )
 ```
 
-Every dispatched command for a region corresponds to an active
-procedure on that region, or the target server is CRASHED (stale
-commands awaiting cleanup by RSAbort/ServerRestart).  Catches
-orphaned commands that could cause ghost opens/closes.
+### `DispatchCorrespondance`
 
-*Source:* TRSP dispatch actions produce commands only when a procedure
-is active; RS consume actions and RSAbort/ServerRestart clean up.
+Every dispatched command for a region corresponds to an active procedure on that region, or the target server is `CRASHED` (stale commands awaiting cleanup by `RSAbort`/`ServerRestart`). Catches orphaned commands that could cause ghost opens/closes.
+
+> *Source:* TRSP dispatch actions produce commands only when a procedure is active; RS consume actions and `RSAbort`/`ServerRestart` clean up.
 
 ```tla
 DispatchCorrespondance ==
@@ -1061,17 +928,11 @@ DispatchCorrespondance ==
                                    \/ serverState[s] = "CRASHED"
 ```
 
-A procedure-bearing region must never be in OFFLINE state.
-OFFLINE is a quiescent state entered only by GoOffline (which
-requires procType = NONE).  TRSPCreate may attach to OFFLINE
-but it does not SET the region to OFFLINE—it attaches ASSIGN
-at GET_ASSIGN_CANDIDATE while the region stays OFFLINE until
-TRSPDispatchOpen transitions it to OPENING.  Wait—that means
-a region CAN be OFFLINE with an ASSIGN procedure attached
-(between TRSPCreate and TRSPDispatchOpen).  This is correct
-behavior; the invariant below accounts for it.
+### `NoOrphanedProcedures`
 
-*Source:* RegionStateNode.offline(); TRSPCreate action guards.
+A procedure-bearing region must never be in `OFFLINE` state — *except* for `ASSIGN` procedures. `OFFLINE` is a quiescent state entered only by `GoOffline` (which requires `procType = NONE`). `TRSPCreate` may attach to `OFFLINE` but it does not *set* the region to `OFFLINE` — it attaches `ASSIGN` at `GET_ASSIGN_CANDIDATE` while the region stays `OFFLINE` until `TRSPDispatchOpen` transitions it to `OPENING`.
+
+> *Source:* `RegionStateNode.offline()`; `TRSPCreate` action guards.
 
 ```tla
 NoOrphanedProcedures ==
@@ -1086,16 +947,11 @@ NoOrphanedProcedures ==
     )
 ```
 
-NoPEWorkerDeadlock: When the master is alive and all PEWorkers are
-consumed while meta is unavailable, there must exist at least one
-active procedure that is neither suspended nor blocked on meta.
-If this invariant fails, all workers are tied up on meta writes and
-no progress can be made — a thread-pool exhaustion deadlock.
+### `NoPEWorkerDeadlock`
 
-With UseBlockOnMetaWrite = FALSE (default), this should always hold
-because async suspension releases the PEWorker immediately.
-With UseBlockOnMetaWrite = TRUE (branch-2.6), violations are EXPECTED
-and represent genuine deadlock scenarios.
+When the master is alive and all PEWorkers are consumed while meta is unavailable, there must exist at least one active procedure that is neither suspended nor blocked on meta. If this invariant fails, all workers are tied up on meta writes and no progress can be made — a thread-pool exhaustion deadlock.
+
+With `UseBlockOnMetaWrite = FALSE` (default), this should always hold because async suspension releases the PEWorker immediately. With `UseBlockOnMetaWrite = TRUE` (branch-2.6), violations are **expected** and represent genuine deadlock scenarios.
 
 ```tla
 NoPEWorkerDeadlock ==
@@ -1107,17 +963,13 @@ NoPEWorkerDeadlock ==
     )
 ```
 
-Action constraint: SCP state machine transitions are strictly monotonic.
-The SCP never moves backward; only forward along the defined sequence,
-plus the DONE->NONE reset on ServerRestart.
+### `SCPMonotonicity` *(action constraint)*
 
-Gated on masterAlive in both current and next state: during master
-crash/recovery, scpState is reset from stale values (MasterCrash
-preserves them as UNCHANGED; MasterRecover resets based on ZK
-re-discovery), which are not normal SCP forward-progress transitions.
+SCP state machine transitions are strictly monotonic. The SCP never moves backward; only forward along the defined sequence, plus the `DONE`→`NONE` reset on `ServerRestart`.
 
-*Source:* SCP state machine actions in SCP.tla, ServerRestart in
-Master.tla.
+Gated on `masterAlive` in both current and next state: during master crash/recovery, `scpState` is reset from stale values (`MasterCrash` preserves them as `UNCHANGED`; `MasterRecover` resets based on ZK re-discovery), which are not normal SCP forward-progress transitions.
+
+> *Source:* SCP state machine actions in `SCP.tla`, `ServerRestart` in `Master.tla`.
 
 ```tla
 SCPMonotonicity ==
@@ -1133,21 +985,19 @@ SCPMonotonicity ==
             << "ASSIGN", "DONE" >>,
             << "DONE", "NONE" >>
           }
+
 ```
 
-KeyspaceCoverage: every key in [0, MaxKey) is covered by exactly
-one live region.  A region covers a key if:
-1. It exists (regionKeyRange # NoRange)
-2. The key falls within its range [startKey, endKey)
-3. It is not in a terminal split/merge state (SPLIT, MERGED)
+### `KeyspaceCoverage`
 
-SPLITTING_NEW and MERGING_NEW regions ARE counted as covering
-their keyspaces — they have been materialized at PONR and will
-become OPEN when their child TRSP completes.
+Every key in `[0, MaxKey)` is covered by exactly one live region. A region covers a key if:
+1. It exists (`regionKeyRange ≠ NoRange`)
+2. The key falls within its range `[startKey, endKey)`
+3. It is not in a terminal split/merge state (`SPLIT`, `MERGED`)
 
-In this iteration (no split/merge actions), KeyspaceCoverage
-holds trivially: DeployedRegions tile the full keyspace and no
-operation changes regionKeyRange.
+`SPLITTING_NEW` and `MERGING_NEW` regions **are** counted as covering their keyspaces — they have been materialized at PONR and will become `OPEN` when their child TRSP completes.
+
+During a split: the parent's keyspace is preserved until `SplitDone` clears it to `NoRange`. At PONR, the parent transitions to `SPLIT` state (excluded from coverage), and daughters are materialized in `SPLITTING_NEW` (included in coverage). So coverage is maintained across the PONR boundary.
 
 ```tla
 KeyspaceCoverage ==
@@ -1161,47 +1011,98 @@ KeyspaceCoverage ==
       1
 ```
 
-SplitMergeMutualExclusion: no SPLIT or MERGE procedures exist.
-Trivially true in this iteration since no action creates them.
-Will become non-trivial when split/merge actions are added
-(iterations 21+).
+### `SplitMergeMutualExclusion`
+
+Per-region mutual exclusion:
+1. A daughter region (`SPLITTING_NEW`) cannot be a parent procedure target (`parentProc` is for parents; daughters are protected by `SplitPrepare`'s `state=OPEN` guard).
+2. No region has concurrent split and merge (trivially true: no merge actions in this iteration).
+
+Multiple disjoint splits **can** occur in parallel (faithful to the implementation). The `SplitMergeConstraint` state constraint bounds total concurrent splits for TLC tractability.
 
 ```tla
 SplitMergeMutualExclusion ==
-  ~\E r \in Regions: regionState[r].procType \in { "SPLIT", "MERGE" }
+  masterAlive = TRUE =>
+    \A r \in Regions:
 ```
 
-State constraints for TLC
+A daughter cannot also be tracked as a parent procedure target.
 
-Symmetry reduction: only unused region identifiers are interchangeable
-(deployed regions have distinct keyspaces).  Servers remain
-interchangeable.  With 4 unused identifiers this provides up to
-24x reduction.
+```tla
+            regionState[r].state = "SPLITTING_NEW" =>
+        parentProc[r] = NoParentProc
+```
+
+### `SplitAtomicity`
+
+Pre-PONR, daughters of this parent are not yet materialized. If the split parent is in `SPAWNED_CLOSE` phase, no `SPLITTING_NEW` daughters whose keyspace is carved from this parent's range should exist. Scoped per-parent so that concurrent splits on disjoint regions do not falsely trigger the invariant.
+
+```tla
+SplitAtomicity ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      parentProc[r].step = "SPAWNED_CLOSE" =>
+        LET startK == regionKeyRange[r].startKey
+            endK == regionKeyRange[r].endKey
+            mid == ( startK + endK ) \div 2
+        IN ~\E d \in Regions:
+              /\ regionState[d].state = "SPLITTING_NEW"
+              /\ RegionExists(d)
+              /\ \/ regionKeyRange[d] = [ startKey |-> startK, endKey |-> mid ]
+                 \/ regionKeyRange[d] = [ startKey |-> mid, endKey |-> endK ]
+```
+
+### `NoOrphanedDaughters`
+
+A region in `SPLITTING_NEW` state always has an `ASSIGN` procedure (child TRSP from `SplitUpdateMeta`).
+
+```tla
+NoOrphanedDaughters ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( RegionExists(r) /\ regionState[r].state = "SPLITTING_NEW" ) =>
+        regionState[r].procType = "ASSIGN"
+```
+
+### `SplitCompleteness`
+
+After a split completes (parent is `SPLIT` with `NoRange`, meaning `SplitDone` has fired), the daughters' keyspaces exist and are correct. This is a post-condition check: if the parent has been cleaned up, the daughters should be `OPEN`. Gated on no active SCP (SCP may disrupt daughter assignments).
+
+```tla
+SplitCompleteness ==
+  masterAlive = TRUE =>
+    ( ( \A s \in Servers: scpState[s] = "NONE" ) =>
+        \A r \in Regions:
+          ( regionState[r].state = "SPLIT" /\ ~RegionExists(r) ) =>
+            parentProc[r] = NoParentProc
+    )
+```
+
+## State Constraints for TLC
+
+Symmetry reduction: only unused region identifiers are interchangeable (deployed regions have distinct keyspaces). Servers remain interchangeable. With 2 unused identifiers this provides up to 2× reduction.
 
 ```tla
 Symmetry == Permutations(Regions \ DeployedRegions) \union Permutations(Servers)
 ```
 
-State constraint: bound concurrent split/merge procedures.
-In this iteration no split/merge actions exist, so this is
-vacuously satisfied.  Included for forward compatibility.
+State constraint: bound concurrent split/merge procedures. Limits to at most 1 concurrent split to keep the state space tractable for TLC. Multiple disjoint splits are permitted by the specification (faithful to implementation); this constraint is purely a model-checking optimization.
 
 ```tla
 SplitMergeConstraint ==
-  Cardinality({r \in Regions: regionState[r].procType \in { "SPLIT", "MERGE" }}) <=
-    1
+  Cardinality({r \in Regions: parentProc[r] # NoParentProc}) <= 1
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Initial state
+## Initial State
 
 ```tla
 Init ==
 ```
 
-DeployedRegions start OFFLINE with assigned keyspaces;
-unused identifiers start OFFLINE with NoRange.
+`DeployedRegions` start `OFFLINE` with assigned keyspaces; unused identifiers start `OFFLINE` with `NoRange`.
 
 ```tla
   /\ regionState =
@@ -1216,7 +1117,7 @@ unused identifiers start OFFLINE with NoRange.
        ]
 ```
 
-META table mirrors the initial in-memory state: all regions OFFLINE.
+META table mirrors the initial in-memory state: all regions `OFFLINE`.
 
 ```tla
   /\ metaTable =
@@ -1242,7 +1143,7 @@ No regions are online on any RS at startup.
   /\ rsOnlineRegions = [s \in Servers |-> {}]
 ```
 
-All servers are initially ONLINE.
+All servers are initially `ONLINE`.
 
 ```tla
   /\ serverState = [s \in Servers |-> "ONLINE"]
@@ -1299,21 +1200,14 @@ No procedures are suspended or blocked on meta.
   /\ blockedOnMeta = {}
 ```
 
-Keyspace tiling: DeployedRegions tile [0, MaxKey) evenly.
-Unused identifiers get NoRange.
-The tiling assigns contiguous, equal-width sub-ranges to deployed
-regions.  Each deployed region r gets [rank * width, (rank+1) * width)
-where rank is its position in an arbitrary bijection and
-width = MaxKey ÷ |DeployedRegions|.
+**Keyspace tiling:** `DeployedRegions` tile `[0, MaxKey)` evenly. Unused identifiers get `NoRange`. The tiling assigns contiguous, equal-width sub-ranges to deployed regions. Each deployed region `r` gets `[rank × width, (rank+1) × width)` where `rank` is its position in an arbitrary bijection and `width = MaxKey ÷ |DeployedRegions|`.
 
 ```tla
   /\ LET n == Cardinality(DeployedRegions)
          width == MaxKey \div n
 ```
 
-Bijection from DeployedRegions to 0..(n-1).  CHOOSE picks
-an arbitrary injective function (TLC-compatible: no ordering
-on model values required).
+Bijection from `DeployedRegions` to `0..(n-1)`. `CHOOSE` picks an arbitrary injective function (TLC-compatible: no ordering on model values required).
 
 ```tla
          rank ==
@@ -1329,136 +1223,152 @@ on model values required).
            ]
 ```
 
----
-
-Next-state relation
+No parent procedures are in progress.
 
 ```tla
-Next == \* -- ASSIGN path --
-        \/ \E r \in Regions: trsp!TRSPCreate(r)
-        \/ \E r \in Regions: \E s \in Servers: trsp!TRSPGetCandidate(r, s)
-        \/ \E r \in Regions: trsp!TRSPDispatchOpen(r)
-        \/ \E r \in Regions: trsp!TRSPReportSucceedOpen(r)
-        \/ \E r \in Regions: trsp!TRSPPersistToMetaOpen(r)
-        \/ \E r \in Regions: trsp!DispatchFail(r)
+  /\ parentProc = [r \in Regions |-> NoParentProc]
 ```
-
--- UNASSIGN path --
 
 ```tla
-        \/ \E r \in Regions: trsp!TRSPCreateUnassign(r)
+---------------------------------------------------------------------------
 ```
 
--- MOVE path --
+## Next-State Relation
 
 ```tla
-        \/ \E r \in Regions: trsp!TRSPCreateMove(r)
+Next ==
 ```
 
--- REOPEN path (branch-2.6 only, controlled by UseReopen) --
+**ASSIGN path**
 
 ```tla
-        \/ \E r \in Regions: trsp!TRSPCreateReopen(r)
-        \/ \E r \in Regions: trsp!TRSPDispatchClose(r)
-        \/ \E r \in Regions: trsp!TRSPReportSucceedClose(r)
-        \/ \E r \in Regions: trsp!TRSPPersistToMetaClose(r)
-        \/ \E r \in Regions: trsp!TRSPConfirmClosedCrash(r)
-        \/ \E r \in Regions: trsp!DispatchFailClose(r)
+  \/ \E r \in Regions: trsp!TRSPCreate(r)
+  \/ \E r \in Regions: \E s \in Servers: trsp!TRSPGetCandidate(r, s)
+  \/ \E r \in Regions: trsp!TRSPDispatchOpen(r)
+  \/ \E r \in Regions: trsp!TRSPReportSucceedOpen(r)
+  \/ \E r \in Regions: trsp!TRSPPersistToMetaOpen(r)
+  \/ \E r \in Regions: trsp!DispatchFail(r)
 ```
 
--- External events --
+**UNASSIGN path**
 
 ```tla
-        \/ \E r \in Regions: master!GoOffline(r)
-        \/ \E s \in Servers: master!MasterDetectCrash(s)
-        \/ \E s \in Servers: rs!RSRestart(s)
+  \/ \E r \in Regions: trsp!TRSPCreateUnassign(r)
 ```
 
--- Crash recovery --
+**MOVE path**
 
 ```tla
-        \/ \E r \in Regions: trsp!TRSPServerCrashed(r)
+  \/ \E r \in Regions: trsp!TRSPCreateMove(r)
 ```
 
--- PEWorker meta-resume --
+**REOPEN path** (branch-2.6 only, controlled by `UseReopen`)
 
 ```tla
-        \/ \E r \in Regions: trsp!ResumeFromMeta(r)
+  \/ \E r \in Regions: trsp!TRSPCreateReopen(r)
+  \/ \E r \in Regions: trsp!TRSPDispatchClose(r)
+  \/ \E r \in Regions: trsp!TRSPReportSucceedClose(r)
+  \/ \E r \in Regions: trsp!TRSPPersistToMetaClose(r)
+  \/ \E r \in Regions: trsp!TRSPConfirmClosedCrash(r)
+  \/ \E r \in Regions: trsp!DispatchFailClose(r)
 ```
 
--- RS abort (zombie shutdown) --
+**External events**
 
 ```tla
-        \/ \E s \in Servers: rs!RSAbort(s)
+  \/ \E r \in Regions: master!GoOffline(r)
+  \/ \E s \in Servers: master!MasterDetectCrash(s)
+  \/ \E s \in Servers: rs!RSRestart(s)
 ```
 
--- SCP state machine --
+**Crash recovery**
 
 ```tla
-        \/ \E s \in Servers: scp!SCPAssignMeta(s)
-        \/ \E s \in Servers: scp!SCPGetRegions(s)
-        \/ \E s \in Servers: scp!SCPFenceWALs(s)
-        \/ \E s \in Servers: \E r \in Regions: scp!SCPAssignRegion(s, r)
-        \/ \E s \in Servers: scp!SCPDone(s)
+  \/ \E r \in Regions: trsp!TRSPServerCrashed(r)
 ```
 
--- Stale report cleanup --
+**PEWorker meta-resume**
 
 ```tla
-        \/ rs!DropStaleReport
+  \/ \E r \in Regions: trsp!ResumeFromMeta(r)
 ```
 
--- RS-side open handler --
+**RS abort** (zombie shutdown)
 
 ```tla
-        \/ \E s \in Servers: \E r \in Regions: rs!RSOpen(s, r)
-        \/ \E s \in Servers: \E r \in Regions: rs!RSFailOpen(s, r)
+  \/ \E s \in Servers: rs!RSAbort(s)
 ```
 
--- RS-side close handler --
+**SCP state machine**
 
 ```tla
-        \/ \E s \in Servers: \E r \in Regions: rs!RSClose(s, r)
+  \/ \E s \in Servers: scp!SCPAssignMeta(s)
+  \/ \E s \in Servers: scp!SCPGetRegions(s)
+  \/ \E s \in Servers: scp!SCPFenceWALs(s)
+  \/ \E s \in Servers: \E r \in Regions: scp!SCPAssignRegion(s, r)
+  \/ \E s \in Servers: scp!SCPDone(s)
 ```
 
--- RS-side duplicate open handler (conditional) --
+**Stale report cleanup**
 
 ```tla
-        \/ \E s \in Servers: \E r \in Regions: rs!RSOpenDuplicate(s, r)
+  \/ rs!DropStaleReport
 ```
 
--- Master crash and recovery --
+**RS-side open handler**
 
 ```tla
-        \/ master!MasterCrash
-        \/ master!MasterRecover
+  \/ \E s \in Servers: \E r \in Regions: rs!RSOpen(s, r)
+  \/ \E s \in Servers: \E r \in Regions: rs!RSFailOpen(s, r)
 ```
 
--- ZK session expiry --
+**RS-side close handler**
 
 ```tla
-        \/ \E s \in Servers: zk!ZKSessionExpire(s)
+  \/ \E s \in Servers: \E r \in Regions: rs!RSClose(s, r)
 ```
 
----
+**RS-side duplicate open handler** (conditional)
 
-Fairness
+```tla
+  \/ \E s \in Servers: \E r \in Regions: rs!RSOpenDuplicate(s, r)
+```
 
-Weak fairness on deterministic actions ensures forward progress.
-Procedure-step actions, crash-recovery actions, SCP state machine
-steps, and RS-side processing are all deterministic once enabled and
-therefore receive WF.  Non-deterministic environmental events
-(DispatchFail, DispatchFailClose, MasterDetectCrash, RSFailOpen,
-GoOffline) receive no fairness -- they may occur but are not
-required to.
+**Master crash and recovery**
+
+```tla
+  \/ master!MasterCrash
+  \/ master!MasterRecover
+```
+
+**ZK session expiry**
+
+```tla
+  \/ \E s \in Servers: zk!ZKSessionExpire(s)
+```
+
+**Split forward path**
+
+```tla
+  \/ \E r \in Regions: split!SplitPrepare(r)
+  \/ \E r \in Regions: split!SplitResumeAfterClose(r)
+  \/ \E r \in Regions: \E dA, dB \in Regions: split!SplitUpdateMeta(r, dA, dB)
+  \/ \E r \in Regions: split!SplitDone(r)
+```
+
+```tla
+---------------------------------------------------------------------------
+```
+
+## Fairness
+
+Weak fairness on deterministic actions ensures forward progress. Procedure-step actions, crash-recovery actions, SCP state machine steps, and RS-side processing are all deterministic once enabled and therefore receive WF. Non-deterministic environmental events (`DispatchFail`, `DispatchFailClose`, `MasterDetectCrash`, `RSFailOpen`, `GoOffline`) receive no fairness — they may occur but are not required to.
 
 ```tla
 Fairness ==
 ```
 
-Procedure invocations
-Note: No WF on TRSPCreate: In the implementation, no automatic
-process creates ASSIGN procedures for lost regions.
+**Procedure invocations.** *Note:* No WF on `TRSPCreate`: in the implementation, no automatic process creates `ASSIGN` procedures for lost regions.
 
 ```tla
   /\ \A r \in Regions: WF_vars(trsp!TRSPCreateUnassign(r))
@@ -1467,7 +1377,7 @@ process creates ASSIGN procedures for lost regions.
   /\ \A s \in Servers: WF_vars(rs!RSRestart(s))
 ```
 
-Deterministic procedure steps
+**Deterministic procedure steps**
 
 ```tla
   /\ \A r \in Regions: \A s \in Servers: WF_vars(trsp!TRSPGetCandidate(r, s))
@@ -1480,40 +1390,40 @@ Deterministic procedure steps
   /\ \A r \in Regions: WF_vars(trsp!TRSPConfirmClosedCrash(r))
 ```
 
-Crash recovery
+**Crash recovery**
 
 ```tla
   /\ \A r \in Regions: WF_vars(trsp!TRSPServerCrashed(r))
 ```
 
-PEWorker meta-resume
+**PEWorker meta-resume**
 
 ```tla
   /\ \A r \in Regions: WF_vars(trsp!ResumeFromMeta(r))
   /\ WF_vars(rs!DropStaleReport)
 ```
 
-RS abort (zombie eventually shuts down)
+**RS abort** (zombie eventually shuts down)
 
 ```tla
   /\ \A s \in Servers: WF_vars(rs!RSAbort(s))
 ```
 
-Master eventually recovers after crash.
+**Master** eventually recovers after crash.
 
 ```tla
   /\ WF_vars(master!MasterRecover)
 ```
 
-ZK session expiry (eventually cleans up dead server nodes).
+**ZK session expiry** (eventually cleans up dead server nodes).
 
 ```tla
   /\ \A s \in Servers: WF_vars(zk!ZKSessionExpire(s))
 ```
 
-No fairness on MasterCrash (non-deterministic environmental event).
-No fairness on RSOpenDuplicate (fires non-deterministically; conditional).
-SCP state machine
+No fairness on `MasterCrash` (non-deterministic environmental event). No fairness on `RSOpenDuplicate` (fires non-deterministically; conditional).
+
+**SCP state machine**
 
 ```tla
   /\ \A s \in Servers: WF_vars(scp!SCPAssignMeta(s))
@@ -1523,37 +1433,48 @@ SCP state machine
   /\ \A s \in Servers: WF_vars(scp!SCPDone(s))
 ```
 
-RS-side processing
+**RS-side processing**
 
 ```tla
   /\ \A s \in Servers: \A r \in Regions: WF_vars(rs!RSOpen(s, r))
   /\ \A s \in Servers: \A r \in Regions: WF_vars(rs!RSClose(s, r))
 ```
 
----
+**Split forward path** (deterministic steps; no WF on `SplitPrepare`)
 
-Specification
+```tla
+  /\ \A r \in Regions: WF_vars(split!SplitResumeAfterClose(r))
+  /\ \A r \in Regions:
+       \A dA, dB \in Regions: WF_vars(split!SplitUpdateMeta(r, dA, dB))
+  /\ \A r \in Regions: WF_vars(split!SplitDone(r))
+```
+
+```tla
+---------------------------------------------------------------------------
+```
+
+## Specification
 
 ```tla
 Spec == Init /\ [][Next]_vars /\ Fairness
 ```
 
-Liveness: when meta becomes unavailable (a server enters ASSIGN_META),
-the SCP eventually completes meta assignment and MetaIsAvailable
-becomes TRUE again.  This ensures suspended/blocked procedures
-are eventually able to resume.
+### Liveness: `MetaEventuallyAssigned`
 
-*Source:* The SCP state machine has WF on all steps including
-SCPAssignMeta, so meta assignment always completes.
+When meta becomes unavailable (a server enters `ASSIGN_META`), the SCP eventually completes meta assignment and `MetaIsAvailable` becomes `TRUE` again. This ensures suspended/blocked procedures are eventually able to resume.
+
+> *Source:* The SCP state machine has WF on all steps including `SCPAssignMeta`, so meta assignment always completes.
 
 ```tla
 MetaEventuallyAssigned ==
   \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
 ```
 
----
+```tla
+---------------------------------------------------------------------------
+```
 
-Theorems / properties to check
+## Theorems
 
 Safety: every step preserves the type invariant.
 
@@ -1561,7 +1482,7 @@ Safety: every step preserves the type invariant.
         THEOREM Spec => []TypeOK
 ```
 
-Safety: OPEN regions always have a location.
+Safety: `OPEN` regions always have a location.
 
 ```tla
         THEOREM Spec => []OpenImpliesLocation
@@ -1603,7 +1524,7 @@ Safety: procedure lock held only during appropriate states.
         THEOREM Spec => []LockExclusivity
 ```
 
-Safety: stably OPEN region is online on its RS.
+Safety: stably `OPEN` region is online on its RS.
 
 ```tla
         THEOREM Spec => []RSMasterAgreement
@@ -1615,31 +1536,31 @@ Safety: RS-online region is acknowledged by master.
         THEOREM Spec => []RSMasterAgreementConverse
 ```
 
-Safety: procStep correlates with region lifecycle state.
+Safety: `procStep` correlates with region lifecycle state.
 
 ```tla
         THEOREM Spec => []ProcStepConsistency
 ```
 
-Safety: targetServer presence correlates with procStep.
+Safety: `targetServer` presence correlates with `procStep`.
 
 ```tla
         THEOREM Spec => []TargetServerConsistency
 ```
 
-Safety: OPENING region always has a location.
+Safety: `OPENING` region always has a location.
 
 ```tla
         THEOREM Spec => []OpeningImpliesLocation
 ```
 
-Safety: CLOSING region always has a location.
+Safety: `CLOSING` region always has a location.
 
 ```tla
         THEOREM Spec => []ClosingImpliesLocation
 ```
 
-Safety: serverRegions tracks location for stable regions.
+Safety: `serverRegions` tracks location for stable regions.
 
 ```tla
         THEOREM Spec => []ServerRegionsTrackLocation
@@ -1663,29 +1584,51 @@ Safety: in-memory procedures match persisted records (when master alive).
         THEOREM Spec => []ProcStoreBijection
 ```
 
-Safety: OFFLINE procedure-bearing regions are ASSIGN only.
+Safety: `OFFLINE` procedure-bearing regions are `ASSIGN` only.
 
 ```tla
         THEOREM Spec => []NoOrphanedProcedures
 ```
 
-Safety: live regions' keyspaces cover [0, MaxKey) with no gaps or overlaps.
+Safety: live regions' keyspaces cover `[0, MaxKey)` with no gaps or overlaps.
 
 ```tla
         THEOREM Spec => []KeyspaceCoverage
 ```
 
-Safety: no split/merge procedures exist (trivially true this iteration).
+Safety: at most one split/merge procedure at a time.
 
 ```tla
         THEOREM Spec => []SplitMergeMutualExclusion
 ```
 
-All transitions in every step are members of ValidTransition.
-Expressed as an action property checked via TLC's action constraint.
-Gated on masterAlive: MasterRecover rebuilds regionState from
-durable storage, which is a state reconstruction, not a normal
-state machine transition.
+Safety: pre-PONR daughters not materialized.
+
+```tla
+        THEOREM Spec => []SplitAtomicity
+```
+
+Safety: `SPLITTING_NEW` daughters always have a procedure.
+
+```tla
+        THEOREM Spec => []NoOrphanedDaughters
+```
+
+Safety: completed split has cleaned-up parent.
+
+```tla
+        THEOREM Spec => []SplitCompleteness
+```
+
+Safety: at most one server carrying meta.
+
+```tla
+        THEOREM Spec => []AtMostOneCarryingMeta
+```
+
+### `TransitionValid` *(action property)*
+
+All transitions in every step are members of `ValidTransition`. Expressed as an action property checked via TLC's action constraint. Gated on `masterAlive`: `MasterRecover` rebuilds `regionState` from durable storage, which is a state reconstruction, not a normal state machine transition.
 
 ```tla
 TransitionValid ==
@@ -1696,4 +1639,8 @@ TransitionValid ==
             << regionState[r].state, regionState'[r].state >> \in
               ValidTransition
         )
+```
+
+```tla
+============================================================================
 ```

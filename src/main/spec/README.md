@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-18 state variables capturing:
+19 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -114,28 +114,43 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **PEWorker thread pool** — available worker count (`availableWorkers`), async
   suspension (`suspendedOnMeta`), and sync blocking (`blockedOnMeta`) when
   `hbase:meta` is unavailable during SCP meta-reassignment.
-- **Keyspace infrastructure** — per-region key range (`regionKeyRange`) mapping
+- **Keyspace infrastructure** -- per-region key range (`regionKeyRange`) mapping
   each region to a `[startKey, endKey)` interval or `NoRange` for unused
   identifiers.  `DeployedRegions` tile `[0, MaxKey)` at Init; unused identifiers
   are available for future split/merge.
+- **Parent-child procedure framework** -- per-region `parentProc` record tracking
+  parent procedure type and step (split or merge), persists across child TRSP
+  lifecycles and survives master crash.
+- **Split procedure forward path** -- four-step `SplitTableRegionProcedure`
+  modeled through the parent-child framework: `SplitPrepare` (set SPLITTING,
+  spawn child UNASSIGN TRSP to close parent), `SplitResumeAfterClose` (detect
+  child completion, advance to point-of-no-return), `SplitUpdateMeta` (PONR:
+  write meta, materialize two daughters with computed `[startKey, mid)` and
+  `[mid, endKey)` keyspaces, spawn child ASSIGN TRSPs), and `SplitDone`
+  (daughters OPEN, clear parent keyspace and procedure state).  Pre-PONR
+  rollback and crash-during-split are deferred.
 
-The specification defines 23 safety invariants verified at every reachable
+The specification defines 27 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
 stuck without a procedure after crash recovery), `NoPEWorkerDeadlock`
 (thread pool exhaustion detection), `KeyspaceCoverage` (all keys covered by
-exactly one live region), and `SplitMergeMutualExclusion` (no split/merge
-procedures active — trivially true until split/merge actions are added).
+exactly one live region), `SplitMergeMutualExclusion` (split daughters cannot
+have active parent procedures), `SplitAtomicity` (pre-PONR, no daughters
+materialized), and `AtMostOneCarryingMeta` (at most one server carrying meta).
+
 One liveness property (`MetaEventuallyAssigned`) verifies that `hbase:meta`
 is eventually reassigned after a crash. Two action constraints enforce
-transition validity and SCP monotonicity.
+transition validity and SCP monotonicity.  One state constraint
+(`SplitMergeConstraint`) bounds concurrent split/merge procedures for TLC
+tractability.
 
 The model checker runs in two tiers: fast exhaustive verification at 3
-regions / 2 servers (2 deployed + 1 unused), and deep random simulation at
-7r/3s with extended retries. Configurable "quirk" flags allow toggling known
-implementation bugs to correctly adhere to implementation semantics, reproduce
-failures and validate fixes.
+regions / 2 servers (1 deployed + 2 unused for split daughters), and deep
+random simulation at 9r/3s with extended retries. Configurable "quirk" flags
+allow toggling known implementation bugs to correctly adhere to implementation
+semantics, reproduce failures and validate fixes.
 
 ---
 
@@ -143,23 +158,25 @@ This is a formal TLA+ specification of the HBase AssignmentManager, covering the
 region assignment lifecycle: state transitions, persistent metadata, procedure-
 driven operations, RPC dispatch, RegionServer-side behavior, server crash recovery,
 and master crash/recovery. The spec models the core assign/unassign/move/reopen
-lifecycle for regions across the OFFLINE, OPENING, OPEN, CLOSING, CLOSED,
-FAILED_OPEN, and ABNORMALLY_CLOSED states.
+lifecycle and the split forward path for regions across the OFFLINE, OPENING,
+OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED, SPLITTING, SPLIT, and
+SPLITTING_NEW states.
 
 ## Module Structure
 
-| Module | Lines | Description |
-|--------|------:|-------------|
-| [AssignmentManager.tla](markdown/AssignmentManager.md) | 1184 | Root orchestrator — variables, Init, Next, Fairness, Spec, invariants, liveness, keyspace predicates |
-| [Types.tla](markdown/Types.md) | 220 | Constants, type sets, state definitions, `ValidTransition`, split/merge states |
-| [TRSP.tla](markdown/TRSP.md) | 1287 | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
-| [SCP.tla](markdown/SCP.md) | 483 | ServerCrashProcedure state machine (detect crash → assign meta → get regions → fence WALs → assign regions → done, with meta-blocking) |
-| [RegionServer.tla](markdown/RegionServer.md) | 392 | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
-| [Master.tla](markdown/Master.md) | 354 | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
-| [ProcStore.tla](markdown/ProcStore.md) | 137 | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
-| [ZK.tla](markdown/ZK.md) | 91 | Minimal ZooKeeper model — ephemeral node lifecycle (`ZKSessionExpire`) |
+| Module | Description |
+|--------|-------------|
+| [AssignmentManager.tla](markdown/AssignmentManager.md) | Root orchestrator -- variables, Init, Next, Fairness, Spec, invariants, liveness, keyspace predicates |
+| [Types.tla](markdown/Types.md) | Constants, type sets, state definitions, `ValidTransition`, parent-child procedure types |
+| [TRSP.tla](markdown/TRSP.md) | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
+| [SCP.tla](markdown/SCP.md) | ServerCrashProcedure state machine (detect crash -> assign meta -> get regions -> fence WALs -> assign regions -> done, with meta-blocking) |
+| [Split.tla](markdown/Split.md) | Split procedure forward path using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone) |
+| [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
+| [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
+| [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
+| [ZK.tla](markdown/ZK.md) | Minimal ZooKeeper model -- ephemeral node lifecycle (`ZKSessionExpire`) |
 
-## State Variables (18 total)
+## State Variables (19 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
 - **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
@@ -178,7 +195,8 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 - **`availableWorkers`** — number of idle PEWorker threads
 - **`suspendedOnMeta`** — regions whose procedures are async-suspended on meta unavailability
 - **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
-- **`regionKeyRange`** — per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
+- **`regionKeyRange`** -- per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
+- **`parentProc`** -- per-region parent procedure record (`[type, step]`) tracking split/merge progress across child TRSP lifecycles
 
 ## Configurable Behaviors
 
@@ -187,46 +205,47 @@ FAILED_OPEN, and ABNORMALLY_CLOSED states.
 | `UseReopen` | `TRUE` enables the REOPEN procedure, needed to model branch-2 |
 | `UseRSOpenDuplicateQuirk` | `TRUE` models `AssignRegionHandler.process()` silent-drop bug (causes deadlock) |
 | `UseRestoreSucceedQuirk` | `TRUE` reproduces `OpenRegionProcedure.restoreSucceedState()` bug where FAILED_OPEN reports replay as OPENED (causes constraint violations) |
+| `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
-| `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
-| `DeployedRegions` | Subset of `Regions` that tile the keyspace at Init (remaining are unused identifiers for split/merge) |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
-| `NoRange` | Sentinel value for regions without an assigned keyspace |
 
 ## Verification Configurations
 
-### 1. Primary Exhaustive — 3 Regions / 2 Servers ([AssignmentManager.cfg](markdown/AssignmentManager-cfg.md))
+### 1. Primary Exhaustive -- 3 Regions / 2 Servers ([AssignmentManager.cfg](markdown/AssignmentManager-cfg.md))
 
-Fast exhaustive model check with symmetry reduction. 2 deployed regions tile
-`[0, 8)` with 1 unused identifier for future split/merge.
+Fast exhaustive model check with symmetry reduction. 1 deployed region tiles
+`[0, 2)` with 2 unused identifiers for split daughters.
 
 | Parameter | Value |
 |-----------|-------|
 | Regions | `{r1, r2, r3}` |
 | Servers | `{s1, s2}` |
-| DeployedRegions | `{r1, r2}` |
-| MaxKey | 8 |
+| DeployedRegions | `{r1}` |
+| MaxKey | 2 |
 | MaxRetries | 1 |
 | MaxWorkers | 2 |
 | UseReopen | FALSE |
-| Symmetry | `Permutations(Regions \ DeployedRegions) ∪ Permutations(Servers)` |
+| Symmetry | `Permutations(Regions \ DeployedRegions) \cup Permutations(Servers)` |
 | Mode | Exhaustive |
 
-### 2. Simulation — 7 Regions / 3 Servers ([AssignmentManager-sim.cfg](markdown/AssignmentManager-sim-cfg.md))
+### 2. Simulation -- 9 Regions / 3 Servers ([AssignmentManager-sim.cfg](markdown/AssignmentManager-sim-cfg.md))
 
-Deep random-trace simulation at 7r/3s (3 deployed + 4 unused) with
-`MaxRetries = 2`.  Probabilistic coverage of the full state space including
-cascading crashes, master crash/recovery, and multi-cycle assign/unassign/move
-sequences.  Simulation is the only tier that verifies deeper retry behavior.
+Deep random-trace simulation at 9r/3s (3 deployed + 6 unused) with
+`MaxRetries = 2`.  3 deployed regions tile `[0, 12)` with width 4 each,
+allowing up to 3 independent splits.  Probabilistic coverage of the full
+state space including cascading crashes, master crash/recovery, concurrent
+split operations, and multi-cycle assign/unassign/move sequences.
+Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 | Parameter | Value |
 |-----------|-------|
-| Regions | `{r1, r2, r3, r4, r5, r6, r7}` |
+| Regions | `{r1, r2, r3, r4, r5, r6, r7, r8, r9}` |
 | Servers | `{s1, s2, s3}` |
 | DeployedRegions | `{r1, r2, r3}` |
 | MaxKey | 12 |
 | MaxRetries | 2 |
+| MaxWorkers | 3 |
 | UseReopen | TRUE |
 | Mode | Random Simulation |
 
@@ -240,7 +259,7 @@ sequences.  Simulation is the only tier that verifies deeper retry behavior.
 
 ## Invariants
 
-All configurations check the same 23 safety invariants:
+All configurations check the same 27 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -266,7 +285,11 @@ All configurations check the same 23 safety invariants:
 | `NoOrphanedProcedures` | OFFLINE procedure-bearing regions are ASSIGN only |
 | `NoPEWorkerDeadlock` | When all PEWorkers are consumed and meta is unavailable, at least one active procedure is not blocked/suspended |
 | `KeyspaceCoverage` | All keys in `[0, MaxKey)` covered by exactly one live region with no gaps or overlaps |
-| `SplitMergeMutualExclusion` | No split/merge procedures active (trivially true until split/merge actions are added) |
+| `SplitMergeMutualExclusion` | Daughter regions (SPLITTING_NEW) cannot have active parent procedures |
+| `SplitAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), no SPLITTING_NEW daughters of this parent exist |
+| `NoOrphanedDaughters` | SPLITTING_NEW regions always have an ASSIGN procedure |
+| `SplitCompleteness` | After split completes (parent SPLIT + NoRange), parentProc is cleared |
+| `AtMostOneCarryingMeta` | At most one server can be carrying `hbase:meta` at any time |
 
 ## Liveness Properties
 
@@ -285,32 +308,38 @@ All configurations check the same 23 safety invariants:
 | `TransitionValid` | Every region state change is in `ValidTransition` |
 | `SCPMonotonicity` | SCP state machine transitions are strictly monotonic |
 
+## State Constraints
+
+| Constraint | Description |
+|------------|-------------|
+| `SplitMergeConstraint` | Bounds concurrent split/merge procedures to at most 1 for TLC tractability |
+
 ## Latest Verification Results
 
 ### 3r/2s Exhaustive (Primary)
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-08 |
+| **Date** | 2026-03-09 |
 | **TLC version** | 2026.03.05.210854 |
-| **Config** | `AssignmentManager.cfg` (3r/2s: 2 deployed + 1 unused) |
+| **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
-| **Result** | ✅ All 23 invariants, action constraints, and state constraint passed |
-| **States generated** | 86,037,209 |
-| **States checked** | 24,781,202 distinct |
-| **Depth** | 66 |
-| **Duration** | 8m08s |
+| **Result** | All 27 invariants, 2 action constraints, and state constraint passed |
+| **States generated** | 527,398,193 |
+| **States checked** | 147,814,458 distinct |
+| **Depth** | 83 |
+| **Duration** | ~68 min |
 
 ## Running the Spec
 
-### Exhaustive (2r/2s)
+### Exhaustive (3r/2s)
 
 ```sh
 java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
 ```
 
-### Simulation (3r/3s, configurable duration)
+### Simulation (9r/3s, configurable duration)
 
 ```sh
 java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
@@ -335,8 +364,11 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (300, 900, 3600
 - Configurable implementation quirks (duplicate open, restore succeed)
 - Configurable meta-write behavior
 - Keyspace infrastructure (`regionKeyRange`, `DeployedRegions`, `MaxKey`) with `KeyspaceCoverage` invariant
-- Split/merge states and transitions in `State`/`ValidTransition` (infrastructure only — no actions yet)
+- Split forward path with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`)
+- Parent-child procedure tracking (`parentProc` variable) across child TRSP lifecycles
 
 **Deferred:**
-- Split/merge actions (RequestSplit, SplitRegion, RequestMerge, MergeRegions)
+- Split pre-PONR rollback (Iteration 22)
+- Merge actions (Iteration 23)
+- Crash during split/merge (Iteration 24)
 - FAILED_CLOSE (RS abort triggers crash detection instead)

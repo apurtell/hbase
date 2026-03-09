@@ -61,7 +61,8 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange
+         regionKeyRange,
+         parentProc
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -70,10 +71,10 @@ rpcVars == << dispatchedOps, pendingReports >>
 rsVars == << rsOnlineRegions >>
 
 \* Shorthand for variables unchanged by TRSP actions (used in UNCHANGED
-\* clauses).  Includes SCP state and ZK ephemeral nodes — neither is
+\* clauses).  Includes SCP state and ZK ephemeral nodes -- neither is
 \* modified by any TRSP action.
 scpVars ==
-  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange >>
+  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
@@ -115,6 +116,8 @@ TRSPCreate(r) ==
        { "OFFLINE", "CLOSED", "ABNORMALLY_CLOSED", "FAILED_OPEN" }
   \* No procedure is currently attached to this region.
   /\ regionState[r].procType = "NONE"
+  \* No parent procedure in progress (models ProcedureExecutor region-level locking).
+  /\ parentProc[r].type = "NONE"
   \* Don't auto-create ASSIGN for ABNORMALLY_CLOSED regions while any SCP
   \* is actively processing a crash.  In the implementation, SCP owns
   \* crash recovery; no background daemon races to create procedures for
@@ -452,7 +455,7 @@ TRSPPersistToMetaOpen(r) ==
            /\ tc = "OPENED"
            \* In-memory state must already reflect OPEN (from TRSPReportSucceedOpen).
            /\ regionState[r].state = "OPEN"
-           \* Clear procedure (ASSIGN), or advance to GET_ASSIGN_CANDIDATE (MOVE/REOPEN — this shouldn't normally happen for OPENED on MOVE, but handle uniformly).
+           \* Clear procedure (ASSIGN), or advance to GET_ASSIGN_CANDIDATE (MOVE/REOPEN -- this shouldn't normally happen for OPENED on MOVE, but handle uniformly).
            /\ regionState' =
                 [regionState EXCEPT
                 ![r] =
@@ -631,7 +634,7 @@ DispatchFail(r) ==
 \*      AND the target server is ONLINE.
 \* Post: command removed, TRSP reset to CLOSE.
 \*
-\* Guard: serverState[s] = "ONLINE" — same rationale as DispatchFail.
+\* Guard: serverState[s] = "ONLINE" -- same rationale as DispatchFail.
 \*
 \* Source: RegionRemoteProcedureBase.remoteCallFailed() sets
 \*         DISPATCH_FAIL state and wakes the parent TRSP;
@@ -700,6 +703,8 @@ TRSPCreateUnassign(r) ==
   /\ regionState[r].state = "OPEN"
   \* Region must have a server location assigned.
   /\ regionState[r].location # NoServer
+  \* No parent procedure in progress (models ProcedureExecutor region-level locking).
+  /\ parentProc[r].type = "NONE"
   \* No procedure is currently attached to this region.
   /\ regionState[r].procType = "NONE"
   \* Initialize embedded UNASSIGN procedure at CLOSE step, targeting current server.
@@ -756,6 +761,8 @@ TRSPCreateMove(r) ==
   /\ regionKeyRange[r] # NoRange
   \* Region must be in OPEN state.
   /\ regionState[r].state = "OPEN"
+  \* No parent procedure in progress (models ProcedureExecutor region-level locking).
+  /\ parentProc[r].type = "NONE"
   \* Region must have a server location assigned.
   /\ regionState[r].location # NoServer
   \* No procedure is currently attached to this region.
@@ -813,6 +820,8 @@ TRSPCreateReopen(r) ==
   /\ regionKeyRange[r] # NoRange
   \* REOPEN feature must be enabled.
   /\ UseReopen = TRUE
+  \* No parent procedure in progress (models ProcedureExecutor region-level locking).
+  /\ parentProc[r].type = "NONE"
   \* Region must be in OPEN state.
   /\ regionState[r].state = "OPEN"
   \* Region must have a server location assigned.
@@ -903,7 +912,7 @@ TRSPDispatchClose(r) ==
         /\ r \notin blockedOnMeta
         \* Bind the target server for readability.
         /\ LET s == regionState[r].targetServer
-           IN /\ regionState[r].state \in { "OPEN", "CLOSING" }
+           IN /\ regionState[r].state \in { "OPEN", "CLOSING", "SPLITTING" }
               \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
               /\ regionState' =
                    [regionState EXCEPT
