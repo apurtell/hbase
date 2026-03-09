@@ -829,60 +829,31 @@ per-region actions (16 TRSP + `GoOffline`).  Configs: primary 3r/2s,
 sim 7r/3s, liveness 4r/2s with new constants/invariants/constraint.
 TLC 3r/2s: 24,781,202 distinct, 86,037,209 generated, depth 66, 8m08s, clean.
 
-#### Iteration 21 — Complete split forward path
+#### Iteration 21 — Parent-child procedure framework and split forward path ✅ COMPLETE
 
-**What to add**: The *entire* split procedure forward path in one
-iteration, including the initiation action. Every split procedure
-state has a defined successor, so TLC cannot deadlock.
-- `RequestSplit(r)`: Non-deterministic. Models admin API RPC or
-  RS-autonomous split (we don't model *why* — only eligibility).
-  Pre: `r` is OPEN, no procedure attached, keyspace width ≥ 2,
-  unused identifiers available (∃ regions with `regionKeyRange = NoRange`).
-  If accepted → enters `SplitPrepare`. If any precondition fails →
-  rejected (action does not fire).
-- `SplitPrepare(parent, dA, dB)`: Triggered by `RequestSplit`.
-  Pre: parent is OPEN, no procedure on parent/dA/dB, dA and dB
-  have `regionKeyRange = NoRange` (unused identifiers).
-  **Keyspace halving**: compute `mid = (startKey + endKey) ÷ 2` from
-  parent's keyspace. Record daughter keyspaces in the split procedure
-  state (daughters remain non-existent, i.e. `NoRange`, until PONR).
-  Guard: `endKey - startKey ≥ 2` (keyspace must be splittable).
-  Set parent to SPLITTING, attach split procedure to parent, dA, dB.
-- `SplitCloseParent(p)`: Create child TRSP(UNASSIGN) for parent.
-  Parent transitions: SPLITTING → CLOSING → CLOSED (via TRSP).
-- `SplitCheckClosed(p)`: Verify parent is CLOSED.
-- `SplitUpdateMeta(p)`: **PONR.** Atomically:
-  set parent to SPLIT in both memory and meta;
-  set `regionKeyRange[dA] = [startKey, mid)`,
-  `regionKeyRange[dB] = [mid, endKey)` (daughters now exist);
-  set daughters to SPLITTING_NEW in memory, CLOSED in meta
-  (intentional discrepancy, see C.8).
-  After this action, rollback is forbidden.
-- `SplitOpenChildren(p)`: Create child TRSP(ASSIGN) for each daughter.
-  Daughters transition: SPLITTING_NEW → OPENING → OPEN (via TRSP).
-- `SplitDone(p)`: All child TRSPs complete. Clear parent keyspace:
-  `regionKeyRange[parent] = NoRange` (deletion after compaction,
-  modeled as atomic). Detach split procedure from parent, dA, dB.
-Multi-region locking: split procedure is attached to all three regions
-(parent + 2 daughters), enforcing mutual exclusion.
-**Relax invariant**: `MetaConsistency` must allow
-`regionState = SPLITTING_NEW` while `metaTable = CLOSED`.
-`KeyspaceCoverage` relaxed during in-flight split: parent is SPLIT
-(excluded) and daughters are SPLITTING_NEW (included, covering
-parent's former keyspace).
-**No rollback in this iteration.** `SplitFail` is not yet modeled,
-so splits always succeed. This is safe: the forward path is complete
-and every procedure state has a successor. Rollback is added in
-Iteration 22.
-**Verify**: `TypeOK`, `TransitionValid`, `KeyspaceCoverage`,
-`SplitMergeMutualExclusion`, `SplitCompleteness` (after `SplitDone`,
-both daughters are OPEN with correct keyspaces, parent deleted),
-`NoOrphanedDaughters`, `SplitAtomicity` (pre-PONR states have no
-daughter entries in meta). All existing invariants still pass.
-**Source**: `SplitTableRegionProcedure.java` `prepareSplitRegion()` L509-593,
-`createUnassignProcedures()` L950-954,
-`AssignmentManager.markRegionAsSplit()` L2364-2390,
-`createAssignProcedures()` L956-963.
+New `parentProc[r]` variable (`[type: ParentProcType ∪ {"NONE"}, step:
+ParentProcStep ∪ {"NONE"}]`) replacing flat `splitStep` model;
+`ParentProcType == {"SPLIT"}` (extensible: `"MERGE"` in iteration 23),
+`ParentProcStep == {"SPAWNED_CLOSE", "PONR", "SPAWNED_OPEN", "COMPLETING"}`,
+`NoParentProc` sentinel, `HasActiveParent(r)` predicate.  `parentProc`
+persists across child TRSP lifecycles and survives master crash.  New
+`Split.tla` module with 4 actions: `SplitPrepare(r)` (atomically sets
+SPLITTING, creates parentProc, spawns child UNASSIGN TRSP — prepare +
+addChildProcedure collapsed for state space efficiency),
+`SplitResumeAfterClose(r)` (detects child completion, re-attaches SPLIT
+lock, advances to PONR), `SplitUpdateMeta(r, dA, dB)` (PONR: picks 2
+unused identifiers, materializes daughters with `[startKey, mid)` and
+`[mid, endKey)` keyspaces, spawns child ASSIGN TRSPs),
+`SplitDone(r)` (daughters OPEN, clears parent keyspace + parentProc).
+New/updated invariants: `SplitAtomicity` (pre-PONR, no daughters),
+`NoOrphanedDaughters` (SPLITTING_NEW ⇒ ASSIGN), `SplitCompleteness`
+(SPLIT + NoRange ⇒ NoParentProc), `SplitMergeConstraint` (≤1 concurrent).
+`parentProc[r].type = "NONE"` guard on `TRSPCreate`, `TRSPCreateUnassign`,
+`TRSPCreateMove`, `TRSPCreateReopen`, `GoOffline`.  All configs updated
+with new constants/invariants/constraint; sim config expanded to 9r/3s
+(3 deployed + 6 unused, `MaxKey = 12`); `AtMostOneCarryingMeta` fix;
+TLC 3r/2s: 147,814,458 distinct, 527,398,193 generated, depth 83, ~68min,
+clean.
 
 #### Iteration 22 — Split pre-PONR rollback
 

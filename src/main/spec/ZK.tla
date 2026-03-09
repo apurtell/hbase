@@ -12,7 +12,7 @@
  * of whether the master is alive or not.
  *
  * Contains one action:
- *   ZKSessionExpire(s) — RS dies, ZK deletes its ephemeral node
+ *   ZKSessionExpire(s) -- RS dies, ZK deletes its ephemeral node
  *)
 EXTENDS Types
 
@@ -35,7 +35,8 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange
+         regionKeyRange,
+         parentProc
 
 \* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
@@ -48,7 +49,7 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 \*
 \* This is a ZK-side action, independent of both master and RS.
 \* ZK is the ground truth about RS liveness.  Any live RS can die
-\* at any time — this action is non-deterministic, like MasterCrash.
+\* at any time -- this action is non-deterministic, like MasterCrash.
 \*
 \* After ZKSessionExpire fires:
 \*   - MasterDetectCrash (if master is alive) will observe
@@ -58,7 +59,7 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 \*   - RSAbort will eventually clean up the zombie RS state.
 \*
 \* The RS process may still be a zombie briefly after ZK session
-\* expiry (rsOnlineRegions is NOT cleared here — RSAbort handles
+\* expiry (rsOnlineRegions is NOT cleared here -- RSAbort handles
 \* that).  This preserves the zombie window that makes WAL fencing
 \* necessary for correctness.
 \*
@@ -85,7 +86,8 @@ ZKSessionExpire(s) ==
         procStore,
         masterAlive,
         peVars,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 ============================================================================

@@ -26,7 +26,8 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange
+         regionKeyRange,
+         parentProc
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -69,7 +70,7 @@ MetaIsAvailable == \A t \in Servers: scpState[t] # "ASSIGN_META"
 \*   "GET_REGIONS"    | SERVER_CRASH_GET_REGIONS (=3)
 \*                    |   1:1 match.
 \*   "FENCE_WALS"     | SERVER_CRASH_SPLIT_LOGS (=5)
-\*                    |   WAL splitting → fencing semantics only.
+\*                    |   WAL splitting -> fencing semantics only.
 \*   "ASSIGN"         | SERVER_CRASH_ASSIGN (=8),
 \*                    |   SERVER_CRASH_WAIT_ON_ASSIGN (=9)
 \*                    |   Assign + wait collapsed into per-region
@@ -121,7 +122,8 @@ SCPAssignMeta(s) ==
         scpRegions,
         walFenced,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 \* SCP step 1: Snapshot the set of regions assigned to the crashed
@@ -133,7 +135,7 @@ SCPAssignMeta(s) ==
 \* also calls AM.markRegionsAsCrashed(), which updates internal
 \* bookkeeping (RIT tracking, crash timestamps) to mark the regions
 \* as unavailable.  This does NOT change the RegionState.State enum
-\* — the actual transition to ABNORMALLY_CLOSED happens later in
+\* -- the actual transition to ABNORMALLY_CLOSED happens later in
 \* assignRegions() (SERVER_CRASH_ASSIGN).  The model's abstraction
 \* (no region state change at GET_REGIONS, state change only at
 \* SCPAssignRegion) remains valid.
@@ -177,7 +179,8 @@ SCPGetRegions(s) ==
         walFenced,
         carryingMeta,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 \* SCP step 2: Revoke WAL leases for the crashed server.  After this
@@ -199,7 +202,7 @@ SCPFenceWALs(s) ==
   /\ scpState[s] = "FENCE_WALS"
   \* Meta must be online (no server in ASSIGN_META) before SCP proceeds.
   /\ \A t \in Servers: scpState[t] # "ASSIGN_META"
-  \* Revoke WAL leases — zombie RS can no longer write.
+  \* Revoke WAL leases -- zombie RS can no longer write.
   /\ walFenced' = [walFenced EXCEPT ![s] = TRUE]
   \* Advance SCP to the region assignment step.
   /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN"]
@@ -215,7 +218,8 @@ SCPFenceWALs(s) ==
         scpRegions,
         carryingMeta,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
@@ -268,7 +272,8 @@ SCPAssignRegion(s, r) ==
               carryingMeta,
               peVars,
               zkNode,
-              regionKeyRange
+              regionKeyRange,
+              parentProc
            >>
      \/ \* --- Meta unavailable: suspend or block ---
         \* Paths A/B write to meta; if meta is unavailable,
@@ -279,7 +284,7 @@ SCPAssignRegion(s, r) ==
         /\ r \notin blockedOnMeta
         /\ IF UseBlockOnMetaWrite = FALSE
            THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc >>
            ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
                 /\ availableWorkers' = availableWorkers - 1
                 /\ UNCHANGED suspendedOnMeta
@@ -297,7 +302,8 @@ SCPAssignRegion(s, r) ==
               procStore,
               masterVars,
               zkNode,
-              regionKeyRange
+              regionKeyRange,
+              parentProc
            >>
      \/ \* --- Path A: TRSP already attached ---
         \* Meta must be available for Path A (writes to meta).
@@ -309,12 +315,12 @@ SCPAssignRegion(s, r) ==
         \* convert the existing TRSP to ASSIGN/GET_ASSIGN_CANDIDATE.
         \* This models the implementation's serverCrashed() callback
         \* firing under the same RegionStateNode lock as the state
-        \* transition — they are a single atomic step.
+        \* transition -- they are a single atomic step.
         \*
         \* Source: ServerCrashProcedure.assignRegions() acquires
         \*         RegionStateNode.lock(), then calls
         \*         regionNode.getProcedure().serverCrashed(env, ...);
-        \*         TRSP.serverCrashed() → AM.regionClosedAbnormally()
+        \*         TRSP.serverCrashed() -> AM.regionClosedAbnormally()
         \*         all execute under that same lock.
         /\ regionState[r].location = s
         /\ regionState[r].procType # "NONE"
@@ -370,7 +376,8 @@ SCPAssignRegion(s, r) ==
               walFenced,
               carryingMeta,
               zkNode,
-              regionKeyRange
+              regionKeyRange,
+              parentProc
            >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
         /\ suspendedOnMeta' = suspendedOnMeta \ { r }
@@ -436,7 +443,8 @@ SCPAssignRegion(s, r) ==
               walFenced,
               carryingMeta,
               zkNode,
-              regionKeyRange
+              regionKeyRange,
+              parentProc
            >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
         /\ suspendedOnMeta' = suspendedOnMeta \ { r }
@@ -464,7 +472,7 @@ SCPDone(s) ==
   /\ scpRegions[s] = {}
   \* Mark SCP as complete for this crashed server.
   /\ scpState' = [scpState EXCEPT ![s] = "DONE"]
-  \* All other state unchanged — region reassignments already applied.
+  \* All other state unchanged -- region reassignments already applied.
   /\ UNCHANGED << rpcVars,
         serverVars,
         procStore,
@@ -477,7 +485,8 @@ SCPDone(s) ==
         walFenced,
         carryingMeta,
         zkNode,
-        regionKeyRange
+        regionKeyRange,
+        parentProc
      >>
 
 ============================================================================

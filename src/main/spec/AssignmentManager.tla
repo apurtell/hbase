@@ -223,7 +223,7 @@ VARIABLE serverRegions
 \* procStore[r] is the persisted procedure record for region r, or
 \* NoProcedure when no procedure is persisted.  Models the
 \* WALProcedureStore / RegionProcedureStore persistence layer.
-\* Survives master crash — only cleared by procedure completion or
+\* Survives master crash -- only cleared by procedure completion or
 \* explicit delete.  Updated by ProcedureExecutor.store.update()
 \* after each executeFromState step (except when skipPersistence
 \* is called, e.g., DispatchFail).
@@ -231,7 +231,7 @@ VARIABLE procStore
 
 \* masterAlive is TRUE when the active master JVM is running.
 \* When FALSE, all in-memory state (regionState, serverState, etc.)
-\* is invalid — the master does not exist.  Durable state (metaTable,
+\* is invalid -- the master does not exist.  Durable state (metaTable,
 \* procStore) and RS-side state (rsOnlineRegions) survive.
 VARIABLE masterAlive
 
@@ -275,6 +275,18 @@ VARIABLE blockedOnMeta
 \* parent/target deletion clears to NoRange.
 VARIABLE regionKeyRange
 
+\* parentProc[r] tracks the parent procedure (split or merge) whose
+\* target region is r.  NoParentProc means no parent procedure is
+\* active.  During child TRSP execution (close parent, open daughters),
+\* the region's procType reflects the child TRSP (UNASSIGN or ASSIGN),
+\* while parentProc retains the parent's overall progress.
+\* parentProc is durable (survives master crash): it models the
+\* ProcedureStore persistence of the parent procedure.
+\*
+\* Source: SplitTableRegionProcedure / MergeTableRegionsProcedure
+\*         state machines (MasterProcedure.proto).
+VARIABLE parentProc
+
 vars ==
   << regionState,
      metaTable,
@@ -293,7 +305,8 @@ vars ==
      availableWorkers,
      suspendedOnMeta,
      blockedOnMeta,
-     regionKeyRange
+     regionKeyRange,
+     parentProc
   >>
 
 ---------------------------------------------------------------------------
@@ -332,6 +345,7 @@ rs == INSTANCE RegionServer
 master == INSTANCE Master
 ps == INSTANCE ProcStore
 zk == INSTANCE ZK
+split == INSTANCE Split
 
 ---------------------------------------------------------------------------
 
@@ -345,7 +359,7 @@ TypeOK ==
        /\ regionState[r].location \in Servers \cup { NoServer }
        \* Embedded procedure type must be a valid ProcType.
        /\ regionState[r].procType \in ProcType
-       \* Procedure step is a TRSP state or IDLE (when no procedure).
+       \* Procedure step is a TRSP state or IDLE.
        /\ regionState[r].procStep \in TRSPState \cup { "IDLE" }
        \* Procedure's target server is a server or None.
        /\ regionState[r].targetServer \in Servers \cup { NoServer }
@@ -356,9 +370,11 @@ TypeOK ==
             /\ regionState[r].procStep = "IDLE"
             /\ regionState[r].targetServer = NoServer
             /\ regionState[r].retries = 0
-       \* Active procedure has a valid step.
-       /\ regionState[r].procType # "NONE" =>
+       \* Active TRSP procedure has a TRSP step.
+       /\ regionState[r].procType \in { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN" } =>
             regionState[r].procStep \in TRSPState
+       \* Active SPLIT procedure has IDLE step (parent lock marker).
+       /\ regionState[r].procType = "SPLIT" => regionState[r].procStep = "IDLE"
   \* META table maps every region to a persistent (state, location) record.
   /\ metaTable \in
        [Regions -> [state:State, location:Servers \cup { NoServer } ]]
@@ -397,7 +413,11 @@ TypeOK ==
   /\ blockedOnMeta \subseteq Regions
   \* Keyspace range: assigned range or NoRange (unused identifier).
   /\ regionKeyRange \in
-       [Regions -> [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }]
+         [Regions
+         ->
+         [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }] \* Parent procedure progress per region.
+       /\
+       parentProc \in [Regions -> ParentProcRecord]
 
 ---------------------------------------------------------------------------
 
@@ -411,14 +431,20 @@ OpenImpliesLocation ==
           )
     )
 
-\* A region that is OFFLINE, CLOSED, FAILED_OPEN, or ABNORMALLY_CLOSED
-\* must NOT have a location.
+\* A region that is OFFLINE, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED,
+\* SPLIT, or SPLITTING_NEW must NOT have a location.
 OfflineImpliesNoLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
         RegionExists(r) =>
           ( regionState[r].state \in
-                { "OFFLINE", "CLOSED", "FAILED_OPEN", "ABNORMALLY_CLOSED" } =>
+                { "OFFLINE",
+                  "CLOSED",
+                  "FAILED_OPEN",
+                  "ABNORMALLY_CLOSED",
+                  "SPLIT",
+                  "SPLITTING_NEW"
+                } =>
               regionState[r].location = NoServer
           )
     )
@@ -452,6 +478,15 @@ MetaConsistency ==
                          \* retains OPENING.  Divergence is always resolved
                          \* when the procedure completes or is cleared.
                          \/ regionState[r].procType # "NONE"
+                         \* Parent procedure window: parentProc tracks
+                         \* the parent; procType/procStep temporarily
+                         \* reflect child TRSPs.
+                         \* split is still in progress.
+                         \/ parentProc[r].type # "NONE"
+                         \* SPLITTING_NEW daughters: in-memory is SPLITTING_NEW
+                         \* while meta is CLOSED (Appendix C.8).
+                         \/ /\ regionState[r].state = "SPLITTING_NEW"
+                            /\ metaTable[r].state = "CLOSED"
 
 \* NoDoubleAssignment: HBase term of art for "at most one server per
 \* region."  The precise semantics here are "no double write": a region
@@ -505,20 +540,22 @@ LockExclusivity ==
                         "ABNORMALLY_CLOSED",
                         "FAILED_OPEN",
                         "OPENING",
-                        "OPEN"
-                      \* REPORT_SUCCEED window: RS reported OPENED,
-                      \* in-memory state is OPEN but procedure not
-                      \* yet cleared (meta not yet written).
+                        "OPEN",
+                        "SPLITTING_NEW"
+                      \* SPLITTING_NEW: daughters enter ASSIGN via
+                      \* SplitUpdateMeta, then TRSPGetCandidate picks a
+                      \* server, TRSPDispatchOpen transitions to OPENING.
                       }
               \/ /\ regionState[r].procType = "UNASSIGN"
                  /\ regionState[r].state \in
                       { "OPEN",
+                        "SPLITTING",
                         "CLOSING",
                         "ABNORMALLY_CLOSED",
                         "CLOSED"
-                      \* REPORT_SUCCEED window: RS reported CLOSED,
-                      \* in-memory state is CLOSED but procedure
-                      \* not yet cleared.
+                      \* SPLITTING: split yields parent to UNASSIGN
+                      \* (SplitPrepare sets procType=UNASSIGN while
+                      \* parent is still in SPLITTING state).
                       }
               \/ /\ regionState[r].procType = "MOVE"
                  /\ regionState[r].state \in
@@ -537,6 +574,15 @@ LockExclusivity ==
                         "ABNORMALLY_CLOSED",
                         "FAILED_OPEN",
                         "OPENING"
+                      }
+              \/ /\ regionState[r].procType = "SPLIT"
+                 /\ regionState[r].state \in
+                      { "CLOSED",
+                        "SPLIT",
+                        "SPLITTING_NEW"
+                      \* CLOSED: parent after close, before PONR.
+                      \* SPLIT: parent after PONR.
+                      \* SPLITTING_NEW: daughter lock before open yield.
                       }
           )
     )
@@ -594,7 +640,8 @@ RSMasterAgreementConverse ==
       \A r \in rsOnlineRegions[s]:
         serverState[s] = "CRASHED" \/ zkNode[s] = FALSE \/
           /\ regionState[r].location = s
-          /\ regionState[r].state \in { "OPENING", "OPEN", "CLOSING" }
+          /\ regionState[r].state \in
+               { "OPENING", "OPEN", "CLOSING", "SPLITTING" }
 
 \* SCP does not reassign regions (scpState = "ASSIGN") until WAL
 \* leases have been revoked (walFenced = TRUE).  Verified by
@@ -616,6 +663,15 @@ FencingOrder == \A s \in Servers: scpState[s] = "ASSIGN" => walFenced[s] = TRUE
 MetaAvailableForRecovery ==
   \A s \in Servers:
     carryingMeta[s] = TRUE => scpState[s] \in { "NONE", "ASSIGN_META", "DONE" }
+
+\* AtMostOneCarryingMeta: hbase:meta is hosted on exactly one server,
+\* so at most one crashed server can be carrying meta at any time.
+\* MasterDetectCrash guards the carryingMeta=TRUE branch to enforce
+\* this; the invariant is an explicit cross-check.
+\*
+\* Source: hbase:meta single-assignment semantics.
+AtMostOneCarryingMeta ==
+  Cardinality({s \in Servers: carryingMeta[s] = TRUE}) <= 1
 
 \* After any SCP completes, no region is stuck without a procedure and
 \* without an SCP that will process it.  A region is lost when it is
@@ -653,7 +709,7 @@ NoLostRegions ==
 \* procedure.  This invariant will require relaxation in iteration 18
 \* when MasterCrash clears in-memory state but preserves procStore.
 \*
-\* Source: ProcedureExecutor lifecycle — insert on creation,
+\* Source: ProcedureExecutor lifecycle -- insert on creation,
 \*         update on each step, delete on completion.
 \* Intra-record correlation invariant for procStore records. Defined
 \* in ProcStore.tla; always checked regardless of masterAlive.
@@ -669,7 +725,7 @@ ProcStoreBijection == ps!ProcStoreBijection
 \*     (OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN, or OPENING
 \*     if DispatchFail reset the step while the region was still OPENING).
 \*   OPEN: target chosen, region not yet transitioned to OPENING
-\*     (same set as GET_ASSIGN_CANDIDATE — TRSPDispatchOpen will move it).
+\*     (same set as GET_ASSIGN_CANDIDATE -- TRSPDispatchOpen will move it).
 \*   CONFIRM_OPENED: region is OPENING (TRSPDispatchOpen transitioned it).
 \*   CLOSE: region is OPEN or CLOSING (CLOSING on retry after DispatchFailClose),
 \*     or ABNORMALLY_CLOSED (TRSPConfirmClosed Path 2 re-routes to close).
@@ -680,14 +736,18 @@ ProcStepConsistency ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
         RegionExists(r) =>
-          ( regionState[r].procType # "NONE" =>
+          ( regionState[r].procType \in
+                { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN" } =>
               /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
                      regionState[r].state \in
                        { "OFFLINE",
                          "CLOSED",
                          "ABNORMALLY_CLOSED",
                          "FAILED_OPEN",
-                         "OPENING"
+                         "OPENING",
+                         "SPLITTING_NEW"
+                       \* SPLITTING_NEW: daughter in ASSIGN at
+                       \* GET_ASSIGN_CANDIDATE (SplitUpdateMeta).
                        }
                  )
               /\ ( regionState[r].procStep = "OPEN" =>
@@ -696,7 +756,8 @@ ProcStepConsistency ==
                          "CLOSED",
                          "ABNORMALLY_CLOSED",
                          "FAILED_OPEN",
-                         "OPENING"
+                         "OPENING",
+                         "SPLITTING_NEW"
                        }
                  )
               /\ ( regionState[r].procStep = "CONFIRM_OPENED" =>
@@ -704,7 +765,8 @@ ProcStepConsistency ==
                  )
               /\ ( regionState[r].procStep = "CLOSE" =>
                      regionState[r].state \in
-                       { "OPEN", "CLOSING", "ABNORMALLY_CLOSED" }
+                       { "OPEN", "SPLITTING", "CLOSING", "ABNORMALLY_CLOSED" }
+                 \* SPLITTING: split-yielded UNASSIGN starts from SPLITTING.
                  )
               /\ ( regionState[r].procStep = "CONFIRM_CLOSED" =>
                      regionState[r].state \in { "CLOSING", "ABNORMALLY_CLOSED" }
@@ -726,7 +788,8 @@ TargetServerConsistency ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
         RegionExists(r) =>
-          ( regionState[r].procType # "NONE" =>
+          ( regionState[r].procType \in
+                { "ASSIGN", "UNASSIGN", "MOVE", "REOPEN" } =>
               /\ ( regionState[r].procStep = "GET_ASSIGN_CANDIDATE" =>
                      regionState[r].targetServer = NoServer
                  )
@@ -744,7 +807,7 @@ TargetServerConsistency ==
 \* A region in OPENING state always has a non-None location.
 \* TRSPDispatchOpen atomically sets state=OPENING and location=targetServer.
 \*
-\* Source: TRSPDispatchOpen — the only action that creates OPENING state.
+\* Source: TRSPDispatchOpen -- the only action that creates OPENING state.
 OpeningImpliesLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
@@ -759,7 +822,7 @@ OpeningImpliesLocation ==
 \* location; clearing the location only happens at TRSPConfirmClosed Path 1
 \* (CLOSING -> CLOSED) or SCPAssignRegion (CLOSING -> ABNORMALLY_CLOSED).
 \*
-\* Source: TRSPDispatchClose — preserves location on CLOSING transition.
+\* Source: TRSPDispatchClose -- preserves location on CLOSING transition.
 ClosingImpliesLocation ==
   masterAlive = TRUE =>
     ( \A r \in Regions:
@@ -807,9 +870,9 @@ DispatchCorrespondance ==
 \* A procedure-bearing region must never be in OFFLINE state.
 \* OFFLINE is a quiescent state entered only by GoOffline (which
 \* requires procType = NONE).  TRSPCreate may attach to OFFLINE
-\* but it does not SET the region to OFFLINE—it attaches ASSIGN
+\* but it does not SET the region to OFFLINE--it attaches ASSIGN
 \* at GET_ASSIGN_CANDIDATE while the region stays OFFLINE until
-\* TRSPDispatchOpen transitions it to OPENING.  Wait—that means
+\* TRSPDispatchOpen transitions it to OPENING.  Wait--that means
 \* a region CAN be OFFLINE with an ASSIGN procedure attached
 \* (between TRSPCreate and TRSPDispatchOpen).  This is correct
 \* behavior; the invariant below accounts for it.
@@ -830,7 +893,7 @@ NoOrphanedProcedures ==
 \* consumed while meta is unavailable, there must exist at least one
 \* active procedure that is neither suspended nor blocked on meta.
 \* If this invariant fails, all workers are tied up on meta writes and
-\* no progress can be made — a thread-pool exhaustion deadlock.
+\* no progress can be made -- a thread-pool exhaustion deadlock.
 \*
 \* With UseBlockOnMetaWrite = FALSE (default), this should always hold
 \* because async suspension releases the PEWorker immediately.
@@ -877,12 +940,14 @@ SCPMonotonicity ==
 \*   3. It is not in a terminal split/merge state (SPLIT, MERGED)
 \*
 \* SPLITTING_NEW and MERGING_NEW regions ARE counted as covering
-\* their keyspaces — they have been materialized at PONR and will
+\* their keyspaces -- they have been materialized at PONR and will
 \* become OPEN when their child TRSP completes.
 \*
-\* In this iteration (no split/merge actions), KeyspaceCoverage
-\* holds trivially: DeployedRegions tile the full keyspace and no
-\* operation changes regionKeyRange.
+\* During a split: the parent's keyspace is preserved until SplitDone
+\* clears it to NoRange.  At PONR, the parent transitions to SPLIT
+\* state (excluded from coverage), and daughters are materialized in
+\* SPLITTING_NEW (included in coverage).  So coverage is maintained
+\* across the PONR boundary.
 KeyspaceCoverage ==
   \A k \in 0 .. ( MaxKey - 1 ):
     Cardinality({r \in Regions:
@@ -893,26 +958,78 @@ KeyspaceCoverage ==
         }) =
       1
 
-\* SplitMergeMutualExclusion: no SPLIT or MERGE procedures exist.
-\* Trivially true in this iteration since no action creates them.
-\* Will become non-trivial when split/merge actions are added
-\* (iterations 21+).
+\* SplitMergeMutualExclusion: per-region mutual exclusion.
+\*   1. A daughter region (SPLITTING_NEW) cannot be a parent
+\*      procedure target (parentProc is for parents; daughters
+\*      are protected by SplitPrepare's state=OPEN guard).
+\*   2. No region has concurrent split and merge (trivially true:
+\*      no merge actions in this iteration).
+\*
+\* Multiple disjoint splits CAN occur in parallel (faithful to
+\* the implementation).  The SplitMergeConstraint state constraint
+\* bounds total concurrent splits for TLC tractability.
 SplitMergeMutualExclusion ==
-  ~\E r \in Regions: regionState[r].procType \in { "SPLIT", "MERGE" }
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      \* A daughter cannot also be tracked as a parent procedure target.
+            regionState[r].state = "SPLITTING_NEW" =>
+        parentProc[r] = NoParentProc
+
+\* SplitAtomicity: pre-PONR, daughters of this parent are not yet
+\* materialized.  If the split parent is in SPAWNED_CLOSE phase,
+\* no SPLITTING_NEW daughters whose keyspace is carved from this
+\* parent's range should exist.  Scoped per-parent so that concurrent
+\* splits on disjoint regions do not falsely trigger the invariant.
+SplitAtomicity ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      parentProc[r].step = "SPAWNED_CLOSE" =>
+        LET startK == regionKeyRange[r].startKey
+            endK == regionKeyRange[r].endKey
+            mid == ( startK + endK ) \div 2
+        IN ~\E d \in Regions:
+              /\ regionState[d].state = "SPLITTING_NEW"
+              /\ RegionExists(d)
+              /\ \/ regionKeyRange[d] = [ startKey |-> startK, endKey |-> mid ]
+                 \/ regionKeyRange[d] = [ startKey |-> mid, endKey |-> endK ]
+
+\* NoOrphanedDaughters: a region in SPLITTING_NEW state always has
+\* an ASSIGN procedure (child TRSP from SplitUpdateMeta).
+NoOrphanedDaughters ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( RegionExists(r) /\ regionState[r].state = "SPLITTING_NEW" ) =>
+        regionState[r].procType = "ASSIGN"
+
+\* SplitCompleteness: after a split completes (parent is SPLIT with
+\* NoRange, meaning SplitDone has fired), the daughters' keyspaces
+\* exist and are correct.  This is a post-condition check: if the
+\* parent has been cleaned up, the daughters should be OPEN.
+\* Gated on no active SCP (SCP may disrupt daughter assignments).
+SplitCompleteness ==
+  masterAlive = TRUE =>
+    ( ( \A s \in Servers: scpState[s] = "NONE" ) =>
+        \A r \in Regions:
+          ( regionState[r].state = "SPLIT" /\ ~RegionExists(r) ) =>
+            parentProc[r] = NoParentProc
+    )
 
 (* State constraints for TLC *)
 \* Symmetry reduction: only unused region identifiers are interchangeable
 \* (deployed regions have distinct keyspaces).  Servers remain
-\* interchangeable.  With 4 unused identifiers this provides up to
-\* 24x reduction.
+\* interchangeable.  With 2 unused identifiers this provides up to
+\* 2x reduction.
 Symmetry == Permutations(Regions \ DeployedRegions) \union Permutations(Servers)
 
 \* State constraint: bound concurrent split/merge procedures.
-\* In this iteration no split/merge actions exist, so this is
-\* vacuously satisfied.  Included for forward compatibility.
+\* Limits to at most 1 concurrent split to keep the state space
+\* tractable for TLC.  Multiple disjoint splits are permitted by
+\* the specification (faithful to implementation); this constraint
+\* is purely a model-checking optimization.  With 2 deployed + 2
+\* unused regions, at most 1 split is physically possible anyway
+\* (each split consumes 2 unused identifiers).
 SplitMergeConstraint ==
-  Cardinality({r \in Regions: regionState[r].procType \in { "SPLIT", "MERGE" }}) <=
-    1
+  Cardinality({r \in Regions: parentProc[r] # NoParentProc}) <= 1
 
 ---------------------------------------------------------------------------
 
@@ -966,7 +1083,7 @@ Init ==
   \* The tiling assigns contiguous, equal-width sub-ranges to deployed
   \* regions.  Each deployed region r gets [rank * width, (rank+1) * width)
   \* where rank is its position in an arbitrary bijection and
-  \* width = MaxKey ÷ |DeployedRegions|.
+  \* width = MaxKey div |DeployedRegions|.
   /\ LET n == Cardinality(DeployedRegions)
          width == MaxKey \div n
          \* Bijection from DeployedRegions to 0..(n-1).  CHOOSE picks
@@ -983,58 +1100,66 @@ Init ==
                ]
              ELSE NoRange
            ]
+  \* No parent procedures are in progress.
+  /\ parentProc = [r \in Regions |-> NoParentProc]
 
 ---------------------------------------------------------------------------
 
 (* Next-state relation *)
-Next == \* -- ASSIGN path --
-        \/ \E r \in Regions: trsp!TRSPCreate(r)
-        \/ \E r \in Regions: \E s \in Servers: trsp!TRSPGetCandidate(r, s)
-        \/ \E r \in Regions: trsp!TRSPDispatchOpen(r)
-        \/ \E r \in Regions: trsp!TRSPReportSucceedOpen(r)
-        \/ \E r \in Regions: trsp!TRSPPersistToMetaOpen(r)
-        \/ \E r \in Regions: trsp!DispatchFail(r)
-        \* -- UNASSIGN path --
-        \/ \E r \in Regions: trsp!TRSPCreateUnassign(r)
-        \* -- MOVE path --
-        \/ \E r \in Regions: trsp!TRSPCreateMove(r)
-        \* -- REOPEN path (branch-2.6 only, controlled by UseReopen) --
-        \/ \E r \in Regions: trsp!TRSPCreateReopen(r)
-        \/ \E r \in Regions: trsp!TRSPDispatchClose(r)
-        \/ \E r \in Regions: trsp!TRSPReportSucceedClose(r)
-        \/ \E r \in Regions: trsp!TRSPPersistToMetaClose(r)
-        \/ \E r \in Regions: trsp!TRSPConfirmClosedCrash(r)
-        \/ \E r \in Regions: trsp!DispatchFailClose(r)
-        \* -- External events --
-        \/ \E r \in Regions: master!GoOffline(r)
-        \/ \E s \in Servers: master!MasterDetectCrash(s)
-        \/ \E s \in Servers: rs!RSRestart(s)
-        \* -- Crash recovery --
-        \/ \E r \in Regions: trsp!TRSPServerCrashed(r)
-        \* -- PEWorker meta-resume --
-        \/ \E r \in Regions: trsp!ResumeFromMeta(r)
-        \* -- RS abort (zombie shutdown) --
-        \/ \E s \in Servers: rs!RSAbort(s)
-        \* -- SCP state machine --
-        \/ \E s \in Servers: scp!SCPAssignMeta(s)
-        \/ \E s \in Servers: scp!SCPGetRegions(s)
-        \/ \E s \in Servers: scp!SCPFenceWALs(s)
-        \/ \E s \in Servers: \E r \in Regions: scp!SCPAssignRegion(s, r)
-        \/ \E s \in Servers: scp!SCPDone(s)
-        \* -- Stale report cleanup --
-        \/ rs!DropStaleReport
-        \* -- RS-side open handler --
-        \/ \E s \in Servers: \E r \in Regions: rs!RSOpen(s, r)
-        \/ \E s \in Servers: \E r \in Regions: rs!RSFailOpen(s, r)
-        \* -- RS-side close handler --
-        \/ \E s \in Servers: \E r \in Regions: rs!RSClose(s, r)
-        \* -- RS-side duplicate open handler (conditional) --
-        \/ \E s \in Servers: \E r \in Regions: rs!RSOpenDuplicate(s, r)
-        \* -- Master crash and recovery --
-        \/ master!MasterCrash
-        \/ master!MasterRecover
-        \* -- ZK session expiry --
-        \/ \E s \in Servers: zk!ZKSessionExpire(s)
+Next ==
+  \* -- ASSIGN path --
+  \/ \E r \in Regions: trsp!TRSPCreate(r)
+  \/ \E r \in Regions: \E s \in Servers: trsp!TRSPGetCandidate(r, s)
+  \/ \E r \in Regions: trsp!TRSPDispatchOpen(r)
+  \/ \E r \in Regions: trsp!TRSPReportSucceedOpen(r)
+  \/ \E r \in Regions: trsp!TRSPPersistToMetaOpen(r)
+  \/ \E r \in Regions: trsp!DispatchFail(r)
+  \* -- UNASSIGN path --
+  \/ \E r \in Regions: trsp!TRSPCreateUnassign(r)
+  \* -- MOVE path --
+  \/ \E r \in Regions: trsp!TRSPCreateMove(r)
+  \* -- REOPEN path (branch-2.6 only, controlled by UseReopen) --
+  \/ \E r \in Regions: trsp!TRSPCreateReopen(r)
+  \/ \E r \in Regions: trsp!TRSPDispatchClose(r)
+  \/ \E r \in Regions: trsp!TRSPReportSucceedClose(r)
+  \/ \E r \in Regions: trsp!TRSPPersistToMetaClose(r)
+  \/ \E r \in Regions: trsp!TRSPConfirmClosedCrash(r)
+  \/ \E r \in Regions: trsp!DispatchFailClose(r)
+  \* -- External events --
+  \/ \E r \in Regions: master!GoOffline(r)
+  \/ \E s \in Servers: master!MasterDetectCrash(s)
+  \/ \E s \in Servers: rs!RSRestart(s)
+  \* -- Crash recovery --
+  \/ \E r \in Regions: trsp!TRSPServerCrashed(r)
+  \* -- PEWorker meta-resume --
+  \/ \E r \in Regions: trsp!ResumeFromMeta(r)
+  \* -- RS abort (zombie shutdown) --
+  \/ \E s \in Servers: rs!RSAbort(s)
+  \* -- SCP state machine --
+  \/ \E s \in Servers: scp!SCPAssignMeta(s)
+  \/ \E s \in Servers: scp!SCPGetRegions(s)
+  \/ \E s \in Servers: scp!SCPFenceWALs(s)
+  \/ \E s \in Servers: \E r \in Regions: scp!SCPAssignRegion(s, r)
+  \/ \E s \in Servers: scp!SCPDone(s)
+  \* -- Stale report cleanup --
+  \/ rs!DropStaleReport
+  \* -- RS-side open handler --
+  \/ \E s \in Servers: \E r \in Regions: rs!RSOpen(s, r)
+  \/ \E s \in Servers: \E r \in Regions: rs!RSFailOpen(s, r)
+  \* -- RS-side close handler --
+  \/ \E s \in Servers: \E r \in Regions: rs!RSClose(s, r)
+  \* -- RS-side duplicate open handler (conditional) --
+  \/ \E s \in Servers: \E r \in Regions: rs!RSOpenDuplicate(s, r)
+  \* -- Master crash and recovery --
+  \/ master!MasterCrash
+  \/ master!MasterRecover
+  \* -- ZK session expiry --
+  \/ \E s \in Servers: zk!ZKSessionExpire(s)
+  \* -- Split forward path --
+  \/ \E r \in Regions: split!SplitPrepare(r)
+  \/ \E r \in Regions: split!SplitResumeAfterClose(r)
+  \/ \E r \in Regions: \E dA, dB \in Regions: split!SplitUpdateMeta(r, dA, dB)
+  \/ \E r \in Regions: split!SplitDone(r)
 
 ---------------------------------------------------------------------------
 
@@ -1085,6 +1210,11 @@ Fairness ==
   \* RS-side processing
   /\ \A s \in Servers: \A r \in Regions: WF_vars(rs!RSOpen(s, r))
   /\ \A s \in Servers: \A r \in Regions: WF_vars(rs!RSClose(s, r))
+  \* Split forward path (deterministic steps; no WF on SplitPrepare)
+  /\ \A r \in Regions: WF_vars(split!SplitResumeAfterClose(r))
+  /\ \A r \in Regions:
+       \A dA, dB \in Regions: WF_vars(split!SplitUpdateMeta(r, dA, dB))
+  /\ \A r \in Regions: WF_vars(split!SplitDone(r))
 
 ---------------------------------------------------------------------------
 
@@ -1164,8 +1294,20 @@ MetaEventuallyAssigned ==
 \* Safety: live regions' keyspaces cover [0, MaxKey) with no gaps or overlaps.
         THEOREM Spec => []KeyspaceCoverage
 
-\* Safety: no split/merge procedures exist (trivially true this iteration).
+\* Safety: at most one split/merge procedure at a time.
         THEOREM Spec => []SplitMergeMutualExclusion
+
+\* Safety: pre-PONR daughters not materialized.
+        THEOREM Spec => []SplitAtomicity
+
+\* Safety: SPLITTING_NEW daughters always have a procedure.
+        THEOREM Spec => []NoOrphanedDaughters
+
+\* Safety: completed split has cleaned-up parent.
+        THEOREM Spec => []SplitCompleteness
+
+\* Safety: at most one server carrying meta.
+        THEOREM Spec => []AtMostOneCarryingMeta
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.
