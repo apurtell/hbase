@@ -28,7 +28,8 @@ VARIABLE regionState,
          zkNode,
          availableWorkers,
          suspendedOnMeta,
-         blockedOnMeta
+         blockedOnMeta,
+         regionKeyRange
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -65,6 +66,8 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 GoOffline(r) ==
   \* Master must be alive for in-memory state operations.
   /\ masterAlive = TRUE
+  \* Region must exist (have an assigned keyspace).
+  /\ regionKeyRange[r] # NoRange
   \* Guards: region is CLOSED and has no active procedure.
   /\ regionState[r].state = "CLOSED"
   /\ regionState[r].procType = "NONE"
@@ -87,7 +90,8 @@ GoOffline(r) ==
         masterVars,
         metaTable,
         peVars,
-        zkNode
+        zkNode,
+        regionKeyRange
      >>
 
 \* The master detects that a RegionServer has crashed.  The master's
@@ -136,7 +140,8 @@ MasterDetectCrash(s) ==
         scpRegions,
         walFenced,
         serverRegions,
-        zkNode
+        zkNode,
+        regionKeyRange
      >>
 
 ---------------------------------------------------------------------------
@@ -177,7 +182,8 @@ MasterCrash ==
         carryingMeta,
         availableWorkers,
         suspendedOnMeta,
-        blockedOnMeta
+        blockedOnMeta,
+        regionKeyRange
      >>
   \* Durable state survives.
   /\ UNCHANGED << metaTable, procStore >>
@@ -337,6 +343,12 @@ MasterRecover ==
   \* Clear blocked procedures.
   /\ blockedOnMeta' = {}
   \* Durable state unchanged.
-  /\ UNCHANGED << metaTable, procStore, rsOnlineRegions, walFenced, zkNode >>
+  /\ UNCHANGED << metaTable,
+        procStore,
+        rsOnlineRegions,
+        walFenced,
+        zkNode,
+        regionKeyRange
+     >>
 
 ============================================================================

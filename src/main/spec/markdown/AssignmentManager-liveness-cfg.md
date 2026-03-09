@@ -1,65 +1,76 @@
-# AssignmentManager-liveness.cfg — Liveness Checking Config
+# AssignmentManager-liveness.cfg — Liveness Config
 
 **Source:** [`AssignmentManager-liveness.cfg`](../AssignmentManager-liveness.cfg)
 
-Liveness-only TLC model configuration: **2 regions, 2 servers**, no symmetry reduction. Liveness properties (temporal `PROPERTY` clauses) are **incompatible** with TLC's `SYMMETRY` reduction — symmetry can create false lasso cycles that don't exist in the real state graph. This config omits `SYMMETRY` so that liveness checking is sound.
-
-**Trade-off:** the state space is ~4× larger without symmetry (for 2r/2s). This config is intended for overnight / batch runs.
-
 ---
 
-## Specification
+TLC model configuration for liveness checking.
+
+Liveness properties (temporal PROPERTY clauses) are INCOMPATIBLE with
+TLC's SYMMETRY reduction.  Symmetry can create false lasso cycles that
+don't exist in the real state graph.  This config OMITS SYMMETRY so
+that liveness checking is sound.
+
+Trade-off: the state space is much larger without symmetry.
+This config is intended for overnight / batch runs.
+
+Run:
+/usr/bin/java -XX:+UseParallelGC \
+-cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
 
 ```cfg
 SPECIFICATION Spec
 ```
 
----
-
-## Constants
-
-Same as primary config (2r/2s):
-
-| Constant | Value | Notes |
-|----------|-------|-------|
-| `Regions` | `{r1, r2}` | 2 model-value regions |
-| `Servers` | `{s1, s2}` | 2 model-value servers |
-| `NoServer` | `NoServer` | Sentinel |
-| `NoProcedure` | `NoProcedure` | Sentinel |
-| `NoTransition` | `NoTransition` | Sentinel |
-| `MaxRetries` | `1` | Max FAILED_OPEN retries |
-| `UseReopen` | `TRUE` | branch-2 REOPEN |
-| `UseRSOpenDuplicateQuirk` | `FALSE` | Disable silent-drop |
-| `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery |
-| `MaxWorkers` | `2` | PEWorker thread pool size |
-| `UseBlockOnMetaWrite` | `FALSE` | Async meta writes |
+Model values
 
 ```cfg
 CONSTANTS
-    Regions = {r1, r2}
-    Servers = {s1, s2}
     NoServer = NoServer
     NoProcedure = NoProcedure
     NoTransition = NoTransition
+    NoRange = NoRange
+    Servers = {s1, s2}
+    Regions = {r1, r2, r3}
+    DeployedRegions = {r1, r2}
+    MaxKey = 8
     MaxRetries = 1
-    UseReopen = TRUE
-    UseRSOpenDuplicateQuirk = FALSE
-    UseRestoreSucceedQuirk = FALSE
     MaxWorkers = 2
+```
+
+UseReopen = TRUE models branch-2's additional REOPEN procedure
+
+```cfg
+    UseReopen = TRUE
+```
+
+UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
+silent-drop behavior to avoid deadlock.  Set TRUE to model the
+implementation quirk (AssignRegionHandler.process()).
+
+```cfg
+    UseRSOpenDuplicateQuirk = FALSE
+```
+
+UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
+Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
+bug where FAILED_OPEN reports are replayed as OPENED.
+
+```cfg
+    UseRestoreSucceedQuirk = FALSE
+```
+
+UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
+procedures suspend and release the PEWorker on async meta writes.
+
+```cfg
     UseBlockOnMetaWrite = FALSE
 ```
 
----
+NO SYMMETRY -- required for sound liveness checking.
 
-## No Symmetry
-
-**NO `SYMMETRY` declaration** — required for sound liveness checking.
-
----
-
-## Invariants
-
-All 21 safety invariants (checked alongside liveness):
+Safety invariants (checked alongside liveness)
 
 ```cfg
 INVARIANT
@@ -84,11 +95,11 @@ INVARIANT
     DispatchCorrespondance
     NoOrphanedProcedures
     NoPEWorkerDeadlock
+    KeyspaceCoverage
+    SplitMergeMutualExclusion
 ```
 
----
-
-## Action Constraints
+Action properties
 
 ```cfg
 ACTION_CONSTRAINT
@@ -96,24 +107,16 @@ ACTION_CONSTRAINT
     SCPMonotonicity
 ```
 
----
+State constraint: bound concurrent split/merge procedures
 
-## Liveness Properties
+```cfg
+CONSTRAINT
+    SplitMergeConstraint
+```
 
-The reason this config exists:
+Liveness properties (the reason this config exists)
 
 ```cfg
 PROPERTY
     MetaEventuallyAssigned
-```
-
----
-
-## Running
-
-```bash
-# Intended for overnight / batch runs (no symmetry, ~4x larger state space):
-/usr/bin/java -XX:+UseParallelGC \
-  -cp "tla2tools.jar:CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
 ```

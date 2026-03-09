@@ -2,162 +2,331 @@
 
 **Source:** [`Master.tla`](../Master.tla)
 
-Master-side actions for the HBase AssignmentManager. Contains actions for master-driven events:
-
-- **GoOffline** — table disable (CLOSED → OFFLINE)
-- **MasterDetectCrash** — ZK expiry → server marked CRASHED, SCP started
-- **MasterCrash** — master JVM crash, in-memory state lost
-- **MasterRecover** — master restart, rebuild from metaTable + procStore
+Master-side actions for the HBase AssignmentManager. Contains actions for master-driven events: GoOffline, MasterDetectCrash, MasterCrash, MasterRecover.
 
 ---
-
-## Module Declaration
 
 ```tla
 ------------------------------- MODULE Master ---------------------------------
+```
+
+Master-side actions for the HBase AssignmentManager.
+
+Contains actions for master-driven events:
+GoOffline — table disable (CLOSED → OFFLINE)
+MasterDetectCrash — ZK expiry → server marked CRASHED, SCP started
+MasterCrash — master JVM crash, in-memory state lost
+MasterRecover — master restart, rebuild from metaTable + procStore
+
+```tla
 EXTENDS Types
 ```
 
-## Variables
+All shared variables are declared as VARIABLE parameters so that
+the root module can substitute its own variables via INSTANCE.
 
 ```tla
-VARIABLE regionState, metaTable, dispatchedOps, pendingReports,
-         rsOnlineRegions, serverState, scpState, scpRegions,
-         walFenced, carryingMeta, serverRegions,
-         procStore, masterAlive, zkNode,
-         availableWorkers, suspendedOnMeta, blockedOnMeta
+VARIABLE regionState,
+         metaTable,
+         dispatchedOps,
+         pendingReports,
+         rsOnlineRegions,
+         serverState,
+         scpState,
+         scpRegions,
+         walFenced,
+         carryingMeta,
+         serverRegions,
+         procStore,
+         masterAlive,
+         zkNode,
+         availableWorkers,
+         suspendedOnMeta,
+         blockedOnMeta,
+         regionKeyRange
 ```
 
-### Variable Group Shorthands
-
-Used in `UNCHANGED` clauses for conciseness:
+Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 
 ```tla
-rpcVars    == << dispatchedOps, pendingReports >>
-rsVars     == << rsOnlineRegions >>
-scpVars    == << scpState, scpRegions, walFenced, carryingMeta >>
+rpcVars == << dispatchedOps, pendingReports >>
+```
+
+Shorthand for the RS-side variable (used in UNCHANGED clauses).
+
+```tla
+rsVars == << rsOnlineRegions >>
+```
+
+Shorthand for the SCP-related variables (used in UNCHANGED clauses).
+
+```tla
+scpVars == << scpState, scpRegions, walFenced, carryingMeta >>
+```
+
+Shorthand for master lifecycle variables (used in UNCHANGED clauses).
+
+```tla
 masterVars == << masterAlive >>
-procStore   == << procStore >>
+```
+
+Shorthand for server tracking variables (used in UNCHANGED clauses).
+
+```tla
 serverVars == << serverState, serverRegions >>
-peVars     == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+```
+
+Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
+
+```tla
+peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 ```
 
 ---
 
-## Actions — Master-Side Events
+Actions -- master-side events
 
-### GoOffline(r)
+Transition from CLOSED back to OFFLINE.
+Used by RegionStateNode.offline() when a region is being taken fully
+offline (e.g., table disable).
+**Pre:** region is CLOSED with no procedure attached, master is alive,
+no SCP is actively processing on any server.
+**Post:** regionState set to OFFLINE with cleared location (in-memory
+only -- metaTable is NOT updated).  META retains CLOSED;
+divergence is resolved on master restart.
 
-Transition from CLOSED back to OFFLINE. Used by `RegionStateNode.offline()` when a region is being taken fully offline (e.g., table disable).
-
-**Pre:** Region is CLOSED with no procedure attached, master is alive, no SCP is actively processing on any server.
-
-**Post:** `regionState` set to OFFLINE with cleared location (in-memory only — `metaTable` is NOT updated). META retains CLOSED; divergence is resolved on master restart.
-
-*Source: `RegionStateNode.offline()` sets state to OFFLINE and clears the region location without writing to meta.*
+*Source:* RegionStateNode.offline() sets state to OFFLINE
+and clears the region location without writing to meta.
 
 ```tla
 GoOffline(r) ==
-  /\ masterAlive = TRUE
-  /\ regionState[r].state = "CLOSED"
-  /\ regionState[r].procType = "NONE"
-  /\ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
-  /\ regionState' =
-       [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
-  /\ UNCHANGED << scpVars, rpcVars, serverVars, procStore,
-                   rsVars, masterVars, metaTable, peVars, zkNode >>
 ```
 
----
+Master must be alive for in-memory state operations.
 
-### MasterDetectCrash(s)
+```tla
+  /\ masterAlive = TRUE
+```
 
-The master detects that a RegionServer has crashed. The master's `RegionServerTracker` watcher observes that the RS's ZK ephemeral node has been deleted (`zkNode[s] = FALSE`) and calls `expireServer()`.
+Region must exist (have an assigned keyspace).
 
-Regions remain in their pre-crash state (OPEN, OPENING, CLOSING) with location pointing at the crashed server. The RS may still be a **zombie** (`rsOnlineRegions` not yet cleared). This creates the window where `NoDoubleAssignment` can be violated if WALs are not fenced before regions are reassigned.
+```tla
+  /\ regionKeyRange[r] # NoRange
+```
 
-**Pre:** Master is alive, server is ONLINE in master's view, ZK ephemeral node is gone (`zkNode[s] = FALSE`).
+Guards: region is CLOSED and has no active procedure.
 
-**Post:** `serverState` set to CRASHED, SCP started. Non-deterministically decides if the server was hosting `hbase:meta` — if `carryingMeta`, SCP enters `ASSIGN_META`; otherwise `GET_REGIONS`.
+```tla
+  /\ regionState[r].state = "CLOSED"
+  /\ regionState[r].procType = "NONE"
+```
 
-*Impl state: `SERVER_CRASH_START` (=1), absorbed into this action. See SCP.tla for the full enum traceability table.*
+Guard: no SCP is actively processing on any server.
+In the implementation, GoOffline runs as part of DisableTableProcedure,
+which is not created during crash recovery.  This prevents GoOffline
+from firing on regions that are about to be processed by SCP.
 
-*Source: `RegionServerTracker.processAsActiveMaster()` detects child removal and calls `ServerManager.expireServer()`, which calls `moveFromOnlineToDeadServers()` and then `AM.submitServerCrash()`.*
+```tla
+  /\ \A s \in Servers: scpState[s] \in { "NONE", "DONE" }
+```
+
+Move region to OFFLINE with cleared location (in-memory only).
+
+```tla
+  /\ regionState' =
+       [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
+```
+
+Meta is NOT updated: RegionStateNode.offline()
+does not write to meta.  metaTable retains CLOSED; divergence is
+resolved on master restart.  See Appendix D.5.
+
+```tla
+  /\ UNCHANGED << scpVars,
+        rpcVars,
+        serverVars,
+        procStore,
+        rsVars,
+        masterVars,
+        metaTable,
+        peVars,
+        zkNode,
+        regionKeyRange
+     >>
+```
+
+The master detects that a RegionServer has crashed.  The master's
+RegionServerTracker watcher observes that the RS's ZK ephemeral
+node has been deleted (zkNode[s] = FALSE) and calls expireServer().
+
+Regions remain in their pre-crash state (OPEN, OPENING, CLOSING)
+with location pointing at the crashed server.  The RS may still
+be a zombie (rsOnlineRegions not yet cleared).  This creates the
+window where NoDoubleAssignment can be violated if WALs are not
+fenced before regions are reassigned.
+
+**Pre:** master is alive, server is ONLINE in master's view,
+ZK ephemeral node is gone (zkNode[s] = FALSE).
+**Post:** serverState set to CRASHED, SCP started.
+
+Impl state: SERVER_CRASH_START (=1), absorbed into this action.
+See SCP.tla header for the full enum traceability table.
+
+*Source:* RegionServerTracker.processAsActiveMaster() detects
+child removal and calls ServerManager.expireServer(),
+which calls moveFromOnlineToDeadServers() and then
+AM.submitServerCrash().
 
 ```tla
 MasterDetectCrash(s) ==
+```
+
+Master must be alive to detect crashes.
+
+```tla
   /\ masterAlive = TRUE
+```
+
+Master still considers this server ONLINE.
+
+```tla
   /\ serverState[s] = "ONLINE"
+```
+
+ZK ephemeral node is gone — ZK has detected the RS death.
+
+```tla
   /\ zkNode[s] = FALSE
   /\ serverState' = [serverState EXCEPT ![s] = "CRASHED"]
+```
+
+Non-deterministic: crashed server may or may not have been
+hosting hbase:meta.  If carryingMeta, SCP must reassign meta
+first (ASSIGN_META state); otherwise proceed to GET_REGIONS.
+
+```tla
   /\ \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
         /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
      \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
         /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
   /\ UNCHANGED << rpcVars,
         peVars,
-        procStore, rsVars, masterVars,
-        regionState, metaTable, scpRegions,
-        walFenced, serverRegions, zkNode >>
+        procStore,
+        rsVars,
+        masterVars,
+        regionState,
+        metaTable,
+        scpRegions,
+        walFenced,
+        serverRegions,
+        zkNode,
+        regionKeyRange
+     >>
 ```
 
 ---
 
-## Actions — Master Crash and Recovery
+Actions -- master crash and recovery
 
-### MasterCrash
+The active master JVM crashes.  All in-memory state is lost.
+Durable state (metaTable, procStore) and RS-side state
+(rsOnlineRegions) survive.  WAL fencing (walFenced) survives
+because fencing is an HDFS-level operation, not master-level.
 
-The active master JVM crashes. All in-memory state is lost. Durable state (`metaTable`, `procStore`) and RS-side state (`rsOnlineRegions`) survive. WAL fencing (`walFenced`) survives because fencing is an HDFS-level operation, not master-level.
+In-memory variables (regionState, serverState, dispatchedOps,
+pendingReports, scpState, scpRegions, serverRegions,
+carryingMeta) become stale but are left UNCHANGED because:
+1. All invariants referencing them are gated on masterAlive=TRUE.
+2. All actions using them require masterAlive=TRUE as a guard.
+3. MasterRecover rebuilds them from durable state.
+4. Mutating them here would create spurious action-constraint
+violations (TransitionValid, SCPMonotonicity).
+The regions are still open on their RegionServers and hbase:meta
+is still valid — only the master's in-memory view vanishes.
 
-In-memory variables (`regionState`, `serverState`, `dispatchedOps`, `pendingReports`, `scpState`, `scpRegions`, `serverRegions`, `carryingMeta`) become stale but are left `UNCHANGED` because:
+**Pre:** masterAlive = TRUE.
+**Post:** masterAlive = FALSE.
 
-1. All invariants referencing them are gated on `masterAlive = TRUE`.
-2. All actions using them require `masterAlive = TRUE` as a guard.
-3. `MasterRecover` rebuilds them from durable state.
-4. Mutating them here would create spurious action-constraint violations (`TransitionValid`, `SCPMonotonicity`).
-
-The regions are still open on their RegionServers and `hbase:meta` is still valid — only the master's in-memory view vanishes.
-
-**Pre:** `masterAlive = TRUE`.
-
-**Post:** `masterAlive = FALSE`.
-
-*Source: Master JVM crash — all in-memory state is lost.*
+*Source:* Master JVM crash — all in-memory state is lost.
 
 ```tla
 MasterCrash ==
+```
+
+Master must be alive to crash
+
+```tla
   /\ masterAlive = TRUE
   /\ masterAlive' = FALSE
-  /\ UNCHANGED << regionState, serverState, dispatchedOps,
-                   pendingReports, scpState, scpRegions,
-                   serverRegions, carryingMeta,
-                   availableWorkers, suspendedOnMeta, blockedOnMeta >>
+```
+
+In-memory master state becomes stale (gated on masterAlive).
+
+```tla
+  /\ UNCHANGED << regionState,
+        serverState,
+        dispatchedOps,
+        pendingReports,
+        scpState,
+        scpRegions,
+        serverRegions,
+        carryingMeta,
+        availableWorkers,
+        suspendedOnMeta,
+        blockedOnMeta,
+        regionKeyRange
+     >>
+```
+
+Durable state survives.
+
+```tla
   /\ UNCHANGED << metaTable, procStore >>
+```
+
+RS-side state survives.
+
+```tla
   /\ UNCHANGED rsOnlineRegions
+```
+
+WAL fencing survives (HDFS-level).
+
+```tla
   /\ UNCHANGED walFenced
+```
+
+ZK ephemeral nodes survive (external to master).
+
+```tla
   /\ UNCHANGED zkNode
 ```
 
----
+The master recovers after a crash.  Rebuilds in-memory state from
+durable storage (metaTable and procStore).
 
-### MasterRecover
+This is modeled as a single atomic action because no external
+interactions happen between the recovery sub-steps (meta scan,
+procedure reload, restoreSucceedState).
 
-The master recovers after a crash. Rebuilds in-memory state from durable storage (`metaTable` and `procStore`).
+Recovery steps:
+1. Rebuild regionState from metaTable (state and location only;
+procedure fields initially NONE/IDLE).
+2. Reload procedures from procStore — for each region with a
+persisted procedure, set procType/procStep/targetServer from
+the record.
+3. For procedures at REPORT_SUCCEED, apply restoreSucceedState
+to compute the recovered regionState.  This replays the
+in-memory state that was updated (RS report consumed) but
+not yet persisted to metaTable before the crash.
+4. Set masterAlive = TRUE.
 
-This is modeled as a single atomic action because no external interactions happen between the recovery sub-steps (meta scan, procedure reload, `restoreSucceedState`).
+**Pre:** masterAlive = FALSE.
+**Post:** masterAlive = TRUE, regionState rebuilt, procedures reattached.
 
-**Recovery steps:**
-
-1. **Rebuild `regionState` from `metaTable`** — state and location only; procedure fields initially NONE/IDLE.
-2. **Reload procedures from `procStore`** — for each region with a persisted procedure, set `procType`/`procStep`/`targetServer` from the record.
-3. **Apply `restoreSucceedState`** for procedures at `REPORT_SUCCEED` — replays the in-memory state that was updated (RS report consumed) but not yet persisted to `metaTable` before the crash.
-4. **Set `masterAlive = TRUE`.**
-
-**Pre:** `masterAlive = FALSE`.
-
-**Post:** `masterAlive = TRUE`, `regionState` rebuilt, procedures reattached.
-
-*Source: `HMaster.finishActiveMasterInitialization()` → `ProcedureExecutor.start()` → recovery of `WALProcedureStore` → `restoreSucceedState()` callbacks.*
+*Source:* HMaster.finishActiveMasterInitialization() →
+ProcedureExecutor.start() → recovery of WALProcedureStore →
+restoreSucceedState() callbacks.
 
 ```tla
 MasterRecover ==
@@ -180,21 +349,52 @@ MasterRecover ==
                LET baseState == metaRec.state
                    baseLoc == metaRec.location
                IN \* Step 3: If procedure was at REPORT_SUCCEED,
-                   \* apply restoreSucceedState.
+```
+
+apply restoreSucceedState to recover the in-memory
+state that reflects the RS report (consumed before
+the crash) but was not yet persisted to metaTable.
+
+```tla
                    IF procRec.step = "REPORT_SUCCEED"
                    THEN LET restored ==
                               IF procRec.transitionCode = "CLOSED"
-                              THEN [ state |-> "CLOSED", location |-> NoServer ]
+                              THEN \* Close-path: always CLOSED, no location.
+                                [ state |-> "CLOSED", location |-> NoServer ]
                               ELSE \* Open-path (OPENED or FAILED_OPEN).
                                 IF UseRestoreSucceedQuirk
-                                THEN [ state |-> "OPEN",
-                                       location |-> procRec.targetServer ]
+                                THEN \* Bug-faithful: unconditionally replay as OPENED,
+```
+
+ignoring transitionCode.  Even a FAILED_OPEN
+gets replayed as OPEN.
+*Source:* OpenRegionProcedure.restoreSucceedState()
+L128-136.
+
+```tla
+                                  [ state |-> "OPEN",
+                                    location |-> procRec.targetServer
+                                  ]
                                 ELSE \* Correct: check transitionCode.
                                   IF procRec.transitionCode = "OPENED"
                                   THEN [ state |-> "OPEN",
-                                         location |-> procRec.targetServer ]
-                                  ELSE [ state |-> "FAILED_OPEN",
-                                         location |-> NoServer ]
+                                      location |-> procRec.targetServer
+                                    ]
+                                  ELSE \* FAILED_OPEN — keep in failed state.
+```
+
+Location cleared: regionFailedOpen() calls
+removeRegionFromServer(); the give-up path
+(TRSPPersistToMetaOpen) sets location=NoServer.
+During REPORT_SUCCEED, TRSPReportSucceedOpen
+leaves location intact (OPENING), but recovery
+must model the eventual FAILED_OPEN terminal
+state, not the transient REPORT_SUCCEED window.
+
+```tla
+                                    [ state |-> "FAILED_OPEN",
+                                      location |-> NoServer
+                                    ]
                      IN [ state |-> restored.state,
                            location |-> restored.location,
                            procType |-> procRec.type,
@@ -202,7 +402,12 @@ MasterRecover ==
                            targetServer |-> procRec.targetServer,
                            retries |-> 0
                          ]
-                   ELSE \* Procedure not at REPORT_SUCCEED — just re-attach.
+                   ELSE \* Procedure not at REPORT_SUCCEED — just re-attach
+```
+
+with state from metaTable.
+
+```tla
                      [ state |-> baseState,
                        location |-> baseLoc,
                        procType |-> procRec.type,
@@ -213,23 +418,57 @@ MasterRecover ==
        ]
 ```
 
-#### Server State Recovery
+ServerState: read ZK ephemeral nodes to determine server liveness.
+On startup the master connects to ZK and gets the list of live
+RegionServers (via ephemeral nodes). Any server whose ephemeral
+node is missing is marked CRASHED and gets a fresh SCP.
 
-Read ZK ephemeral nodes to determine server liveness. On startup the master connects to ZK and gets the list of live RegionServers (via ephemeral nodes). Any server whose ephemeral node is missing is marked CRASHED and gets a fresh SCP.
-
-*Source: `HMaster.finishActiveMasterInitialization()` → `RegionServerTracker.upgrade()` → `ServerManager.findDeadServersAndProcess()`*
+*Source:* HMaster.finishActiveMasterInitialization() ->
+RegionServerTracker.upgrade() ->
+ServerManager.findDeadServersAndProcess()
 
 ```tla
-  \* (continuation of MasterRecover)
   /\ serverState' =
-       [s \in Servers |-> IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"]
-  /\ scpState' =
-       [s \in Servers |-> IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"]
-  /\ scpRegions' = [s \in Servers |-> {}]
-  /\ carryingMeta' = [s \in Servers |-> FALSE]
-  /\ dispatchedOps' = [s \in Servers |-> {}]
-  /\ pendingReports' = {}
+       [s \in Servers |-> IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
+       ]
+```
 
+Crashed servers get a fresh SCP at GET_REGIONS.
+Non-crashed servers get no SCP.
+
+```tla
+  /\ scpState' =
+       [s \in Servers |-> IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"
+       ]
+```
+
+Reset SCP region sets (fresh SCPs will re-scan meta).
+
+```tla
+  /\ scpRegions' = [s \in Servers |-> {}]
+```
+
+Reset carryingMeta (meta assignment handled by fresh SCP if needed).
+
+```tla
+  /\ carryingMeta' = [s \in Servers |-> FALSE]
+```
+
+Clear in-flight RPCs (stale from pre-crash master).
+
+```tla
+  /\ dispatchedOps' = [s \in Servers |-> {}]
+```
+
+Clear pending reports (stale from pre-crash master).
+
+```tla
+  /\ pendingReports' = {}
+```
+
+Rebuild serverRegions from recovered regionState.
+
+```tla
   /\ serverRegions' =
        [s \in Servers |->
          {r \in Regions:
@@ -239,17 +478,58 @@ Read ZK ephemeral nodes to determine server liveness. On startup the master conn
                THEN \* Use restored location
                  IF procRec.transitionCode = "CLOSED"
                  THEN FALSE
+```
+
+CLOSED — no server
+
+```tla
                  ELSE IF UseRestoreSucceedQuirk
                    THEN procRec.targetServer = s
                    ELSE IF procRec.transitionCode = "OPENED"
                      THEN procRec.targetServer = s
                      ELSE FALSE
+```
+
+FAILED_OPEN: no server tracking
+
+```tla
                ELSE metaRec.location = s
          }
        ]
+```
+
+Master is now alive.
+
+```tla
   /\ masterAlive' = TRUE
+```
+
+Reset PEWorker pool state on recovery.
+
+```tla
   /\ availableWorkers' = MaxWorkers
+```
+
+Clear suspended procedures.
+
+```tla
   /\ suspendedOnMeta' = {}
+```
+
+Clear blocked procedures.
+
+```tla
   /\ blockedOnMeta' = {}
-  /\ UNCHANGED << metaTable, procStore, rsOnlineRegions, walFenced, zkNode >>
+```
+
+Durable state unchanged.
+
+```tla
+  /\ UNCHANGED << metaTable,
+        procStore,
+        rsOnlineRegions,
+        walFenced,
+        zkNode,
+        regionKeyRange
+     >>
 ```

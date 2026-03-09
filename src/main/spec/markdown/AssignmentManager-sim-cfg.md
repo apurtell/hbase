@@ -1,63 +1,97 @@
-# AssignmentManager-sim.cfg — Simulation (3r/3s) Config
+# AssignmentManager-sim.cfg — Simulation Config
 
 **Source:** [`AssignmentManager-sim.cfg`](../AssignmentManager-sim.cfg)
 
-Simulation model configuration: **3 regions, 3 servers**, no crash limit. Run alongside the primary exhaustive config to form the two-tier verification strategy:
-
-1. **Primary** (`AssignmentManager.cfg`): fast exhaustive 2r/2s
-2. **Simulation** (this file): deep random traces at 3r/3s
-
-Simulation mode randomly samples long behaviors, providing probabilistic coverage of the full 3r/3s state space including cascading crash scenarios, master crash/recovery cycles, and multi-cycle assign/unassign/move sequences.
-
-> [!NOTE]
-> This config uses `MaxRetries = 2` (vs 1 in the exhaustive configs), so simulation is the **only** verification of the deeper retry behavior.
-
 ---
 
-## Specification
+TLC simulation configuration for AssignmentManager.tla
+
+Simulation model: 7 regions (3 deployed + 4 unused), 3 servers, no crash limit.
+Run at EVERY iteration alongside the primary exhaustive config.
+Together they form the two-tier verification strategy:
+1. Primary (AssignmentManager.cfg): fast exhaustive 6r/2s
+2. Simulation (this file): deep random traces at 7r/3s
+
+The state space is naturally finite with region-keyed procedures
+(no StateConstraint on a procedure ID counter is needed).
+Simulation mode randomly samples long behaviors, providing
+probabilistic coverage of the full 7r/3s state space including
+cascading crash scenarios, master crash/recovery cycles, and
+multi-cycle assign/unassign/move sequences.  Note: this config
+uses MaxRetries = 2 (vs 1 in the exhaustive configs), so
+simulation is the only verification of the deeper retry behavior.
+
+Three-tier simulation durations:
+Per-iteration (routine):      300s  (5 min)  — quick feedback each iteration
+Post-iteration (validation):  900s  (15 min) — after completing an iteration
+Post-phase (milestone):       3600s (1 hr)   — after completing a phase
+
+Via MCP tool (override default 3s with extraJavaOpts):
+Per-iteration:
+tlaplus_mcp_tlc_smoke with cfgFile=AssignmentManager-sim.cfg
+extraJavaOpts: ["-Dtlc2.TLC.stopAfter=300"]
+Post-iteration:
+tlaplus_mcp_tlc_smoke with cfgFile=AssignmentManager-sim.cfg
+extraJavaOpts: ["-Dtlc2.TLC.stopAfter=900"]
+
+Via command line (adjust -Dtlc2.TLC.stopAfter for duration in seconds):
+/usr/bin/java -XX:+UseParallelGC \
+-Dtlc2.TLC.stopAfter=900 \
+-cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" \
+tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate -workers auto
+
+For post-phase (1 hour):  -Dtlc2.TLC.stopAfter=3600
 
 ```cfg
 SPECIFICATION Spec
 ```
 
----
-
-## Constants
-
-| Constant | Value | Notes |
-|----------|-------|-------|
-| `Regions` | `{r1, r2, r3}` | 3 model-value regions |
-| `Servers` | `{s1, s2, s3}` | 3 model-value servers |
-| `NoServer` | `NoServer` | Sentinel |
-| `NoProcedure` | `NoProcedure` | Sentinel |
-| `NoTransition` | `NoTransition` | Sentinel |
-| `MaxRetries` | `2` | Higher than exhaustive configs for deeper retry coverage |
-| `UseReopen` | `TRUE` | Models branch-2's REOPEN procedure |
-| `UseRSOpenDuplicateQuirk` | `FALSE` | Disable silent-drop |
-| `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery |
-| `MaxWorkers` | `2` | PEWorker thread pool size |
-| `UseBlockOnMetaWrite` | `FALSE` | Async meta writes |
+Model values
 
 ```cfg
 CONSTANTS
-    Regions = {r1, r2, r3}
-    Servers = {s1, s2, s3}
     NoServer = NoServer
     NoProcedure = NoProcedure
     NoTransition = NoTransition
+    NoRange = NoRange
+    Servers = {s1, s2, s3}
+    Regions = {r1, r2, r3, r4, r5, r6, r7}
+    DeployedRegions = {r1, r2, r3}
+    MaxKey = 12
     MaxRetries = 2
-    UseReopen = TRUE
-    UseRSOpenDuplicateQuirk = FALSE
-    UseRestoreSucceedQuirk = FALSE
     MaxWorkers = 2
+```
+
+UseReopen = TRUE models branch-2's additional REOPEN procedure
+
+```cfg
+    UseReopen = TRUE
+```
+
+UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
+silent-drop behavior to avoid deadlock.  Set TRUE to model the
+implementation quirk (AssignRegionHandler.process()).
+
+```cfg
+    UseRSOpenDuplicateQuirk = FALSE
+```
+
+UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
+Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
+bug where FAILED_OPEN reports are replayed as OPENED.
+
+```cfg
+    UseRestoreSucceedQuirk = FALSE
+```
+
+UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
+procedures suspend and release the PEWorker on async meta writes.
+
+```cfg
     UseBlockOnMetaWrite = FALSE
 ```
 
----
-
-## Invariants
-
-All 21 safety invariants (same as primary config):
+Invariants to check
 
 ```cfg
 INVARIANT
@@ -82,11 +116,12 @@ INVARIANT
     DispatchCorrespondance
     NoOrphanedProcedures
     NoPEWorkerDeadlock
+    KeyspaceCoverage
+    SplitMergeMutualExclusion
 ```
 
----
-
-## Action Constraints
+Action property: every state change follows ValidTransition
+and SCP progress is monotonic
 
 ```cfg
 ACTION_CONSTRAINT
@@ -94,29 +129,12 @@ ACTION_CONSTRAINT
     SCPMonotonicity
 ```
 
----
+State constraint: bound concurrent split/merge procedures
 
-## Liveness
-
-Liveness properties (`PROPERTY MetaEventuallyAssigned`) require symmetry to be disabled. Use [`AssignmentManager-liveness.cfg`](../AssignmentManager-liveness.cfg) for overnight liveness checking.
-
----
-
-## Running
-
-Three-tier simulation durations:
-
-| Tier | Duration | Use Case |
-|------|----------|----------|
-| Per-iteration (routine) | 300s (5 min) | Quick feedback each iteration |
-| Post-iteration (validation) | 900s (15 min) | After completing an iteration |
-| Post-phase (milestone) | 3600s (1 hr) | After completing a phase |
-
-```bash
-# Via command line (adjust -Dtlc2.TLC.stopAfter for duration in seconds):
-/usr/bin/java -XX:+UseParallelGC \
-  -Dtlc2.TLC.stopAfter=900 \
-  -cp "tla2tools.jar:CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate \
-  -workers auto -cleanup
+```cfg
+CONSTRAINT
+    SplitMergeConstraint
 ```
+
+Liveness properties require symmetry to be disabled.
+Use AssignmentManager-liveness.cfg for liveness checking.
