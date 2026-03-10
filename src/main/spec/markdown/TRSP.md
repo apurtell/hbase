@@ -1454,7 +1454,7 @@ Bind the target server for readability.
 
 ```tla
         /\ LET s == regionState[r].targetServer
-           IN /\ regionState[r].state \in { "OPEN", "CLOSING", "SPLITTING" }
+           IN /\ regionState[r].state \in { "OPEN", "CLOSING", "SPLITTING", "MERGING" }
 ```
 
 Transition region to `CLOSING` and advance to `CONFIRM_CLOSED`.

@@ -51,6 +51,20 @@ ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
 CONSTANTS UseReopen
 ASSUME UseReopen \in BOOLEAN
 
+\* NoRegion: sentinel model value for "no region reference" in
+\* parentProc records.  Used when a region-reference field is not
+\* applicable (e.g., split pre-PONR before daughters are chosen).
+CONSTANTS NoRegion
+ASSUME NoRegion \notin Regions
+
+\* UseMerge: when TRUE, merge actions are enabled in Next and Fairness.
+\* With both split and merge active, the state space becomes unbounded
+\* (split -> daughters -> merge -> parent -> split -> ...).  Setting
+\* FALSE keeps exhaustive model checking tractable (split-only).
+\* Setting TRUE enables merge in simulation mode.
+CONSTANTS UseMerge
+ASSUME UseMerge \in BOOLEAN
+
 \* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
 \* enabled, modeling AssignRegionHandler.process() L107-115 where the
 \* RS silently drops OPEN requests for already-online regions without
@@ -206,15 +220,28 @@ ParentProcStep ==
 
 \* Parent procedure types.  "NONE" means no parent procedure is
 \* attached.  Extensible: "MERGE" will be added in a future iteration.
-ParentProcType == { "SPLIT" }
+ParentProcType == { "SPLIT", "MERGE" }
 
 \* Sentinel: no parent procedure attached.
-NoParentProc == [ type |-> "NONE", step |-> "NONE" ]
+NoParentProc == [ type |-> "NONE", step |-> "NONE",
+                  ref1 |-> NoRegion, ref2 |-> NoRegion ]
 
 \* Type definition for parentProc records (used in TypeOK).
+\*
+\* ref1 and ref2 store region-identifier references that the parent
+\* procedure needs across steps, modeling persisted procedure fields:
+\*   Split: ref1 = daughter A, ref2 = daughter B
+\*          (set at PONR when daughters are chosen; NoRegion before)
+\*   Merge: ref1 = other target region, ref2 = merged region
+\*          (set at MergePrepare; cross-referenced on both targets)
+\*
+\* Source: SplitTableRegionProcedure.daughterOneRI/daughterTwoRI;
+\*         MergeTableRegionsProcedure.regionsToMerge[]/mergedRegion.
 ParentProcRecord ==
   [type:ParentProcType \cup { "NONE" },
-    step:ParentProcStep \cup { "NONE" }
+    step:ParentProcStep \cup { "NONE" },
+    ref1:Regions \cup { NoRegion },
+    ref2:Regions \cup { NoRegion }
   ]
 
 \* Procedure types.  "NONE" means no procedure is attached.

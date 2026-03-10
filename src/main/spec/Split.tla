@@ -147,8 +147,10 @@ SplitPrepare(r) ==
        ![r] =
        NewProcRecord("UNASSIGN", "CLOSE", regionState[r].location, NoTransition)]
   \* Create parent procedure record (yielding to child).
+  \* ref1/ref2 are NoRegion pre-PONR (daughters not yet chosen).
   /\ parentProc' =
-       [parentProc EXCEPT ![r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]]
+       [parentProc EXCEPT ![r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE",
+                                   ref1 |-> NoRegion, ref2 |-> NoRegion ]]
   \* Everything else unchanged.
   /\ UNCHANGED << scpVars,
         rpcVars,
@@ -185,7 +187,8 @@ SplitResumeAfterClose(r) ==
   \* No procedure attached -- child UNASSIGN cleared it.
   /\ regionState[r].procType = "NONE"
   \* Split is pending at the close phase.
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "SPAWNED_CLOSE"
   \* Re-attach SPLIT procedure to parent for protection.
   /\ regionState' =
        [regionState EXCEPT ![r].procType = "SPLIT", ![r].procStep = "IDLE"]
@@ -240,7 +243,8 @@ SplitUpdateMeta(r, dA, dB) ==
   \* The SPLIT procedure must be attached to this region.
   /\ regionState[r].procType = "SPLIT"
   \* Parent procedure has reached the point of no return.
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "PONR" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "PONR"
   \* Parent region must be CLOSED before meta can be updated.
   /\ regionState[r].state = "CLOSED"
   \* dA and dB are distinct unused identifiers.
@@ -304,7 +308,10 @@ SplitUpdateMeta(r, dA, dB) ==
              ![dB] =
              NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
   \* Parent yields to daughter ASSIGNs: step -> SPAWNED_OPEN.
-  /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN"]
+  \* Store daughter references for SplitDone to read back.
+  /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN",
+                                      ![r].ref1 = dA,
+                                      ![r].ref2 = dB]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -336,23 +343,19 @@ SplitDone(r) ==
   \* The SPLIT procedure must be attached to this region.
   /\ regionState[r].procType = "SPLIT"
   \* Parent procedure is waiting for daughters to open.
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_OPEN" ]
-  \* Identify daughters: OPEN regions whose keyspaces were carved
-  \* from this parent.  Under SplitMergeConstraint <= 1, these are
-  \* the only regions with keyspaces that partition the parent's range.
-  /\ LET startK == regionKeyRange[r].startKey
-         endK == regionKeyRange[r].endKey
-         mid == ( startK + endK ) \div 2
-         daughters ==
-           {d \in Regions:
-             /\ regionState[d].state = "OPEN"
-             /\ regionState[d].procType = "NONE"
-             /\ regionKeyRange[d] # NoRange
-             /\ \/ regionKeyRange[d] = [ startKey |-> startK, endKey |-> mid ]
-                \/ regionKeyRange[d] = [ startKey |-> mid, endKey |-> endK ]
-           }
-     IN \* Both daughters must be OPEN and unattached.
-        /\ Cardinality(daughters) = 2
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "SPAWNED_OPEN"
+  \* Read daughter references stored at PONR (SplitUpdateMeta).
+  /\ LET dA == parentProc[r].ref1
+         dB == parentProc[r].ref2
+     IN \* Daughters must have been stored.
+        /\ dA # NoRegion
+        /\ dB # NoRegion
+        \* Both daughters must be OPEN and unattached.
+        /\ regionState[dA].state = "OPEN"
+        /\ regionState[dA].procType = "NONE"
+        /\ regionState[dB].state = "OPEN"
+        /\ regionState[dB].procType = "NONE"
         \* Clear parent procedure state.
         /\ regionState' =
              [regionState EXCEPT
@@ -419,7 +422,8 @@ SplitFail(r) ==
   \* No procedure attached -- child UNASSIGN cleared it.
   /\ regionState[r].procType = "NONE"
   \* Split is pending at the close phase (pre-PONR).
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "SPAWNED_CLOSE"
   \* Create fresh ASSIGN TRSP to reopen the parent.
   /\ regionState' =
        [regionState EXCEPT

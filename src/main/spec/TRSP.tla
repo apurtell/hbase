@@ -912,7 +912,7 @@ TRSPDispatchClose(r) ==
         /\ r \notin blockedOnMeta
         \* Bind the target server for readability.
         /\ LET s == regionState[r].targetServer
-           IN /\ regionState[r].state \in { "OPEN", "CLOSING", "SPLITTING" }
+           IN /\ regionState[r].state \in { "OPEN", "CLOSING", "SPLITTING", "MERGING" }
               \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
               /\ regionState' =
                    [regionState EXCEPT

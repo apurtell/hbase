@@ -26,6 +26,7 @@ Action logic is factored into sub-modules:
 | **ProcStore**    | Procedure store invariants and recovery operators                              |
 | **ZK**           | ZooKeeper ephemeral-node lifecycle (session expiry)                            |
 | **Split**        | `SplitTableRegionProcedure` forward path and rollback                          |
+| **Merge**        | `MergeTableRegionsProcedure` forward path and rollback                         |
 
 ### Region Assignment Lifecycle
 
@@ -264,9 +265,10 @@ RegionExists(r) == regionKeyRange[r] # NoRange
 Two regions are **adjacent** when the first's `endKey` equals the second's `startKey`. Both must exist (have assigned keyspaces). Used as a precondition for merge operations (iterations 23+).
 
 ```tla
-Adjacent(r1, r2) == /\ RegionExists(r1)
-                    /\ RegionExists(r2)
-                    /\ regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
+Adjacent(r1, r2) ==
+  /\ RegionExists(r1)
+  /\ RegionExists(r2)
+  /\ regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
 ```
 
 PEWorker pool variables (used in `UNCHANGED` clauses).
@@ -287,6 +289,7 @@ master == INSTANCE Master
 ps == INSTANCE ProcStore
 zk == INSTANCE ZK
 split == INSTANCE Split
+merge == INSTANCE Merge
 ```
 
 ```tla
@@ -357,10 +360,11 @@ Active TRSP procedure has a TRSP step.
             regionState[r].procStep \in TRSPState
 ```
 
-Active `SPLIT` procedure has `IDLE` step (parent lock marker).
+Active `SPLIT` or `MERGE` procedure has `IDLE` step (parent lock marker).
 
 ```tla
        /\ regionState[r].procType = "SPLIT" => regionState[r].procStep = "IDLE"
+       /\ regionState[r].procType = "MERGE" => regionState[r].procStep = "IDLE"
 ```
 
 META table maps every region to a persistent `(state, location)` record.
@@ -509,7 +513,9 @@ OfflineImpliesNoLocation ==
                   "FAILED_OPEN",
                   "ABNORMALLY_CLOSED",
                   "SPLIT",
-                  "SPLITTING_NEW"
+                  "SPLITTING_NEW",
+                  "MERGED",
+                  "MERGING_NEW"
                 } =>
               regionState[r].location = NoServer
           )
@@ -528,31 +534,39 @@ Becomes further non-trivial when master crash is introduced: `metaTable` survive
 MetaConsistency ==
   masterAlive = TRUE =>
     \A r \in Regions:
-      RegionExists(r) => \/ /\ metaTable[r].state = regionState[r].state
-                            /\ metaTable[r].location = regionState[r].location
-                         \/ /\ regionState[r].state = "OFFLINE"
-                            /\ metaTable[r].state = "CLOSED"
-                            /\ regionState[r].location = NoServer
-                            /\ metaTable[r].location = NoServer
+      RegionExists(r) =>
+        \/ /\ metaTable[r].state = regionState[r].state
+           /\ metaTable[r].location = regionState[r].location
+        \/ /\ regionState[r].state = "OFFLINE"
+           /\ metaTable[r].state = "CLOSED"
+           /\ regionState[r].location = NoServer
+           /\ metaTable[r].location = NoServer
 ```
 
 Active procedure window: in-memory state may diverge from `metaTable` during TRSP execution. E.g., `TRSPReportSucceedOpen` sets state to `OPEN` while meta still shows `OPENING`; `TRSPPersistToMeta` retry resets to `GET_ASSIGN_CANDIDATE` while meta retains `OPENING`. Divergence is always resolved when the procedure completes or is cleared.
 
 ```tla
-                         \/ regionState[r].procType # "NONE"
+        \/ regionState[r].procType # "NONE"
 ```
 
 Parent procedure window: `parentProc` tracks the parent; `procType`/`procStep` temporarily reflect child TRSPs. Split is still in progress.
 
 ```tla
-                         \/ parentProc[r].type # "NONE"
+        \/ parentProc[r].type # "NONE"
 ```
 
 `SPLITTING_NEW` daughters: in-memory is `SPLITTING_NEW` while meta is `CLOSED` (Appendix C.8).
 
 ```tla
-                         \/ /\ regionState[r].state = "SPLITTING_NEW"
-                            /\ metaTable[r].state = "CLOSED"
+        \/ /\ regionState[r].state = "SPLITTING_NEW"
+           /\ metaTable[r].state = "CLOSED"
+```
+
+`MERGING_NEW` merged region: in-memory is `MERGING_NEW` while meta is `CLOSED` (same pattern as `SPLITTING_NEW`).
+
+```tla
+        \/ /\ regionState[r].state = "MERGING_NEW"
+           /\ metaTable[r].state = "CLOSED"
 ```
 
 ### `NoDoubleAssignment`
@@ -595,26 +609,28 @@ LockExclusivity ==
                         "FAILED_OPEN",
                         "OPENING",
                         "OPEN",
-                        "SPLITTING_NEW"
+                        "SPLITTING_NEW",
+                        "MERGING_NEW"
+                      }
 ```
 
-`SPLITTING_NEW`: daughters enter `ASSIGN` via `SplitUpdateMeta`, then `TRSPGetCandidate` picks a server, `TRSPDispatchOpen` transitions to `OPENING`.
+`SPLITTING_NEW` / `MERGING_NEW`: daughters/merged regions enter `ASSIGN` via `SplitUpdateMeta` / `MergeUpdateMeta`, then `TRSPGetCandidate` picks a server, `TRSPDispatchOpen` transitions to `OPENING`.
 
 ```tla
-                      }
               \/ /\ regionState[r].procType = "UNASSIGN"
                  /\ regionState[r].state \in
                       { "OPEN",
                         "SPLITTING",
+                        "MERGING",
                         "CLOSING",
                         "ABNORMALLY_CLOSED",
                         "CLOSED"
+                      }
 ```
 
-`SPLITTING`: split yields parent to `UNASSIGN` (`SplitPrepare` sets `procType=UNASSIGN` while parent is still in `SPLITTING` state).
+`SPLITTING` / `MERGING`: split/merge yields parent to `UNASSIGN` (`SplitPrepare`/`MergePrepare` sets `procType=UNASSIGN` while parent is still in `SPLITTING`/`MERGING` state).
 
 ```tla
-                      }
               \/ /\ regionState[r].procType = "MOVE"
                  /\ regionState[r].state \in
                       { "OPEN",
@@ -638,15 +654,17 @@ LockExclusivity ==
                       { "CLOSED",
                         "SPLIT",
                         "SPLITTING_NEW"
-```
-
-`CLOSED`: parent after close, before PONR. `SPLIT`: parent after PONR. `SPLITTING_NEW`: daughter lock before open yield.
-
-```tla
+                      }
+              \/ /\ regionState[r].procType = "MERGE"
+                 /\ regionState[r].state \in
+                      { "CLOSED",
+                        "MERGED"
                       }
           )
     )
 ```
+
+`CLOSED`: parent after close, before PONR. `SPLIT`/`MERGED`: parent after PONR. `SPLITTING_NEW`: daughter lock before open yield. `CLOSED` for merge: both targets after UNASSIGN.
 
 ### `RSMasterAgreement`
 
@@ -689,7 +707,7 @@ RSMasterAgreementConverse ==
         serverState[s] = "CRASHED" \/ zkNode[s] = FALSE \/
           /\ regionState[r].location = s
           /\ regionState[r].state \in
-               { "OPENING", "OPEN", "CLOSING", "SPLITTING" }
+               { "OPENING", "OPEN", "CLOSING", "SPLITTING", "MERGING" }
 ```
 
 ### `FencingOrder`
@@ -773,10 +791,10 @@ TRSP `procStep` must correlate with the region's lifecycle state.
 
 | procStep               | Allowed region states                                                           |
 |------------------------|--------------------------------------------------------------------------------|
-| `GET_ASSIGN_CANDIDATE` | `OFFLINE`, `CLOSED`, `ABNORMALLY_CLOSED`, `FAILED_OPEN`, `OPENING`, `SPLITTING_NEW` |
+| `GET_ASSIGN_CANDIDATE` | `OFFLINE`, `CLOSED`, `ABNORMALLY_CLOSED`, `FAILED_OPEN`, `OPENING`, `SPLITTING_NEW`, `MERGING_NEW` |
 | `OPEN`                 | Same as above (target chosen, not yet transitioned to `OPENING`)               |
 | `CONFIRM_OPENED`       | `OPENING`                                                                       |
-| `CLOSE`                | `OPEN`, `SPLITTING`, `CLOSING`, `ABNORMALLY_CLOSED`                             |
+| `CLOSE`                | `OPEN`, `SPLITTING`, `MERGING`, `CLOSING`, `ABNORMALLY_CLOSED`                  |
 | `CONFIRM_CLOSED`       | `CLOSING`, `ABNORMALLY_CLOSED`                                                  |
 | `REPORT_SUCCEED`       | `OPEN`, `OPENING`, `FAILED_OPEN`, `CLOSED`                                      |
 
@@ -796,14 +814,15 @@ ProcStepConsistency ==
                          "ABNORMALLY_CLOSED",
                          "FAILED_OPEN",
                          "OPENING",
-                         "SPLITTING_NEW"
+                         "SPLITTING_NEW",
+                         "MERGING_NEW"
+                       }
+                 )
 ```
 
 `SPLITTING_NEW`: daughter in `ASSIGN` at `GET_ASSIGN_CANDIDATE` (`SplitUpdateMeta`).
 
 ```tla
-                       }
-                 )
               /\ ( regionState[r].procStep = "OPEN" =>
                      regionState[r].state \in
                        { "OFFLINE",
@@ -811,7 +830,8 @@ ProcStepConsistency ==
                          "ABNORMALLY_CLOSED",
                          "FAILED_OPEN",
                          "OPENING",
-                         "SPLITTING_NEW"
+                         "SPLITTING_NEW",
+                         "MERGING_NEW"
                        }
                  )
               /\ ( regionState[r].procStep = "CONFIRM_OPENED" =>
@@ -819,7 +839,8 @@ ProcStepConsistency ==
                  )
               /\ ( regionState[r].procStep = "CLOSE" =>
                      regionState[r].state \in
-                       { "OPEN", "SPLITTING", "CLOSING", "ABNORMALLY_CLOSED" }
+                       { "OPEN", "SPLITTING", "MERGING", "CLOSING", "ABNORMALLY_CLOSED" }
+                 )
 ```
 
 `SPLITTING`: split-yielded `UNASSIGN` starts from `SPLITTING`.
@@ -1027,11 +1048,13 @@ SplitMergeMutualExclusion ==
     \A r \in Regions:
 ```
 
-A daughter cannot also be tracked as a parent procedure target.
+A daughter or merged region cannot also be tracked as a parent procedure target.
 
 ```tla
-            regionState[r].state = "SPLITTING_NEW" =>
-        parentProc[r] = NoParentProc
+            /\ regionState[r].state = "SPLITTING_NEW" =>
+               parentProc[r] = NoParentProc
+            /\ regionState[r].state = "MERGING_NEW" =>
+               parentProc[r] = NoParentProc
 ```
 
 ### `SplitAtomicity`
@@ -1079,6 +1102,45 @@ SplitCompleteness ==
     )
 ```
 
+### `NoOrphanedMergedRegion`
+
+A region in `MERGING_NEW` state always has an `ASSIGN` procedure (child TRSP from `MergeUpdateMeta`).
+
+```tla
+NoOrphanedMergedRegion ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( RegionExists(r) /\ regionState[r].state = "MERGING_NEW" ) =>
+        regionState[r].procType = "ASSIGN"
+```
+
+### `MergeCompleteness`
+
+After a merge completes (targets are `MERGED` with `NoRange`, meaning `MergeDone` has fired), the `parentProc` on both targets is cleared. Gated on no active SCP.
+
+```tla
+MergeCompleteness ==
+  masterAlive = TRUE =>
+    ( ( \A s \in Servers: scpState[s] = "NONE" ) =>
+        \A r \in Regions:
+          ( regionState[r].state = "MERGED" /\ ~RegionExists(r) ) =>
+            parentProc[r] = NoParentProc
+    )
+```
+
+### `MergeAtomicity`
+
+Pre-PONR, the merged region is not yet materialized. If a merge target's `parentProc` is at `SPAWNED_CLOSE`, the merged region (`ref2`) must still have `NoRange`.
+
+```tla
+MergeAtomicity ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( parentProc[r].type = "MERGE" /\ parentProc[r].step = "SPAWNED_CLOSE" ) =>
+        /\ parentProc[r].ref2 # NoRegion
+        /\ regionKeyRange[parentProc[r].ref2] = NoRange
+```
+
 ## State Constraints for TLC
 
 Symmetry reduction: only unused region identifiers are interchangeable (deployed regions have distinct keyspaces). Servers remain interchangeable. With 2 unused identifiers this provides up to 2× reduction.
@@ -1098,10 +1160,34 @@ SplitMergeConstraint ==
 ---------------------------------------------------------------------------
 ```
 
+## Configuration Printing
+
+Print configuration at start of TLC run.
+
+```tla
+PrintConfig ==
+  /\ PrintT("========================================")
+  /\ PrintT("AssignmentManager TLC Configuration")
+  /\ PrintT("========================================")
+  /\ PrintT(<< "Servers", Servers >>)
+  /\ PrintT(<< "Regions", Regions >>)
+  /\ PrintT(<< "DeployedRegions", DeployedRegions >>)
+  /\ PrintT(<< "MaxKey", MaxKey >>)
+  /\ PrintT(<< "MaxRetries", MaxRetries >>)
+  /\ PrintT(<< "MaxWorkers", MaxWorkers >>)
+  /\ PrintT(<< "UseReopen", UseReopen >>)
+  /\ PrintT(<< "UseMerge", UseMerge >>)
+  /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
+  /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
+  /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
+  /\ PrintT("========================================")
+```
+
 ## Initial State
 
 ```tla
 Init ==
+  /\ PrintConfig
 ```
 
 `DeployedRegions` start `OFFLINE` with assigned keyspaces; unused identifiers start `OFFLINE` with `NoRange`.
@@ -1364,6 +1450,21 @@ Next ==
   \/ \E r \in Regions: split!SplitFail(r)
 ```
 
+**Merge forward path** (gated on `UseMerge`)
+
+```tla
+  \/ (UseMerge /\ \E r1, r2, m \in Regions: merge!MergePrepare(r1, r2, m))
+  \/ (UseMerge /\ \E r \in Regions: merge!MergeCheckClosed(r))
+  \/ (UseMerge /\ \E r \in Regions: merge!MergeUpdateMeta(r))
+  \/ (UseMerge /\ \E r \in Regions: merge!MergeDone(r))
+```
+
+**Merge pre-PONR rollback** (gated on `UseMerge`)
+
+```tla
+  \/ (UseMerge /\ \E r \in Regions: merge!MergeFail(r))
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1455,6 +1556,14 @@ No fairness on `MasterCrash` (non-deterministic environmental event). No fairnes
   /\ \A r \in Regions:
        \A dA, dB \in Regions: WF_vars(split!SplitUpdateMeta(r, dA, dB))
   /\ \A r \in Regions: WF_vars(split!SplitDone(r))
+```
+
+**Merge forward path** (deterministic steps; gated on `UseMerge`; no WF on `MergePrepare` or `MergeFail`)
+
+```tla
+  /\ ( UseMerge => \A r \in Regions: WF_vars(merge!MergeCheckClosed(r)) )
+  /\ ( UseMerge => \A r \in Regions: WF_vars(merge!MergeUpdateMeta(r)) )
+  /\ ( UseMerge => \A r \in Regions: WF_vars(merge!MergeDone(r)) )
 ```
 
 ```tla
@@ -1632,6 +1741,24 @@ Safety: at most one server carrying meta.
 
 ```tla
         THEOREM Spec => []AtMostOneCarryingMeta
+```
+
+Safety: `MERGING_NEW` regions always have a procedure.
+
+```tla
+        THEOREM Spec => []NoOrphanedMergedRegion
+```
+
+Safety: completed merge has cleaned-up targets.
+
+```tla
+        THEOREM Spec => []MergeCompleteness
+```
+
+Safety: pre-PONR merged region not materialized.
+
+```tla
+        THEOREM Spec => []MergeAtomicity
 ```
 
 ### `TransitionValid` *(action property)*

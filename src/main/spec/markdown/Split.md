@@ -211,7 +211,8 @@ Create parent procedure record (yielding to child).
 
 ```tla
   /\ parentProc' =
-       [parentProc EXCEPT ![r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]]
+       [parentProc EXCEPT ![r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE",
+                                    ref1 |-> NoRegion, ref2 |-> NoRegion ]]
 ```
 
 Everything else unchanged.
@@ -261,7 +262,8 @@ No procedure attached — child `UNASSIGN` cleared it.
 Split is pending at the close phase.
 
 ```tla
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "SPAWNED_CLOSE"
 ```
 
 Re-attach `SPLIT` procedure to parent for protection.
@@ -305,8 +307,8 @@ Non-deterministically picks two unused region identifiers for daughters. Compute
 - **Daughter A:** keyspace = `[startKey, mid)`, state = `SPLITTING_NEW` (in-memory), `CLOSED` (meta). `procType = ASSIGN` (child spawned).
 - **Daughter B:** keyspace = `[mid, endKey)`, state = `SPLITTING_NEW` (in-memory), `CLOSED` (meta). `procType = ASSIGN` (child spawned).
 
-**Pre:** master alive, PEWorker available, meta available, parent has `procType = SPLIT`, `parentProc = [SPLIT, PONR]`, state = `CLOSED`. `dA` and `dB` are distinct unused identifiers.
-**Post:** parent in `SPLIT` state, daughters materialized with child `ASSIGN` TRSPs. `parentProc` step = `SPAWNED_OPEN`.
+**Pre:** master alive, PEWorker available, meta available, parent has `procType = SPLIT`, `parentProc[r].type = "SPLIT"` and `.step = "PONR"`, state = `CLOSED`. `dA` and `dB` are distinct unused identifiers.
+**Post:** parent in `SPLIT` state, daughters materialized with child `ASSIGN` TRSPs. `parentProc` step = `SPAWNED_OPEN`, `ref1 = dA`, `ref2 = dB`.
 
 > *Source:* `AssignmentManager.markRegionAsSplit()` L2364–2390; `RegionStateStore.splitRegion()` L392–395; `OPEN_CHILD_REGIONS`: `addChildProcedure(createAssignProcedures)`.
 
@@ -317,7 +319,8 @@ SplitUpdateMeta(r, dA, dB) ==
   /\ MetaIsAvailable
   /\ RegionExists(r)
   /\ regionState[r].procType = "SPLIT"
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "PONR" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "PONR"
   /\ regionState[r].state = "CLOSED"
 ```
 
@@ -418,9 +421,12 @@ Persist daughter `ASSIGN` procedures to `procStore`.
 ```
 
 Parent yields to daughter ASSIGNs: step → `SPAWNED_OPEN`.
+Store daughter references for `SplitDone` to read back.
 
 ```tla
-  /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN"]
+  /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN",
+                                      ![r].ref1 = dA,
+                                      ![r].ref2 = dB]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -437,7 +443,7 @@ Complete the split after both daughters are `OPEN`.
 
 Clears the parent's keyspace to `NoRange` (region *"deleted"* — models the post-compaction cleanup) and clears the parent procedure state.
 
-**Pre:** master alive, PEWorker available, `parentProc = [SPLIT, SPAWNED_OPEN]`, both daughters are `OPEN` with `procType = NONE` (ASSIGN completed).
+**Pre:** master alive, PEWorker available, `parentProc[r].type = "SPLIT"` and `.step = "SPAWNED_OPEN"`, daughters referenced by `parentProc[r].ref1` and `.ref2` are `OPEN` with `procType = NONE` (ASSIGN completed).
 **Post:** parent keyspace cleared (`NoRange`), `procType = NONE`, `parentProc = NoParentProc`. Parent stays in `SPLIT` state (terminal).
 
 > *Source:* `POST_OPERATION` state (procedure completes).
@@ -447,26 +453,22 @@ SplitDone(r) ==
   /\ masterAlive = TRUE
   /\ availableWorkers > 0
   /\ RegionExists(r)
-  /\ regionState[r].procType = "SPLIT"
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_OPEN" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "SPAWNED_OPEN"
 ```
 
-Identify daughters: `OPEN` regions whose keyspaces were carved from this parent. Under `SplitMergeConstraint ≤ 1`, these are the only regions with keyspaces that partition the parent's range.
+Read daughter references from `parentProc`.
 
 ```tla
-  /\ LET startK == regionKeyRange[r].startKey
-         endK == regionKeyRange[r].endKey
-         mid == ( startK + endK ) \div 2
-         daughters ==
-           {d \in Regions:
-             /\ regionState[d].state = "OPEN"
-             /\ regionState[d].procType = "NONE"
-             /\ regionKeyRange[d] # NoRange
-             /\ \/ regionKeyRange[d] = [ startKey |-> startK, endKey |-> mid ]
-                \/ regionKeyRange[d] = [ startKey |-> mid, endKey |-> endK ]
-           }
-     IN \* Both daughters must be OPEN and unattached.
-        /\ Cardinality(daughters) = 2
+  /\ LET dA == parentProc[r].ref1
+         dB == parentProc[r].ref2
+     IN /\ dA # NoRegion
+        /\ dB # NoRegion
+        \* Both daughters must be OPEN and unattached.
+        /\ regionState[dA].state = "OPEN"
+        /\ regionState[dA].procType = "NONE"
+        /\ regionState[dB].state = "OPEN"
+        /\ regionState[dB].procType = "NONE"
 ```
 
 Clear parent procedure state.
@@ -552,7 +554,8 @@ No procedure attached — child `UNASSIGN` cleared it.
 Split is pending at the close phase (pre-PONR).
 
 ```tla
-  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]
+  /\ parentProc[r].type = "SPLIT"
+  /\ parentProc[r].step = "SPAWNED_CLOSE"
 ```
 
 Create fresh `ASSIGN` TRSP to reopen the parent.
