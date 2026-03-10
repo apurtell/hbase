@@ -36,6 +36,7 @@ CONSTANTS
     NoTransition = NoTransition
     NoRange = NoRange
     NoServer = NoServer
+    NoRegion = NoRegion
     Servers = {s1, s2}
     Regions = {r1, r2, r3}
     DeployedRegions = {r1}
@@ -63,6 +64,7 @@ procedures suspend and release the PEWorker on async meta writes.
     UseRSOpenDuplicateQuirk = FALSE
     UseRestoreSucceedQuirk = FALSE
     UseBlockOnMetaWrite = FALSE
+    UseMerge = FALSE
 ```
 
 ## Symmetry Reduction
@@ -76,7 +78,7 @@ SYMMETRY Symmetry
 
 ## Invariants
 
-All 27 safety invariants are checked:
+All 30 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -107,6 +109,9 @@ INVARIANT
     NoOrphanedDaughters
     SplitCompleteness
     AtMostOneCarryingMeta
+    NoOrphanedMergedRegion
+    MergeCompleteness
+    MergeAtomicity
 ```
 
 ## Action Constraints
