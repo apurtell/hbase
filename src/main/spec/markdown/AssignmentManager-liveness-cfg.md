@@ -2,25 +2,39 @@
 
 **Source:** [`AssignmentManager-liveness.cfg`](../AssignmentManager-liveness.cfg)
 
+## Overview
+
+TLC model configuration for liveness checking.
+
+Liveness properties (temporal `PROPERTY` clauses) are incompatible with
+TLC's `SYMMETRY` reduction. Symmetry can create false lasso cycles that don't
+exist in the real state graph. This config omits `SYMMETRY` so that
+liveness checking is sound.
+
+**Trade-off:** the state space is much larger without symmetry. This config is
+intended for overnight / batch runs.
+
+## Running
+
+```sh
+/usr/bin/java -XX:+UseParallelGC \
+  -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
+```
+
+---
+
+## Specification
+
 ```tla
-\* TLC model configuration for liveness checking.
-\*
-\* Liveness properties (temporal PROPERTY clauses) are INCOMPATIBLE with
-\* TLC's SYMMETRY reduction.  Symmetry can create false lasso cycles that
-\* don't exist in the real state graph.  This config OMITS SYMMETRY so
-\* that liveness checking is sound.
-\*
-\* Trade-off: the state space is much larger without symmetry.
-\* This config is intended for overnight / batch runs.
-\*
-\* Run:
-\*   /usr/bin/java -XX:+UseParallelGC \
-\*     -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
-\*     tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
-
 SPECIFICATION Spec
+```
 
-\* Model values
+## Constants
+
+Model values and universe sizing (same as primary exhaustive config):
+
+```tla
 CONSTANTS
     NoProcedure = NoProcedure
     NoTransition = NoTransition
@@ -32,23 +46,37 @@ CONSTANTS
     MaxKey = 2
     MaxRetries = 1
     MaxWorkers = 2
-    \* UseReopen = TRUE models branch-2's additional REOPEN procedure
+```
+
+**`UseReopen = FALSE`** — the REOPEN procedure (branch-2) is disabled.
+
+**`UseRSOpenDuplicateQuirk = FALSE`** disables the RS duplicate-open
+silent-drop behavior to avoid deadlock. Set `TRUE` to model the implementation
+quirk (`AssignRegionHandler.process()`).
+
+**`UseRestoreSucceedQuirk = FALSE`** for correct recovery behavior. Set `TRUE`
+to reproduce the `OpenRegionProcedure.restoreSucceedState()` bug where
+`FAILED_OPEN` reports are replayed as `OPENED`.
+
+**`UseBlockOnMetaWrite = FALSE`** models master/branch-3+ behavior where
+procedures suspend and release the PEWorker on async meta writes.
+
+```tla
     UseReopen = FALSE
-    \* UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
-    \* silent-drop behavior to avoid deadlock.  Set TRUE to model the
-    \* implementation quirk (AssignRegionHandler.process()).
     UseRSOpenDuplicateQuirk = FALSE
-    \* UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
-    \* Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
-    \* bug where FAILED_OPEN reports are replayed as OPENED.
     UseRestoreSucceedQuirk = FALSE
-    \* UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
-    \* procedures suspend and release the PEWorker on async meta writes.
     UseBlockOnMetaWrite = FALSE
+```
 
-\* NO SYMMETRY -- required for sound liveness checking.
+## Symmetry
 
-\* Safety invariants (checked alongside liveness)
+**No `SYMMETRY`** — required for sound liveness checking.
+
+## Safety Invariants
+
+All 27 safety invariants are checked alongside liveness:
+
+```tla
 INVARIANT
     TypeOK
     OpenImpliesLocation
@@ -77,17 +105,31 @@ INVARIANT
     NoOrphanedDaughters
     SplitCompleteness
     AtMostOneCarryingMeta
+```
 
-\* Action properties
+## Action Constraints
+
+```tla
 ACTION_CONSTRAINT
     TransitionValid
     SCPMonotonicity
+```
 
-\* State constraint: bound concurrent split/merge procedures
+## State Constraints
+
+Bound concurrent split/merge procedures for TLC tractability:
+
+```tla
 CONSTRAINT
     SplitMergeConstraint
+```
 
-\* Liveness properties (the reason this config exists)
+## Liveness Properties
+
+The reason this config exists — temporal properties that require `SYMMETRY` to
+be disabled:
+
+```tla
 PROPERTY
     MetaEventuallyAssigned
 ```

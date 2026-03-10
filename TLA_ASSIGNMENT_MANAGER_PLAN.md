@@ -308,9 +308,9 @@ every iteration.  A third is reserved for ad hoc on-demand checks.
 | Config | Model | Mode | Role | Time |
 |--------|-------|------|------|------|
 | `AssignmentManager.cfg` | 2r/2s, MaxRetries=1 | Exhaustive | Every iteration | <10s |
-| `AssignmentManager-sim.cfg` | 3r/3s, MaxRetries=2 | Simulation | Every iteration | 5 min |
-| `AssignmentManager-sim.cfg` | (same) | Simulation | Post-iteration | 15 min |
-| `AssignmentManager-sim.cfg` | (same) | Simulation | Post-phase | 1 hr |
+| `AssignmentManager-sim.cfg` | 3r/3s, MaxRetries=2 | Simulation | Every iteration | 15 min |
+| `AssignmentManager-sim.cfg` | (same) | Simulation | Post-iteration | 1 hr |
+| `AssignmentManager-sim.cfg` | (same) | Simulation | Post-phase | 4 hr |
 | `AssignmentManager-full.cfg` | 3r/3s, MaxRetries=1 | Exhaustive | Ad hoc | **Expensive** |
 
 ### 5.3 Abstraction Decisions
@@ -476,19 +476,19 @@ tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg \
 -workers auto -cleanup
 ```
 
-**Post-phase simulation** (1 hour, high-confidence sweep after completing a phase):
+**Post-phase simulation** (4 hours, high-confidence sweep after completing a phase):
 
 ```bash
 /usr/bin/java -XX:+UseParallelGC \
--cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" -Dtlc2.TLC.stopAfter=3600 \
+-cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.22149-universal/tools/CommunityModules-deps.jar" -Dtlc2.TLC.stopAfter=14400 \
 tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg \
 -simulate -workers auto
 ```
 
 Run in background (Shell `block_until_ms: 0`) and monitor the terminal
 file for progress. Use `-Dtlc2.TLC.stopAfter=N` (seconds) to adjust
-the time limit. Standard durations: 300 (per-iteration), 900
-(post-iteration), 3600 (post-phase).
+the time limit. Standard durations: 900 (per-iteration), 3600
+(post-iteration), 14400 (post-phase).
 
 ---
 
@@ -853,45 +853,61 @@ New/updated invariants: `SplitAtomicity` (pre-PONR, no daughters),
 with new constants/invariants/constraint; sim config expanded to 9r/3s
 (3 deployed + 6 unused, `MaxKey = 12`); `AtMostOneCarryingMeta` fix;
 TLC 3r/2s: 147,814,458 distinct, 527,398,193 generated, depth 83, ~68min,
-clean.
+clean. TLC 9r/3s: 9,015,843 traces, 928,632,272 generated, ~4hrs, clean.
 
-#### Iteration 22 — Split pre-PONR rollback
+#### Iteration 22 — Split pre-PONR rollback ✅ COMPLETE
 
-**What to add**: Non-deterministic failure action for pre-PONR states.
-Now TLC explores both success and failure paths for splits.
-- `SplitFail(p)`: Pre: split procedure is in a pre-PONR state
-  (PREPARE, CLOSE_PARENT, CHECK_CLOSED). Triggers rollback.
-- `SplitRollback(p)`: Revert parent from SPLITTING to OPEN (if in
-  PREPARE) or create TRSP(ASSIGN) to reopen parent (if parent was
-  already CLOSED). Set `regionKeyRange[dA] = NoRange`,
-  `regionKeyRange[dB] = NoRange` (daughters were never materialized
-  pre-PONR, but this is defense in depth). Detach procedure from all
-  regions.
-**Why this is safe**: `SplitFail` only fires in pre-PONR states.
-`SplitRollback` always transitions to a terminal state (parent OPEN
-or being reassigned, procedure detached). No procedure is left in a
-state without a successor.
-**Verify**: After rollback, parent is OPEN (or being reassigned), no
-daughters exist, no procedures attached. `KeyspaceCoverage` restored.
-All safety invariants hold under both success and failure paths.
-**Source**: `SplitTableRegionProcedure.java` `rollbackState()` L368-411.
+New `SplitFail(r)` action in `Split.tla`: non-deterministic pre-PONR
+rollback fires at the same precondition as `SplitResumeAfterClose`
+(parent `CLOSED`, child `UNASSIGN` complete, `parentProc = [SPLIT,
+SPAWNED_CLOSE]`).  Creates a fresh `ASSIGN` TRSP to reopen the parent,
+clears `parentProc`, reverts meta from `SPLITTING` to `CLOSED`.  No
+daughter cleanup needed pre-PONR (`SplitAtomicity` invariant).  TLC
+explores both the success path (`SplitResumeAfterClose`) and the
+failure path (`SplitFail`) for every reachable split state. Wired into
+`Next` (no WF — failure is non-deterministic).
+TLC 3r/2s: 147,814,458 distinct, 527,398,347 generated, depth 83,
+~68min, clean.
 
 #### Iteration 23 — Complete merge forward path with rollback
+
+**`UseMerge` conditional guard** (follows `UseReopen`
+pattern): Add `UseMerge ∈ BOOLEAN` constant in `Types.tla` with
+`ASSUME UseMerge ∈ BOOLEAN`.  All merge actions in `Next` and
+`Fairness` are gated on `UseMerge = TRUE`.  Each merge action's
+precondition also includes `UseMerge = TRUE` as a conjunct.  Config
+settings:
+- `AssignmentManager.cfg` (primary exhaustive): `UseMerge = FALSE`.
+  Split-only verification remains exhaustive and tractable.
+- `AssignmentManager-liveness.cfg`: `UseMerge = FALSE`.
+- `AssignmentManager-sim.cfg` (simulation): `UseMerge = TRUE`.
+  Simulation mode performs long random walks and does not require
+  exhaustive enumeration, so the unbounded cycle is not a problem.
+  `SplitMergeConstraint` (≤ 1 concurrent) still bounds the number of
+  concurrent procedures at any given state, preventing per-step
+  explosion.  Simulation traces will exercise interleaved split/merge
+  sequences at depth, catching safety violations that arise from the
+  interaction.
+Why: Once both split and merge actions are active, the state space
+becomes unbounded.  A split produces two daughters whose keyspaces are
+adjacent, making them eligible for merging.  A merge produces a single
+region whose keyspace is wide enough to split again.  This creates an
+infinite cycle: split → daughters → merge → parent → split → …, with
+merging freeing region-pool slots for new splits and splitting
+enabling new merge opportunities.  Exhaustive model-checking cannot
+terminate on an infinite state graph.
 
 **What to add**: The *entire* merge procedure (forward path + rollback)
 in one iteration, following the same pattern as split. Rollback is
 included from the start so that TLC can explore both success and
 failure paths without requiring a separate iteration.
-- `RequestMerge(r1, r2)`: Non-deterministic. Models admin API RPC
-  or master merge chore. Pre: both OPEN, no procedures attached,
-  `Adjacent(r1, r2)` (i.e. `regionKeyRange[r1].endKey =
-  regionKeyRange[r2].startKey`), unused identifier available
-  (∃ region with `regionKeyRange = NoRange`).
-  If accepted → enters `MergePrepare`. Non-adjacent pairs rejected.
-- `MergePrepare(r1, r2, m)`: Triggered by `RequestMerge`.
-  Pre: r1, r2 OPEN, no procedures attached,
+- **`UseMerge` constant**: `Types.tla` — `CONSTANTS UseMerge`,
+  `ASSUME UseMerge ∈ BOOLEAN`.  All configs updated.
+- `MergePrepare(r1, r2, m)`: Non-deterministic. Models admin API RPC
+  or master merge chore. Pre: `UseMerge = TRUE`, both OPEN, no
+  procedures attached, `Adjacent(r1, r2)` (i.e.
+  `regionKeyRange[r1].endKey = regionKeyRange[r2].startKey`),
   m has `regionKeyRange = NoRange` (unused identifier).
-  **Adjacency guard**: `Adjacent(r1, r2)`.
   Merged region will get keyspace `[r1.startKey, r2.endKey)`.
   Set r1, r2 to MERGING. Attach merge procedure to r1, r2, m
   (enforcing mutual exclusion on all three regions).
@@ -911,10 +927,21 @@ failure paths without requiring a separate iteration.
   Triggers rollback.
 - `MergeRollback(p)`: Pre-PONR only: revert targets to OPEN, set
   `regionKeyRange[m] = NoRange`, detach procedure.
+- **`Next` updates**: Merge actions guarded by `UseMerge`:
+  `\/ (UseMerge /\ \E r1, r2, m \in Regions: merge!MergePrepare(r1, r2, m))`
+  and similarly for each merge step.  Split actions remain ungated.
+- **`Fairness` updates**: WF on deterministic merge steps gated by
+  `(UseMerge => ...)`, matching the `UseReopen` pattern.  No WF on
+  `MergePrepare` (non-deterministic) or `MergeFail` (non-deterministic).
+- **Config updates**: `UseMerge = FALSE` in primary and liveness
+  configs; `UseMerge = TRUE` in simulation config.  Simulation config
+  comment updated to note merge coverage.
 **Verify**: `MergeCompleteness` — after done, merged region is OPEN
 with keyspace `[r1.startKey, r2.endKey)`, targets have `NoRange`
 (deleted). `KeyspaceCoverage` restored under both success and failure
-paths. All safety invariants hold.
+paths. All safety invariants hold.  Primary exhaustive run (split-only)
+must remain clean.  Simulation run (split+merge) exercises the
+interaction and checks all 27+ invariants.
 **Source**: `MergeTableRegionsProcedure.java` `executeFromState()` L189-255.
 
 #### Iteration 24 — Crash during split/merge
@@ -1176,11 +1203,11 @@ Each iteration follows a fixed loop:
    (see Section 7 for iteration descriptions).
 3. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
 4. **RUN TLC** — Run both mandatory configurations:
-   - `AssignmentManager.cfg` (primary, exhaustive 2r/2s) — must pass.
-   - `AssignmentManager-sim.cfg` (simulation, 3r/3s, 300s) — must pass.
-   After completing an iteration, run a 15-minute post-iteration
-   simulation (900s).  After completing a phase, run a 1-hour
-   post-phase simulation (3600s).  The full exhaustive config
+   - `AssignmentManager.cfg` (primary, exhaustive 3r/2s) — must pass.
+   - `AssignmentManager-sim.cfg` (simulation, 9r/3s) — must pass.
+   After completing an iteration, run a 1-hour post-iteration
+   simulation (3600s).  After completing a phase, run a 4-hour
+   post-phase simulation (14400s).  The full exhaustive config
    (`AssignmentManager-full.cfg`) is not run at every iteration.
    It is reserved for ad hoc on-demand checks at user-requested
    checkpoints.
@@ -1664,18 +1691,18 @@ Key properties:
  │    │
  │    ├── RSProcedureDispatcher batches ──────► ExecuteProcedures RPC
  │    │                                         │
- │    └── suspend                                ├─ executeProcedures()
- │                                               │   └─ executeOpenRegionProcedures()
- │                                               │       └─ submit AssignRegionHandler
- │                                               │
- │                                               ├─ AssignRegionHandler.process()
- │                                               │   ├─ regionsInTransition[r] = TRUE
- │                                               │   ├─ HRegion.openHRegion()
- │                                               │   ├─ postOpenDeployTasks()
- │                                               │   │   └─ openSeqNum = getOpenSeqNum()
- │                                               │   ├─ addRegion(region)
- │                                               │   └─ remove from regionsInTransition
- │                                               │
+ │    └── suspend                               ├─ executeProcedures()
+ │                                              │   └─ executeOpenRegionProcedures()
+ │                                              │       └─ submit AssignRegionHandler
+ │                                              │
+ │                                              ├─ AssignRegionHandler.process()
+ │                                              │   ├─ regionsInTransition[r] = TRUE
+ │                                              │   ├─ HRegion.openHRegion()
+ │                                              │   ├─ postOpenDeployTasks()
+ │                                              │   │   └─ openSeqNum = getOpenSeqNum()
+ │                                              │   ├─ addRegion(region)
+ │                                              │   └─ remove from regionsInTransition
+ │                                              │
  │    reportRegionStateTransition() ◄────────── reportRegionStateTransition(OPENED)
  │    │                                          retry loop until accepted
  │    ├─ validate epoch
@@ -1717,16 +1744,16 @@ Key properties:
  │    │
  │    ├── RSProcedureDispatcher batches ──────► ExecuteProcedures RPC
  │    │                                         │
- │    └── suspend                                ├─ executeProcedures()
- │                                               │   └─ executeCloseRegionProcedures()
- │                                               │       └─ submit UnassignRegionHandler
- │                                               │
- │                                               ├─ UnassignRegionHandler.process()
- │                                               │   ├─ regionsInTransition[r] = FALSE
- │                                               │   ├─ region.close()
- │                                               │   ├─ removeRegion(region)
- │                                               │   └─ remove from regionsInTransition
- │                                               │
+ │    └── suspend                               ├─ executeProcedures()
+ │                                              │   └─ executeCloseRegionProcedures()
+ │                                              │       └─ submit UnassignRegionHandler
+ │                                              │
+ │                                              ├─ UnassignRegionHandler.process()
+ │                                              │   ├─ regionsInTransition[r] = FALSE
+ │                                              │   ├─ region.close()
+ │                                              │   ├─ removeRegion(region)
+ │                                              │   └─ remove from regionsInTransition
+ │                                              │
  │    reportRegionStateTransition() ◄────────── reportRegionStateTransition(CLOSED)
  │    │                                          retry loop until accepted
  │    ├─ validate epoch
