@@ -130,16 +130,28 @@ This TLA+ specification models the AssignmentManager as a state machine with
   (daughters OPEN, clear parent keyspace and procedure state), and `SplitFail`
   (pre-PONR rollback: abort the split, create a fresh ASSIGN TRSP to reopen
   the parent).  Crash-during-split is deferred.
+- **Merge procedure** -- `MergeTableRegionsProcedure`
+  modeled through the parent-child framework: `MergePrepare` (set MERGING on
+  two adjacent targets, spawn child UNASSIGN TRSPs to close both),
+  `MergeCheckClosed` (detect child completion, advance to PONR),
+  `MergeUpdateMeta` (PONR: write meta, materialize merged region with union
+  keyspace `[r1.startKey, r2.endKey)`, spawn child ASSIGN TRSP), `MergeDone`
+  (merged region OPEN, clear target keyspaces), and `MergeFail` (pre-PONR
+  rollback: create fresh ASSIGN TRSPs to reopen both targets).  Gated by
+  `UseMerge` constant; disabled in exhaustive mode (unbounded state space
+  with split+merge cycle), enabled in simulation mode.
 
-The specification defines 27 safety invariants verified at every reachable
+The specification defines 30 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
 stuck without a procedure after crash recovery), `NoPEWorkerDeadlock`
 (thread pool exhaustion detection), `KeyspaceCoverage` (all keys covered by
-exactly one live region), `SplitMergeMutualExclusion` (split daughters cannot
-have active parent procedures), `SplitAtomicity` (pre-PONR, no daughters
-materialized), and `AtMostOneCarryingMeta` (at most one server carrying meta).
+exactly one live region), `SplitMergeMutualExclusion` (split daughters and
+merged regions cannot have active parent procedures), `SplitAtomicity`
+(pre-PONR, no daughters materialized), `AtMostOneCarryingMeta` (at most one
+server carrying meta), `MergeCompleteness` (completed merge has cleaned-up
+targets), and `MergeAtomicity` (pre-PONR, merged region not materialized).
 
 One liveness property (`MetaEventuallyAssigned`) verifies that `hbase:meta`
 is eventually reassigned after a crash. Two action constraints enforce
@@ -149,9 +161,10 @@ tractability.
 
 The model checker runs in two tiers: fast exhaustive verification at 3
 regions / 2 servers (1 deployed + 2 unused for split daughters), and deep
-random simulation at 9r/3s with extended retries. Configurable "quirk" flags
-allow toggling known implementation bugs to correctly adhere to implementation
-semantics, reproduce failures and validate fixes.
+random simulation at 9r/3s with extended retries and merge enabled.
+Configurable "quirk" flags allow toggling known implementation bugs to
+correctly adhere to implementation semantics, reproduce failures and
+validate fixes.
 
 ---
 
@@ -159,9 +172,10 @@ This is a formal TLA+ specification of the HBase AssignmentManager, covering the
 region assignment lifecycle: state transitions, persistent metadata, procedure-
 driven operations, RPC dispatch, RegionServer-side behavior, server crash recovery,
 and master crash/recovery. The spec models the core assign/unassign/move/reopen
-lifecycle, the split forward path, and pre-PONR split rollback for regions across
-the OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED,
-SPLITTING, SPLIT, and SPLITTING_NEW states.
+lifecycle, the split forward path, the merge forward path, and pre-PONR
+split/merge rollback for regions across the OFFLINE, OPENING, OPEN, CLOSING,
+CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED, SPLITTING, SPLIT, SPLITTING_NEW,
+MERGING, MERGED, and MERGING_NEW states.
 
 ## Module Structure
 
@@ -172,6 +186,7 @@ SPLITTING, SPLIT, and SPLITTING_NEW states.
 | [TRSP.tla](markdown/TRSP.md) | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
 | [SCP.tla](markdown/SCP.md) | ServerCrashProcedure state machine (detect crash -> assign meta -> get regions -> fence WALs -> assign regions -> done, with meta-blocking) |
 | [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
+| [Merge.tla](markdown/Merge.md) | Merge procedure forward path and pre-PONR rollback using parent-child framework (MergePrepare, MergeCheckClosed, MergeUpdateMeta, MergeDone, MergeFail) |
 | [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
 | [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
@@ -197,7 +212,7 @@ SPLITTING, SPLIT, and SPLITTING_NEW states.
 - **`suspendedOnMeta`** — regions whose procedures are async-suspended on meta unavailability
 - **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
 - **`regionKeyRange`** -- per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
-- **`parentProc`** -- per-region parent procedure record (`[type, step]`) tracking split/merge progress across child TRSP lifecycles
+- **`parentProc`** -- per-region parent procedure record (`[type, step, ref1, ref2]`) tracking split/merge progress across child TRSP lifecycles; `ref1`/`ref2` hold region references (daughters for split, peer/merged for merge)
 
 ## Configurable Behaviors
 
@@ -207,6 +222,7 @@ SPLITTING, SPLIT, and SPLITTING_NEW states.
 | `UseRSOpenDuplicateQuirk` | `TRUE` models `AssignRegionHandler.process()` silent-drop bug (causes deadlock) |
 | `UseRestoreSucceedQuirk` | `TRUE` reproduces `OpenRegionProcedure.restoreSucceedState()` bug where FAILED_OPEN reports replay as OPENED (causes constraint violations) |
 | `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
+| `UseMerge` | `TRUE` enables merge actions in `Next`/`Fairness`. `FALSE` (default) keeps exhaustive mode tractable (split-only) |
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
@@ -260,7 +276,7 @@ Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 ## Invariants
 
-All configurations check the same 27 safety invariants:
+All configurations check the same 30 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -286,11 +302,14 @@ All configurations check the same 27 safety invariants:
 | `NoOrphanedProcedures` | OFFLINE procedure-bearing regions are ASSIGN only |
 | `NoPEWorkerDeadlock` | When all PEWorkers are consumed and meta is unavailable, at least one active procedure is not blocked/suspended |
 | `KeyspaceCoverage` | All keys in `[0, MaxKey)` covered by exactly one live region with no gaps or overlaps |
-| `SplitMergeMutualExclusion` | Daughter regions (SPLITTING_NEW) cannot have active parent procedures |
+| `SplitMergeMutualExclusion` | Daughter/merged regions (SPLITTING_NEW, MERGING_NEW) cannot have active parent procedures |
 | `SplitAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), no SPLITTING_NEW daughters of this parent exist |
 | `NoOrphanedDaughters` | SPLITTING_NEW regions always have an ASSIGN procedure |
 | `SplitCompleteness` | After split completes (parent SPLIT + NoRange), parentProc is cleared |
 | `AtMostOneCarryingMeta` | At most one server can be carrying `hbase:meta` at any time |
+| `NoOrphanedMergedRegion` | MERGING_NEW regions always have an ASSIGN procedure |
+| `MergeCompleteness` | After merge completes (targets MERGED + NoRange), parentProc is cleared |
+| `MergeAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), merged region not materialized |
 
 ## Liveness Properties
 
@@ -326,11 +345,11 @@ All configurations check the same 27 safety invariants:
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 10 on 10 cores |
-| **Result** | All 27 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 527,398,347 |
 | **States checked** | 147,814,458 distinct |
 | **Depth** | 83 |
-| **Duration** | ~68 min |
+| **Duration** | ~71 min |
 
 ### 9r/3s Simulation
 
@@ -341,7 +360,7 @@ All configurations check the same 27 safety invariants:
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused) |
 | **Mode** | Random Simulation (seed -877283493496910210) |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 27 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 928,632,272 |
 | **Traces generated** | ~9,015,843 |
 | **Duration** | 4 hours |
@@ -381,9 +400,9 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 144
 - Configurable meta-write behavior
 - Keyspace infrastructure (`regionKeyRange`, `DeployedRegions`, `MaxKey`) with `KeyspaceCoverage` invariant
 - Split forward path and pre-PONR rollback with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`, `SplitFail`)
-- Parent-child procedure tracking (`parentProc` variable) across child TRSP lifecycles
+- Merge forward path and pre-PONR rollback with parent-child procedure framework (`MergePrepare`, `MergeCheckClosed`, `MergeUpdateMeta`, `MergeDone`, `MergeFail`); gated by `UseMerge`
+- Parent-child procedure tracking (`parentProc` variable with `ref1`/`ref2` region references) across child TRSP lifecycles
 
 **Deferred:**
-- Merge actions (Iteration 23)
 - Crash during split/merge (Iteration 24)
 - FAILED_CLOSE (RS abort triggers crash detection instead)

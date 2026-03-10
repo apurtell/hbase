@@ -93,6 +93,7 @@ CONSTANTS
     NoProcedure = NoProcedure
     NoTransition = NoTransition
     NoRange = NoRange
+    NoRegion = NoRegion
     Servers = {s1, s2, s3}
     Regions = {r1, r2, r3, r4, r5, r6, r7, r8, r9}
     DeployedRegions = {r1, r2, r3}
@@ -119,6 +120,7 @@ procedures suspend and release the PEWorker on async meta writes.
     UseRSOpenDuplicateQuirk = FALSE
     UseRestoreSucceedQuirk = FALSE
     UseBlockOnMetaWrite = FALSE
+    UseMerge = TRUE
 ```
 
 ## Invariants
@@ -154,6 +156,9 @@ INVARIANT
     NoOrphanedDaughters
     SplitCompleteness
     AtMostOneCarryingMeta
+    NoOrphanedMergedRegion
+    MergeCompleteness
+    MergeAtomicity
 ```
 
 ## Action Constraints

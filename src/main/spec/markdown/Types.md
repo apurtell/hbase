@@ -92,6 +92,20 @@ CONSTANTS UseReopen
 ASSUME UseReopen \in BOOLEAN
 ```
 
+`NoRegion` — sentinel model value for "no region reference" in `parentProc` records. Used when a region-reference field is not applicable (e.g., split pre-PONR before daughters are chosen).
+
+```tla
+CONSTANTS NoRegion
+ASSUME NoRegion \notin Regions
+```
+
+`UseMerge` — when `TRUE`, merge actions are enabled in `Next` and `Fairness`. With both split and merge active, the state space becomes unbounded (split → daughters → merge → parent → split → …). Setting `FALSE` keeps exhaustive model checking tractable (split-only). Setting `TRUE` enables merge in simulation mode.
+
+```tla
+CONSTANTS UseMerge
+ASSUME UseMerge \in BOOLEAN
+```
+
 `UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling `AssignRegionHandler.process()` L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
 
 ```tla
@@ -267,24 +281,27 @@ ParentProcStep ==
 
 ### Parent Procedure Types
 
-Parent procedure types. `"NONE"` means no parent procedure is attached. Extensible: `"MERGE"` will be added in a future iteration.
+Parent procedure types. `"NONE"` means no parent procedure is attached.
 
 ```tla
-ParentProcType == { "SPLIT" }
+ParentProcType == { "SPLIT", "MERGE" }
 ```
 
 `NoParentProc` — sentinel: no parent procedure attached.
 
 ```tla
-NoParentProc == [ type |-> "NONE", step |-> "NONE" ]
+NoParentProc == [ type |-> "NONE", step |-> "NONE",
+                  ref1 |-> NoRegion, ref2 |-> NoRegion ]
 ```
 
-Type definition for `parentProc` records (used in `TypeOK`).
+Type definition for `parentProc` records (used in `TypeOK`). The `ref1` and `ref2` fields hold region-reference values: for split, `ref1`/`ref2` are the daughter identifiers (set at PONR); for merge, `ref1` is the peer target and `ref2` is the merged region identifier.
 
 ```tla
 ParentProcRecord ==
   [type:ParentProcType \cup { "NONE" },
-    step:ParentProcStep \cup { "NONE" }
+    step:ParentProcStep \cup { "NONE" },
+    ref1:Regions \cup { NoRegion },
+    ref2:Regions \cup { NoRegion }
   ]
 ```
 
