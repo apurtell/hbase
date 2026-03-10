@@ -10,18 +10,22 @@ Split procedure actions using the parent-child framework.
 ------------------------------- MODULE Split ---------------------------------
 ```
 
-Models the forward path of `SplitTableRegionProcedure`, which splits a region into two daughters. The procedure uses the **parent-child framework**: it spawns child TRSPs via `addChildProcedure()` and yields while children execute.
+Models `SplitTableRegionProcedure`: forward path (split a region into two daughters) and pre-PONR rollback (abort and reopen parent). The procedure uses the **parent-child framework**: it spawns child TRSPs via `addChildProcedure()` and yields while children execute.
 
-**Actions:**
-- **`SplitPrepare`** — set `SPLITTING`, create `parentProc`
-- **`SplitSpawnClose`** — spawn child `UNASSIGN` TRSP (`addChildProcedure`)
+**Forward-path actions:**
+- **`SplitPrepare`** — set `SPLITTING`, create `parentProc`, spawn child `UNASSIGN` TRSP
 - **`SplitResumeAfterClose`** — resume after child TRSP completes
 - **`SplitUpdateMeta`** — PONR: meta write, materialize daughters, spawn child `ASSIGN` TRSPs
 - **`SplitDone`** — daughters `OPEN`, cleanup
 
+**Rollback action:**
+- **`SplitFail`** — pre-PONR failure: create fresh `ASSIGN` to reopen parent, clear `parentProc`
+
 The `parentProc[r]` variable tracks the parent procedure's state. It persists across child TRSP lifecycles and survives master crash. Child TRSPs use the normal TRSP machinery (`procType`/`procStep`).
 
-*Rollback and failure paths are deferred to a future iteration.*
+`SplitFail` fires non-deterministically at the same precondition as `SplitResumeAfterClose` (parent `CLOSED`, child complete). TLC explores both the success path (`SplitResumeAfterClose`) and the failure path (`SplitFail`) for every reachable split state.
+
+> *Source:* `SplitTableRegionProcedure.rollbackState()` L368–411; `openParentRegion()` L647–651.
 
 ```tla
 EXTENDS Types
@@ -119,19 +123,19 @@ In the implementation, `prepareSplitRegion()` and `addChildProcedure(createUnass
 SplitPrepare(r) ==
 ```
 
-Master must be alive.
+Master must be alive to execute the procedure.
 
 ```tla
   /\ masterAlive = TRUE
 ```
 
-PEWorker thread available.
+PEWorker thread available to execute this step.
 
 ```tla
   /\ availableWorkers > 0
 ```
 
-Region must exist.
+Region must still exist (has an assigned keyspace).
 
 ```tla
   /\ RegionExists(r)
@@ -503,6 +507,99 @@ Clear parent procedure.
         masterVars,
         peVars,
         metaTable,
+        zkNode
+     >>
+```
+
+### `SplitFail(r)`
+
+Pre-PONR rollback: abort the split and create a fresh `ASSIGN` TRSP to reopen the parent region.
+
+Fires non-deterministically at the same precondition as `SplitResumeAfterClose` (parent `CLOSED`, child `UNASSIGN` complete, `parentProc = [SPLIT, SPAWNED_CLOSE]`). The non-deterministic choice between `SplitResumeAfterClose` and `SplitFail` models the success/failure decision: TLC explores both branches.
+
+**The rollback:**
+1. Creates a fresh `ASSIGN` TRSP on the parent (`GET_ASSIGN_CANDIDATE`) to reopen it. Matches `openParentRegion()` → `assignRegionForRollback()`.
+2. Clears `parentProc` to `NoParentProc` (split is terminated).
+3. Reverts meta from `SPLITTING` to `CLOSED` (parent's actual state; the `ASSIGN` TRSP will update meta to `OPENING` → `OPEN` later).
+4. Persists the new `ASSIGN` procedure to `procStore`.
+
+No daughters are created pre-PONR (`SplitAtomicity` invariant), so no daughter cleanup is needed. `regionKeyRange` is unchanged (parent keeps its keyspace).
+
+**Pre:** master alive, PEWorker available, region exists, parent `CLOSED`, no procedure attached, `parentProc = SPAWNED_CLOSE`.
+**Post:** `ASSIGN` TRSP spawned, `parentProc` cleared, meta reverted.
+
+> *Source:* `rollbackState()` `CHECK_CLOSED_REGIONS` case L386–388; `openParentRegion()` L647–651.
+
+```tla
+SplitFail(r) ==
+  /\ masterAlive = TRUE
+  /\ availableWorkers > 0
+  /\ RegionExists(r)
+```
+
+Parent must be `CLOSED` — the child `UNASSIGN` completed.
+
+```tla
+  /\ regionState[r].state = "CLOSED"
+```
+
+No procedure attached — child `UNASSIGN` cleared it.
+
+```tla
+  /\ regionState[r].procType = "NONE"
+```
+
+Split is pending at the close phase (pre-PONR).
+
+```tla
+  /\ parentProc[r] = [ type |-> "SPLIT", step |-> "SPAWNED_CLOSE" ]
+```
+
+Create fresh `ASSIGN` TRSP to reopen the parent.
+
+```tla
+  /\ regionState' =
+       [regionState EXCEPT
+       ![r].procType = "ASSIGN",
+       ![r].procStep = "GET_ASSIGN_CANDIDATE",
+       ![r].targetServer = NoServer,
+       ![r].retries = 0]
+```
+
+Persist the new `ASSIGN` procedure to `procStore`.
+
+```tla
+  /\ procStore' =
+       [procStore EXCEPT
+       ![r] =
+       NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
+```
+
+Clear parent procedure — split is terminated.
+
+```tla
+  /\ parentProc' = [parentProc EXCEPT ![r] = NoParentProc]
+```
+
+Revert meta from `SPLITTING` to `CLOSED` (parent's actual state).
+
+```tla
+  /\ metaTable' =
+       [metaTable EXCEPT
+       ![r] =
+       [ state |-> "CLOSED", location |-> NoServer ]]
+```
+
+Everything else unchanged.
+
+```tla
+  /\ UNCHANGED << scpVars,
+        rpcVars,
+        serverVars,
+        rsVars,
+        masterVars,
+        peVars,
+        regionKeyRange,
         zkNode
      >>
 ```

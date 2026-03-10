@@ -121,14 +121,15 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **Parent-child procedure framework** -- per-region `parentProc` record tracking
   parent procedure type and step (split or merge), persists across child TRSP
   lifecycles and survives master crash.
-- **Split procedure forward path** -- four-step `SplitTableRegionProcedure`
+- **Split procedure** -- `SplitTableRegionProcedure`
   modeled through the parent-child framework: `SplitPrepare` (set SPLITTING,
   spawn child UNASSIGN TRSP to close parent), `SplitResumeAfterClose` (detect
   child completion, advance to point-of-no-return), `SplitUpdateMeta` (PONR:
   write meta, materialize two daughters with computed `[startKey, mid)` and
-  `[mid, endKey)` keyspaces, spawn child ASSIGN TRSPs), and `SplitDone`
-  (daughters OPEN, clear parent keyspace and procedure state).  Pre-PONR
-  rollback and crash-during-split are deferred.
+  `[mid, endKey)` keyspaces, spawn child ASSIGN TRSPs), `SplitDone`
+  (daughters OPEN, clear parent keyspace and procedure state), and `SplitFail`
+  (pre-PONR rollback: abort the split, create a fresh ASSIGN TRSP to reopen
+  the parent).  Crash-during-split is deferred.
 
 The specification defines 27 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
@@ -158,9 +159,9 @@ This is a formal TLA+ specification of the HBase AssignmentManager, covering the
 region assignment lifecycle: state transitions, persistent metadata, procedure-
 driven operations, RPC dispatch, RegionServer-side behavior, server crash recovery,
 and master crash/recovery. The spec models the core assign/unassign/move/reopen
-lifecycle and the split forward path for regions across the OFFLINE, OPENING,
-OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED, SPLITTING, SPLIT, and
-SPLITTING_NEW states.
+lifecycle, the split forward path, and pre-PONR split rollback for regions across
+the OFFLINE, OPENING, OPEN, CLOSING, CLOSED, FAILED_OPEN, ABNORMALLY_CLOSED,
+SPLITTING, SPLIT, and SPLITTING_NEW states.
 
 ## Module Structure
 
@@ -170,7 +171,7 @@ SPLITTING_NEW states.
 | [Types.tla](markdown/Types.md) | Constants, type sets, state definitions, `ValidTransition`, parent-child procedure types |
 | [TRSP.tla](markdown/TRSP.md) | TransitionRegionStateProcedure actions (assign, unassign, move, reopen, dispatch, confirm, failure, crash recovery, meta-blocking, ResumeFromMeta) |
 | [SCP.tla](markdown/SCP.md) | ServerCrashProcedure state machine (detect crash -> assign meta -> get regions -> fence WALs -> assign regions -> done, with meta-blocking) |
-| [Split.tla](markdown/Split.md) | Split procedure forward path using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone) |
+| [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
 | [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
 | [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
@@ -253,9 +254,9 @@ Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 | Tier | Duration | Use Case |
 |------|----------|----------|
-| Per-iteration | 300s (5 min) | Quick feedback during development |
-| Post-iteration | 900s (15 min) | Validation after completing an iteration |
-| Post-phase | 3600s (1 hr) | Milestone verification |
+| Per-iteration | 900s (15 min) | Feedback during development |
+| Post-iteration | 3600s (1 hr) | Validation after completing an iteration |
+| Post-phase | 14400s (4 hr) | Milestone verification |
 
 ## Invariants
 
@@ -320,15 +321,30 @@ All configurations check the same 27 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-09 |
-| **TLC version** | 2026.03.05.210854 |
+| **Date** | 2026-03-10 |
+| **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
+| **Workers** | 10 on 10 cores |
 | **Result** | All 27 invariants, 2 action constraints, and state constraint passed |
-| **States generated** | 527,398,193 |
+| **States generated** | 527,398,347 |
 | **States checked** | 147,814,458 distinct |
 | **Depth** | 83 |
 | **Duration** | ~68 min |
+
+### 9r/3s Simulation
+
+| Detail | Value |
+|--------|-------|
+| **Date** | 2026-03-10 |
+| **TLC version** | 2026.03.02.213938 |
+| **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused) |
+| **Mode** | Random Simulation (seed -877283493496910210) |
+| **Workers** | 128 on 128 cores |
+| **Result** | All 27 invariants, 2 action constraints, and state constraint passed |
+| **States generated** | 928,632,272 |
+| **Traces generated** | ~9,015,843 |
+| **Duration** | 4 hours |
 
 ## Running the Spec
 
@@ -343,12 +359,12 @@ java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
 
 ```sh
 java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
-  -Dtlc2.TLC.stopAfter=600 \
+  -Dtlc2.TLC.stopAfter=3600 \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate \
   -workers auto -cleanup
 ```
 
-Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (300, 900, 3600).
+Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 14400).
 
 ## Scope and Limitations
 
@@ -364,11 +380,10 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (300, 900, 3600
 - Configurable implementation quirks (duplicate open, restore succeed)
 - Configurable meta-write behavior
 - Keyspace infrastructure (`regionKeyRange`, `DeployedRegions`, `MaxKey`) with `KeyspaceCoverage` invariant
-- Split forward path with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`)
+- Split forward path and pre-PONR rollback with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`, `SplitFail`)
 - Parent-child procedure tracking (`parentProc` variable) across child TRSP lifecycles
 
 **Deferred:**
-- Split pre-PONR rollback (Iteration 22)
 - Merge actions (Iteration 23)
 - Crash during split/merge (Iteration 24)
 - FAILED_CLOSE (RS abort triggers crash detection instead)
