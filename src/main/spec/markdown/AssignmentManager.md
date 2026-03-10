@@ -23,7 +23,9 @@ Action logic is factored into sub-modules:
 | **SCP**          | `ServerCrashProcedure` state machine                                           |
 | **RegionServer** | RS-side handlers (open, close, abort, stale reports, restart, duplicate open)   |
 | **Master**       | Master-side actions (offline, crash detect, crash, recover)                    |
-| **Split**        | `SplitTableRegionProcedure` actions                                            |
+| **ProcStore**    | Procedure store invariants and recovery operators                              |
+| **ZK**           | ZooKeeper ephemeral-node lifecycle (session expiry)                            |
+| **Split**        | `SplitTableRegionProcedure` forward path and rollback                          |
 
 ### Region Assignment Lifecycle
 
@@ -75,11 +77,11 @@ Server liveness is tracked by `serverState`. RS crash is decomposed into a multi
 
 Separately, `RSAbort(s)` models the zombie RS discovering it is dead and clearing its RS-side state (`rsOnlineRegions`, `dispatchedOps`). `RSAbort` may fire at any time after `MasterDetectCrash`.
 
-RS-side actions and report consumption are guarded by server liveness. Reports from crashed servers are dropped by `DropStaleReport`. `ServerRestart(s)` models a process supervisor (Kubernetes, systemd) restarting a crashed server after SCP completes; WF on `ServerRestart` ensures crashed servers eventually come back online.
+RS-side actions and report consumption are guarded by server liveness. Reports from crashed servers are dropped by `DropStaleReport`. `RSRestart(s)` (in `RegionServer.tla`) models a process supervisor (Kubernetes, systemd) restarting a crashed server after SCP completes; WF on `RSRestart` ensures crashed servers eventually come back online.
 
 ### Failed Open Handling
 
-When a region fails to open on an RS, the `FAILED_OPEN` report is consumed by `TRSPReportSucceedOpen` (report phase), and `TRSPPersistToMetaOpen` resets the procedure to `GET_ASSIGN_CANDIDATE` for retry on a different server. If the retry counter reaches `MaxRetries`, the persist phase moves the region to `FAILED_OPEN` state (persistent) and clears the procedure.
+When a region fails to open on an RS, the `FAILED_OPEN` report is consumed by `TRSPReportSucceedOpen` (report phase) which updates in-memory state. `TRSPPersistToMetaOpen` (persist phase) then increments the retry counter and resets the procedure to `GET_ASSIGN_CANDIDATE` for retry on a different server. If the retry counter reaches `MaxRetries`, the procedure gives up: the region is left in `FAILED_OPEN` state and the procedure is cleared.
 
 ### State Space Finiteness
 
@@ -151,7 +153,7 @@ VARIABLE scpState
 VARIABLE scpRegions
 ```
 
-`walFenced[s]` is `TRUE` after SCP revokes WAL leases for server `s`. Reset to `FALSE` on `ServerRestart`. After fencing, the zombie RS cannot write to its WALs; any write attempt fails with an HDFS lease exception, triggering RS self-abort.
+`walFenced[s]` is `TRUE` after SCP revokes WAL leases for server `s`. Reset to `FALSE` on `RSRestart`. After fencing, the zombie RS cannot write to its WALs; any write attempt fails with an HDFS lease exception, triggering RS self-abort.
 
 ```tla
 VARIABLE walFenced
@@ -916,9 +918,9 @@ ServerRegionsTrackLocation ==
 
 ### `DispatchCorrespondance`
 
-Every dispatched command for a region corresponds to an active procedure on that region, or the target server is `CRASHED` (stale commands awaiting cleanup by `RSAbort`/`ServerRestart`). Catches orphaned commands that could cause ghost opens/closes.
+Every dispatched command for a region corresponds to an active procedure on that region, or the target server is `CRASHED` (stale commands awaiting cleanup by `RSAbort`/`RSRestart`). Catches orphaned commands that could cause ghost opens/closes.
 
-> *Source:* TRSP dispatch actions produce commands only when a procedure is active; RS consume actions and `RSAbort`/`ServerRestart` clean up.
+> *Source:* TRSP dispatch actions produce commands only when a procedure is active; RS consume actions and `RSAbort`/`RSRestart` clean up.
 
 ```tla
 DispatchCorrespondance ==
@@ -965,11 +967,11 @@ NoPEWorkerDeadlock ==
 
 ### `SCPMonotonicity` *(action constraint)*
 
-SCP state machine transitions are strictly monotonic. The SCP never moves backward; only forward along the defined sequence, plus the `DONE`→`NONE` reset on `ServerRestart`.
+SCP state machine transitions are strictly monotonic. The SCP never moves backward; only forward along the defined sequence, plus the `DONE`→`NONE` reset on `RSRestart`.
 
 Gated on `masterAlive` in both current and next state: during master crash/recovery, `scpState` is reset from stale values (`MasterCrash` preserves them as `UNCHANGED`; `MasterRecover` resets based on ZK re-discovery), which are not normal SCP forward-progress transitions.
 
-> *Source:* SCP state machine actions in `SCP.tla`, `ServerRestart` in `Master.tla`.
+> *Source:* SCP state machine actions in `SCP.tla`, `RSRestart` in `RegionServer.tla`.
 
 ```tla
 SCPMonotonicity ==
@@ -1354,6 +1356,12 @@ Next ==
   \/ \E r \in Regions: split!SplitResumeAfterClose(r)
   \/ \E r \in Regions: \E dA, dB \in Regions: split!SplitUpdateMeta(r, dA, dB)
   \/ \E r \in Regions: split!SplitDone(r)
+```
+
+**Split pre-PONR rollback**
+
+```tla
+  \/ \E r \in Regions: split!SplitFail(r)
 ```
 
 ```tla
