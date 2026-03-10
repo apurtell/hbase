@@ -2,23 +2,35 @@
 
 **Source:** [`AssignmentManager.cfg`](../AssignmentManager.cfg)
 
+## Overview
+
+TLC model configuration for `AssignmentManager.tla`.
+
+**Primary (fast) model: 3 regions (1 deployed + 2 unused), 2 servers.**
+`DeployedRegions` tile `[0, MaxKey)` at `Init`. `Regions \ DeployedRegions` are
+unused identifiers for future splits/merges.
+
+## Running
+
+```sh
+/usr/bin/java -XX:+UseParallelGC \
+  -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
+```
+
+---
+
+## Specification
+
 ```tla
-\* TLC model configuration for AssignmentManager.tla
-\*
-\* Primary (fast) model: 3 regions (1 deployed + 2 unused), 2 servers.
-\*
-\* DeployedRegions tile [0, MaxKey) at Init.
-\* Regions \ DeployedRegions are unused identifiers for future splits/merges.
-\*
-\* Preferred: run via MCP tool tlaplus_mcp_tlc_check (handles Java/classpath).
-\* Fallback:
-\*   /usr/bin/java -XX:+UseParallelGC \
-\*     -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
-\*     tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
-
 SPECIFICATION Spec
+```
 
-\* Model values
+## Constants
+
+Model values and universe sizing:
+
+```tla
 CONSTANTS
     NoProcedure = NoProcedure
     NoTransition = NoTransition
@@ -30,25 +42,43 @@ CONSTANTS
     MaxKey = 2
     MaxRetries = 1
     MaxWorkers = 2
-    \* UseReopen = TRUE models branch-2's additional REOPEN procedure
+```
+
+**`UseReopen = FALSE`** — the REOPEN procedure (branch-2) is disabled in the
+primary exhaustive config for state-space reasons.
+
+**`UseRSOpenDuplicateQuirk = FALSE`** disables the RS duplicate-open
+silent-drop behavior to avoid deadlock. Set `TRUE` to model the implementation
+quirk (`AssignRegionHandler.process()`).
+
+**`UseRestoreSucceedQuirk = FALSE`** for correct recovery behavior. Set `TRUE`
+to reproduce the `OpenRegionProcedure.restoreSucceedState()` bug where
+`FAILED_OPEN` reports are replayed as `OPENED`.
+
+**`UseBlockOnMetaWrite = FALSE`** models master/branch-3+ behavior where
+procedures suspend and release the PEWorker on async meta writes.
+
+```tla
     UseReopen = FALSE
-    \* UseRSOpenDuplicateQuirk = FALSE to disable the RS duplicate-open
-    \* silent-drop behavior to avoid deadlock.  Set TRUE to model the
-    \* implementation quirk (AssignRegionHandler.process()).
     UseRSOpenDuplicateQuirk = FALSE
-    \* UseRestoreSucceedQuirk = FALSE for correct recovery behavior.
-    \* Set TRUE to reproduce the OpenRegionProcedure.restoreSucceedState()
-    \* bug where FAILED_OPEN reports are replayed as OPENED.
     UseRestoreSucceedQuirk = FALSE
-    \* UseBlockOnMetaWrite = FALSE models master/branch-3+ behavior where
-    \* procedures suspend and release the PEWorker on async meta writes.
     UseBlockOnMetaWrite = FALSE
+```
 
-\* Symmetry reduction: unused region identifiers and servers are interchangeable.
-\* DeployedRegions have distinct keyspaces and cannot be permuted.
+## Symmetry Reduction
+
+Unused region identifiers and servers are interchangeable.
+`DeployedRegions` have distinct keyspaces and cannot be permuted.
+
+```tla
 SYMMETRY Symmetry
+```
 
-\* Invariants to check
+## Invariants
+
+All 27 safety invariants are checked:
+
+```tla
 INVARIANT
     TypeOK
     OpenImpliesLocation
@@ -77,17 +107,28 @@ INVARIANT
     NoOrphanedDaughters
     SplitCompleteness
     AtMostOneCarryingMeta
+```
 
-\* Action property: every state change follows ValidTransition
-\* and SCP progress is monotonic
+## Action Constraints
+
+Every state change follows `ValidTransition` and SCP progress is monotonic:
+
+```tla
 ACTION_CONSTRAINT
     TransitionValid
     SCPMonotonicity
+```
 
-\* State constraint: bound concurrent split/merge procedures
+## State Constraints
+
+Bound concurrent split/merge procedures for TLC tractability:
+
+```tla
 CONSTRAINT
     SplitMergeConstraint
-
-\* Liveness properties require symmetry to be disabled.
-\* Use AssignmentManager-liveness.cfg for liveness checking.
 ```
+
+## Liveness
+
+Liveness properties require symmetry to be disabled. Use
+`AssignmentManager-liveness.cfg` for liveness checking.
