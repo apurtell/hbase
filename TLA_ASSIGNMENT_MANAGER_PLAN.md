@@ -871,78 +871,24 @@ TLC 3r/2s: 147,814,458 distinct, 527,398,347 generated, depth 83,
 
 #### Iteration 23 — Complete merge forward path with rollback
 
-**`UseMerge` conditional guard** (follows `UseReopen`
-pattern): Add `UseMerge ∈ BOOLEAN` constant in `Types.tla` with
-`ASSUME UseMerge ∈ BOOLEAN`.  All merge actions in `Next` and
-`Fairness` are gated on `UseMerge = TRUE`.  Each merge action's
-precondition also includes `UseMerge = TRUE` as a conjunct.  Config
-settings:
-- `AssignmentManager.cfg` (primary exhaustive): `UseMerge = FALSE`.
-  Split-only verification remains exhaustive and tractable.
-- `AssignmentManager-liveness.cfg`: `UseMerge = FALSE`.
-- `AssignmentManager-sim.cfg` (simulation): `UseMerge = TRUE`.
-  Simulation mode performs long random walks and does not require
-  exhaustive enumeration, so the unbounded cycle is not a problem.
-  `SplitMergeConstraint` (≤ 1 concurrent) still bounds the number of
-  concurrent procedures at any given state, preventing per-step
-  explosion.  Simulation traces will exercise interleaved split/merge
-  sequences at depth, catching safety violations that arise from the
-  interaction.
-Why: Once both split and merge actions are active, the state space
-becomes unbounded.  A split produces two daughters whose keyspaces are
-adjacent, making them eligible for merging.  A merge produces a single
-region whose keyspace is wide enough to split again.  This creates an
-infinite cycle: split → daughters → merge → parent → split → …, with
-merging freeing region-pool slots for new splits and splitting
-enabling new merge opportunities.  Exhaustive model-checking cannot
-terminate on an infinite state graph.
-
-**What to add**: The *entire* merge procedure (forward path + rollback)
-in one iteration, following the same pattern as split. Rollback is
-included from the start so that TLC can explore both success and
-failure paths without requiring a separate iteration.
-- **`UseMerge` constant**: `Types.tla` — `CONSTANTS UseMerge`,
-  `ASSUME UseMerge ∈ BOOLEAN`.  All configs updated.
-- `MergePrepare(r1, r2, m)`: Non-deterministic. Models admin API RPC
-  or master merge chore. Pre: `UseMerge = TRUE`, both OPEN, no
-  procedures attached, `Adjacent(r1, r2)` (i.e.
-  `regionKeyRange[r1].endKey = regionKeyRange[r2].startKey`),
-  m has `regionKeyRange = NoRange` (unused identifier).
-  Merged region will get keyspace `[r1.startKey, r2.endKey)`.
-  Set r1, r2 to MERGING. Attach merge procedure to r1, r2, m
-  (enforcing mutual exclusion on all three regions).
-- `MergeCloseRegions(p)`: Create child TRSP(UNASSIGN) for each target.
-- `MergeCheckClosed(p)`: Verify all targets CLOSED.
-- `MergeCreateMerged(p)`: Set m to MERGING_NEW in memory.
-- `MergeUpdateMeta(p)`: **PONR**: Set targets to MERGED (terminal),
-  set `regionKeyRange[m] = [r1.startKey, r2.endKey)` (merged region
-  now exists with the union keyspace). Create merged region as CLOSED
-  in meta, MERGING_NEW in memory.
-- `MergeOpenMerged(p)`: Create child TRSP(ASSIGN) for merged region.
-- `MergeDone(p)`: Merged region is OPEN. Clear target keyspaces:
-  `regionKeyRange[r1] = NoRange`, `regionKeyRange[r2] = NoRange`
-  (modeling deletion after compaction — atomic data copy).
-  Detach procedure from all regions.
-- `MergeFail(p)`: Pre: merge procedure is in a pre-PONR state.
-  Triggers rollback.
-- `MergeRollback(p)`: Pre-PONR only: revert targets to OPEN, set
-  `regionKeyRange[m] = NoRange`, detach procedure.
-- **`Next` updates**: Merge actions guarded by `UseMerge`:
-  `\/ (UseMerge /\ \E r1, r2, m \in Regions: merge!MergePrepare(r1, r2, m))`
-  and similarly for each merge step.  Split actions remain ungated.
-- **`Fairness` updates**: WF on deterministic merge steps gated by
-  `(UseMerge => ...)`, matching the `UseReopen` pattern.  No WF on
-  `MergePrepare` (non-deterministic) or `MergeFail` (non-deterministic).
-- **Config updates**: `UseMerge = FALSE` in primary and liveness
-  configs; `UseMerge = TRUE` in simulation config.  Simulation config
-  comment updated to note merge coverage.
-**Verify**: `MergeCompleteness` — after done, merged region is OPEN
-with keyspace `[r1.startKey, r2.endKey)`, targets have `NoRange`
-(deleted). `KeyspaceCoverage` restored under both success and failure
-paths. All safety invariants hold.  Primary exhaustive run (split-only)
-must remain clean.  Simulation run (split+merge) exercises the
-interaction and checks all 27+ invariants.
-**Source**: `MergeTableRegionsProcedure.java` `executeFromState()` L189-255.
+`UseMerge` conditional guard (follows `UseReopen` pattern):
+`UseMerge ∈ BOOLEAN` constant in `Types.tla`.  All merge actions
+gated on `UseMerge = TRUE` in `Next`/`Fairness`.  New `Merge.tla` module —
+5 actions (`MergePrepare`, `MergeCheckClosed`, `MergeUpdateMeta`,
+`MergeDone`, `MergeFail`) using the parent-child framework with
+`parentProc` cross-references (`ref1` = peer target, `ref2` = 
+merged region).  `parentProc` extended to 4-field record 
+`[type, step,ref1, ref2]` with `NoRegion` sentinel.  Split actions updated:
+`SplitUpdateMeta` stores daughters in `ref1`/`ref2`, `SplitDone` reads them
+back.  All `parentProc` equality checks converted to field-by-field.
+`TRSP.tla`: added `"MERGING"` to `TRSPDispatchClose` state guard.
+`AssignmentManager.tla`: +`INSTANCE Merge`, TypeOK extended for MERGE
+procType, 11 invariants extended for MERGING/MERGED/MERGING_NEW, 3 new
+invariants (`NoOrphanedMergedRegion`, `MergeCompleteness`,
+`MergeAtomicity`), 5 merge disjuncts in `Next`, 3 WF entries in
+`Fairness`, 3 THEOREMs.  All configs updated (+`NoRegion`, +`UseMerge`,
++3 merge invariants). TLC 3r/2s (UseMerge=FALSE): 147,814,458 distinct,
+527,398,347 generated, depth 83, ~71min, clean.
 
 #### Iteration 24 — Crash during split/merge
 
