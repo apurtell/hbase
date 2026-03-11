@@ -153,11 +153,13 @@ merged regions cannot have active parent procedures), `SplitAtomicity`
 server carrying meta), `MergeCompleteness` (completed merge has cleaned-up
 targets), and `MergeAtomicity` (pre-PONR, merged region not materialized).
 
-One liveness property (`MetaEventuallyAssigned`) verifies that `hbase:meta`
-is eventually reassigned after a crash. Two action constraints enforce
-transition validity and SCP monotonicity.  One state constraint
-(`SplitMergeConstraint`) bounds concurrent split/merge procedures for TLC
-tractability.
+Three liveness properties verify temporal guarantees:
+`MetaEventuallyAssigned` (meta eventually reassigned after crash),
+`OfflineEventuallyOpen` (ASSIGN-bearing OFFLINE region eventually opens),
+and `SCPEventuallyDone` (started SCP eventually completes).  Two action
+constraints enforce transition validity and SCP monotonicity.  One state
+constraint (`SplitMergeConstraint`) bounds concurrent split/merge procedures
+for TLC tractability.
 
 The model checker runs in two tiers: fast exhaustive verification at 3
 regions / 2 servers (1 deployed + 2 unused for split daughters), and deep
@@ -316,6 +318,8 @@ All configurations check the same 30 safety invariants:
 | Property | Description |
 |----------|-------------|
 | `MetaEventuallyAssigned` | When meta becomes unavailable (`ASSIGN_META`), the SCP eventually reassigns it |
+| `OfflineEventuallyOpen` | Once an ASSIGN procedure is attached to an OFFLINE region, the region eventually reaches OPEN |
+| `SCPEventuallyDone` | Once an SCP starts for a crashed server (`scpState ∉ {NONE, DONE}`), it eventually completes (`scpState = DONE`) |
 
 > Liveness properties are incompatible with TLC's `SYMMETRY` reduction.
 > Use [`AssignmentManager-liveness.cfg`](markdown/AssignmentManager-liveness-cfg.md)
@@ -345,11 +349,11 @@ All configurations check the same 30 safety invariants:
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 10 on 10 cores |
-| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 30 invariants, 2 liveness properties, 2 action constraints, and state constraint passed |
 | **States generated** | 527,398,347 |
 | **States checked** | 147,814,458 distinct |
 | **Depth** | 83 |
-| **Duration** | ~71 min |
+| **Duration** | ~70 min |
 
 ### 9r/3s Simulation
 
@@ -358,11 +362,11 @@ All configurations check the same 30 safety invariants:
 | **Date** | 2026-03-10 |
 | **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused) |
-| **Mode** | Random Simulation (seed -877283493496910210) |
+| **Mode** | Random Simulation (seed -8506467816346790913) |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
-| **States generated** | 928,632,272 |
-| **Traces generated** | ~9,015,843 |
+| **Result** | All 30 invariants, 2 liveness properties, 2 action constraints, and state constraint passed |
+| **States generated** | 723,156,021 |
+| **Traces generated** | ~7,020,665 |
 | **Duration** | 4 hours |
 
 ## Running the Spec
@@ -404,5 +408,5 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 144
 - Parent-child procedure tracking (`parentProc` variable with `ref1`/`ref2` region references) across child TRSP lifecycles
 
 **Deferred:**
-- Crash during split/merge (Iteration 24)
+- Crash during split/merge
 - FAILED_CLOSE (RS abort triggers crash detection instead)
