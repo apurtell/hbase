@@ -1308,9 +1308,14 @@ Fairness ==
   /\ \A s \in Servers: WF_vars(scp!SCPFenceWALs(s))
   /\ \A s \in Servers: \A r \in Regions: WF_vars(scp!SCPAssignRegion(s, r))
   /\ \A s \in Servers: WF_vars(scp!SCPDone(s))
-  \* RS-side processing
-  /\ \A s \in Servers: \A r \in Regions: WF_vars(rs!RSOpen(s, r))
-  /\ \A s \in Servers: \A r \in Regions: WF_vars(rs!RSClose(s, r))
+  \* RS-side processing -- strong fairness: RS report delivery is
+  \* intermittently enabled (dispatch -> consume -> done per cycle).
+  \* SF ensures that if the action is infinitely often enabled, it
+  \* eventually fires, guaranteeing report delivery across retry cycles.
+  /\ \A s \in Servers: \A r \in Regions: SF_vars(rs!RSOpen(s, r))
+  /\ \A s \in Servers: \A r \in Regions: SF_vars(rs!RSClose(s, r))
+  \* RS-side failure reports (intermittently enabled; SF needed)
+  /\ \A s \in Servers: \A r \in Regions: SF_vars(rs!RSFailOpen(s, r))
   \* Split forward path (deterministic steps; no WF on SplitPrepare)
   /\ \A r \in Regions: WF_vars(split!SplitResumeAfterClose(r))
   /\ \A r \in Regions:
@@ -1335,6 +1340,31 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 \*         SCPAssignMeta, so meta assignment always completes.
 MetaEventuallyAssigned ==
   \A s \in Servers: scpState[s] = "ASSIGN_META" ~> MetaIsAvailable
+
+\* Liveness: once an ASSIGN procedure is attached to an OFFLINE region,
+\* the region eventually reaches OPEN.  This tests the full TRSP assign
+\* pipeline under fairness (candidate selection -> dispatch -> RS open ->
+\* report -> persist).
+\*
+\* Precondition: procedure must be ASSIGN (not merely OFFLINE with no
+\* procedure, since TRSPCreate has no fairness -- the decision to create
+\* an ASSIGN is an external event).
+\*
+\* Source: TRSP pipeline liveness guarantee.
+OfflineEventuallyOpen ==
+  \A r \in Regions:
+    ( RegionExists(r) /\ regionState[r].state = "OFFLINE"
+      /\ regionState[r].procType = "ASSIGN" ) ~>
+    regionState[r].state = "OPEN"
+
+\* Liveness: once an SCP starts for a crashed server, it eventually
+\* completes.  All SCP steps have WF and the SCP state machine is
+\* deterministic, so forward progress is guaranteed.
+\*
+\* Source: SCP state machine (GET_REGIONS -> FENCE_WALS -> ASSIGN -> DONE).
+SCPEventuallyDone ==
+  \A s \in Servers:
+    scpState[s] \notin {"NONE", "DONE"} ~> scpState[s] = "DONE"
 
 ---------------------------------------------------------------------------
 
@@ -1422,6 +1452,12 @@ MetaEventuallyAssigned ==
 
 \* Safety: pre-PONR merged region not materialized.
         THEOREM Spec => []MergeAtomicity
+
+\* Liveness: ASSIGN-bearing OFFLINE region eventually opens.
+        THEOREM Spec => OfflineEventuallyOpen
+
+\* Liveness: started SCP eventually completes.
+        THEOREM Spec => SCPEventuallyDone
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.

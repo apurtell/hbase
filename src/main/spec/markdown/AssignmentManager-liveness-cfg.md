@@ -76,7 +76,7 @@ procedures suspend and release the PEWorker on async meta writes.
 
 ## Safety Invariants
 
-All 27 safety invariants are checked alongside liveness:
+All 30 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -134,7 +134,14 @@ CONSTRAINT
 The reason this config exists — temporal properties that require `SYMMETRY` to
 be disabled:
 
+- **`MetaEventuallyAssigned`**: Meta eventually reassigned after crash.
+- **`OfflineEventuallyOpen`**: ASSIGN-bearing OFFLINE region eventually opens.
+- **`SCPEventuallyDone`**: Started SCP eventually completes.
+
 ```tla
+\* Liveness properties (the reason this config exists)
 PROPERTY
     MetaEventuallyAssigned
+    OfflineEventuallyOpen
+    SCPEventuallyDone
 ```
