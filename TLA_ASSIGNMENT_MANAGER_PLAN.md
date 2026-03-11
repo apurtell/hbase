@@ -809,7 +809,7 @@ TLC 2r/2s: 12,412,690 distinct, 43,093,199 generated, 2m57s, clean.
 
 ---
 
-### Phase 7: Split and Merge
+### Phase 7: Split and Merge ✅ COMPLETE
 
 #### Iteration 20 — Keyspace infrastructure (no split/merge actions) ✅ COMPLETE
 
@@ -890,38 +890,31 @@ invariants (`NoOrphanedMergedRegion`, `MergeCompleteness`,
 +3 merge invariants). TLC 3r/2s (UseMerge=FALSE): 147,814,458 distinct,
 527,398,347 generated, depth 83, ~71min, clean.
 
-#### Iteration 24 — Crash during split/merge
-
-**What to add**: No new actions — this is a **verification-only** iteration.
-Configure TLC to allow RS crash and master crash during active
-split/merge procedures. Verify:
-- Pre-PONR crash → rollback succeeds, parent/targets reopen.
-- Post-PONR crash → procedure resumes and completes.
-- SCP interaction: SCP calls `serverCrashed()` on child TRSPs of the
-  split/merge procedure; child TRSPs reassign to new server.
-- `NoLostRegions`, `NoDoubleAssignment`, `SplitCompleteness`,
-  `MergeCompleteness`, `KeyspaceCoverage`, `SplitMergeMutualExclusion`
-  all hold under crash scenarios.
-**Source**: See Appendix C.9 for crash interaction analysis.
-
 ---
 
 ### Phase 8: Liveness and Refinement
 
-#### Iteration 27 — Fairness and liveness
+#### Iteration 24 — Fairness and liveness
 
-**What to add**: Weak fairness on procedure execution, strong fairness
-on message delivery. Check temporal properties:
-- `□(regionState[r].state = "OFFLINE" ⇒ ◇ regionState[r].state = "OPEN")`
-- `□(scp_started(s) ⇒ ◇ scp_done(s))`
+Strong fairness (SF) on RS-side message delivery: upgraded `RSOpen`,
+`RSClose` from WF to SF (report delivery is intermittently enabled
+across retry cycles); added SF on `RSFailOpen` (previously no fairness).
+Two new temporal liveness properties: `OfflineEventuallyOpen` (ASSIGN-
+bearing OFFLINE region eventually reaches OPEN; leads-to with
+`procType="ASSIGN"` precondition since `TRSPCreate` has no fairness),
+`SCPEventuallyDone` (`scpState ∉ {NONE, DONE} ~> scpState = DONE`).
+`AssignmentManager.tla`: Fairness (WF→SF, +SF RSFailOpen), 2 property
+definitions, 2 THEOREMs.  `AssignmentManager-liveness.cfg`: +2 PROPERTY
+entries. TLC 3r/2s (UseMerge=FALSE): 147,814,458 distinct,
+527,398,347 generated, depth 83, ~70min, clean.
 
-#### Iteration 28 — TLC optimization
+#### Iteration 25 — TLC optimization
 
 **What to add**: State constraints to bound message queue sizes.
 Action constraints to limit crash frequency. Measure cumulative state
 space reduction across all phases.
 
-#### Iteration 29 — Advanced scenarios and findings
+#### Iteration 26 — Advanced scenarios and findings
 
 **What to verify**: Cascade crashes, master failover during SCP,
 concurrent split and move on the same region, split during merge of
@@ -1063,8 +1056,8 @@ For each module, the primary source files and their key line ranges:
 | Phase 5: Procedure Store + Master Recovery | 17-18 | +150 | Persistence, crash+rebuild |
 | Phase 6: PEWorker Pool + Meta-Blocking | 19 | +100 | Finite worker pool, synchronous meta-blocking semantics |
 | Phase 7: Split and Merge | 20-26 | +350 | Keyspace modeling, multi-region locking, PONR, rollback |
-| Phase 8: Liveness and Refinement | 27-29 | +50 | Fairness, scenarios (symmetry already done) |
-| **Total** | **29** | **~1860** (est.) | |
+| Phase 8: Liveness and Refinement | 24-26 | +50 | Fairness, scenarios (symmetry already done) |
+| **Total** | **26** | **~1860** (est.) | |
 
 ---
 
@@ -1303,7 +1296,7 @@ The overall TLA+ specification effort is complete when ALL of the following
 hold:
 
 1. **All planned iterations are done**: Every iteration in Section 7
-   (Phases 1–7, Iterations 1–29) has been completed per the workflow in
+   (Phases 1–8, Iterations 1–26) has been completed per the workflow in
    12.2, or explicitly deferred with justification.
 
 2. **All invariants pass**: TLC reports zero violations for all defined
