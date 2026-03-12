@@ -954,7 +954,7 @@ All 3 configs: +`UseRSCloseNotFoundQuirk = FALSE`.  With quirk disabled
 
 #### Iteration 27 — Miscellaneous fidelity improvements ✅ COMPLETE
 
-Two fidelity fixes, no new variables or actions.  `SCP.tla`: `SCPDone`
+Two fidelity fixes, no new variables or actions. `SCP.tla`: `SCPDone`
 now clears `serverRegions[s]` to `{}`, modeling
 `ServerManager.expireServer()` → `RegionStates.removeServer()`
 (L679–681) which removes the `ServerStateNode` entirely on SCP
@@ -969,46 +969,24 @@ accepting stale `OPENED` reports from a previous server after
 crash+reassign. TLC 3r/2s: 137,680,580 distinct, 488,668,819 generated,
 depth 82, ~74min, clean.
 
-#### Iteration 28 — Dispatch-failure server expiration
+#### Iteration 28 — Dispatch-failure server expiration ✅ COMPLETE
 
-Model the `RSProcedureDispatcher.scheduleForRetry()` →
+Modeled `RSProcedureDispatcher.scheduleForRetry()` →
 `ServerManager.expireServer()` code path where repeated dispatch
 failures cause the master to expire the target server, triggering
-SCP while the RS may still be alive (ZK node still present).
-Extend `DispatchFail(r)` and `DispatchFailClose(r)` in `TRSP.tla`
-with a second disjunct. Existing first disjunct retains the
-current behavior (server stays ONLINE, TRSP resets to
-`GET_ASSIGN_CANDIDATE`/`CLOSE`).  The new second disjunct fires
-under the same dispatch-pending preconditions and atomically:
-1. Sets `serverState[s] = "CRASHED"` and starts SCP for `s`
-  (`scpState[s] = "GET_REGIONS"` or `"ASSIGN_META"`, with
-  non-deterministic `carryingMeta` — same pattern as
-  `MasterDetectCrash`).
-2. Removes the dispatched command from `dispatchedOps[s]`.
-3. Does **not** advance or reset the TRSP — the procedure is left
-  at `CONFIRM_OPENED` / `CONFIRM_CLOSED` (matching the
- `remoteCallFailed()` early-return when `isServerOnline()=false`).
-The TRSP-vs-SCP race is explored naturally: SCP's
-`SCPAssignRegion → TRSPServerCrashed` path drives the region forward
-while the TRSP is still in its dispatch-waiting step.
-The RS may still be alive (ZK node present);
-this models the hung-RS scenario where the server is unreachable
-by RPC but has not yet lost its ZK session.  `RSAbort` (guarded by
-`zkNode[s] = FALSE`) will not fire until ZK eventually detects the
-death, so the RS may process the already-dispatched command and
-even report back before `RSAbort` clears state.
-**State-explosion mitigation**:
-  - Gated by `UseDispatchExpiry ∈ BOOLEAN` constant (default TRUE).
-  - No retry counter: the 10-retry threshold is abstracted as
-    non-deterministic choice.  Sound because TLC explores all
-    non-deterministic choices regardless of retry count.
-  - Merged disjunct: no new action in `Next`; the second disjunct
-    shares preconditions with the existing `DispatchFail` /
-    `DispatchFailClose`, adding exactly one additional successor per
-    reachable dispatch state.
-   - *Subsumed SCP start*: atomically sets `serverState[s] = "CRASHED"`
-    and initializes `scpState[s]` in a single step, matching the
-    atomicity of `expireServer()`
+SCP while the RS may still be alive (ZK node present).  `TRSP.tla`:
+extended `DispatchFail(r)` and `DispatchFailClose(r)` with a second
+disjunct (unconditional).  First disjunct retains existing retry
+behavior (server stays ONLINE, TRSP resets).  Second disjunct
+atomically: (1) sets `serverState[s] = "CRASHED"` and starts SCP
+(non-deterministic `carryingMeta`, same `MasterDetectCrash` pattern),
+(2) removes dispatched command from `dispatchedOps[s]`,
+(3) leaves the TRSP at `CONFIRM_OPENED`/`CONFIRM_CLOSED` (matching
+`remoteCallFailed()` early-return when `isServerOnline()=false`).
+TRSP-vs-SCP race explored naturally: SCP's `SCPAssignRegion →
+TRSPServerCrashed` drives the region forward while TRSP is in its
+dispatch-waiting step. TLC 3r/2s: 368,662,744 distinct,
+1,328,348,760 generated, depth 92, ~71min, clean.
 
 ---
 
