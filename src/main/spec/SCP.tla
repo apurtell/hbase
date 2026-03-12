@@ -472,9 +472,11 @@ SCPDone(s) ==
   /\ scpRegions[s] = {}
   \* Mark SCP as complete for this crashed server.
   /\ scpState' = [scpState EXCEPT ![s] = "DONE"]
+  \* Clean up ServerStateNode tracking for the crashed server.
+  /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
   \* All other state unchanged -- region reassignments already applied.
   /\ UNCHANGED << rpcVars,
-        serverVars,
+        serverState,
         procStore,
         rsVars,
         masterVars,

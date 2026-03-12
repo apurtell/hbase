@@ -351,10 +351,10 @@ All configurations check the same 30 safety invariants:
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 10 on 10 cores |
 | **Result** | All 30 invariants, 2 liveness properties, 2 action constraints, and state constraint passed |
-| **States generated** | 527,675,023 |
-| **States checked** | 147,814,458 distinct |
-| **Depth** | 83 |
-| **Duration** | ~69 min |
+| **States generated** | 488,668,819 |
+| **States checked** | 137,680,580 distinct |
+| **Depth** | 82 |
+| **Duration** | ~74 min |
 
 ### 9r/3s Simulation
 
