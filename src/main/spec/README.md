@@ -344,16 +344,16 @@ All configurations check the same 30 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-10 |
-| **TLC version** | 2026.03.02.213938 |
+| **Date** | 2026-03-11 |
+| **TLC version** | 2026.03.11.044424 |
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 10 on 10 cores |
 | **Result** | All 30 invariants, 2 liveness properties, 2 action constraints, and state constraint passed |
-| **States generated** | 527,398,347 |
+| **States generated** | 527,675,023 |
 | **States checked** | 147,814,458 distinct |
 | **Depth** | 83 |
-| **Duration** | ~70 min |
+| **Duration** | ~74 min |
 
 ### 9r/3s Simulation
 

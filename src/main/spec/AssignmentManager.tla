@@ -571,13 +571,18 @@ LockExclusivity ==
                         "MERGING",
                         "CLOSING",
                         "ABNORMALLY_CLOSED",
-                        "CLOSED"
+                        "CLOSED",
+                        "OPENING",
+                        "FAILED_OPEN"
                       \* SPLITTING: split yields parent to UNASSIGN
                       \* (SplitPrepare sets procType=UNASSIGN while
                       \* parent is still in SPLITTING state).
                       \* MERGING: merge yields targets to UNASSIGN
                       \* (MergePrepare sets procType=UNASSIGN while
                       \* targets are still in MERGING state).
+                      \* OPENING/OPEN/FAILED_OPEN: UNASSIGN two-phase
+                      \* crash recovery reopens the region before
+                      \* re-closing it (confirmClosed() L379-389).
                       }
               \/ /\ regionState[r].procType = "MOVE"
                  /\ regionState[r].state \in

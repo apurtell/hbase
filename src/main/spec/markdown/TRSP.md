@@ -33,7 +33,7 @@ The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionPro
 | `DISPATCH` (=1)       | `TRSPDispatchOpen`, `TRSPDispatchClose` — RPC dispatch is atomic within TRSP step   |
 | `REPORT_SUCCEED` (=2) | `TRSPConfirmOpened`, `TRSPConfirmClosed` — decomposed to model crash window         |
 | `DISPATCH_FAIL` (=3)  | `DispatchFail`, `DispatchFailClose` — RPC failure resets TRSP to retry               |
-| `SERVER_CRASH` (=4)   | `TRSPServerCrashed` — server crash converts TRSP to ASSIGN                          |
+| `SERVER_CRASH` (=4)   | `TRSPServerCrashed` — server crash recovery (type-preserving)                       |
 
 ```tla
 EXTENDS Types
@@ -210,7 +210,7 @@ META, RPC channels, RS-side state, and server liveness unchanged.
 
 ### `TRSPGetCandidate(r, s)`
 
-Choose a target server for the `ASSIGN`, `MOVE`, or `REOPEN` procedure.
+Choose a target server for the `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN` procedure. `UNASSIGN` reaches `GET_ASSIGN_CANDIDATE` during two-phase crash recovery (reopen then re-close).
 
 **Pre:** TRSP is in `GET_ASSIGN_CANDIDATE` state, chosen server is `ONLINE`, and no `CRASHED` server still has `r` in its `rsOnlineRegions` (the zombie window must be closed).
 **Post:** `targetServer` set, TRSP advances to `OPEN` state.
@@ -221,7 +221,7 @@ Choose a target server for the `ASSIGN`, `MOVE`, or `REOPEN` procedure.
 TRSPGetCandidate(r, s) ==
 ```
 
-Procedure is `ASSIGN`, `MOVE`, or `REOPEN` at `GET_ASSIGN_CANDIDATE`. Chosen server is `ONLINE`; no `CRASHED` server still holds `r` in `rsOnlineRegions`. Master must be alive for procedure execution.
+Procedure is `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN` at `GET_ASSIGN_CANDIDATE`. Chosen server is `ONLINE`; no `CRASHED` server still holds `r` in `rsOnlineRegions`. Master must be alive for procedure execution.
 
 ```tla
   /\ masterAlive = TRUE
@@ -239,10 +239,10 @@ Region must exist (have an assigned keyspace).
   /\ regionKeyRange[r] # NoRange
 ```
 
-Procedure type must be `ASSIGN`, `MOVE`, or `REOPEN`.
+Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN` (`UNASSIGN` reaches `GET_ASSIGN_CANDIDATE` during two-phase crash recovery: reopen then re-close).
 
 ```tla
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
 ```
 
 Procedure must be at the candidate selection step.
@@ -314,7 +314,7 @@ Region must exist (have an assigned keyspace).
 
 ```tla
   /\ regionKeyRange[r] # NoRange
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
   /\ \/ \* --- Meta unavailable: suspend or block ---
@@ -466,10 +466,10 @@ Region must exist (have an assigned keyspace).
   /\ regionKeyRange[r] # NoRange
 ```
 
-Procedure type must be `ASSIGN`, `MOVE`, or `REOPEN`.
+Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN`.
 
 ```tla
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
 ```
 
 Procedure must be waiting for the open confirmation.
@@ -603,10 +603,10 @@ Region must exist (have an assigned keyspace).
   /\ regionKeyRange[r] # NoRange
 ```
 
-Procedure type must be `ASSIGN`, `MOVE`, or `REOPEN`.
+Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN`.
 
 ```tla
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
 ```
 
 Procedure must be at the report-succeed (persist-to-meta) step.
@@ -687,7 +687,13 @@ Region is not blocking a PEWorker on meta.
 Transition code must be `OPENED`.
 
 ```tla
-        /\ procStore[r].transitionCode = "OPENED"
+        /\ tc = "OPENED"
+```
+
+In-memory state must already reflect `OPEN` (from `TRSPReportSucceedOpen`).
+
+```tla
+        /\ regionState[r].state = "OPEN"
 ```
 
 Persist `OPEN` to `metaTable`. Write final `OPEN` state and server location to meta.
@@ -696,29 +702,36 @@ Persist `OPEN` to `metaTable`. Write final `OPEN` state and server location to m
         /\ metaTable' =
              [metaTable EXCEPT
              ![r] =
-             [ state |-> "OPEN",
-               location |-> regionState[r].location ]]
+             [ state |-> "OPEN", location |-> metaTable[r].location ]]
 ```
 
-TRSP completed: clear procedure.
+Branch on procedure type. **UNASSIGN two-phase recovery:** reopen succeeded, now continue to `CLOSE` phase to complete the unassignment. Models `confirmOpened()` L289-301 where `lastState == CONFIRM_CLOSED` triggers `nextState = CLOSE`, returns `HAS_MORE_STATE`. **ASSIGN/MOVE/REOPEN:** procedure complete.
 
 ```tla
-        /\ regionState' =
-             [regionState EXCEPT
-             ![r] =
-             [ state |-> "OPEN",
-               location |-> regionState[r].location,
-               procType |-> "NONE",
-               procStep |-> "IDLE",
-               targetServer |-> NoServer,
-               retries |-> 0
-             ]]
-```
-
-Delete completed procedure from store.
-
-```tla
-        /\ procStore' = [procStore EXCEPT ![r] = NoProcedure]
+        /\ IF regionState[r].procType = "UNASSIGN"
+              THEN /\ regionState' =
+                        [regionState EXCEPT
+                        ![r].procStep =
+                        "CLOSE",
+                        ![r].targetServer =
+                        regionState[r].location]
+                   /\ procStore' =
+                        [procStore EXCEPT
+                        ![r] =
+                        NewProcRecord("UNASSIGN", "CLOSE",
+                                       regionState[r].location,
+                                       NoTransition)]
+              ELSE /\ regionState' =
+                        [regionState EXCEPT
+                        ![r] =
+                        [ state |-> "OPEN",
+                          location |-> regionState[r].location,
+                          procType |-> "NONE",
+                          procStep |-> "IDLE",
+                          targetServer |-> NoServer,
+                          retries |-> 0
+                        ]]
+                   /\ procStore' = [procStore EXCEPT ![r] = NoProcedure]
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
@@ -899,10 +912,10 @@ Region must exist (have an assigned keyspace).
   /\ regionKeyRange[r] # NoRange
 ```
 
-Procedure type must be `ASSIGN`, `MOVE`, or `REOPEN`.
+Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN`.
 
 ```tla
-  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN" }
+  /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
 ```
 
 Procedure must be waiting for the open confirmation.
@@ -1792,10 +1805,10 @@ Branch on procedure type.
 
 ### `TRSPConfirmClosedCrash(r)`
 
-**Crash during close** (`ABNORMALLY_CLOSED`) — the target server crashed while the close was in flight. The procedure self-recovers: convert to `ASSIGN` at `GET_ASSIGN_CANDIDATE` to reopen the region (needed to process recovered edits).
+**Crash during close** (`ABNORMALLY_CLOSED`) — the target server crashed while the close was in flight. The procedure self-recovers with type-preserving crash recovery (matching Java `confirmClosed()` L379-389): the original `procType` is preserved instead of unconditionally converting to `ASSIGN`. For `UNASSIGN`, this triggers two-phase recovery (reopen then re-close) in `TRSPPersistToMetaOpen`.
 
 **Pre:** `UNASSIGN`/`MOVE`/`REOPEN` at `CONFIRM_CLOSED`, region `ABNORMALLY_CLOSED`.
-**Post:** procedure converted to `ASSIGN`/`GET_ASSIGN_CANDIDATE`, stale dispatched commands cleared.
+**Post:** procedure at `GET_ASSIGN_CANDIDATE` with preserved type, stale dispatched commands cleared.
 
 > *Source:* `TRSP.confirmClosed()` detects `ABNORMALLY_CLOSED`, `RegionRemoteProcedureBase.serverCrashed()`.
 
@@ -1839,13 +1852,11 @@ Region was marked `ABNORMALLY_CLOSED` by SCP (server crashed).
   /\ regionState[r].state = "ABNORMALLY_CLOSED"
 ```
 
-Convert procedure to `ASSIGN` at `GET_ASSIGN_CANDIDATE` for reassignment.
+Type-preserving crash recovery: preserve the original `procType` instead of unconditionally converting to `ASSIGN`. For `UNASSIGN`, this triggers two-phase recovery (reopen then re-close) in `TRSPPersistToMetaOpen`.
 
 ```tla
   /\ regionState' =
        [regionState EXCEPT
-       ![r].procType =
-       "ASSIGN",
        ![r].procStep =
        "GET_ASSIGN_CANDIDATE",
        ![r].targetServer =
@@ -1862,13 +1873,13 @@ Clear stale dispatched commands for this region.
        ]
 ```
 
-Update persisted procedure: convert to `ASSIGN`.
+Update persisted procedure: preserve type.
 
 ```tla
   /\ procStore' =
        [procStore EXCEPT
        ![r] =
-       NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
+       NewProcRecord(regionState[r].procType, "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
 ```
 
 `ServerStateNode` tracking.
@@ -1898,12 +1909,16 @@ Update persisted procedure: convert to `ASSIGN`.
 
 ### `TRSPServerCrashed(r)`
 
-A procedure's region has been crashed (`ABNORMALLY_CLOSED`). The procedure converts itself to an `ASSIGN` at `GET_ASSIGN_CANDIDATE`, modeling the TRSP `serverCrashed()` callback plus the `closeRegion()` recovery branch: when `closeRegion()` finds the region is not in a closeable state, it sets `forceNewPlan=true`, clears the location, and jumps to `GET_ASSIGN_CANDIDATE`.
+A procedure's region has been crashed (`ABNORMALLY_CLOSED`). The procedure preserves its type and advances to `GET_ASSIGN_CANDIDATE`, modeling the TRSP `serverCrashed()` callback plus the `closeRegion()` recovery branch: when `closeRegion()` finds the region is not in a closeable state, it sets `forceNewPlan=true`, clears the location, and jumps to `GET_ASSIGN_CANDIDATE`.
+
+**Type-preserving** (matching Java `serverCrashed()`):
+- **UNASSIGN:** preserves type for two-phase recovery (reopen then re-close). `TRSPPersistToMetaOpen` detects `UNASSIGN` and continues to `CLOSE` instead of completing.
+- **MOVE/REOPEN/ASSIGN:** preserves existing type; behaviorally equivalent to the old `ASSIGN` conversion since the remaining steps are identical.
 
 This resolves the deadlock where an `UNASSIGN` procedure is stranded on an `ABNORMALLY_CLOSED` region with no way to progress. The full SCP machinery (`ServerCrashProcedure`) orchestrates *when* this callback fires; this action models *what* happens to the TRSP.
 
 **Pre:** region has an active procedure (any type) AND region state is `ABNORMALLY_CLOSED`.
-**Post:** procedure converted to `ASSIGN`/`GET_ASSIGN_CANDIDATE` with cleared `targetServer` and reset retries. Stale `CLOSE` commands for this region cleared from all servers' `dispatchedOps`. Stale `CLOSED` reports for this region dropped from `pendingReports`.
+**Post:** procedure at `GET_ASSIGN_CANDIDATE` with preserved type, cleared `targetServer` and reset retries. Stale `CLOSE` commands for this region cleared from all servers' `dispatchedOps`. Stale `CLOSED` reports for this region dropped from `pendingReports`.
 
 > *Source:* `TRSP.serverCrashed()` delegates to `RegionRemoteProcedureBase.serverCrashed()` if a sub-procedure is in flight, or directly calls `AM.regionClosedAbnormally()`; `TRSP.closeRegion()` else-branch sets `forceNewPlan` and advances to `GET_ASSIGN_CANDIDATE` when the region is not in a closeable state.
 
@@ -1953,13 +1968,11 @@ Procedure must not already be at `GET_ASSIGN_CANDIDATE` (already converted).
   /\ \E s \in Servers: scpState[s] \in { "ASSIGN", "DONE" }
 ```
 
-Convert the procedure to `ASSIGN` at `GET_ASSIGN_CANDIDATE`, clear target.
+Type-preserving crash recovery: preserve the procedure type, advance to `GET_ASSIGN_CANDIDATE`. Matches Java `serverCrashed()` which does not change `TransitionType`.
 
 ```tla
   /\ regionState' =
        [regionState EXCEPT
-       ![r].procType =
-       "ASSIGN",
        ![r].procStep =
        "GET_ASSIGN_CANDIDATE",
        ![r].targetServer =
@@ -1968,7 +1981,7 @@ Convert the procedure to `ASSIGN` at `GET_ASSIGN_CANDIDATE`, clear target.
        0]
 ```
 
-Clear any `CLOSE` for `r` from `dispatchedOps`. The prior procedure (`UNASSIGN` or `MOVE`) dispatched it; we are abandoning that and doing `ASSIGN` instead. Without this, `RSClose` can consume the stale `CLOSE` after we reassign, violating `RSMasterAgreement` (`OPEN` in `regionState` but `r` not in `rsOnlineRegions`).
+Clear any `CLOSE` for `r` from `dispatchedOps`. The prior procedure (`UNASSIGN` or `MOVE`) dispatched it; we are abandoning that and reopening instead. Without this, `RSClose` can consume the stale `CLOSE` after we reassign, violating `RSMasterAgreement` (`OPEN` in `regionState` but `r` not in `rsOnlineRegions`).
 
 ```tla
   /\ dispatchedOps' =
@@ -1977,20 +1990,20 @@ Clear any `CLOSE` for `r` from `dispatchedOps`. The prior procedure (`UNASSIGN` 
        ]
 ```
 
-Drop `CLOSED` reports for `r`. They are from the abandoned `UNASSIGN`/`MOVE`; consuming them after we reassign would set `CLOSED` while `r` is in `rsOnlineRegions` (from `RSOpen`), violating `RSMasterAgreementConverse`.
+Drop `CLOSED` reports for `r`. They are from the abandoned close; consuming them after we reopen would set `CLOSED` while `r` is in `rsOnlineRegions` (from `RSOpen`), violating `RSMasterAgreementConverse`.
 
 ```tla
   /\ pendingReports' =
        {pr \in pendingReports: pr.region # r \/ pr.code # "CLOSED"}
 ```
 
-META, RS-side state, and server liveness unchanged. Update persisted procedure: convert to `ASSIGN`.
+META, RS-side state, and server liveness unchanged. Update persisted procedure: preserve type.
 
 ```tla
   /\ procStore' =
        [procStore EXCEPT
        ![r] =
-       NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
+       NewProcRecord(regionState[r].procType, "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
   /\ UNCHANGED << scpVars, serverVars, rsVars, masterVars, metaTable >>
 ```
 

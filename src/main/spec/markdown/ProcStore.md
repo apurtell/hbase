@@ -38,7 +38,7 @@ Intra-record correlation invariant for persisted procedure records. Validates st
 **Checks:**
 1. `transitionCode` is recorded iff step is `REPORT_SUCCEED`
 2. `targetServer` presence correlates with step
-3. `UNASSIGN` type never reaches open-path steps
+3. `UNASSIGN` type step and transition-code constraints (both close-path and open-path for two-phase recovery)
 4. `transitionCode` must match procedure type
 
 ```tla
@@ -76,21 +76,23 @@ ProcStoreConsistency ==
          )
 ```
 
-`UNASSIGN` starts at `CLOSE` and never reaches open-path steps.
+`UNASSIGN` normally starts at `CLOSE`, but during two-phase crash recovery (`confirmClosed` `ABNORMALLY_CLOSED`), `UNASSIGN` traverses the open-path steps (`GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` → `REPORT_SUCCEED`) before returning to `CLOSE`.
 
 ```tla
       /\ ( procStore[r].type = "UNASSIGN" =>
              procStore[r].step \in
-               { "CLOSE", "CONFIRM_CLOSED", "REPORT_SUCCEED" }
+               { "CLOSE", "CONFIRM_CLOSED", "REPORT_SUCCEED",
+                 "GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED" }
          )
 ```
 
-`transitionCode` must match procedure type — `UNASSIGN` can only report `CLOSED`.
+`transitionCode` must match procedure type — `UNASSIGN` can report `CLOSED` (normal close path or re-close after recovery), `OPENED` (reopen succeeded during two-phase recovery), or `FAILED_OPEN` (reopen failed).
 
 ```tla
       /\ ( procStore[r].type = "UNASSIGN" /\
                procStore[r].transitionCode # NoTransition =>
-             procStore[r].transitionCode = "CLOSED"
+             procStore[r].transitionCode \in
+               { "CLOSED", "OPENED", "FAILED_OPEN" }
          )
 ```
 
