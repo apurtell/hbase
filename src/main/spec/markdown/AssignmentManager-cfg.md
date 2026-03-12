@@ -52,6 +52,10 @@ primary exhaustive config for state-space reasons.
 silent-drop behavior to avoid deadlock. Set `TRUE` to model the implementation
 quirk (`AssignRegionHandler.process()`).
 
+**`UseRSCloseNotFoundQuirk = FALSE`** disables the RS close-not-found
+silent-drop behavior to avoid deadlock. Set `TRUE` to model the implementation
+quirk (`UnassignRegionHandler.process()`).
+
 **`UseRestoreSucceedQuirk = FALSE`** for correct recovery behavior. Set `TRUE`
 to reproduce the `OpenRegionProcedure.restoreSucceedState()` bug where
 `FAILED_OPEN` reports are replayed as `OPENED`.
@@ -62,6 +66,7 @@ procedures suspend and release the PEWorker on async meta writes.
 ```tla
     UseReopen = FALSE
     UseRSOpenDuplicateQuirk = FALSE
+    UseRSCloseNotFoundQuirk = FALSE
     UseRestoreSucceedQuirk = FALSE
     UseBlockOnMetaWrite = FALSE
     UseMerge = FALSE

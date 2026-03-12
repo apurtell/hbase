@@ -113,6 +113,13 @@ CONSTANTS UseRSOpenDuplicateQuirk
 ASSUME UseRSOpenDuplicateQuirk \in BOOLEAN
 ```
 
+`UseRSCloseNotFoundQuirk` — when `TRUE`, the `RSCloseNotFound` action is enabled, modeling `UnassignRegionHandler.process()` L111–117 where the RS silently drops `CLOSE` requests for regions that are not online without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_CLOSED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
+
+```tla
+CONSTANTS UseRSCloseNotFoundQuirk
+ASSUME UseRSCloseNotFoundQuirk \in BOOLEAN
+```
+
 `UseRestoreSucceedQuirk` — when `TRUE`, `RestoreSucceedState` faithfully reproduces the `OpenRegionProcedure.restoreSucceedState()` L128–136 bug where `OPEN`-type procedures always replay as `OPENED` regardless of the persisted `transitionCode` (even `FAILED_OPEN`). Default `FALSE` so that recovery correctly checks `transitionCode` and branches; set `TRUE` to demonstrate the violation and generate counterexample traces.
 
 ```tla

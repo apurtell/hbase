@@ -1180,6 +1180,7 @@ PrintConfig ==
   /\ PrintT(<< "UseReopen", UseReopen >>)
   /\ PrintT(<< "UseMerge", UseMerge >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
+  /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
   /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
   /\ PrintT("========================================")
@@ -1424,6 +1425,12 @@ Next ==
   \/ \E s \in Servers: \E r \in Regions: rs!RSOpenDuplicate(s, r)
 ```
 
+**RS-side close-not-found handler** (conditional)
+
+```tla
+  \/ \E s \in Servers: \E r \in Regions: rs!RSCloseNotFound(s, r)
+```
+
 **Master crash and recovery**
 
 ```tla
@@ -1532,7 +1539,7 @@ Fairness ==
   /\ \A s \in Servers: WF_vars(zk!ZKSessionExpire(s))
 ```
 
-No fairness on `MasterCrash` (non-deterministic environmental event). No fairness on `RSOpenDuplicate` (fires non-deterministically; conditional).
+No fairness on `MasterCrash` (non-deterministic environmental event). No fairness on `RSOpenDuplicate` (fires non-deterministically; conditional). No fairness on `RSCloseNotFound` (fires non-deterministically; conditional).
 
 **SCP state machine**
 
