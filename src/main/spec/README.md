@@ -189,7 +189,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [SCP.tla](markdown/SCP.md) | ServerCrashProcedure state machine (detect crash -> assign meta -> get regions -> fence WALs -> assign regions -> done, with meta-blocking) |
 | [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
 | [Merge.tla](markdown/Merge.md) | Merge procedure forward path and pre-PONR rollback using parent-child framework (MergePrepare, MergeCheckClosed, MergeUpdateMeta, MergeDone, MergeFail) |
-| [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, stale report drop) |
+| [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, close-not-found, stale report drop) |
 | [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
 | [ZK.tla](markdown/ZK.md) | Minimal ZooKeeper model -- ephemeral node lifecycle (`ZKSessionExpire`) |
@@ -222,6 +222,7 @@ MERGING, MERGED, and MERGING_NEW states.
 |----------|-------------|
 | `UseReopen` | `TRUE` enables the REOPEN procedure, needed to model branch-2 |
 | `UseRSOpenDuplicateQuirk` | `TRUE` models `AssignRegionHandler.process()` silent-drop bug (causes deadlock) |
+| `UseRSCloseNotFoundQuirk` | `TRUE` models `UnassignRegionHandler.process()` silent-drop bug (causes deadlock) |
 | `UseRestoreSucceedQuirk` | `TRUE` reproduces `OpenRegionProcedure.restoreSucceedState()` bug where FAILED_OPEN reports replay as OPENED (causes constraint violations) |
 | `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
 | `UseMerge` | `TRUE` enables merge actions in `Next`/`Fairness`. `FALSE` (default) keeps exhaustive mode tractable (split-only) |
@@ -353,7 +354,7 @@ All configurations check the same 30 safety invariants:
 | **States generated** | 527,675,023 |
 | **States checked** | 147,814,458 distinct |
 | **Depth** | 83 |
-| **Duration** | ~74 min |
+| **Duration** | ~69 min |
 
 ### 9r/3s Simulation
 
@@ -400,7 +401,7 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 144
 - `hbase:meta` persistence and divergence resolution
 - Procedure store persistence and recovery
 - PEWorker thread pool (worker availability, meta-blocking, async suspension vs sync blocking)
-- Configurable implementation quirks (duplicate open, restore succeed)
+- Configurable implementation quirks (duplicate open, close-not-found, restore succeed)
 - Configurable meta-write behavior
 - Keyspace infrastructure (`regionKeyRange`, `DeployedRegions`, `MaxKey`) with `KeyspaceCoverage` invariant
 - Split forward path and pre-PONR rollback with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`, `SplitFail`)

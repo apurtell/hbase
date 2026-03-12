@@ -935,6 +935,23 @@ widened UNASSIGN allowed transitionCodes to include `OPENED`,
 TLC 3r/2s: 147,814,458 distinct, 527,675,023 generated, depth 83,
 ~74min, clean.
 
+#### Iteration 26 — RSCloseNotFound quirk (silent close-command consumption) ✅ COMPLETE
+
+Modeled two silent-return paths in `UnassignRegionHandler.process()`
+(L94–109 already-transitioning, L111–117 region-not-found) where the RS
+consumes a CLOSE command without producing a CLOSED report.  Analogous
+to `RSOpenDuplicate` (Iter 18); can cause TRSP deadlock at
+`CONFIRM_CLOSED`.  `Types.tla`: +`UseRSCloseNotFoundQuirk ∈ BOOLEAN`
+(follows `UseRSOpenDuplicateQuirk` pattern).  `RegionServer.tla`: new
+`RSCloseNotFound(s, r)` — guard `UseRSCloseNotFoundQuirk = TRUE`,
+server ONLINE, `zkNode[s] = TRUE`, `r ∉ rsOnlineRegions[s]`, CLOSE
+command exists; consumes command, produces no report.
+`AssignmentManager.tla`: wired into `Next` (after `RSOpenDuplicate`),
+`PrintConfig`, `Fairness` comment (no WF — non-deterministic quirk).
+All 3 configs: +`UseRSCloseNotFoundQuirk = FALSE`.  With quirk disabled
+(default), state space unchanged from Iter 25.  TLC 3r/2s:
+147,814,458 distinct, 527,675,023 generated, depth 83, ~69min, clean.
+
 ---
 
 ## 8. Mapping from Code to TLA+ Actions
@@ -996,9 +1013,10 @@ is shown.
 | `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 23 | ✅ |
 | `MergeTableRegionsProcedure.rollbackState()` | `MergeFail(p)` | 23 | ✅ |
 | SF on `RSOpen`, `RSClose`, `RSFailOpen` | `OfflineEventuallyOpen`, `SCPEventuallyDone` | 24 | ✅ |
-| `TRSP.confirmClosed()` ABNORMALLY_CLOSED type-preserving | `TRSPConfirmClosedCrash` type-preserving branches | 25 | ⏳ |
-| `TRSP.serverCrashed()` type-preserving | `TRSPServerCrashed` type-preserving branches | 25 | ⏳ |
-| `TRSP.confirmOpened()` UNASSIGN continuation (L289-301) | `TRSPConfirmOpened` UNASSIGN→CLOSE branch | 25 | ⏳ |
+| `TRSP.confirmClosed()` ABNORMALLY_CLOSED type-preserving | `TRSPConfirmClosedCrash` type-preserving branches | 25 | ✅ |
+| `TRSP.serverCrashed()` type-preserving | `TRSPServerCrashed` type-preserving branches | 25 | ✅ |
+| `TRSP.confirmOpened()` UNASSIGN continuation (L289-301) | `TRSPConfirmOpened` UNASSIGN→CLOSE branch | 25 | ✅ |
+| `UnassignRegionHandler.process()` silent return (L111-117, L132-138) | `RSCloseNotFound(s, r)` gated by `UseRSCloseNotFoundQuirk` | 26 | ✅ |
 
 ---
 
