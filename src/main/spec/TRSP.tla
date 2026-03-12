@@ -74,7 +74,14 @@ rsVars == << rsOnlineRegions >>
 \* clauses).  Includes SCP state and ZK ephemeral nodes -- neither is
 \* modified by any TRSP action.
 scpVars ==
-  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc >>
+  << scpState,
+     scpRegions,
+     walFenced,
+     carryingMeta,
+     zkNode,
+     regionKeyRange,
+     parentProc
+  >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
 masterVars == << masterAlive >>
@@ -337,6 +344,8 @@ TRSPReportSucceedOpen(r) ==
        \* Report must be for region r.
        /\ rpt.region = r
        /\ rpt.code \in { "OPENED", "FAILED_OPEN" }
+       \* Report must be from the target server.
+       /\ rpt.server = regionState[r].targetServer
        \* Prefer OPENED over FAILED_OPEN: if both exist, only consume OPENED.
        /\ rpt.code = "FAILED_OPEN" =>
             ~\E rpt2 \in pendingReports: rpt2.region = r /\ rpt2.code = "OPENED"
@@ -478,9 +487,7 @@ TRSPPersistToMetaOpen(r) ==
                    /\ procStore' =
                         [procStore EXCEPT
                         ![r] =
-                        NewProcRecord("UNASSIGN", "CLOSE",
-                                       regionState[r].location,
-                                       NoTransition)]
+                        NewProcRecord("UNASSIGN", "CLOSE", regionState[r].location, NoTransition)]
               ELSE \* ASSIGN/MOVE/REOPEN: procedure complete.
                    /\ regionState' =
                         [regionState EXCEPT
@@ -933,7 +940,8 @@ TRSPDispatchClose(r) ==
         /\ r \notin blockedOnMeta
         \* Bind the target server for readability.
         /\ LET s == regionState[r].targetServer
-           IN /\ regionState[r].state \in { "OPEN", "CLOSING", "SPLITTING", "MERGING" }
+           IN /\ regionState[r].state \in
+                   { "OPEN", "CLOSING", "SPLITTING", "MERGING" }
               \* Transition region to CLOSING and advance to CONFIRM_CLOSED.
               /\ regionState' =
                    [regionState EXCEPT

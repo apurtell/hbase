@@ -680,11 +680,19 @@ Mark SCP as complete for this crashed server.
   /\ scpState' = [scpState EXCEPT ![s] = "DONE"]
 ```
 
+Clean up `ServerStateNode` tracking for the crashed server.
+
+> *Source:* `ServerManager.expireServer()` → `RegionStates.removeServer()` (L679–681) removes the `ServerStateNode` entirely.
+
+```tla
+  /\ serverRegions' = [serverRegions EXCEPT ![s] = {}]
+```
+
 All other state unchanged — region reassignments already applied.
 
 ```tla
   /\ UNCHANGED << rpcVars,
-        serverVars,
+        serverState,
         procStore,
         rsVars,
         masterVars,
