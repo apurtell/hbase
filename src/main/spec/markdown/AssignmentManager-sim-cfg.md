@@ -85,48 +85,25 @@ SPECIFICATION Spec
 
 ## Constants
 
-Model values and universe sizing:
-
-```tla
-CONSTANTS
-    NoServer = NoServer
-    NoProcedure = NoProcedure
-    NoTransition = NoTransition
-    NoRange = NoRange
-    NoRegion = NoRegion
-    Servers = {s1, s2, s3}
-    Regions = {r1, r2, r3, r4, r5, r6, r7, r8, r9}
-    DeployedRegions = {r1, r2, r3}
-    MaxKey = 12
-    MaxRetries = 2
-    MaxWorkers = 3
-```
-
-**`UseReopen = TRUE`** models branch-2's additional REOPEN procedure.
-
-**`UseRSOpenDuplicateQuirk = FALSE`** disables the RS duplicate-open
-silent-drop behavior to avoid deadlock. Set `TRUE` to model the implementation
-quirk (`AssignRegionHandler.process()`).
-
-**`UseRSCloseNotFoundQuirk = FALSE`** disables the RS close-not-found
-silent-drop behavior to avoid deadlock. Set `TRUE` to model the implementation
-quirk (`UnassignRegionHandler.process()`).
-
-**`UseRestoreSucceedQuirk = FALSE`** for correct recovery behavior. Set `TRUE`
-to reproduce the `OpenRegionProcedure.restoreSucceedState()` bug where
-`FAILED_OPEN` reports are replayed as `OPENED`.
-
-**`UseBlockOnMetaWrite = FALSE`** models master/branch-3+ behavior where
-procedures suspend and release the PEWorker on async meta writes.
-
-```tla
-    UseReopen = TRUE
-    UseRSOpenDuplicateQuirk = FALSE
-    UseRSCloseNotFoundQuirk = FALSE
-    UseRestoreSucceedQuirk = FALSE
-    UseBlockOnMetaWrite = FALSE
-    UseMerge = TRUE
-```
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `NoServer` | model value | Sentinel: no server assigned |
+| `NoProcedure` | model value | Sentinel: no procedure attached |
+| `NoTransition` | model value | Sentinel: no transition code recorded |
+| `NoRange` | model value | Sentinel: unused region identifier (no keyspace) |
+| `NoRegion` | model value | Sentinel: no region reference |
+| `Servers` | `{s1, s2, s3}` | Finite set of RegionServer identifiers |
+| `Regions` | `{r1, r2, r3, r4, r5, r6, r7, r8, r9}` | All region identifiers (3 deployed + 6 spare for split/merge) |
+| `DeployedRegions` | `{r1, r2, r3}` | Regions that exist at system start; tile `[0, 12)` with width 4 |
+| `MaxKey` | `12` | Upper bound of keyspace: keys range over `0..(MaxKey-1)` |
+| `MaxRetries` | `2` | Maximum open-retry count (deeper than exhaustive's 1) |
+| `MaxWorkers` | `3` | ProcedureExecutor worker-thread pool size (realistic for 3 servers) |
+| `UseReopen` | `TRUE` | REOPEN procedure (branch-2) enabled in simulation |
+| `UseMerge` | `TRUE` | Merge procedure enabled; exercises interleaved split/merge |
+| `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
+| `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
+| `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
+| `UseBlockOnMetaWrite` | `FALSE` | Async suspension releases PEWorker (master/branch-3+ behavior) |
 
 ## Invariants
 
