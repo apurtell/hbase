@@ -869,7 +869,7 @@ failure path (`SplitFail`) for every reachable split state. Wired into
 TLC 3r/2s: 147,814,458 distinct, 527,398,347 generated, depth 83,
 ~68min, clean.
 
-#### Iteration 23 — Complete merge forward path with rollback
+#### Iteration 23 — Complete merge forward path with rollback  ✅ COMPLETE
 
 `UseMerge` conditional guard (follows `UseReopen` pattern):
 `UseMerge ∈ BOOLEAN` constant in `Types.tla`.  All merge actions
@@ -894,7 +894,7 @@ invariants (`NoOrphanedMergedRegion`, `MergeCompleteness`,
 
 ### Phase 8: Liveness and Refinement
 
-#### Iteration 24 — Fairness and liveness
+#### Iteration 24 — Fairness and liveness ✅ COMPLETE
 
 Strong fairness (SF) on RS-side message delivery: upgraded `RSOpen`,
 `RSClose` from WF to SF (report delivery is intermittently enabled
@@ -908,27 +908,32 @@ definitions, 2 THEOREMs.  `AssignmentManager-liveness.cfg`: +2 PROPERTY
 entries. TLC 3r/2s (UseMerge=FALSE): 147,814,458 distinct,
 527,398,347 generated, depth 83, ~70min, clean.
 
-#### Iteration 25 — TLC optimization
+#### Iteration 25 — TRSPConfirmClosedCrash type-preserving crash recovery
 
-**What to add**: State constraints to bound message queue sizes.
-Action constraints to limit crash frequency. Measure cumulative state
-space reduction across all phases.
-
-#### Iteration 26 — Advanced scenarios and findings
-
-**What to verify**: Cascade crashes, master failover during SCP,
-concurrent split and move on the same region, split during merge of
-adjacent regions. Document all counterexamples or confirmed invariants.
-**Optional: meta write failure modeling**: Model non-deterministic meta
-write failure for all meta-writing actions (see Appendix D). This would
-split each meta-writing action into attempt + succeed/fail sub-actions,
-add a `metaWritePending` variable, and verify that the three revert
-patterns (state-only revert, full revert, no revert) correctly restore
-invariants under all crash and concurrency scenarios. Key properties to
-check: revert correctness after Pattern A failure (asymmetric revert —
-state reverted but location not), interaction between meta write retry
-and server crash (SCP blocked by procedure lock during retry), and
-GoOffline meta divergence (in-memory OFFLINE while meta shows CLOSED).
+Type-preserving crash recovery (matching Java `confirmClosed()` L379-389
+and `serverCrashed()`): `TRSPConfirmClosedCrash` and `TRSPServerCrashed`
+now preserve the original `procType` instead of unconditionally converting
+to `ASSIGN`.  For `UNASSIGN`, this enables two-phase recovery (reopen →
+re-close): `TRSPPersistToMetaOpen` OPENED branch detects
+`procType = "UNASSIGN"` and advances to `CLOSE` instead of completing,
+modeling `confirmOpened()` L289-301 where `lastState == CONFIRM_CLOSED`
+triggers `nextState = CLOSE`.  `TRSP.tla`: 8 actions modified —
+type-preserving `TRSPConfirmClosedCrash` and `TRSPServerCrashed`
+(removed unconditional `procType = "ASSIGN"` override, preserve
+`regionState[r].procType`); widened procType guards on `TRSPGetCandidate`,
+`TRSPDispatchOpen`, `TRSPReportSucceedOpen`, `TRSPPersistToMetaOpen`,
+`DispatchFail` to include `"UNASSIGN"`; added UNASSIGN continuation
+branch in `TRSPPersistToMetaOpen` OPENED (IF/ELSE on procType).
+`AssignmentManager.tla`: `LockExclusivity` — added `OPENING`, `OPEN`,
+`FAILED_OPEN` to UNASSIGN state set (reachable during reopen phase).
+`ProcStore.tla`: `ProcStoreConsistency` — widened UNASSIGN allowed
+steps to include `GET_ASSIGN_CANDIDATE`, `OPEN`, `CONFIRM_OPENED`;
+widened UNASSIGN allowed transitionCodes to include `OPENED`,
+`FAILED_OPEN`.  No changes needed to `ProcStepConsistency`,
+`TargetServerConsistency`, `NoOrphanedProcedures`, or `Master.tla`
+(existing constraints already accommodate the UNASSIGN reopen path).
+TLC 3r/2s: 147,814,458 distinct, 527,675,023 generated, depth 83,
+~74min, clean.
 
 ---
 
@@ -953,8 +958,8 @@ is shown.
 | `TRSP.confirmOpened()` FAILED_OPEN retry | `TRSPHandleFailedOpen(r)` | 10 | ✅ |
 | `RegionStateNode.offline()` | `GoOffline(r)` | 1 | ✅ |
 | `ServerManager.expireServer()` (atomic per-server) | `ServerCrashAll(s)` | 10 | ✅ |
-| `ServerManager.expireServer()` (master-side only) | `MasterDetectCrash(s)` | 14 | ⏳ |
-| `HRegionServer.abort()` (RS discovers death) | `RSAbort(s)` | 14 | ⏳ |
+| `ServerManager.expireServer()` (master-side only) | `MasterDetectCrash(s)` | 14 | ✅ |
+| `HRegionServer.abort()` (RS discovers death) | `RSAbort(s)` | 14 | ✅ |
 | `TRSP.serverCrashed()` | `TRSPServerCrashed(r)` | 5 | ✅ |
 | Drop report from crashed server | `DropStaleReport` | 10 | ✅ |
 | `AssignRegionHandler.process()` (success path) | `RSOpen(s, r)` | 8 | ✅ |
@@ -965,28 +970,35 @@ is shown.
 | Kubernetes / process supervisor restart | `ServerRestart(s)` | 12 | ✅ |
 | `SCP.splitLogs()` (WAL lease revocation) | `SCPFenceWALs(scp)` | 14 | ✅ |
 | `SCP.assignRegions()` (simplified) | `SCPAssignRegion(s, r)` | 14 | ✅ |
-| `TRSP.reopen()` | `TRSPCreateReopen(r)` | 15 | ⏳ |
-| Per-region write lock | `locked[r]` variable | 15 | ⏳ |
-| SCP carryingMeta path | `SCPSplitMetaLogs`, `SCPAssignMeta` | 15 | ⏳ |
-| `SCP.assignRegions()` with `isMatchingRegionLocation` | `SCPAssignRegion(s,r)` refined | 16 | ⏳ |
-| `SCP` + `TRSP.serverCrashed()` interaction | `SCPInterruptTRSP(scp, p)` | 17 | ⏳ |
-| Master crash | `MasterCrash` | 20 | ⏳ |
-| Master recovery (load from store) | `MasterRecover` | 20 | ⏳ |
-| `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(parent, dA, dB)` | 22 | ⏳ |
-| `SplitTableRegionProcedure` CLOSE_PARENT | `SplitCloseParent(p)` | 22 | ⏳ |
-| `SplitTableRegionProcedure` CHECK_CLOSED | `SplitCheckClosed(p)` | 22 | ⏳ |
-| `AssignmentManager.markRegionAsSplit()` | `SplitUpdateMeta(p)` | 23 | ⏳ |
-| `SplitTableRegionProcedure` OPEN_CHILDREN | `SplitOpenChildren(p)` | 24 | ⏳ |
-| `SplitTableRegionProcedure` completion | `SplitDone(p)` | 24 | ⏳ |
-| `SplitTableRegionProcedure.rollbackState()` | `SplitRollback(p)` | 25 | ⏳ |
-| `MergeTableRegionsProcedure.prepareMergeRegion()` | `MergePrepare(r1, r2, m)` | 26 | ⏳ |
-| `MergeTableRegionsProcedure` CLOSE_REGIONS | `MergeCloseRegions(p)` | 26 | ⏳ |
-| `MergeTableRegionsProcedure` CHECK_CLOSED | `MergeCheckClosed(p)` | 26 | ⏳ |
-| `MergeTableRegionsProcedure` CREATE_MERGED | `MergeCreateMerged(p)` | 26 | ⏳ |
-| `AssignmentManager.markRegionAsMerged()` | `MergeUpdateMeta(p)` | 26 | ⏳ |
-| `MergeTableRegionsProcedure` OPEN_MERGED | `MergeOpenMerged(p)` | 26 | ⏳ |
-| `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 26 | ⏳ |
-| `MergeTableRegionsProcedure.rollbackState()` | `MergeRollback(p)` | 26 | ⏳ |
+| `TRSP.reopen()` | `TRSPCreateReopen(r)` | 15 | ✅ |
+| SCP carryingMeta path | `SCPAssignMeta(s)` | 15 | ✅ |
+| `SCP.assignRegions()` with `isMatchingRegionLocation` | `SCPAssignRegion(s,r)` refined | 16 | ✅ |
+| `serverRegions` tracking (`ServerStateNode`) | `serverRegions[s]` variable | 16.5 | ✅ |
+| `SCP` + `TRSP.serverCrashed()` interaction | `SCPAssignRegion` Path A + `TRSPServerCrashed` | 17 | ✅ |
+| `WALProcedureStore` persistence | `procStore[r]` variable | 17 | ✅ |
+| Cross-variable consistency | 8 new invariants (e.g. `ProcStepConsistency`) | 17.5 | ✅ |
+| Master crash | `MasterCrash` | 18 | ✅ |
+| Master recovery (load from store) | `MasterRecover` + `RestoreSucceedState` | 18 | ✅ |
+| `RegionRemoteProcedureBase` two-phase reports | `TRSPReportSucceedOpen/Close`, `TRSPPersistToMetaOpen/Close` | 18 | ✅ |
+| ZK session expiry (crash detection) | `ZKSessionExpire(s)` (`ZK.tla`) | 18 | ✅ |
+| `ProcedureExecutor` worker pool | `availableWorkers` (counting semaphore) | 19 | ✅ |
+| Meta-blocking semantics | `suspendedOnMeta`/`blockedOnMeta`, `ResumeFromMeta(r)` | 19 | ✅ |
+| Per-region write lock | `locked[r]` variable (added Iter 15; removed Iter 19.5) | 19.5 | ✅ |
+| Keyspace infrastructure (`regionKeyRange`) | `RegionExists(r)`, `Adjacent(r1, r2)` | 20 | ✅ |
+| `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(r)` | 21 | ✅ |
+| `SplitTableRegionProcedure` CHECK_CLOSED | `SplitResumeAfterClose(r)` | 21 | ✅ |
+| `AssignmentManager.markRegionAsSplit()` | `SplitUpdateMeta(r, dA, dB)` | 21 | ✅ |
+| `SplitTableRegionProcedure` completion | `SplitDone(r)` | 21 | ✅ |
+| `SplitTableRegionProcedure.rollbackState()` | `SplitFail(r)` | 22 | ✅ |
+| `MergeTableRegionsProcedure.prepareMergeRegion()` | `MergePrepare(r1, r2, m)` | 23 | ✅ |
+| `MergeTableRegionsProcedure` CHECK_CLOSED | `MergeCheckClosed(p)` | 23 | ✅ |
+| `AssignmentManager.markRegionAsMerged()` | `MergeUpdateMeta(p)` | 23 | ✅ |
+| `MergeTableRegionsProcedure` completion | `MergeDone(p)` | 23 | ✅ |
+| `MergeTableRegionsProcedure.rollbackState()` | `MergeFail(p)` | 23 | ✅ |
+| SF on `RSOpen`, `RSClose`, `RSFailOpen` | `OfflineEventuallyOpen`, `SCPEventuallyDone` | 24 | ✅ |
+| `TRSP.confirmClosed()` ABNORMALLY_CLOSED type-preserving | `TRSPConfirmClosedCrash` type-preserving branches | 25 | ⏳ |
+| `TRSP.serverCrashed()` type-preserving | `TRSPServerCrashed` type-preserving branches | 25 | ⏳ |
+| `TRSP.confirmOpened()` UNASSIGN continuation (L289-301) | `TRSPConfirmOpened` UNASSIGN→CLOSE branch | 25 | ⏳ |
 
 ---
 
@@ -1045,70 +1057,13 @@ For each module, the primary source files and their key line ranges:
 
 ---
 
-## 10. Estimated Scope and Complexity
-
-| Phase | Iterations | Estimated TLA+ Lines | Key Challenge |
-|-------|-----------|---------------------|---------------|
-| Phase 1: Master-Side Foundation | 1-5 | ~500 (actual) | State machine + procedures in isolation |
-| Phase 2: RPC and RegionServer | 6-10 | ~800 (actual at Iter 10) | Two-channel RPC, RS-side state, report validation |
-| Phase 3: MOVE and Failures | 11-13 | ~1200 (actual at Iter 13) | Move lifecycle, retry logic, server restart, procedure inlining refactor, fairness, liveness |
-| Phase 4: RS Crash and Recovery | 14-16 | +200 | SCP, TRSP interaction, double crash |
-| Phase 5: Procedure Store + Master Recovery | 17-18 | +150 | Persistence, crash+rebuild |
-| Phase 6: PEWorker Pool + Meta-Blocking | 19 | +100 | Finite worker pool, synchronous meta-blocking semantics |
-| Phase 7: Split and Merge | 20-26 | +350 | Keyspace modeling, multi-region locking, PONR, rollback |
-| Phase 8: Liveness and Refinement | 24-26 | +50 | Fairness, scenarios (symmetry already done) |
-| **Total** | **26** | **~1860** (est.) | |
-
----
-
-## 11. Open Questions and Risks
-
-1. ~~**Meta table modeling granularity**~~: **RESOLVED** — Meta (and all region
-   writes) are modeled as immediately consistent and atomic. When the RPC
-   returns, the write is persisted. This is the guarantee that HBase's single-
-   region-mastering provides. No async replication delay needs to be modeled.
-
-2. ~~**Procedure executor threading**~~: **RESOLVED** — Analysis of the locking
-   discipline confirms that TLA+ interleaving semantics are a faithful model.
-   See Appendix A for the full analysis.
-
-3. ~~**Network model**~~: **RESOLVED** — Model at the RPC level, faithfully
-   representing the two distinct RPCs: `AdminService.ExecuteProcedures`
-   (master→RS, dispatch with retry) and
-   `RegionServerStatusService.ReportRegionStateTransition` (RS→master, report
-   with retry). See Appendix B for the full analysis.
-
-4. ~~**WAL splitting / lease revocation**~~: **RESOLVED** — WAL lease
-   revocation is the mechanism by which the master fences a zombie RS's
-   writes, preventing write-side double-assignment.  It is an assignment
-   safety mechanism, not merely a data recovery step.  Modeled as an
-   abstract fencing step (`SCPFenceWALs`) in SCP (Iteration 14) with a
-   per-server Boolean (`walFenced`).  The `NoDoubleWrite` invariant
-   (Iteration 13) captures the safety property: a region is never
-   writable on two servers simultaneously, where writable means
-   `r ∈ rsOnlineRegions[s] ∧ walFenced[s] = FALSE`.  WAL splitting
-   mechanics (log file replay, HDFS lease details) remain out of
-   scope; only the fencing property is modeled.
-
-5. ~~**Master election**~~: **RESOLVED** — Assume a single master. Master
-   failover is modeled as crash + recovery (master state lost, procedures
-   reloaded from ProcedureStore, region states rebuilt from meta). Split-brain
-   is out of scope.
-
-6. ~~**Region replicas**~~: **RESOLVED** — Deferred. The model covers primary
-   regions (replicaId=0) only. Read replicas have relaxed constraints (no
-   exclusive assignment, staleness tolerated, different lifecycle) and can
-   be layered on as an extension without altering the core model.
-
----
-
-## 12. Iteration Process and Success Criteria
+## 10. Iteration Process and Success Criteria
 
 This section defines the methodology for iterating on the TLA+ specification,
 the classification scheme for TLC findings, and the criteria for declaring an
 iteration complete.
 
-### 12.1 Terminal Outcomes
+### 10.1 Terminal Outcomes
 
 Every iteration ends in one of two states:
 
@@ -1118,16 +1073,16 @@ Every iteration ends in one of two states:
    and no issues are found.
 
 2. **Legitimate finding**: TLC produces a counterexample trace that, after
-   triage (see 12.3), is confirmed to represent a genuine issue in the HBase
+   triage, is confirmed to represent a genuine issue in the HBase
    implementation — a bug, a race condition, or a design gap that requires a
    code or architectural change. The finding is documented with full
-   traceability (see 12.5) and handed off for remediation.
+   traceability and handed off for remediation.
 
 There is no third "acceptable" terminal state. Spurious violations caused by
 modeling errors are intermediate conditions that must be resolved before the
 iteration is considered complete.
 
-### 12.2 Per-Iteration Workflow
+### 10.2 Per-Iteration Workflow
 
 Each iteration follows a fixed loop:
 
@@ -1150,22 +1105,19 @@ Each iteration follows a fixed loop:
    (`AssignmentManager-full.cfg`) is not run at every iteration.
    It is reserved for ad hoc on-demand checks at user-requested
    checkpoints.
-5. **TRIAGE** — If TLC reports violations, classify each one (see 12.3).
+5. **TRIAGE** — If TLC reports violations, classify each one.
    Repeat from step 1 or 4 as needed.
 6. **REGRESSION CHECK** — Re-verify all invariants and properties from
    prior iterations. A fix in iteration N must not break any invariant
    proven in iterations 1 through N-1. The primary and simulation
    configs provide this coverage automatically at every iteration.
 7. **RECORD** — Document the TLC result, configuration, state count,
-   and any findings (see 12.4 and 12.5).
+   and any findings.
 8. **UPDATE PLAN** — Mark the iteration complete in this plan document
    (Section 7). Append `✅ COMPLETE` to the iteration heading, convert
    the "What to add" description to past tense ("What was added"), and
    add a `**TLC result**` line summarizing the final model-checking
    outcome (constants, state count, invariants checked, pass/fail).
-   If the iteration produced a legitimate finding, note it here with
-   its Finding ID (see 12.5). This keeps the plan document as the
-   single source of truth for iteration status.
 9. **GIT COMMIT** — Commit the successful spec files, configuration,
    updated plan document, and iteration record to version control. The
    commit message must identify the iteration number and summarize the
@@ -1178,143 +1130,6 @@ legitimate finding. Step 6 is mandatory — no iteration is complete without
 a regression check against all prior invariants. Steps 8–9 are the
 terminal actions — an iteration is not considered done until the plan
 document is updated and the results are committed.
-
-### 12.3 Finding Classification (Triage)
-
-When TLC reports a violation, the counterexample trace must be classified
-into exactly one of three categories:
-
-| Category | Description | Resolution |
-|----------|-------------|------------|
-| **Spec error** | The TLA+ spec does not faithfully model the implementation. The violation is an artifact of incorrect or incomplete modeling — not a real issue. | Fix the spec. The counterexample represents a behavior that cannot occur in the real system due to constraints not yet captured in the model. Common causes: missing preconditions, over-abstracted actions, incorrect transition guards. |
-| **Modeling abstraction gap** | The spec's abstraction level is too coarse or too fine for the property being checked. The violation is technically possible in the model but prevented by mechanisms not yet modeled (e.g., a locking protocol from a later iteration, or a retry mechanism not yet introduced). | Refine the abstraction or defer to a later iteration that introduces the missing mechanism. Document the gap and the iteration where it will be resolved. |
-| **Legitimate implementation issue** | The counterexample represents a behavior that CAN occur in the real system. The invariant violation maps to a real bug, race condition, or design gap. | Document the finding (see 12.5). Do NOT fix the spec to mask it. The spec is correct — the implementation needs to change. |
-
-**Triage procedure for each counterexample:**
-
-1. Read the full TLC error trace, noting every state transition.
-2. For each transition in the trace, identify the corresponding code path
-   using the mapping in Section 8.
-3. Ask: "Can this exact sequence of events occur in the real system?"
-   - If NO → Spec error or abstraction gap. Identify the constraint or
-     mechanism that prevents it.
-   - If YES → Ask: "Does the violated invariant represent a real safety or
-     liveness requirement?"
-     - If YES → Legitimate finding.
-     - If NO → The invariant is too strong. Weaken it with justification.
-4. When uncertain, default to investigating further rather than dismissing.
-   Err on the side of treating a finding as legitimate until proven otherwise.
-
-### 12.4 TLC Configuration Documentation
-
-Each iteration must record its TLC configuration and results. This ensures
-reproducibility and provides a baseline for regression checks.
-
-**Required fields per iteration:**
-
-```
-Iteration: N
-Date: YYYY-MM-DD
-Spec file(s): [list of .tla files]
-Config file: [.cfg file]
-
-Constants:
-  Regions = {r1, r2, ...}
-  Servers = {s1, s2, ...}
-  MaxRetries = N
-  [other constants]
-
-State constraint: [if any]
-Action constraint: [if any]
-Symmetry sets: [if any]
-
-Invariants checked: [list]
-Properties checked: [list, including temporal]
-
-Result: PASS | FAIL
-  States found: N distinct / N total
-  Duration: N seconds
-  Diameter: N
-
-If FAIL:
-  Violation: [invariant or property name]
-  Trace length: N states
-  Classification: Spec error | Abstraction gap | Legitimate finding
-  Resolution: [brief description]
-```
-
-Configurations should be checked into version control alongside the spec
-files, in standard TLC `.cfg` format.
-
-### 12.5 Finding Documentation
-
-Each legitimate finding must be documented with full traceability:
-
-| Field | Description |
-|-------|-------------|
-| **Finding ID** | Sequential identifier (e.g., F-001) |
-| **Iteration** | The iteration in which it was discovered |
-| **Violated invariant/property** | The name and definition of the violated property |
-| **TLC trace summary** | The sequence of actions leading to the violation, in plain language |
-| **Code path** | The corresponding Java code path(s) from Section 8/9 |
-| **Root cause** | Why the implementation permits this behavior |
-| **Severity** | Critical (data loss / split-brain) / High (stuck region / lost region) / Medium (transient inconsistency, self-healing) / Low (cosmetic or unlikely) |
-| **Recommended fix** | Suggested code or design change |
-| **JIRA** | Link to the tracking issue, once filed |
-
-Findings that are later resolved (either by code change or by re-analysis
-showing they are not real) should be marked as such, not deleted.
-
-### 12.6 Regression Policy
-
-The following rules govern backward compatibility across iterations:
-
-1. **Invariant monotonicity**: The set of checked invariants grows
-   monotonically. An invariant introduced in iteration N is checked in
-   all subsequent iterations. Removing an invariant requires explicit
-   justification documented in the iteration record.
-
-2. **Invariant weakening**: An invariant may be weakened (relaxed) in a
-   later iteration if the original formulation was too strong — e.g.,
-   `MetaConsistency` is relaxed in Iteration 23 to account for the
-   SPLITTING_NEW/MERGING_NEW discrepancy. The weakening must be justified
-   by reference to the implementation behavior that necessitates it.
-
-3. **Clean run required**: An iteration is not complete until TLC passes
-   with ALL invariants from all prior iterations included. If a change in
-   iteration N breaks an invariant from iteration M (M < N), the breakage
-   must be triaged and resolved before proceeding.
-
-4. **Configuration consistency**: When increasing model size (e.g., adding
-   a third server for a multi-crash scenario), all prior invariants
-   must still pass at the new size. If a prior invariant only passed at a
-   smaller size due to state space limitations, this must be documented.
-
-### 12.7 Completion Criteria for the Full Specification
-
-The overall TLA+ specification effort is complete when ALL of the following
-hold:
-
-1. **All planned iterations are done**: Every iteration in Section 7
-   (Phases 1–8, Iterations 1–26) has been completed per the workflow in
-   12.2, or explicitly deferred with justification.
-
-2. **All invariants pass**: TLC reports zero violations for all defined
-   invariants and temporal properties at the documented configuration.
-
-3. **All findings are dispositioned**: Every legitimate finding (12.5) has
-   been either:
-   - Filed as a JIRA issue with a recommended fix, or
-   - Documented as an accepted risk with justification from the project
-     maintainers.
-
-4. **No open abstraction gaps**: Every modeling abstraction gap identified
-   during triage (12.3) has been either resolved by a later iteration or
-   explicitly accepted as out of scope with justification.
-
-5. **Results are reproducible**: Another engineer can check out the spec
-   files and TLC configuration from version control, run TLC, and obtain
-   the same results.
 
 ---
 
