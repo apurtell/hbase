@@ -32,7 +32,7 @@ The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionPro
 |-----------------------|-------------------------------------------------------------------------------------|
 | `DISPATCH` (=1)       | `TRSPDispatchOpen`, `TRSPDispatchClose` — RPC dispatch is atomic within TRSP step   |
 | `REPORT_SUCCEED` (=2) | `TRSPConfirmOpened`, `TRSPConfirmClosed` — decomposed to model crash window         |
-| `DISPATCH_FAIL` (=3)  | `DispatchFail`, `DispatchFailClose` — RPC failure resets TRSP to retry               |
+| `DISPATCH_FAIL` (=3)  | `DispatchFail`, `DispatchFailClose` — RPC failure resets TRSP to retry (disjunct 1) or expires server and starts SCP (disjunct 2) |
 | `SERVER_CRASH` (=4)   | `TRSPServerCrashed` — server crash recovery (type-preserving)                       |
 
 ```tla
@@ -77,7 +77,7 @@ RS-side variable (used in `UNCHANGED` clauses).
 rsVars == << rsOnlineRegions >>
 ```
 
-Variables unchanged by TRSP actions (includes SCP state and ZK ephemeral nodes — neither is modified by any TRSP action).
+Variables unchanged by TRSP actions (includes SCP state and ZK ephemeral nodes — neither is modified by any TRSP action except `DispatchFail`/`DispatchFailClose` disjunct 2 which modifies `scpState`, `carryingMeta`, `serverState`, and `serverRegions` via dispatch-expiry server crash).
 
 ```tla
 scpVars ==
@@ -887,14 +887,20 @@ Delete completed procedure from store.
 
 ### `DispatchFail(r)`
 
-Open command dispatch failed (non-deterministic RPC failure). The command is removed from `dispatchedOps` without delivery and the TRSP returns to `GET_ASSIGN_CANDIDATE` with `forceNewPlan` (i.e., `targetServer` is cleared so a fresh candidate will be chosen). The region remains `OPENING` with its current location; the next `TRSPDispatchOpen` will update the location to the new server.
+Open command dispatch failed (non-deterministic RPC failure).
 
-**Pre:** `ASSIGN`/`MOVE`/`REOPEN` procedure in `CONFIRM_OPENED` state, the matching open command still exists in `dispatchedOps` (not yet consumed by an RS), AND the target server is `ONLINE`.
-**Post:** command removed, TRSP reset to `GET_ASSIGN_CANDIDATE`.
+Two disjuncts model two outcomes of dispatch failure:
+
+- **Disjunct 1 (retry):** The command is removed from `dispatchedOps` without delivery and the TRSP returns to `GET_ASSIGN_CANDIDATE` with `forceNewPlan` (`targetServer` cleared). Server stays `ONLINE`.
+
+- **Disjunct 2 (dispatch-expiry server crash):** Repeated dispatch failures cause `RSProcedureDispatcher.scheduleForRetry()` to call `ServerManager.expireServer()`, atomically crashing the target server and starting SCP. The TRSP is left at `CONFIRM_OPENED` (matching `remoteCallFailed()` early-return when `isServerOnline()=false`, RRPB.java L122-127). SCP's `SCPAssignRegion → TRSPServerCrashed` path drives the region forward. The RS may still be alive (ZK node present), modeling the hung-RS scenario where the server is unreachable by RPC but has not yet lost its ZK session. The 10-retry threshold is abstracted as non-deterministic choice — sound because TLC explores all branches regardless of counter value.
+
+**Pre:** `ASSIGN`/`MOVE`/`REOPEN`/`UNASSIGN` procedure in `CONFIRM_OPENED` state, the matching open command still exists in `dispatchedOps` (not yet consumed by an RS), AND the target server is `ONLINE`.
+**Post:** Disjunct 1: command removed, TRSP reset to `GET_ASSIGN_CANDIDATE`. Disjunct 2: command removed, server `CRASHED`, SCP started, TRSP unchanged (left at `CONFIRM_OPENED`).
 
 Guard: `serverState[s] = "ONLINE"` matches the implementation's early-return in `RRPB.remoteCallFailed()` (RRPB.java L122-127): if the server is dead, `remoteCallFailed()` returns without setting `DISPATCH_FAIL`, relying on `SCP.serverCrashed()` instead.
 
-> *Source:* `RegionRemoteProcedureBase.remoteCallFailed()` sets `DISPATCH_FAIL` state and wakes the parent TRSP; `RSProcedureDispatcher.scheduleForRetry()` decides whether to retry or fail the remote call.
+> *Source:* `RegionRemoteProcedureBase.remoteCallFailed()` sets `DISPATCH_FAIL` state and wakes the parent TRSP; `RSProcedureDispatcher.scheduleForRetry()` decides whether to retry or fail the remote call; `RSProcedureDispatcher.scheduleForRetry()` L326-336 → `ServerManager.expireServer()` L662-720.
 
 ```tla
 DispatchFail(r) ==
@@ -950,48 +956,99 @@ Reconstruct the dispatched command and verify it is still queued.
            IN /\ cmd \in dispatchedOps[s]
 ```
 
+#### Disjunct 1: retry (server stays ONLINE)
+
 Remove the undelivered command from the server's queue.
 
 ```tla
-              /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
+              /\ \/ /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
 ```
 
-Reset the procedure to `GET_ASSIGN_CANDIDATE` with no target server.
+Reset the procedure to `GET_ASSIGN_CANDIDATE` with no target.
 
 ```tla
-        /\ regionState' =
-             [regionState EXCEPT
-             ![r].procStep =
-             "GET_ASSIGN_CANDIDATE",
-             ![r].targetServer =
-             NoServer]
+                    /\ regionState' =
+                         [regionState EXCEPT
+                         ![r].procStep =
+                         "GET_ASSIGN_CANDIDATE",
+                         ![r].targetServer =
+                         NoServer]
 ```
 
-META, pending reports, RS-side state, and server liveness unchanged.
+META, pending reports, RS-side state, server liveness unchanged.
 
 ```tla
-        /\ UNCHANGED << scpVars,
-              serverVars,
-              procStore,
-              rsVars,
-              masterVars,
-              peVars,
-              metaTable,
-              pendingReports
-           >>
+                    /\ UNCHANGED << scpVars,
+                          serverVars,
+                          procStore,
+                          rsVars,
+                          masterVars,
+                          peVars,
+                          metaTable,
+                          pendingReports
+                       >>
+```
+
+#### Disjunct 2: dispatch-expiry server crash
+
+Repeated dispatch failures → `expireServer()`. Atomically crash the target server and start SCP.
+
+```tla
+                 \/ /\ serverState' = [serverState EXCEPT ![s] = "CRASHED"]
+```
+
+Non-deterministic `carryingMeta` (same pattern as `MasterDetectCrash`): the crashed server may or may not have been hosting `hbase:meta`.
+
+```tla
+                    /\ \/ /\ \A t \in Servers \ { s }: carryingMeta[t] = FALSE
+                          /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
+                          /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
+                       \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
+                          /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
+```
+
+Remove the dispatched command.
+
+```tla
+                    /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
+```
+
+TRSP stays at `CONFIRM_OPENED` — not reset. Matches `remoteCallFailed()` early-return when `isServerOnline()=false`.
+
+```tla
+                    /\ UNCHANGED << regionState,
+                          procStore,
+                          metaTable,
+                          pendingReports,
+                          rsVars,
+                          masterVars,
+                          peVars,
+                          scpRegions,
+                          walFenced,
+                          serverRegions,
+                          zkNode,
+                          regionKeyRange,
+                          parentProc
+                       >>
 
 ```
 
 ### `DispatchFailClose(r)`
 
-Close command dispatch failed (non-deterministic RPC failure). The command is removed from `dispatchedOps` without delivery and the TRSP returns to `CLOSE` to retry the dispatch. Unlike the open path (`DispatchFail`), the `targetServer` is *not* cleared because the close must still target the server hosting the region.
+Close command dispatch failed (non-deterministic RPC failure).
 
-**Pre:** `UNASSIGN` or `MOVE` procedure in `CONFIRM_CLOSED` state, the matching close command still exists in `dispatchedOps`, AND the target server is `ONLINE`.
-**Post:** command removed, TRSP reset to `CLOSE`.
+Two disjuncts (same structure as `DispatchFail`):
+
+- **Disjunct 1 (retry):** Command removed, TRSP returns to `CLOSE`. Unlike the open path (`DispatchFail`), `targetServer` is *not* cleared because the close must still target the server hosting the region. Server stays `ONLINE`.
+
+- **Disjunct 2 (dispatch-expiry server crash):** Repeated dispatch failures cause `expireServer()`. Server atomically `CRASHED`, SCP started. TRSP left at `CONFIRM_CLOSED` (matching `remoteCallFailed()` early-return when `isServerOnline()=false`).
+
+**Pre:** `UNASSIGN`/`MOVE`/`REOPEN` procedure in `CONFIRM_CLOSED` state, the matching close command still exists in `dispatchedOps`, AND the target server is `ONLINE`.
+**Post:** Disjunct 1: command removed, TRSP reset to `CLOSE`. Disjunct 2: command removed, server `CRASHED`, SCP started, TRSP unchanged (left at `CONFIRM_CLOSED`).
 
 Guard: `serverState[s] = "ONLINE"` — same rationale as `DispatchFail`.
 
-> *Source:* `RegionRemoteProcedureBase.remoteCallFailed()` sets `DISPATCH_FAIL` state and wakes the parent TRSP; `RSProcedureDispatcher.scheduleForRetry()` decides whether to retry or fail the remote call.
+> *Source:* `RegionRemoteProcedureBase.remoteCallFailed()` sets `DISPATCH_FAIL` state and wakes the parent TRSP; `RSProcedureDispatcher.scheduleForRetry()` decides whether to retry or fail the remote call; `RSProcedureDispatcher.scheduleForRetry()` L326-336 → `ServerManager.expireServer()` L662-720.
 
 ```tla
 DispatchFailClose(r) ==
@@ -1047,30 +1104,75 @@ Reconstruct the dispatched command and verify it is still queued.
            IN /\ cmd \in dispatchedOps[s]
 ```
 
+#### Disjunct 1: retry (server stays ONLINE)
+
 Remove the undelivered command from the server's queue.
 
 ```tla
-              /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
+              /\ \/ /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
 ```
 
 Reset the procedure to `CLOSE` to retry (target server kept).
 
 ```tla
-        /\ regionState' = [regionState EXCEPT ![r].procStep = "CLOSE"]
+                    /\ regionState' = [regionState EXCEPT ![r].procStep = "CLOSE"]
 ```
 
-META, pending reports, RS-side state, and server liveness unchanged.
+META, pending reports, RS-side state, server liveness unchanged.
 
 ```tla
-        /\ UNCHANGED << scpVars,
-              serverVars,
-              procStore,
-              rsVars,
-              masterVars,
-              peVars,
-              metaTable,
-              pendingReports
-           >>
+                    /\ UNCHANGED << scpVars,
+                          serverVars,
+                          procStore,
+                          rsVars,
+                          masterVars,
+                          peVars,
+                          metaTable,
+                          pendingReports
+                       >>
+```
+
+#### Disjunct 2: dispatch-expiry server crash
+
+Repeated dispatch failures → `expireServer()`. Atomically crash the target server and start SCP.
+
+```tla
+                 \/ /\ serverState' = [serverState EXCEPT ![s] = "CRASHED"]
+```
+
+Non-deterministic `carryingMeta` (same pattern as `MasterDetectCrash`).
+
+```tla
+                    /\ \/ /\ \A t \in Servers \ { s }: carryingMeta[t] = FALSE
+                          /\ carryingMeta' = [carryingMeta EXCEPT ![s] = TRUE]
+                          /\ scpState' = [scpState EXCEPT ![s] = "ASSIGN_META"]
+                       \/ /\ carryingMeta' = [carryingMeta EXCEPT ![s] = FALSE]
+                          /\ scpState' = [scpState EXCEPT ![s] = "GET_REGIONS"]
+```
+
+Remove the dispatched command.
+
+```tla
+                    /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
+```
+
+TRSP stays at `CONFIRM_CLOSED` — not reset. Matches `remoteCallFailed()` early-return when `isServerOnline()=false`.
+
+```tla
+                    /\ UNCHANGED << regionState,
+                          procStore,
+                          metaTable,
+                          pendingReports,
+                          rsVars,
+                          masterVars,
+                          peVars,
+                          scpRegions,
+                          walFenced,
+                          serverRegions,
+                          zkNode,
+                          regionKeyRange,
+                          parentProc
+                       >>
 
 ```
 
