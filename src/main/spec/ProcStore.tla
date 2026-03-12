@@ -55,16 +55,23 @@ ProcStoreConsistency ==
                { "OPEN", "CONFIRM_OPENED", "CONFIRM_CLOSED", "REPORT_SUCCEED" } =>
              procStore[r].targetServer # NoServer
          )
-      \* UNASSIGN starts at CLOSE and never reaches open-path steps.
+      \* UNASSIGN normally starts at CLOSE, but during two-phase crash
+      \* recovery (confirmClosed ABNORMALLY_CLOSED), UNASSIGN traverses
+      \* the open-path steps (GET_ASSIGN_CANDIDATE -> OPEN ->
+      \* CONFIRM_OPENED -> REPORT_SUCCEED) before returning to CLOSE.
       /\ ( procStore[r].type = "UNASSIGN" =>
              procStore[r].step \in
-               { "CLOSE", "CONFIRM_CLOSED", "REPORT_SUCCEED" }
+               { "CLOSE", "CONFIRM_CLOSED", "REPORT_SUCCEED",
+                 "GET_ASSIGN_CANDIDATE", "OPEN", "CONFIRM_OPENED" }
          )
       \* transitionCode must match procedure type:
-      \*   UNASSIGN can only report CLOSED.
+      \*   UNASSIGN can report CLOSED (normal close path or re-close
+      \*   after recovery), OPENED (reopen succeeded during two-phase
+      \*   recovery), or FAILED_OPEN (reopen failed).
       /\ ( procStore[r].type = "UNASSIGN" /\
                procStore[r].transitionCode # NoTransition =>
-             procStore[r].transitionCode = "CLOSED"
+             procStore[r].transitionCode \in
+               { "CLOSED", "OPENED", "FAILED_OPEN" }
          )
       \*   Pure ASSIGN procedures only reach the open path:
       \*   transitionCode can be OPENED or FAILED_OPEN.

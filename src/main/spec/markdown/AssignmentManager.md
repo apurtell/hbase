@@ -589,7 +589,7 @@ NoDoubleAssignment ==
 Correlates procedure type with the set of region states in which that procedure may be attached. Each TRSP type attaches before its first state transition (`setProcedure` precedes `regionOpening`/`regionClosing`), so the procedure may be present in the pre-transitional state.
 
 - **`ASSIGN`** attaches during `{OFFLINE, CLOSED, ABNORMALLY_CLOSED, FAILED_OPEN}` and the region transitions through `OPENING` before being cleared at `OPEN`. During the `REPORT_SUCCEED` window the region may briefly show `OPEN` or `FAILED_OPEN` while the `ASSIGN` procedure is still attached.
-- **`UNASSIGN`** attaches during `OPEN` and the region transitions through `CLOSING` before being cleared at `CLOSED`. During `REPORT_SUCCEED` the region may briefly show `CLOSED` while the `UNASSIGN` procedure is still attached.
+- **`UNASSIGN`** attaches during `OPEN` and the region transitions through `CLOSING` before being cleared at `CLOSED`. During two-phase crash recovery (`ABNORMALLY_CLOSED` at `CONFIRM_CLOSED`), UNASSIGN reopens the region through `OPENING`/`OPEN` before re-closing. During `REPORT_SUCCEED` the region may briefly show `CLOSED` while the `UNASSIGN` procedure is still attached.
 - **`MOVE`** attaches during `OPEN` and drives the region through `CLOSING`, `CLOSED`, `OPENING` before being cleared at `OPEN`.
 - Any type may be found on an `ABNORMALLY_CLOSED` region if a server crash occurs while the procedure is in flight.
 
@@ -624,11 +624,13 @@ LockExclusivity ==
                         "MERGING",
                         "CLOSING",
                         "ABNORMALLY_CLOSED",
-                        "CLOSED"
+                        "CLOSED",
+                        "OPENING",
+                        "FAILED_OPEN"
                       }
 ```
 
-`SPLITTING` / `MERGING`: split/merge yields parent to `UNASSIGN` (`SplitPrepare`/`MergePrepare` sets `procType=UNASSIGN` while parent is still in `SPLITTING`/`MERGING` state).
+`SPLITTING` / `MERGING`: split/merge yields parent to `UNASSIGN` (`SplitPrepare`/`MergePrepare` sets `procType=UNASSIGN` while parent is still in `SPLITTING`/`MERGING` state). `OPENING` / `OPEN` / `FAILED_OPEN`: UNASSIGN two-phase crash recovery reopens the region before re-closing it (`confirmClosed()` L379-389).
 
 ```tla
               \/ /\ regionState[r].procType = "MOVE"
