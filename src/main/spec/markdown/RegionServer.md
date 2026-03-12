@@ -2,7 +2,7 @@
 
 **Source:** [`RegionServer.tla`](../RegionServer.tla)
 
-RS-side handlers: open, fail-open, close, abort, restart, duplicate-open, stale report drop.
+RS-side handlers: open, fail-open, close, abort, restart, duplicate-open, close-not-found, stale report drop.
 
 ---
 
@@ -17,6 +17,7 @@ RegionServer-side actions for the HBase AssignmentManager:
 - **`RSRestart`** — process supervisor restart
 - **`DropStaleReport`** — stale report cleanup
 - **`RSOpenDuplicate`** — conditional duplicate-open handler
+- **`RSCloseNotFound`** — conditional close-not-found handler
 
 ```tla
 EXTENDS Types
@@ -480,6 +481,93 @@ Command must be an `OPEN` command.
 
 ```tla
        /\ cmd.type = "OPEN"
+```
+
+Command must target region `r`.
+
+```tla
+       /\ cmd.region = r
+```
+
+Consume the command — but produce *no* report.
+
+```tla
+       /\ dispatchedOps' = [dispatchedOps EXCEPT ![s] = @ \ { cmd }]
+```
+
+All other state unchanged: no report, no `rsOnlineRegions` change.
+
+```tla
+       /\ UNCHANGED << scpVars,
+             serverVars,
+             peVars,
+             procStore,
+             rsVars,
+             masterVars,
+             regionState,
+             metaTable,
+             pendingReports,
+             zkNode
+          >>
+```
+
+```tla
+---------------------------------------------------------------------------
+```
+
+## RS-Side Close-Not-Found Handler
+
+### `RSCloseNotFound(s, r)`
+
+RS receives a `CLOSE` command for a region that is **not online** on this server. The command is consumed *without* producing a `CLOSED` report, modeling `UnassignRegionHandler.process()` L111–117 where the handler discovers `rs.getRegion(encodedName) == null` and returns early without calling `reportRegionStateTransition()`. Also covers the L94–109 path where `regionsInTransitionInRS` already has the region (already closing/opening) — the TLA+ model collapses both paths to the same predicate: `r ∉ rsOnlineRegions[s]`.
+
+This means the TRSP on the master side will never receive the expected `CLOSED` report and will get stuck at `CONFIRM_CLOSED`, eventually causing **deadlock**.
+
+Guarded by `UseRSCloseNotFoundQuirk`: disabled by default to avoid deadlock in model checking. Enable to faithfully model this implementation quirk and generate counterexample traces.
+
+**Pre:** `UseRSCloseNotFoundQuirk = TRUE`, server is `ONLINE`, region `r` is *not* in `rsOnlineRegions[s]`, a `CLOSE` command for `r` exists.
+**Post:** Command consumed, *no* report produced, `rsOnlineRegions` unchanged.
+
+> *Source:* `UnassignRegionHandler.process()` L111–117.
+
+```tla
+RSCloseNotFound(s, r) ==
+```
+
+Quirk modeling must be enabled.
+
+```tla
+  /\ UseRSCloseNotFoundQuirk = TRUE
+```
+
+Server is `ONLINE`.
+
+```tla
+  /\ serverState[s] = "ONLINE"
+```
+
+ZK confirms server is still alive.
+
+```tla
+  /\ zkNode[s] = TRUE
+```
+
+Region is NOT online on this server (not found).
+
+```tla
+  /\ r \notin rsOnlineRegions[s]
+```
+
+A `CLOSE` command for region `r` exists in the server's queue.
+
+```tla
+  /\ \E cmd \in dispatchedOps[s]:
+```
+
+Command must be a `CLOSE` command.
+
+```tla
+       /\ cmd.type = "CLOSE"
 ```
 
 Command must target region `r`.
