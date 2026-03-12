@@ -935,7 +935,7 @@ widened UNASSIGN allowed transitionCodes to include `OPENED`,
 TLC 3r/2s: 147,814,458 distinct, 527,675,023 generated, depth 83,
 ~74min, clean.
 
-#### Iteration 26 — RSCloseNotFound quirk (silent close-command consumption) ✅ COMPLETE
+#### Iteration 26 — RSCloseNotFound quirk ✅ COMPLETE
 
 Modeled two silent-return paths in `UnassignRegionHandler.process()`
 (L94–109 already-transitioning, L111–117 region-not-found) where the RS
@@ -949,8 +949,66 @@ command exists; consumes command, produces no report.
 `AssignmentManager.tla`: wired into `Next` (after `RSOpenDuplicate`),
 `PrintConfig`, `Fairness` comment (no WF — non-deterministic quirk).
 All 3 configs: +`UseRSCloseNotFoundQuirk = FALSE`.  With quirk disabled
-(default), state space unchanged from Iter 25.  TLC 3r/2s:
+(default), state space unchanged from Iter 25. TLC 3r/2s:
 147,814,458 distinct, 527,675,023 generated, depth 83, ~69min, clean.
+
+#### Iteration 27 — Miscellaneous fidelity improvements ✅ COMPLETE
+
+Two fidelity fixes, no new variables or actions.  `SCP.tla`: `SCPDone`
+now clears `serverRegions[s]` to `{}`, modeling
+`ServerManager.expireServer()` → `RegionStates.removeServer()`
+(L679–681) which removes the `ServerStateNode` entirely on SCP
+completion, preventing ghost tracking entries.  `UNCHANGED`
+clause updated (`serverVars` → `serverState`).  `TRSP.tla`:
+`TRSPReportSucceedOpen` added server-name check
+`rpt.server = regionState[r].targetServer`, matching the guard
+already present in `TRSPReportSucceedClose` (L996) and the Java
+`RegionRemoteProcedureBase.reportTransition()` (L208–211) which
+validates the server name for both open and close paths; prevents
+accepting stale `OPENED` reports from a previous server after
+crash+reassign. TLC 3r/2s: 137,680,580 distinct, 488,668,819 generated,
+depth 82, ~74min, clean.
+
+#### Iteration 28 — Dispatch-failure server expiration
+
+Model the `RSProcedureDispatcher.scheduleForRetry()` →
+`ServerManager.expireServer()` code path where repeated dispatch
+failures cause the master to expire the target server, triggering
+SCP while the RS may still be alive (ZK node still present).
+Extend `DispatchFail(r)` and `DispatchFailClose(r)` in `TRSP.tla`
+with a second disjunct. Existing first disjunct retains the
+current behavior (server stays ONLINE, TRSP resets to
+`GET_ASSIGN_CANDIDATE`/`CLOSE`).  The new second disjunct fires
+under the same dispatch-pending preconditions and atomically:
+1. Sets `serverState[s] = "CRASHED"` and starts SCP for `s`
+  (`scpState[s] = "GET_REGIONS"` or `"ASSIGN_META"`, with
+  non-deterministic `carryingMeta` — same pattern as
+  `MasterDetectCrash`).
+2. Removes the dispatched command from `dispatchedOps[s]`.
+3. Does **not** advance or reset the TRSP — the procedure is left
+  at `CONFIRM_OPENED` / `CONFIRM_CLOSED` (matching the
+ `remoteCallFailed()` early-return when `isServerOnline()=false`).
+The TRSP-vs-SCP race is explored naturally: SCP's
+`SCPAssignRegion → TRSPServerCrashed` path drives the region forward
+while the TRSP is still in its dispatch-waiting step.
+The RS may still be alive (ZK node present);
+this models the hung-RS scenario where the server is unreachable
+by RPC but has not yet lost its ZK session.  `RSAbort` (guarded by
+`zkNode[s] = FALSE`) will not fire until ZK eventually detects the
+death, so the RS may process the already-dispatched command and
+even report back before `RSAbort` clears state.
+**State-explosion mitigation**:
+  - Gated by `UseDispatchExpiry ∈ BOOLEAN` constant (default TRUE).
+  - No retry counter: the 10-retry threshold is abstracted as
+    non-deterministic choice.  Sound because TLC explores all
+    non-deterministic choices regardless of retry count.
+  - Merged disjunct: no new action in `Next`; the second disjunct
+    shares preconditions with the existing `DispatchFail` /
+    `DispatchFailClose`, adding exactly one additional successor per
+    reachable dispatch state.
+   - *Subsumed SCP start*: atomically sets `serverState[s] = "CRASHED"`
+    and initializes `scpState[s]` in a single step, matching the
+    atomicity of `expireServer()`
 
 ---
 
@@ -1017,6 +1075,7 @@ is shown.
 | `TRSP.serverCrashed()` type-preserving | `TRSPServerCrashed` type-preserving branches | 25 | ✅ |
 | `TRSP.confirmOpened()` UNASSIGN continuation (L289-301) | `TRSPConfirmOpened` UNASSIGN→CLOSE branch | 25 | ✅ |
 | `UnassignRegionHandler.process()` silent return (L111-117, L132-138) | `RSCloseNotFound(s, r)` gated by `UseRSCloseNotFoundQuirk` | 26 | ✅ |
+| `RSProcedureDispatcher.scheduleForRetry()` → `expireServer()` (L326-336) | `DispatchFail`/`DispatchFailClose` second disjunct, gated by `UseDispatchExpiry` | 28 | ⏳ |
 
 ---
 
