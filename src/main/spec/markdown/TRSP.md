@@ -435,7 +435,7 @@ Pending reports, RS-side state, and server liveness unchanged.
 ```
 ### `TRSPReportSucceedOpen(r)`
 
-**Report-succeed for OPEN path** — RS report consumed: in-memory `regionState` updated to reflect the RS report (`OPENED` or `FAILED_OPEN`), procedure persisted to `procStore` at `REPORT_SUCCEED` with the transition code recorded. `metaTable` is *not* updated yet — that happens in `TRSPPersistToMetaOpen`.
+RS report consumed: in-memory `regionState` updated to reflect the RS report (`OPENED` or `FAILED_OPEN`), procedure persisted to `procStore` at `REPORT_SUCCEED` with the transition code recorded. `metaTable` is *not* updated yet — that happens in `TRSPPersistToMetaOpen`.
 
 This action absorbs the former `TRSPConfirmOpened` (OPENED path), `TRSPHandleFailedOpen`, and `TRSPGiveUpOpen` by uniformly processing all report codes through the `REPORT_SUCCEED` intermediate step.
 
@@ -495,6 +495,12 @@ Report must be for region `r`.
 ```tla
        /\ rpt.region = r
        /\ rpt.code \in { "OPENED", "FAILED_OPEN" }
+```
+
+Report must be from the target server. In Java, `RegionRemoteProcedureBase.reportTransition()` (L208–211) validates the server name for both open and close paths via `reportRegionStateTransition()`. Without this check the model could accept stale `OPENED` reports from a previous server after a crash+reassign.
+
+```tla
+       /\ rpt.server = regionState[r].targetServer
 ```
 
 Prefer `OPENED` over `FAILED_OPEN`: if both exist, only consume `OPENED`.
