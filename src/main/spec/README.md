@@ -345,30 +345,30 @@ All configurations check the same 30 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-11 |
-| **TLC version** | 2026.03.11.044424 |
+| **Date** | 2026-03-12 |
+| **TLC version** | 2026.03.12.002851 |
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
 | **Mode** | Exhaustive with symmetry reduction |
-| **Workers** | 10 on 10 cores |
-| **Result** | All 30 invariants, 2 liveness properties, 2 action constraints, and state constraint passed |
-| **States generated** | 488,668,819 |
-| **States checked** | 137,680,580 distinct |
-| **Depth** | 82 |
-| **Duration** | ~74 min |
+| **Workers** | 128 on 128 cores |
+| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
+| **States generated** | 1,328,348,760 |
+| **States checked** | 368,662,744 distinct |
+| **Depth** | 92 |
+| **Duration** | ~71 min |
 
 ### 9r/3s Simulation
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-10 |
+| **Date** | 2026-03-12 |
 | **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused) |
-| **Mode** | Random Simulation (seed -8506467816346790913) |
+| **Mode** | Random Simulation (seed 7001099511625069765) |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 30 invariants, 2 liveness properties, 2 action constraints, and state constraint passed |
-| **States generated** | 723,156,021 |
-| **Traces generated** | ~7,020,665 |
-| **Duration** | 4 hours |
+| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
+| **States generated** | 350,615,021 |
+| **Traces generated** | ~3,380,794 |
+| **Duration** | 2 hours |
 
 ## Running the Spec
 
@@ -407,6 +407,7 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 144
 - Split forward path and pre-PONR rollback with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`, `SplitFail`)
 - Merge forward path and pre-PONR rollback with parent-child procedure framework (`MergePrepare`, `MergeCheckClosed`, `MergeUpdateMeta`, `MergeDone`, `MergeFail`); gated by `UseMerge`
 - Parent-child procedure tracking (`parentProc` variable with `ref1`/`ref2` region references) across child TRSP lifecycles
+- Dispatch-failure server expiration (`DispatchFail`/`DispatchFailClose` disjunct 2: `scheduleForRetry()` → `expireServer()` atomically crashes server and starts SCP)
 
 **Deferred:**
 - Crash during split/merge
