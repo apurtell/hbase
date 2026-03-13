@@ -1185,6 +1185,7 @@ PrintConfig ==
   /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
   /\ PrintT(<< "UseUnknownServerQuirk", UseUnknownServerQuirk >>)
   /\ PrintT(<< "UseMasterAbortOnMetaWriteQuirk", UseMasterAbortOnMetaWriteQuirk >>)
+  /\ PrintT(<< "UseStaleStateQuirk", UseStaleStateQuirk >>)
   /\ PrintT("========================================")
 ```
 

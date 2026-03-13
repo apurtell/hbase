@@ -1017,25 +1017,18 @@ when FALSE (default), existing suspend/block per `UseBlockOnMetaWrite`.
 All 3 configs updated with `UseMasterAbortOnMetaWriteQuirk = FALSE`.
 TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated, depth 92, clean.
 
-#### Iteration 31 - UseStaleStateQuirk
+#### Iteration 31 - UseStaleStateQuirk ✅ COMPLETE
 
-The UseStaleStateQuirk models the scenario where
-RegionStateStore.visitMeta() also populates serverState/ServerStateNode
-entries for servers referenced in meta, even if those servers are dead.
-We can model this by changing the serverState' reconstruction to also
-mark servers ONLINE if ∃ r ∈ Regions: metaTable[r].location = s,
-regardless of zkNode[s]:
-```
-serverState' = [s ∈ Servers |→ 
-  IF UseStaleStateQuirk 
-  THEN IF zkNode[s] = TRUE 
-       THEN "ONLINE" 
-       ELSE IF ∃ r ∈ Regions: metaTable[r].location = s 
-            THEN "ONLINE"    \* BUG: stale entry
-            ELSE "CRASHED"
-  ELSE IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
-]
-```
+`RegionStateStore.visitMeta()` / `AM.start()` L341-348 calls
+`regionStates.createServer(regionLocation)` for every region in meta,
+creating `ServerStateNode` entries for dead servers and making them appear
+`ONLINE` to subsequent crash-detection — no SCP started, regions never
+recovered.  Added `UseStaleStateQuirk ∈ BOOLEAN` (Types.tla).  Modified
+`MasterRecover` `serverState'` and `scpState'` reconstruction (Master.tla):
+when TRUE and `zkNode[s]=FALSE`, server marked `ONLINE` (no SCP) if
+`∃ r ∈ Regions: metaTable[r].location = s`; when FALSE (default), correct
+`zkNode`-based liveness.  All 3 configs updated. TLC 3r/2s: 368,662,744
+distinct, 1,328,348,760 generated, depth 92, ~64min, clean.
 
 #### Iteration 32 - TruncateTableProcedure
 
