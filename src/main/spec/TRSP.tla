@@ -241,27 +241,31 @@ TRSPDispatchOpen(r) ==
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
-  /\ \/ \* --- Meta unavailable: suspend or block ---
+  /\ \/ \* --- Meta unavailable: abort, suspend, or block ---
         /\ ~MetaIsAvailable
         \* Region is not already suspended waiting for meta.
         /\ r \notin suspendedOnMeta
         \* Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
-        \* Branch on meta-write blocking mode.
-        /\ IF UseBlockOnMetaWrite = FALSE
-           \* Async: suspend procedure, release PEWorker thread.
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
-           \* Sync: block PEWorker thread on meta write.
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+        \* Branch on meta-write failure mode.
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+           \* HBASE-23595: master.abort() on IOException.
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
+                   \* Async: suspend procedure, release PEWorker thread.
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   \* Sync: block PEWorker thread on meta write.
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         \* No state changes: procedure paused before the write.
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore
@@ -421,9 +425,11 @@ TRSPPersistToMetaOpen(r) ==
   /\ regionState[r].procStep = "REPORT_SUCCEED"
   \* Bind the transition code from the persisted procedure record.
   /\ LET tc == procStore[r].transitionCode
-     IN \/ \* --- Meta unavailable: suspend or block ---
+     IN \/ \* --- Meta unavailable: abort, suspend, or block ---
            \* When meta is unavailable and the procedure attempts a meta
-           \* write, two behaviors are modeled:
+           \* write, three behaviors are modeled:
+           \*   HBASE-23595 (UseMasterAbortOnMetaWriteQuirk=TRUE):
+           \*     master.abort() crashes the master.
            \*   Default (UseBlockOnMetaWrite=FALSE, master/branch-3+):
            \*     Procedure suspends via ProcedureFutureUtil.
            \*     suspendIfNecessary(), releasing the PEWorker thread.
@@ -437,20 +443,24 @@ TRSPPersistToMetaOpen(r) ==
            /\ r \notin suspendedOnMeta
            \* Region is not already blocking a PEWorker on meta.
            /\ r \notin blockedOnMeta
-           /\ IF UseBlockOnMetaWrite = FALSE
-              THEN \* Async: suspend procedure, release PEWorker.
-                   /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                   /\ UNCHANGED << availableWorkers, blockedOnMeta >>
-              ELSE \* Sync: block PEWorker thread on meta write.
-                   /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                   /\ availableWorkers' = availableWorkers - 1
-                   /\ UNCHANGED suspendedOnMeta
+           /\ IF UseMasterAbortOnMetaWriteQuirk
+              THEN \* HBASE-23595: master.abort() on IOException.
+                   /\ masterAlive' = FALSE
+                   /\ UNCHANGED peVars
+              ELSE /\ IF UseBlockOnMetaWrite = FALSE
+                      THEN \* Async: suspend procedure, release PEWorker.
+                           /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                           /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                      ELSE \* Sync: block PEWorker thread on meta write.
+                           /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                           /\ availableWorkers' = availableWorkers - 1
+                           /\ UNCHANGED suspendedOnMeta
+                   /\ UNCHANGED masterVars
            \* No state changes: procedure paused before the write.
            /\ UNCHANGED << scpVars,
                  rpcVars,
                  serverVars,
                  rsVars,
-                 masterVars,
                  regionState,
                  metaTable,
                  procStore
@@ -1006,26 +1016,30 @@ TRSPDispatchClose(r) ==
   /\ regionState[r].procStep = "CLOSE"
   \* A target server must be set for the close dispatch.
   /\ regionState[r].targetServer # NoServer
-  /\ \/ \* --- Meta unavailable: suspend or block ---
+  /\ \/ \* --- Meta unavailable: abort, suspend, or block ---
         /\ ~MetaIsAvailable
         \* Region is not already suspended waiting for meta.
         /\ r \notin suspendedOnMeta
         \* Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
-        \* Branch on meta-write blocking mode.
-        /\ IF UseBlockOnMetaWrite = FALSE
-           \* Async: suspend procedure, release PEWorker thread.
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
-           \* Sync: block PEWorker thread on meta write.
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+        \* Branch on meta-write failure mode.
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+           \* HBASE-23595: master.abort() on IOException.
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
+                   \* Async: suspend procedure, release PEWorker thread.
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   \* Sync: block PEWorker thread on meta write.
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore
@@ -1158,26 +1172,30 @@ TRSPPersistToMetaClose(r) ==
   /\ regionState[r].procStep = "REPORT_SUCCEED"
   \* Transition code must be CLOSED.
   /\ procStore[r].transitionCode = "CLOSED"
-  /\ \/ \* --- Meta unavailable: suspend or block ---
+  /\ \/ \* --- Meta unavailable: abort, suspend, or block ---
         /\ ~MetaIsAvailable
         \* Region is not already suspended waiting for meta.
         /\ r \notin suspendedOnMeta
         \* Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
-        \* Branch on meta-write blocking mode.
-        /\ IF UseBlockOnMetaWrite = FALSE
-           \* Async: suspend procedure, release PEWorker thread.
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
-           \* Sync: block PEWorker thread on meta write.
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+        \* Branch on meta-write failure mode.
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+           \* HBASE-23595: master.abort() on IOException.
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
+                   \* Async: suspend procedure, release PEWorker thread.
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   \* Sync: block PEWorker thread on meta write.
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore

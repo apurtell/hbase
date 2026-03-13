@@ -1130,6 +1130,7 @@ PrintConfig ==
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
   /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
   /\ PrintT(<< "UseUnknownServerQuirk", UseUnknownServerQuirk >>)
+  /\ PrintT(<< "UseMasterAbortOnMetaWriteQuirk", UseMasterAbortOnMetaWriteQuirk >>)
   /\ PrintT("========================================")
 
 (* Initial state *)

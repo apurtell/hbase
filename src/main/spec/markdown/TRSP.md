@@ -333,30 +333,38 @@ Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
 ```
 
-Branch on meta-write blocking mode.
+Branch on meta-write failure mode.
 
 ```tla
-        /\ IF UseBlockOnMetaWrite = FALSE
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+```
+
+HBASE-23595: `master.abort()` on `IOException`.
+
+```tla
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
 ```
 
 Async: suspend procedure, release PEWorker thread.
 
 ```tla
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
 ```
 
 Sync: block PEWorker thread on meta write.
 
 ```tla
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore
@@ -641,30 +649,38 @@ Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
 ```
 
-Branch on meta-write blocking mode.
+Branch on meta-write failure mode.
 
 ```tla
-        /\ IF UseBlockOnMetaWrite = FALSE
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+```
+
+HBASE-23595: `master.abort()` on `IOException`.
+
+```tla
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
 ```
 
 Async: suspend procedure, release PEWorker thread.
 
 ```tla
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
 ```
 
 Sync: block PEWorker thread on meta write.
 
 ```tla
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore
@@ -1537,30 +1553,38 @@ Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
 ```
 
-Branch on meta-write blocking mode.
+Branch on meta-write failure mode.
 
 ```tla
-        /\ IF UseBlockOnMetaWrite = FALSE
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+```
+
+HBASE-23595: `master.abort()` on `IOException`.
+
+```tla
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
 ```
 
 Async: suspend procedure, release PEWorker thread.
 
 ```tla
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
 ```
 
 Sync: block PEWorker thread on meta write.
 
 ```tla
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore
@@ -1819,30 +1843,38 @@ Region is not already blocking a PEWorker on meta.
         /\ r \notin blockedOnMeta
 ```
 
-Branch on meta-write blocking mode.
+Branch on meta-write failure mode.
 
 ```tla
-        /\ IF UseBlockOnMetaWrite = FALSE
+        /\ IF UseMasterAbortOnMetaWriteQuirk
+```
+
+HBASE-23595: `master.abort()` on `IOException`.
+
+```tla
+           THEN /\ masterAlive' = FALSE
+                /\ UNCHANGED peVars
+           ELSE /\ IF UseBlockOnMetaWrite = FALSE
 ```
 
 Async: suspend procedure, release PEWorker thread.
 
 ```tla
-           THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta >>
+                   THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
+                        /\ UNCHANGED << availableWorkers, blockedOnMeta >>
 ```
 
 Sync: block PEWorker thread on meta write.
 
 ```tla
-           ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
-                /\ availableWorkers' = availableWorkers - 1
-                /\ UNCHANGED suspendedOnMeta
+                   ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
+                        /\ availableWorkers' = availableWorkers - 1
+                        /\ UNCHANGED suspendedOnMeta
+                /\ UNCHANGED masterVars
         /\ UNCHANGED << scpVars,
               rpcVars,
               serverVars,
               rsVars,
-              masterVars,
               regionState,
               metaTable,
               procStore
