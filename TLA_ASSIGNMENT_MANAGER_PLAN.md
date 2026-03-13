@@ -988,6 +988,22 @@ TRSPServerCrashed` drives the region forward while TRSP is in its
 dispatch-waiting step. TLC 3r/2s: 368,662,744 distinct,
 1,328,348,760 generated, depth 92, ~71min, clean.
 
+#### Iteration 29 — UseUnknownServerQuirk ✅ COMPLETE
+
+`AssignmentManager.checkOnlineRegionsReport()` closes regions on stale
+servers without scheduling reassignment, leaving orphans on "Unknown Servers"
+indefinitely. Most common production path: RS crashes → DEAD → SCP runs and
+processes most regions → new RS starts on same host:port →
+`DeadServer.cleanPreviousInstance()` removes old dead entry → any region that
+SCP's `isMatchingRegionLocation()` skipped remains pointing at the
+now-unknown server → `closeRegionSilently()` closes without TRSP.
+Added `UseUnknownServerQuirk ∈ BOOLEAN` (Types.tla) and
+`DetectUnknownServer(r)` action (Master.tla). When TRUE: region closed
+silently, no TRSP — stuck CLOSED/OFFLINE forever. When FALSE (default):
+master creates TRSP(ASSIGN). Wired into Next (no WF — non-deterministic
+event). All 3 configs updated. TLC 3r/2s: 368,662,744 distinct,
+1,328,348,760 generated, depth 92, clean.
+
 ---
 
 ## 8. Mapping from Code to TLA+ Actions
