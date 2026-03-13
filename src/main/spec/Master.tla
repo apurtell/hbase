@@ -311,12 +311,29 @@ MasterRecover ==
   \*         RegionServerTracker.upgrade() ->
   \*         ServerManager.findDeadServersAndProcess()
   /\ serverState' =
-       [s \in Servers |-> IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
+       [s \in Servers |->
+         IF UseStaleStateQuirk
+         THEN IF zkNode[s] = TRUE
+              THEN "ONLINE"
+              ELSE IF \E r \in Regions: metaTable[r].location = s
+                   THEN "ONLINE"    \* BUG: stale entry
+                   ELSE "CRASHED"
+         ELSE IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
        ]
   \* Crashed servers get a fresh SCP at GET_REGIONS.
   \* Non-crashed servers get no SCP.
+  \* When UseStaleStateQuirk is TRUE and a dead server appears ONLINE
+  \* due to stale meta references, no SCP is started for it -- the
+  \* core of the bug (regions on the dead server are never recovered).
   /\ scpState' =
-       [s \in Servers |-> IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"
+       [s \in Servers |->
+         IF UseStaleStateQuirk
+         THEN IF zkNode[s] = TRUE
+              THEN "NONE"
+              ELSE IF \E r \in Regions: metaTable[r].location = s
+                   THEN "NONE"     \* BUG: no SCP for stale-online
+                   ELSE "GET_REGIONS"
+         ELSE IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"
        ]
   \* Reset SCP region sets (fresh SCPs will re-scan meta).
   /\ scpRegions' = [s \in Servers |-> {}]
