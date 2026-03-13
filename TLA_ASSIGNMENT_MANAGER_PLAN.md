@@ -1,6 +1,6 @@
 # TLA+ Model of the HBase AssignmentManager
 
-## 1. Executive Summary
+## 1. Summary
 
 This document presents a detailed analysis of the HBase AssignmentManager system and a
 step-by-step plan for modeling it in TLA+. The AssignmentManager is the component of the
@@ -84,7 +84,7 @@ ABNORMALLY_CLOSED — Closed due to RS crash
   OFFLINE ──► OPENING ──► OPEN ──► CLOSING ──► CLOSED ──► OFFLINE     │
                  │                    │           │                   │
                  v                    │           v                   │
-            FAILED_OPEN               │      FAILED_CLOSE (dead)       │
+            FAILED_OPEN               │      FAILED_CLOSE (dead)      │
                  │                    │                               │
                  v                    v                               │
            (retry/abort)      ABNORMALLY_CLOSED ──────────────────────┘
@@ -260,6 +260,16 @@ Combined with `onlineRegions` membership, the RS-side region lifecycle is:
     explicitly for documentation and as a safety net if SCP states are
     later decomposed further.
 
+11. **Table Lock Exclusivity** (Iteration 32): Table-level exclusive
+     operations (CREATE, DELETE, TRUNCATE) and shared operations (SPLIT,
+     MERGE) respect the `MasterProcedureScheduler`'s table-queue locking:
+     an exclusive-type `parentProc` on any region of table `t` blocks all
+     other table-level procedures and all split/merge on that table;
+     concurrent splits/merges on different regions of the same table are
+     permitted (shared compatibility).  Modeled via guard predicates
+     `TableLockFree(t)` and `NoTableExclusiveLock(r)` over
+     `parentProc[r].type`.
+
 ### 4.2 Liveness Properties
 
 1. **Assignment Progress**: A region in OFFLINE state is eventually assigned (assuming servers are available).
@@ -307,11 +317,11 @@ every iteration.  A third is reserved for ad hoc on-demand checks.
 
 | Config | Model | Mode | Role | Time |
 |--------|-------|------|------|------|
-| `AssignmentManager.cfg` | 2r/2s, MaxRetries=1 | Exhaustive | Every iteration | <10s |
-| `AssignmentManager-sim.cfg` | 3r/3s, MaxRetries=2 | Simulation | Every iteration | 15 min |
+| `AssignmentManager.cfg` | 3r/2s, MaxRetries=1 | Exhaustive | Every iteration | 1 hr|
+| `AssignmentManager-sim.cfg` | 9r/3s, MaxRetries=2 | Simulation | Every iteration | 15 min |
 | `AssignmentManager-sim.cfg` | (same) | Simulation | Post-iteration | 1 hr |
 | `AssignmentManager-sim.cfg` | (same) | Simulation | Post-phase | 4 hr |
-| `AssignmentManager-full.cfg` | 3r/3s, MaxRetries=1 | Exhaustive | Ad hoc | **Expensive** |
+| `AssignmentManager-liveness.cfg` | 3r/2s, MaxRetries=1 | Exhaustive | Ad hoc | 1 hr |
 
 ### 5.3 Abstraction Decisions
 
@@ -323,7 +333,7 @@ The following table documents what is modeled concretely vs. abstracted:
 | TRSP state machine | **Concrete** | The heart of assignment logic |
 | RegionRemoteProcedure (Open/Close) | **Merged into TRSP** | Simplify by treating open/close dispatch as atomic TRSP actions |
 | RS open/close execution | **Concrete** | Models the RS-side lifecycle and failure modes |
-| ProcedureExecutor | **Abstract** (Iter 19 adds thread pool) | Model execute/suspend/resume/crash-recover; Iter 19 adds counting-semaphore model of PEWorker thread pool for exhaustion analysis |
+| ProcedureExecutor | **Abstract** (counting semaphore, Iter 19) | Model execute/suspend/resume/crash-recover; counting-semaphore model of PEWorker thread pool for exhaustion analysis |
 | ProcedureStore (WAL) | **Abstract** | Model as a persistent set of procedure states; no WAL rolling details |
 | hbase:meta | **Abstract** | Model as a function `Region → (State, Server)` |
 | ZooKeeper crash detection | **Abstract** | Model as non-deterministic crash detection with delay |
@@ -333,120 +343,20 @@ The following table documents what is modeled concretely vs. abstracted:
 | Load balancer | **Abstract** | Non-deterministic choice of move targets |
 | REOPEN vs MOVE | **Concrete** | `TRSPCreateReopen` pins `assignCandidate` to the region's current server; `TRSPCreateMove` forces a new plan. Separate `REOPEN` ProcType added. |
 | SCP carryingMeta path | **Concrete** | `carryingMeta` variable, `SCPAssignMeta` action (`ASSIGN_META` → `GET_REGIONS`), all non-meta SCP steps gated on `∀ t: scpState[t] ≠ "ASSIGN_META"` (`waitMetaLoaded`). `MetaAvailableForRecovery` invariant. |
-| Split/Merge procedures | **Concrete** | Keyspace-aware model: `regionKeyRange`, `MaxKey`, `DeployedRegions`, `Adjacent` predicate, `KeyspaceCoverage`/`SplitMergeMutualExclusion` invariants, `RequestSplit`/`RequestMerge` initiation. `DeployedRegions ⊆ Regions` are the initially deployed table regions; `Regions \ DeployedRegions` are unused identifiers available for split/merge to materialize new regions. See C.6, C.10, C.11. |
+| Split/Merge procedures | **Concrete** | Keyspace-aware model: `regionKeyRange`, `MaxKey`, `DeployedRegions`, `Adjacent` predicate, `KeyspaceCoverage`/`SplitMergeMutualExclusion` invariants, `RequestSplit`/`RequestMerge` initiation. `DeployedRegions ⊆ Regions` are the initially deployed table regions; `Regions \ DeployedRegions` are unused identifiers available for split/merge to materialize new regions. See C.6, C.11. |
 | ServerCrashProcedure | **Concrete** | Critical failure recovery path |
 | WAL lease revocation (fencing) | **Abstract** | Modeled as per-server Boolean (`walFenced`); fencing property only, no HDFS lease or log-splitting details |
 | RS crash / zombie window | **Concrete** | Decomposed into non-atomic `MasterDetectCrash` + `RSAbort` to expose the zombie RS window |
 | RS epoch / ServerName | **Omitted** | Not needed: `serverState` ONLINE/CRASHED flag (Iter 10) plus atomic crash/restart provides equivalent fencing without an explicit epoch counter. |
 | `isMatchingRegionLocation()` in SCP | **Concrete** | `SCPAssignRegion` models the implementation's `isMatchingRegionLocation()` check (SCP.java L498-500, L529-538): regions whose location changed since `SCPGetRegions` are skipped — matching the implementation behavior that is a known source of bugs (HBASE-24293, HBASE-21623) and may expose `NoLostRegions` violations confirming those bugs. |
+| Table identity | **Concrete** (Iter 32) | Per-region `regionTable[r]` tracks which table each region belongs to. `Tables` constant, `NoTable` sentinel. Daughters inherit parent's table on split; merged region inherits on merge. Freed identifiers get `NoTable`. |
+| Exclusive table locks | **Abstract** (Iter 32) | Modeled via guard predicates over `parentProc[r].type` — `TableLockFree(t)` for exclusive ops, `NoTableExclusiveLock(r)` for shared ops. No separate lock variable; the scheduler's `TableQueue` shared/exclusive semantics are captured by type checks. |
+| CreateTableProcedure | **Concrete** (Iter 33) | `CreateTablePrepare` → child ASSIGNs → `CreateTableDone`. Consumes unused region identifiers, tiles new table keyspace `[0, MaxKey)`. |
+| DeleteTableProcedure | **Concrete** (Iter 34) | `DeleteTablePrepare` → `DeleteTableRemoveMeta` → `DeleteTableDone`. Frees region identifiers. Precondition: table disabled (all regions CLOSED/OFFLINE). |
+| TruncateTableProcedure | **Concrete** (Iter 35) | Multi-step: delete old → create new → assign. Crash between delete-meta and create-meta is the key bug. `UseTruncateCrashQuirk` toggle. |
 | Coprocessor hooks | **Omitted** | Not relevant to correctness of assignment protocol |
 | Replication queues | **Omitted** | Orthogonal concern |
-| Table enable/disable | **Deferred** | Can be added as a constraint on assignment |
-
-### 5.4 Model Constants and Variables
-
-The following shows the full planned variable set. Variables marked with
-✅ are implemented in the current spec; those marked with ⏳ are planned
-for future iterations. Names reflect the actual spec where implemented.
-
-```tla
-CONSTANTS
-    Regions,          \* Finite universe of all region identifiers     ✅ (Iter 1)
-                      \* in the model. Includes both deployed table
-                      \* regions and unused identifiers available
-                      \* for split/merge to create new regions.
-    Servers,          \* Set of regionserver identifiers               ✅ (Iter 1)
-    None              \* Sentinel for "no server assigned"             ✅ (Iter 1)
-    MaxRetries        \* Maximum open retries before giving up         ✅ (Iter 12)
-    DeployedRegions   \* ⊆ Regions. The table regions that exist at    ⏳ (Iter 20)
-                      \* system start with assigned keyspaces (they
-                      \* tile [0, MaxKey) in Init). Regions not in
-                      \* DeployedRegions start with regionKeyRange =
-                      \* NoRange and are available for split/merge
-                      \* to materialize as daughters or merged regions.
-    MaxKey            \* Keyspace upper bound (integer); keyspace is   ⏳ (Iter 20)
-                      \* 0..(MaxKey-1). E.g. MaxKey=8 gives [0,8).
-
-VARIABLES
-    \* --- Master-side state ---
-    regionState,      \* [Regions → [state: State,                    ✅ (Iter 1)
-                      \*              location: Servers ∪ {None},      ✅ (Iter 1)
-                      \*              procType: ProcType,              ✅ (Iter 12)
-                      \*              procStep: TRSPState ∪ {"IDLE"},  ✅ (Iter 12)
-                      \*              targetServer: Servers ∪ {None},  ✅ (Iter 12)
-                      \*              retries: 0..MaxRetries]]         ✅ (Iter 12)
-                      \* Procedure state is inlined (region-keyed)
-                      \* rather than indexed by a global procedure ID.
-                      \* At most one procedure per region; region
-                      \* identity is sufficient for matching.
-                      \* Supersedes the former `procedures` map and
-                      \* `nextProcId` counter (Iter 4 design, refactored
-                      \* during Iter 12).
-    metaTable,        \* [Regions → [state: State,                    ✅ (Iter 2)
-                      \*              location: Servers ∪ {None}]]
-    serverState,      \* [Servers → {"ONLINE", "CRASHED"}]            ✅ (Iter 10)
-    procStore,        \* Set of ProcedureRecord (persisted to WAL)    ⏳ (Iter 17)
-
-    \* --- Communication ---
-    dispatchedOps,    \* [Servers → SUBSET [type: CommandType,        ✅ (Iter 6)
-                      \*   region: Regions]]
-                      \* Master→RS command channel (per server).
-                      \* Commands dispatched by TRSP actions (Iter 7+),
-                      \* consumed by RS-side actions (Iter 8+).
-                      \* Matched by region (not by procedure ID);
-                      \* at most one procedure per region ensures
-                      \* region identity provides sufficient
-                      \* discrimination.
-    pendingReports,   \* SUBSET [server: Servers, region: Regions,    ✅ (Iter 6)
-                      \*   code: ReportCode]
-                      \* RS→master report channel.
-                      \* Matched by region (same rationale as
-                      \* dispatchedOps above).
-
-    \* --- RegionServer-side state ---
-    rsOnlineRegions,  \* [Servers → SUBSET Regions]                   ✅ (Iter 8)
-                      \* RS-side model simplified: rsTransitions
-                      \* (originally planned in Iter 8) was dropped;
-                      \* rsOnlineRegions alone captures the RS view.
-                      \* RSReceiveOpen+RSCompleteOpen merged into
-                      \* atomic RSOpen; same for RSClose.
-
-    \* --- Fencing and epoch ---
-    serverEpoch,      \* [Servers → Nat] (incarnation counter)        ⏳ (Iter 14)
-                      \* Starts at 1, incremented on ServerRestart.
-                      \* Reports carry epoch; master rejects mismatches.
-                      \* Models ServerName startcode-based rejection.
-                      \* Note: the current spec achieves epoch-like
-                      \* fencing via atomic crash (ServerCrashAll) +
-                      \* atomic restart (ServerRestart purges stale
-                      \* reports).  Explicit epochs are only needed if
-                      \* crash is decomposed into non-atomic steps
-                      \* (Iter 14).  See spec design note at
-                      \* ServerRestart.
-    walFenced,        \* [Servers → BOOLEAN]                          ✅ (Iter 14)
-                      \* TRUE after SCP revokes WAL leases for server.
-                      \* Reset to FALSE on ServerRestart. Guards
-                      \* SCPAssign and the NoDoubleWrite invariant.
-
-    \* --- Failure model ---
-    masterAlive       \* BOOLEAN                                      ⏳ (Iter 18)
-    \* Note: serverAlive was originally planned for Iter 14 but was
-    \* superseded by serverState (above), implemented in Iter 10.
-
-    \* --- Split/merge keyspace ---
-    regionKeyRange    \* [Regions → [startKey: 0..MaxKey,             ⏳ (Iter 20)
-                      \*              endKey: 0..MaxKey]
-                      \*            ∪ {NoRange}]
-                      \* Maps each region identifier to its keyspace
-                      \* range, or NoRange if the identifier is not
-                      \* currently in use. A region "exists" iff
-                      \* regionKeyRange[r] ≠ NoRange.
-                      \* At Init: DeployedRegions tile [0, MaxKey);
-                      \* all other identifiers are NoRange.
-                      \* Split materializes daughter keyspaces at PONR;
-                      \* merge materializes the union keyspace at PONR;
-                      \* parent/target deletion clears to NoRange.
-```
+| Table enable/disable | **Deferred** | Not explicitly modeled; create/delete/truncate preconditions enforce the disabled-table requirement via region-state guards |
 
 ---
 
@@ -467,7 +377,7 @@ The MCP tools handle per-iteration and post-iteration simulation checks.
 Use the command line for the full exhaustive config (ad hoc,
 user-requested) or extended post-phase simulation runs.
 
-**Exhaustive check** (2r/2s, per-iteration):
+**Exhaustive check** (3r/2s, per-iteration):
 
 ```bash
 /usr/bin/java -XX:+UseParallelGC \
@@ -1030,19 +940,158 @@ when TRUE and `zkNode[s]=FALSE`, server marked `ONLINE` (no SCP) if
 `zkNode`-based liveness.  All 3 configs updated. TLC 3r/2s: 368,662,744
 distinct, 1,328,348,760 generated, depth 92, ~64min, clean.
 
-#### Iteration 32 - TruncateTableProcedure
+---
 
-Requires a new `TruncateTableProcedure` parent procedure type, analogous to
-`SplitTableRegionProcedure`. This is a significant extension: new
-`parentProcType = "TRUNCATE"`, new child TRSP sequencing (unassign all →
-delete regions → create new regions → assign all), new crash recovery for
-each step.
-- New module `Truncate.tla` with `TruncatePrepare`, `TruncateUnassign`,
-  `TruncateDeleteMeta`, `TruncateCreateMeta`, `TruncateAssign` actions.
-- Crash between `TruncateDeleteMeta` and `TruncateCreateMeta` is the bug:
-  old regions deleted from meta but new regions not yet created → data loss.
-- Quirk: `UseTruncateCrashQuirk` , default FALSE, skips the crash guard
-  between delete and create.
+### Phase 9: Table-Level Procedures
+
+#### Iteration 32 — Table identity infrastructure and exclusive table lock guards
+
+Add table identity tracking and exclusive table lock guard predicates.
+No new table-level procedures — infrastructure only.  Independently
+verifiable as a refactoring pass (all existing invariants must still pass).
+
+- `Types.tla`: new `Tables` constant (set of table identifiers), `NoTable`
+  sentinel model value, `ParentProcType` extended with
+  `{"CREATE","DELETE","TRUNCATE"}`, new `TableExclusiveType ==
+  {"CREATE","DELETE","TRUNCATE"}` set.
+- `AssignmentManager.tla`: new `regionTable` variable
+  (`[Regions → Tables ∪ {NoTable}]`).  `Init`: `DeployedRegions → T1`
+  (element of `Tables`), unused identifiers `→ NoTable`.  `TypeOK`:
+  `regionTable` type assertion.  New guard predicates `NoTableExclusiveLock(r)`
+  and `TableLockFree(t)`.  New invariant `TableLockExclusivity` — at most
+  one exclusive-type `parentProc` active per table, and no exclusive-type
+  coexists with SPLIT/MERGE on same table.  `regionTable` added to `vars`
+  tuple and `UNCHANGED` clauses across all modules.
+- `Split.tla`: `SplitPrepare(r)` gains `NoTableExclusiveLock(r)` guard.
+  `SplitUpdateMeta(r, dA, dB)` sets `regionTable'[dA] = regionTable[r]`,
+  `regionTable'[dB] = regionTable[r]` (daughters inherit parent's table).
+  `SplitDone(r)` sets `regionTable'[r] = NoTable` (parent identifier freed).
+- `Merge.tla`: `MergePrepare(r1, r2, m)` gains `NoTableExclusiveLock(r1)`
+  guard.  `MergeUpdateMeta(p)` sets `regionTable'[m] = regionTable[r1]`
+  (merged region inherits table).  `MergeDone(p)` sets
+  `regionTable'[r1] = NoTable`, `regionTable'[r2] = NoTable` (target
+  identifiers freed).
+- All other modules (TRSP, SCP, Master, RegionServer, ProcStore, ZK):
+  `regionTable` added to `VARIABLE` declarations and `UNCHANGED` in every
+  action.
+- Configs: primary `Tables = {T1}`, `NoTable` model value.  Single table
+  suffices for this iteration (no table-level procedures yet).  State space
+  expected ≈ same as Iter 31 (`regionTable` is functionally dependent on
+  existing state for single-table model).
+
+#### Iteration 33 — CreateTableProcedure
+
+Model `CreateTableProcedure` which creates new regions for a new table,
+consuming free region identifiers from the pool and assigning keyspaces.
+
+Source: `CreateTableProcedure.java` —
+`PRE_OPERATION → WRITE_FS_LAYOUT → ADD_TO_META → ASSIGN_REGIONS →
+UPDATE_DESC_CACHE → POST_OPERATION`.  Filesystem and descriptor operations
+abstracted.
+
+Abstracted model state machine:
+`CreateTablePrepare → (child ASSIGN TRSPs execute) → CreateTableDone`
+
+- New module `CreateTable.tla` with 2 actions:
+  - `CreateTablePrepare(t)`: non-deterministically picks N unused region
+    identifiers (N ≥ 1, ≤ available count), tiles `[0, MaxKey)` across them,
+    sets `regionTable = t`, writes `metaTable` as `CLOSED`/`NoServer`, spawns
+    child ASSIGN TRSPs (`procType = "ASSIGN"`), sets
+    `parentProc[r] = [type |-> "CREATE", step |-> "SPAWNED_OPEN", ...]` on
+    each created region.  Guard: `t` not in use
+    (`~ ∃ r: regionTable[r] = t`), unused identifiers available, master alive,
+    PEWorker available.
+  - `CreateTableDone(t)`: all regions of table `t` are OPEN with
+    `procType = "NONE"`.  Clears `parentProc` on all regions of the table.
+    Guard: master alive, PEWorker available, all regions OPEN and unattached.
+- `Types.tla`: `ParentProcType` already includes `"CREATE"` from Iter 32;
+  reuse `"SPAWNED_OPEN"` from `ParentProcStep`.
+- `AssignmentManager.tla`: wire `CreateTablePrepare`, `CreateTableDone` into
+  `Next` and `Fairness`.  New invariant `CreateTableCompleteness` — if
+  `parentProc[r].type = "CREATE"` and step = `"SPAWNED_OPEN"`, all same-table
+  regions must also have `parentProc.type = "CREATE"` (table-level atomicity).
+  `KeyspaceCoverage` invariant extended to per-table: for each table `t` with
+  existing regions, deployed regions of `t` tile `[0, MaxKey)`.
+- Configs: `Tables = {T1, T2}`, regions expanded (e.g., 5r/2s primary:
+  2 deployed for T1, 3 unused for split daughters or T2 creation).
+  `SplitMergeConstraint` extended to limit concurrent table-level ops.
+
+#### Iteration 34 — DeleteTableProcedure
+
+Model `DeleteTableProcedure` which deletes all regions of a table, freeing
+region identifiers back to the pool.
+
+Source: `DeleteTableProcedure.java` —
+`PRE_OPERATION → CLEAR_FS_LAYOUT → REMOVE_FROM_META → UNASSIGN_REGIONS →
+POST_OPERATION`.  The implementation requires a **disabled** table (all
+regions CLOSED/OFFLINE).  Since Enable/Disable table is not modeled, the
+precondition is that all regions of the table are in `{"CLOSED","OFFLINE"}`
+with `procType = "NONE"`.
+
+Abstracted model state machine:
+`DeleteTablePrepare → DeleteTableRemoveMeta → DeleteTableDone`
+
+- New module `DeleteTable.tla` with 3 actions:
+  - `DeleteTablePrepare(t)`: guard `TableLockFree(t)` (exclusive lock — no
+    `parentProc` active on any region of table `t`), all regions of `t` in
+    `{"CLOSED","OFFLINE"}` with `procType = "NONE"`, master alive.  Sets
+    `parentProc[r] = [type |-> "DELETE", step |-> "DELETE_META", ...]` on
+    every region of the table.  No child TRSPs — regions are already closed.
+  - `DeleteTableRemoveMeta(t)`: atomically clears `metaTable[r]` for all
+    regions of table `t`.  Advances `parentProc` step to `"COMPLETING"`.
+  - `DeleteTableDone(t)`: clears `regionKeyRange[r] = NoRange`,
+    `regionTable[r] = NoTable`, resets `regionState[r]` to initial unused
+    state, clears `parentProc[r] = NoParentProc` for all regions of `t`.
+    Frees identifiers back to the unused pool.
+- `Types.tla`: `ParentProcStep` extended with `"DELETE_META"`.
+- `AssignmentManager.tla`: wire into `Next` and `Fairness`.  New invariant
+  `DeleteTableAtomicity` — if any region of table `t` has
+  `parentProc.type = "DELETE"`, then ALL regions of `t` have
+  `parentProc.type = "DELETE"`.  New invariant `IdentifierConservation` —
+  `|{r: regionKeyRange[r] ≠ NoRange}| + |{r: regionKeyRange[r] = NoRange}|
+  = |Regions|` (identifiers are never created or destroyed, just
+  reallocated).
+
+#### Iteration 35 — TruncateTableProcedure
+
+Model `TruncateTableProcedure` which atomically deletes old regions and
+creates new regions for the same table.  The crash between delete-from-meta
+and create-new-regions is the key bug: old regions deleted but new regions
+not yet created → data loss (all region identifiers for the table are freed
+with no replacements).
+
+Source: `TruncateTableProcedure.java` —
+`PRE_OPERATION → CLEAR_FS_LAYOUT → REMOVE_FROM_META → CREATE_FS_LAYOUT →
+ADD_TO_META → ASSIGN_REGIONS → POST_OPERATION`.  The implementation
+requires a **disabled** table (same precondition as Delete).
+
+Abstracted multi-step state machine:
+`TruncatePrepare → TruncateDeleteMeta → TruncateCreateMeta →
+(child ASSIGN TRSPs) → TruncateDone`
+
+- New module `Truncate.tla` with 4 actions:
+  - `TruncatePrepare(t)`: guard `TableLockFree(t)`, all regions of `t` in
+    `{"CLOSED","OFFLINE"}`, master alive.  Snapshots the table's region set.
+    Sets `parentProc` on all regions for lock protection.
+  - `TruncateDeleteMeta(t)`: deletes old regions from meta, clears old
+    `regionKeyRange → NoRange`, `regionTable → NoTable`.  Old region
+    identifiers freed.  Advances step.
+    **This is the crash-vulnerable point**: if master crashes here, old
+    regions are deleted from meta but new ones don't exist yet.
+  - `TruncateCreateMeta(t)`: picks new unused identifiers, assigns keyspaces
+    tiling `[0, MaxKey)`, sets `regionTable = t`, writes meta, spawns child
+    ASSIGN TRSPs.  Advances step to `"SPAWNED_OPEN"`.
+  - `TruncateDone(t)`: all new regions OPEN.  Clears `parentProc` on all
+    new regions.
+- `Types.tla`: new `UseTruncateCrashQuirk ∈ BOOLEAN` constant.
+  When TRUE, the crash guard between `TruncateDeleteMeta` and
+  `TruncateCreateMeta` is disabled (master crash allowed between these
+  steps, surfacing the data-loss bug).  When FALSE (default), these two
+  steps are made crash-safe.
+- `AssignmentManager.tla`: wire into `Next` and `Fairness`.  New invariants
+  `TruncateAtomicity` and `TruncateRecovery` (after truncate completes,
+  table has regions tiling `[0, MaxKey)`).
+- All 3 configs updated with `UseTruncateCrashQuirk = FALSE`.
 
 ---
 
@@ -1066,7 +1115,7 @@ is shown.
 | `TRSP.confirmClosed()` | `TRSPConfirmClosed(r)` | 5 | ✅ |
 | `TRSP.confirmOpened()` FAILED_OPEN retry | `TRSPHandleFailedOpen(r)` | 10 | ✅ |
 | `RegionStateNode.offline()` | `GoOffline(r)` | 1 | ✅ |
-| `ServerManager.expireServer()` (atomic per-server) | `ServerCrashAll(s)` | 10 | ✅ |
+| `ServerManager.expireServer()` (atomic per-server) | `ServerCrashAll(s)` (removed Iter 14) | 10 | ✅→❌ |
 | `ServerManager.expireServer()` (master-side only) | `MasterDetectCrash(s)` | 14 | ✅ |
 | `HRegionServer.abort()` (RS discovers death) | `RSAbort(s)` | 14 | ✅ |
 | `TRSP.serverCrashed()` | `TRSPServerCrashed(r)` | 5 | ✅ |
@@ -1092,7 +1141,7 @@ is shown.
 | ZK session expiry (crash detection) | `ZKSessionExpire(s)` (`ZK.tla`) | 18 | ✅ |
 | `ProcedureExecutor` worker pool | `availableWorkers` (counting semaphore) | 19 | ✅ |
 | Meta-blocking semantics | `suspendedOnMeta`/`blockedOnMeta`, `ResumeFromMeta(r)` | 19 | ✅ |
-| Per-region write lock | `locked[r]` variable (added Iter 15; removed Iter 19.5) | 19.5 | ✅ |
+| Per-region write lock | `locked[r]` (removed Iter 19.5) | 15 | ✅→❌ |
 | Keyspace infrastructure (`regionKeyRange`) | `RegionExists(r)`, `Adjacent(r1, r2)` | 20 | ✅ |
 | `SplitTableRegionProcedure.prepareSplitRegion()` | `SplitPrepare(r)` | 21 | ✅ |
 | `SplitTableRegionProcedure` CHECK_CLOSED | `SplitResumeAfterClose(r)` | 21 | ✅ |
@@ -1109,7 +1158,17 @@ is shown.
 | `TRSP.serverCrashed()` type-preserving | `TRSPServerCrashed` type-preserving branches | 25 | ✅ |
 | `TRSP.confirmOpened()` UNASSIGN continuation (L289-301) | `TRSPConfirmOpened` UNASSIGN→CLOSE branch | 25 | ✅ |
 | `UnassignRegionHandler.process()` silent return (L111-117, L132-138) | `RSCloseNotFound(s, r)` gated by `UseRSCloseNotFoundQuirk` | 26 | ✅ |
-| `RSProcedureDispatcher.scheduleForRetry()` → `expireServer()` (L326-336) | `DispatchFail`/`DispatchFailClose` second disjunct, gated by `UseDispatchExpiry` | 28 | ⏳ |
+| `RSProcedureDispatcher.scheduleForRetry()` → `expireServer()` (L326-336) | `DispatchFail`/`DispatchFailClose` second disjunct (unconditional) | 27 | ✅ |
+| Table identity tracking (`regionTable`) | `regionTable[r]`, `NoTableExclusiveLock(r)`, `TableLockFree(t)` | 32 | ⏳ |
+| `CreateTableProcedure.executeFromState()` ADD_TO_META+ASSIGN | `CreateTablePrepare(t)` | 33 | ⏳ |
+| `CreateTableProcedure` POST_OPERATION | `CreateTableDone(t)` | 33 | ⏳ |
+| `DeleteTableProcedure.executeFromState()` PRE_OPERATION | `DeleteTablePrepare(t)` | 34 | ⏳ |
+| `DeleteTableProcedure` REMOVE_FROM_META | `DeleteTableRemoveMeta(t)` | 34 | ⏳ |
+| `DeleteTableProcedure` POST_OPERATION | `DeleteTableDone(t)` | 34 | ⏳ |
+| `TruncateTableProcedure.executeFromState()` PRE_OPERATION | `TruncatePrepare(t)` | 35 | ⏳ |
+| `TruncateTableProcedure` REMOVE_FROM_META | `TruncateDeleteMeta(t)` | 35 | ⏳ |
+| `TruncateTableProcedure` ADD_TO_META+ASSIGN | `TruncateCreateMeta(t)` | 35 | ⏳ |
+| `TruncateTableProcedure` POST_OPERATION | `TruncateDone(t)` | 35 | ⏳ |
 
 ---
 
@@ -1704,44 +1763,8 @@ Master receives FAILED_OPEN:
 > (3) procedure IDs were replaced by region-keyed matching. The analysis
 > in B.1-B.6 remains accurate as implementation reference.
 
-The RPC-level model should include these variables:
-
-```tla
-VARIABLES
-    \* Master → RS command channel (per server)
-    dispatchedOps,    \* [Servers → Set of {type, region, procId}]
-
-    \* RS → Master report channel
-    pendingReports,   \* Set of {server, region, code, procId, seqNum}
-
-    \* Per-procedure remote state
-    remoteProcState   \* [ProcId → {"DISPATCH", "REPORT_SUCCEED",
-                      \*            "DISPATCH_FAIL", "SERVER_CRASH"}]
-```
-
-The following TLA+ actions model the RPC lifecycle:
-
-| Action | What it models |
-|--------|---------------|
-| `MasterDispatch(p, r, s)` | Master sends open/close via ExecuteProcedures; adds to `dispatchedOps[s]`; may non-deterministically succeed or fail |
-| `DispatchDelivered(p, r, s)` | ExecuteProcedures RPC returned successfully; command delivered to RS |
-| `DispatchFail(p, r, s)` | ExecuteProcedures RPC ultimately fails (after retries exhausted); sets `remoteProcState = DISPATCH_FAIL` |
-| `RSReceiveCommand(s, r, op)` | RS dequeues from `dispatchedOps[s]`; begins processing |
-| `RSCompleteOpen(s, r)` | RS finishes opening; adds OPENED to `pendingReports` |
-| `RSCompleteFail(s, r)` | RS fails to open; adds FAILED_OPEN to `pendingReports` |
-| `RSCompleteClose(s, r)` | RS finishes closing; adds CLOSED to `pendingReports` |
-| `MasterReceiveReport(rpt)` | Master dequeues from `pendingReports`; validates; updates state |
-| `ReportLost(rpt)` | Report lost (network failure); RS will retry |
-| `ServerCrashDuringOp(s)` | RS crashes; `dispatchedOps[s]` cleared; procedure notified |
-
-This model captures the asynchronous dispatch-and-report nature of the
-protocol: the dispatch RPC confirms delivery but not outcome, the
-outcome arrives via an independent report channel, and both channels
-have their own failure and retry semantics. The key correctness
-constraint — that a command that *might* have been delivered must not
-be abandoned in favor of a new server (double-assign risk) — is
-captured by the non-deterministic choice between `DispatchDelivered`
-and `DispatchFail`.
+See the implemented spec for the actual variable and action design,
+which differs from the original pre-implementation analysis above.
 
 ---
 
@@ -1857,48 +1880,9 @@ The merge procedure also has 11 states. Simplified for assignment:
     → UPDATE_META (PONR) → OPEN_MERGED → DONE
 ```
 
-### C.3 Complete Region State Transition Graph (with Split/Merge)
+### C.3 ValidTransition Set
 
-Extended from the core assign/unassign graph to include all split/merge
-states:
-
-```
-                        ┌──────────────────────────────────────────────┐
-                        │                                              │
-                        v                                              │
-  OFFLINE ──► OPENING ──► OPEN ──► CLOSING ──► CLOSED ──► OFFLINE      │
-                 │          │ │       ▲           │                    │
-                 v          │ │       │           v                    │
-            FAILED_OPEN     │ │       │      (to OPENING               │
-                 │          │ │       │       via TRSP)                │
-                 v          │ │       │                                │
-           (to OPENING      │ │       │                                │
-            via TRSP)       │ │       │                                │
-                            │ │       │                                │
-                            │ │  ┌────┘                                │
-                            │ │  │                                     │
-                            │ ├──┤ SPLITTING ──► CLOSING               │
-                            │ │  │                                     │
-                            │ │  └────────────────┐                    │
-                            │ │                   │                    │
-                            │ └──► MERGING ──► CLOSING                 │
-                            │                                          │
-                            v                                          │
-                     ABNORMALLY_CLOSED ────────────────────────────────┘
-
-
-  (Created by split)                    (Created by merge)
-  SPLITTING_NEW ──► OPENING ──► OPEN    MERGING_NEW ──► OPENING ──► OPEN
-
-  (Terminal states)
-  CLOSED ──► SPLIT (split parent; keyspace cleared to NoRange at SplitDone)
-  CLOSED ──► MERGED (merge targets; keyspace cleared to NoRange at MergeDone)
-```
-
-### C.4 Extended ValidTransition Set
-
-The full set of valid transitions, extending the core 10 with
-split/merge transitions:
+The full set of valid transitions:
 
 ```tla
 ValidTransition ==
@@ -1911,6 +1895,8 @@ ValidTransition ==
       <<"CLOSED",             "OPENING">>,
       <<"CLOSED",             "OFFLINE">>,
       <<"OPEN",               "ABNORMALLY_CLOSED">>,
+      <<"OPENING",            "ABNORMALLY_CLOSED">>,
+      <<"CLOSING",            "ABNORMALLY_CLOSED">>,
       <<"ABNORMALLY_CLOSED",  "OPENING">>,
       <<"FAILED_OPEN",        "OPENING">>,
 
@@ -1958,7 +1944,7 @@ ValidTransition ==
   regions are created in `SPLITTING_NEW`/`MERGING_NEW` state and then
   assigned via child TRSP(ASSIGN).
 
-### C.5 PONR Semantics and Rollback Model
+### C.4 PONR Semantics and Rollback Model
 
 Both split and merge have a Point of No Return at `UPDATE_META`:
 
@@ -2000,7 +1986,7 @@ action that triggers rollback. Post-PONR states should have no rollback
 path — only forward progress. The PONR itself is an atomic action that
 commits the meta update.
 
-### C.6 Dynamic Region Creation and Deletion (Keyspace Model)
+### C.5 Dynamic Region Creation and Deletion (Keyspace Model)
 
 Split creates 2 new regions; merge deletes 2 parent/target regions. This
 poses a modeling challenge since TLC works with finite, pre-defined
@@ -2109,7 +2095,7 @@ concurrent split/merge operations via `SplitMergeMutualExclusion`.
   it. The `KeyspaceCoverage` invariant is exactly what force-merge is
   designed to fix.
 
-### C.7 Multi-Region Locking
+### C.6 Multi-Region Locking
 
 Split and merge procedures acquire `ProcedureScheduler` region locks
 for ALL involved regions before any state changes:
@@ -2121,25 +2107,15 @@ for ALL involved regions before any state changes:
 
 Locks are held for the entire procedure lifetime (`holdLock() == true`).
 
-**TLA+ modeling**: Before the split/merge procedure begins, verify that
-none of the involved regions have an attached procedure:
-
-```tla
-SplitPrepare(parent, dA, dB) ==
-    /\ regionState[parent].procedure = None
-    /\ regionState[dA].procedure = None   \* (if exists)
-    /\ regionState[dB].procedure = None   \* (if exists)
-    /\ regionState[parent].state = "OPEN"
-    \* ... attach split procedure to all three ...
-```
-
-This is a conjunctive precondition — all locks must be free. If any
-region has a procedure attached, the split/merge cannot proceed.
+**TLA+ modeling**: The implemented spec uses `parentProc` and
+`procType ≠ "NONE"` guards on all involved regions as a conjunctive
+precondition — all locks must be free before split/merge can proceed.
+See `SplitPrepare` and `MergePrepare` in the spec (Iterations 21, 23).
 
 **Source**: `SplitTableRegionProcedure.java` `acquireLock()` L158-171.
 `MergeTableRegionsProcedure.java` `acquireLock()` L398-411.
 
-### C.8 In-Memory vs. Meta State Discrepancy at PONR
+### C.7 In-Memory vs. Meta State Discrepancy at PONR
 
 At the PONR (`UPDATE_META`), there is a deliberate discrepancy between
 in-memory and meta state for newly created regions:
@@ -2173,7 +2149,7 @@ MetaConsistency ==
 **Source**: `RegionStateStore.java` `splitRegion()` L392-395 (daughters
 stored as CLOSED in meta).
 
-### C.9 Interaction with ServerCrashProcedure
+### C.8 Interaction with ServerCrashProcedure
 
 When a RegionServer crashes during a split or merge operation:
 
@@ -2210,184 +2186,6 @@ When a RegionServer crashes during a split or merge operation:
 **TLA+ modeling**: The `ServerCrash(s)` action should check for split/merge
 procedures attached to regions on the crashed server and trigger the
 appropriate crash handling (rollback if pre-PONR, retry if post-PONR).
-
-### C.10 Implications for TLA+ Modeling
-
-**New state constants**:
-
-```tla
-State == { "OFFLINE", "OPENING", "OPEN", "CLOSING", "CLOSED",
-           "FAILED_OPEN", "ABNORMALLY_CLOSED",
-           "SPLITTING", "SPLIT", "SPLITTING_NEW",
-           "MERGING", "MERGED", "MERGING_NEW" }
-```
-
-(`MERGED` is modeled as a terminal state even though the code uses
-deletion — this is simpler for TLC than dynamic set membership.)
-
-**New procedure types**:
-
-```tla
-ProcType == { "ASSIGN", "UNASSIGN", "MOVE",
-              "SPLIT", "MERGE", "SCP" }
-```
-
-**New split procedure states**:
-
-```tla
-SplitProcState == { "SPLIT_PREPARE", "SPLIT_CLOSE_PARENT",
-                    "SPLIT_CHECK_CLOSED", "SPLIT_UPDATE_META",
-                    "SPLIT_OPEN_CHILDREN", "SPLIT_DONE" }
-```
-
-**New merge procedure states**:
-
-```tla
-MergeProcState == { "MERGE_PREPARE", "MERGE_CLOSE_REGIONS",
-                    "MERGE_CHECK_CLOSED", "MERGE_CREATE_MERGED",
-                    "MERGE_UPDATE_META", "MERGE_OPEN_MERGED",
-                    "MERGE_DONE" }
-```
-
-**New variables**:
-
-```tla
-VARIABLES
-    regionKeyRange      \* [Regions → [startKey: 0..MaxKey,
-                        \*              endKey: 0..MaxKey]
-                        \*            ∪ {NoRange}]
-                        \* Region "exists" iff regionKeyRange[r] ≠ NoRange.
-```
-
-**New constants**:
-
-```tla
-CONSTANTS
-    DeployedRegions      \* ⊆ Regions. Deployed table regions that
-                        \* tile [0, MaxKey) at Init. Identifiers in
-                        \* Regions \ DeployedRegions are available
-                        \* for split/merge to create new regions.
-    MaxKey              \* Integer; keyspace is 0..(MaxKey-1)
-```
-
-**New initiation actions** (only entry points into split/merge):
-
-| Action | What it does |
-|--------|-------------|
-| `RequestSplit(r)` | Non-deterministic. Models admin RPC or RS-autonomous split. Pre: OPEN, no proc, keyspace width ≥ 2, unused identifiers available. Transitions into `SplitPrepare`. |
-| `RequestMerge(r1, r2)` | Non-deterministic. Models admin RPC or merge chore. Pre: both OPEN, no procs, `Adjacent(r1, r2)`, unused identifier available. Transitions into `MergePrepare`. |
-
-**New actions (split)**:
-
-| Action | What it does |
-|--------|-------------|
-| `SplitPrepare(r, dA, dB)` | Compute `mid`, record daughter keyspaces. Set r to SPLITTING, attach split proc to r, dA, dB. Daughters stay `NoRange` until PONR. |
-| `SplitCloseParent(p)` | Create child TRSP(UNASSIGN) for parent. |
-| `SplitCheckClosed(p)` | Verify parent is CLOSED. |
-| `SplitUpdateMeta(p)` | **PONR**: Set parent to SPLIT, materialize daughter keyspaces (`[start,mid)`, `[mid,end)`), set daughters to SPLITTING_NEW (mem) / CLOSED (meta). |
-| `SplitOpenChildren(p)` | Create child TRSP(ASSIGN) for each daughter. |
-| `SplitDone(p)` | Clear parent keyspace (`NoRange` — deletion after compaction). Detach procedure. |
-| `SplitRollback(p)` | Pre-PONR only: revert parent to OPEN, clear daughter keyspaces, detach procedure. |
-
-**New actions (merge)**:
-
-| Action | What it does |
-|--------|-------------|
-| `MergePrepare(r1, r2, m)` | Pre: `Adjacent(r1, r2)`. Set r1, r2 to MERGING, attach merge proc to r1, r2, m. |
-| `MergeCloseRegions(p)` | Create child TRSP(UNASSIGN) for each target. |
-| `MergeCheckClosed(p)` | Verify all targets are CLOSED. |
-| `MergeCreateMerged(p)` | Set merged region to MERGING_NEW in memory. |
-| `MergeUpdateMeta(p)` | **PONR**: Set targets to MERGED, materialize merged keyspace (`[r1.start, r2.end)`), create merged as CLOSED in meta. |
-| `MergeOpenMerged(p)` | Create child TRSP(ASSIGN) for merged region. |
-| `MergeDone(p)` | Clear target keyspaces (`NoRange` — deletion after compaction). Detach procedure. |
-| `MergeRollback(p)` | Pre-PONR only: revert targets to OPEN, clear merged keyspace, detach procedure. |
-
-**New invariants**:
-
-```tla
-KeyspaceCoverage ==
-    \A k \in 0..(MaxKey-1) :
-        \E! r \in Regions :
-            /\ regionKeyRange[r] # NoRange
-            /\ regionKeyRange[r].startKey <= k
-            /\ k < regionKeyRange[r].endKey
-            /\ regionState[r].state \notin {"SPLIT", "MERGED"}
-
-SplitMergeMutualExclusion ==
-    \* No region participates in more than one split/merge at a time.
-    \A r \in Regions :
-        regionKeyRange[r] # NoRange =>
-            regionState[r].procType \in {"SPLIT", "MERGE"}
-                => \A r2 \in Regions \ {r} :
-                    regionState[r2].procType \in {"SPLIT", "MERGE"}
-                    => r \notin participants(r2)
-
-SplitCompleteness ==
-    \* After SplitDone: daughters OPEN with correct keyspaces,
-    \* parent deleted (NoRange).
-
-MergeCompleteness ==
-    \* After MergeDone: merged OPEN with union keyspace,
-    \* targets deleted (NoRange).
-
-SplitAtomicity ==
-    \* Pre-PONR: daughters don't exist (NoRange) and have no
-    \* meta entries.
-
-NoOrphanedDaughters ==
-    \A r \in Regions :
-        regionState[r].state = "SPLITTING_NEW"
-            => \E p : r is a daughter of split procedure p
-```
-
-### C.11 Implementation Fidelity Analysis
-
-Code analysis of `SplitTableRegionProcedure.java` (985 lines) and
-`MergeTableRegionsProcedure.java` (802 lines) confirms that the
-keyspace-aware model adequately captures all normal-path split/merge
-operations. Prior to this phase, region keys were not considered at all
-in the model; the keyspace model closes this gap.
-
-**Adequately modeled** (see source references in C.5–C.9):
-
-| Aspect | Verdict | Notes |
-|--------|:-------:|-------|
-| Daughter keyspace construction | ✅ | Midpoint vs RS-chosen split row is a sound abstraction |
-| Split state machine | ✅ | Model collapses CP hooks + FS ops; no safety impact |
-| Merge state machine | ✅ | Same collapsing rationale |
-| PONR boundary | ✅ | Exact match — `UPDATE_META` and beyond are irreversible |
-| Region-level locking | ✅ | `acquireLock` on all involved regions; faithful |
-| Rollback behavior | ✅ | Structurally equivalent |
-| Adjacency check (normal path) | ✅ | `RegionInfo.isAdjacent()` ↔ model's `Adjacent(r1, r2)` |
-| `KeyspaceCoverage` | ✅ | New — major improvement over the no-keyspace model |
-| Mutual exclusion | ✅ | Procedure attachment + state guards |
-| Parent/target deletion | ✅ | SPLIT/MERGED terminal states; GC is async, no safety impact |
-
-**Intentional modeling exclusions**:
-
-1. **N-way merge**: Implementation accepts `RegionInfo[]` (≥2).
-   Model restricts to 2-way. The 2-way case exercises all state
-   transitions, locking, PONR, and crash recovery — N-way is
-   structurally identical but for more regions.
-
-2. **Force merge** (`force=true`): Bypasses `isAdjacent()`/`isOverlap()`
-   check in `checkRegionsToMerge()` (L138). The merged region's
-   keyspace is computed as the `min(startKey)..max(endKey)` envelope,
-   which can overlap existing regions or leave gaps. This is an admin
-   repair tool, not normal operation. `KeyspaceCoverage` would be
-   intentionally violated — the invariant is what force-merge fixes.
-
-3. **State machine steps collapsed**: The implementation has additional
-   states for coprocessor hooks (`PRE_OPERATION`, `PRE_OPERATION_
-   BEFORE_META`, `POST_MERGE_COMMIT_OPERATION`, etc.) and filesystem
-   operations (`CREATE_DAUGHTER_REGIONS`, `WRITE_MAX_SEQUENCE_ID_FILE`).
-   These are collapsed in the model because they do not affect
-   region state transitions or assignment safety properties.
-
-4. **Split point source**: Implementation obtains `bestSplitRow` from
-   the RS via `GetRegionInfoResponse` or from a user-specified row.
-   The model computes `mid = (start + end) ÷ 2`. Both produce valid
-   keyspace partitions; the exact byte is irrelevant to safety.
 
 ---
 
@@ -2534,7 +2332,93 @@ specification. The justification:
 
 4. **Meta write failure as an advanced scenario**: Full meta write failure
    modeling (splitting every meta-writing action, adding a `metaWritePending`
-   variable, weakening 4 invariants) is a candidate for Iteration 30 (advanced
-   scenarios). It would roughly double the action count and significantly
-   increase the state space, but could validate the revert correctness and
-   the interaction between meta write failure and crash recovery.
+   variable, weakening 4 invariants) remains a potential future extension.
+   It would roughly double the action count and significantly increase the
+   state space, but could validate the revert correctness and the interaction
+   between meta write failure and crash recovery.
+
+## Appendix E: Table-Level Procedure Locking Analysis
+
+This appendix documents the table-level locking analysis that informs the
+Phase 9 iterations (Iterations 32–35).
+
+### E.1 Implementation Table Lock Mechanism
+
+The `MasterProcedureScheduler` manages a `TableQueue` per table.  Each
+table-modifying procedure declares its `TableOperationType` via
+`getTableOperationType()`.  The scheduler serializes conflicting operations:
+
+- **Exclusive** (`CREATE`, `DELETE`, `EDIT`): block all other table-level
+  procedures including split/merge.  Used by `CreateTableProcedure` (CREATE),
+  `DeleteTableProcedure` (DELETE), `TruncateTableProcedure` (EDIT).
+  All three have `holdLock() == true`.
+- **Shared** (`REGION_SPLIT`, `REGION_MERGE`): block only exclusive ops.
+  Multiple splits/merges on different regions of the same table can
+  co-exist.  Used by `SplitTableRegionProcedure` (REGION_SPLIT) and
+  `MergeTableRegionsProcedure` (REGION_MERGE).  These acquire per-region
+  locks via `waitRegions()` for intra-table mutual exclusion on specific
+  regions.
+
+Source: `AbstractStateMachineTableProcedure.holdLock()` returns `true`;
+`getTableOperationType()` returns CREATE/DELETE/EDIT respectively.
+`SplitTableRegionProcedure.getTableOperationType()` returns REGION_SPLIT
+(L490); `MergeTableRegionsProcedure.getTableOperationType()` returns
+REGION_MERGE (L433).
+
+### E.2 Table Lock Compatibility Matrix
+
+| | CREATE | DELETE | TRUNCATE | SPLIT | MERGE |
+|---|---|---|---|---|---|
+| **CREATE** | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **DELETE** | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **TRUNCATE** | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **SPLIT** | ✗ | ✗ | ✗ | ✓ | ✓ |
+| **MERGE** | ✗ | ✗ | ✗ | ✓ | ✓ |
+
+*Exclusive ops* are mutually incompatible with everything.
+*Shared ops* (SPLIT/MERGE) are compatible only with each other.
+
+### E.3 TLA+ Guard Predicate Design
+
+The model emulates the scheduler's shared/exclusive semantics using
+predicates over the existing `parentProc[r].type` variable.  No separate
+lock variable is introduced.
+
+**Exclusive lock guard** — used by CreateTable, DeleteTable, TruncateTable:
+
+```tla
+TableLockFree(t) ==
+  \A r \in Regions:
+    regionTable[r] = t => parentProc[r].type = "NONE"
+```
+
+Requires that no region of table `t` has any active parent procedure
+(SPLIT, MERGE, CREATE, DELETE, or TRUNCATE).  This is the exclusive-lock
+acquisition check.
+
+**Shared lock guard** — used by SplitPrepare, MergePrepare:
+
+```tla
+NoTableExclusiveLock(r) ==
+  \A r2 \in Regions:
+    (regionTable[r2] = regionTable[r] /\ r2 # r) =>
+      parentProc[r2].type \notin {"CREATE", "DELETE", "TRUNCATE"}
+```
+
+Permits the split/merge to proceed as long as no exclusive-type procedure
+is active on any other region of the same table.  Other SPLIT/MERGE
+parent procs on different regions are allowed (shared compatibility).
+
+### E.4 Table Identity Tracking
+
+Table identity is tracked per-region via `regionTable[r] ∈ Tables ∪ {NoTable}`.
+Inheritance rules:
+
+- **Split**: daughters inherit the parent's table
+  (`regionTable'[dA] = regionTable[r]`).
+- **Merge**: merged region inherits the targets' table
+  (`regionTable'[m] = regionTable[r1]`).
+- **SplitDone/MergeDone**: freed parent/target identifiers cleared
+  to `NoTable`.
+- **CreateTable**: new regions assigned a fresh table identity.
+- **DeleteTable**: all table regions cleared to `NoTable`.
