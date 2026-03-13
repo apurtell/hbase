@@ -386,21 +386,35 @@ with state from `metaTable`.
        ]
 ```
 
-**ServerState:** read ZK ephemeral nodes to determine server liveness. On startup the master connects to ZK and gets the list of live RegionServers (via ephemeral nodes). Any server whose ephemeral node is missing is marked `CRASHED` and gets a fresh SCP.
+**ServerState:** read ZK ephemeral nodes to determine server liveness. On startup the master connects to ZK and gets the list of live RegionServers (via ephemeral nodes). Any server whose ephemeral node is missing is marked `CRASHED` and gets a fresh SCP. When `UseStaleStateQuirk = TRUE`, a dead server (`zkNode=FALSE`) is marked `ONLINE` if any region in `metaTable` still references it as its location — faithfully reproducing the `AM.start()` L341-348 bug where `regionStates.createServer(regionLocation)` creates a `ServerStateNode` for dead servers.
 
 > *Source:* `HMaster.finishActiveMasterInitialization()` → `RegionServerTracker.upgrade()` → `ServerManager.findDeadServersAndProcess()`.
 
 ```tla
   /\ serverState' =
-       [s \in Servers |-> IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
+       [s \in Servers |->
+         IF UseStaleStateQuirk
+         THEN IF zkNode[s] = TRUE
+              THEN "ONLINE"
+              ELSE IF \E r \in Regions: metaTable[r].location = s
+                   THEN "ONLINE"    \* BUG: stale entry
+                   ELSE "CRASHED"
+         ELSE IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
        ]
 ```
 
-Crashed servers get a fresh SCP at `GET_REGIONS`. Non-crashed servers get no SCP.
+Crashed servers get a fresh SCP at `GET_REGIONS`. Non-crashed servers get no SCP. When `UseStaleStateQuirk` is `TRUE` and a dead server appears `ONLINE` due to stale meta references, no SCP is started for it — the core of the bug (regions on the dead server are never recovered).
 
 ```tla
   /\ scpState' =
-       [s \in Servers |-> IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"
+       [s \in Servers |->
+         IF UseStaleStateQuirk
+         THEN IF zkNode[s] = TRUE
+              THEN "NONE"
+              ELSE IF \E r \in Regions: metaTable[r].location = s
+                   THEN "NONE"     \* BUG: no SCP for stale-online
+                   ELSE "GET_REGIONS"
+         ELSE IF zkNode[s] = FALSE THEN "GET_REGIONS" ELSE "NONE"
        ]
 ```
 

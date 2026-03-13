@@ -174,6 +174,15 @@ CONSTANTS UseMasterAbortOnMetaWriteQuirk
 ASSUME UseMasterAbortOnMetaWriteQuirk \in BOOLEAN
 ```
 
+`UseStaleStateQuirk` — when `TRUE`, `MasterRecover` marks a dead server (`zkNode=FALSE`) as `ONLINE` if any region in `metaTable` still references it as its location. Models `RegionStateStore.visitMeta()` / `AM.start()` L341-348 where `regionStates.createServer(regionLocation)` creates a `ServerStateNode` for the region's location regardless of ZK liveness, making the dead server appear `ONLINE` to subsequent crash-detection. Default `FALSE` for correct behavior.
+
+> *Source:* `AM.start()` L341-348, `regionStates.createServer(regionLocation)`.
+
+```tla
+CONSTANTS UseStaleStateQuirk
+ASSUME UseStaleStateQuirk \in BOOLEAN
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
