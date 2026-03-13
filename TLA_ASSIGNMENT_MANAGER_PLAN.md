@@ -1017,6 +1017,40 @@ when FALSE (default), existing suspend/block per `UseBlockOnMetaWrite`.
 All 3 configs updated with `UseMasterAbortOnMetaWriteQuirk = FALSE`.
 TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated, depth 92, clean.
 
+#### Iteration 31 - UseStaleStateQuirk
+
+The UseStaleStateQuirk models the scenario where
+RegionStateStore.visitMeta() also populates serverState/ServerStateNode
+entries for servers referenced in meta, even if those servers are dead.
+We can model this by changing the serverState' reconstruction to also
+mark servers ONLINE if ∃ r ∈ Regions: metaTable[r].location = s,
+regardless of zkNode[s]:
+```
+serverState' = [s ∈ Servers |→ 
+  IF UseStaleStateQuirk 
+  THEN IF zkNode[s] = TRUE 
+       THEN "ONLINE" 
+       ELSE IF ∃ r ∈ Regions: metaTable[r].location = s 
+            THEN "ONLINE"    \* BUG: stale entry
+            ELSE "CRASHED"
+  ELSE IF zkNode[s] = FALSE THEN "CRASHED" ELSE "ONLINE"
+]
+```
+
+#### Iteration 32 - TruncateTableProcedure
+
+Requires a new `TruncateTableProcedure` parent procedure type, analogous to
+`SplitTableRegionProcedure`. This is a significant extension: new
+`parentProcType = "TRUNCATE"`, new child TRSP sequencing (unassign all →
+delete regions → create new regions → assign all), new crash recovery for
+each step.
+- New module `Truncate.tla` with `TruncatePrepare`, `TruncateUnassign`,
+  `TruncateDeleteMeta`, `TruncateCreateMeta`, `TruncateAssign` actions.
+- Crash between `TruncateDeleteMeta` and `TruncateCreateMeta` is the bug:
+  old regions deleted from meta but new regions not yet created → data loss.
+- Quirk: `UseTruncateCrashQuirk` , default FALSE, skips the crash guard
+  between delete and create.
+
 ---
 
 ## 8. Mapping from Code to TLA+ Actions
