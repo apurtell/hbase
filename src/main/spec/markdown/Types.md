@@ -148,6 +148,23 @@ CONSTANTS UseBlockOnMetaWrite
 ASSUME UseBlockOnMetaWrite \in BOOLEAN
 ```
 
+`UseUnknownServerQuirk` — when `TRUE`, `DetectUnknownServer` silently closes the orphaned region without creating a TRSP(ASSIGN), modeling the `checkOnlineRegionsReport()` gap (AM.java L1496–1546) where regions on Unknown Servers are closed but never reassigned. Default `FALSE`: master creates a TRSP(ASSIGN) for the orphan.
+
+Most common production path to Unknown Server:
+1. RS crashes → goes to DEAD → SCP scheduled.
+2. SCP runs, processes most regions. Some skipped when `isMatchingRegionLocation()` finds location moved by concurrent TRSP.
+3. SCP completes (DONE). Skipped regions still reference crashed server.
+4. New RS starts on same host:port → `DeadServer.cleanPreviousInstance()` removes old dead entry → server becomes UNKNOWN (neither ONLINE nor DEAD).
+5. `checkOnlineRegionsReport()` / CatalogJanitor detects orphans.
+6. `closeRegionSilently()` closes without TRSP — region stuck CLOSED/OFFLINE forever.
+
+> *Source:* `AM.checkOnlineRegionsReport()` L1496–1546, `AM.closeRegionSilently()` L1482–1490, `DeadServer.cleanPreviousInstance()` L98–106, `CatalogJanitorReport` L50–54 (TODO: auto-fix), `HBCKServerCrashProcedure` L40–185 (manual fix).
+
+```tla
+CONSTANTS UseUnknownServerQuirk
+ASSUME UseUnknownServerQuirk \in BOOLEAN
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
