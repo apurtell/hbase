@@ -262,7 +262,8 @@ MERGING, MERGED, and MERGING_NEW states.
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
 | `UseUnknownServerQuirk` | `TRUE` models `checkOnlineRegionsReport()` gap: orphans on Unknown Servers closed silently without TRSP. `FALSE` (default): master creates TRSP(ASSIGN) |
-| `UseMasterAbortOnMetaWriteQuirk` | `TRUE` models HBASE-23595: `RegionStateStore.updateRegionLocation()` calls `master.abort()` on `IOException` during meta write, crashing the master. `FALSE` (default): suspend/block per `UseBlockOnMetaWrite` |
+| `UseMasterAbortOnMetaWriteQuirk` | `TRUE` models when `RegionStateStore.updateRegionLocation()` calls `master.abort()` on `IOException` during meta write, crashing the master. `FALSE` (default): suspend/block per `UseBlockOnMetaWrite` |
+| `UseStaleStateQuirk` | `TRUE` models when `visitMeta()` creates `ServerStateNode` for dead servers referenced in meta, making them appear `ONLINE` (no SCP started, regions never recovered). `FALSE` (default): correct `zkNode`-based liveness |
 
 ## Verification Configurations
 
@@ -379,30 +380,29 @@ All configurations check the same 30 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-12 |
+| **Date** | 2026-03-13 |
 | **TLC version** | 2026.03.12.002851 |
-| **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused) |
+| **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused, split only) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 128 on 128 cores |
 | **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 1,328,348,760 |
 | **States checked** | 368,662,744 distinct |
 | **Depth** | 92 |
-| **Duration** | ~71 min |
+| **Duration** | ~64 min |
 
 ### 9r/3s Simulation
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-12 |
-| **TLC version** | 2026.03.02.213938 |
-| **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused) |
-| **Mode** | Random Simulation (seed 7001099511625069765) |
+| **Date** | 2026-03-13 |
+| **TLC version** | 2026.03.12.002851 |
+| **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
+| **Mode** | Random Simulation (seed -2625496395084300664) |
 | **Workers** | 128 on 128 cores |
 | **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
-| **States generated** | 350,615,021 |
-| **Traces generated** | ~3,380,794 |
-| **Duration** | 2 hours |
+| **States generated** | 1,297,736,623 |
+| **Duration** | 8 hours |
 
 ## Running the Spec
 
