@@ -132,6 +132,19 @@ ASSUME UseBlockOnMetaWrite \in BOOLEAN
 CONSTANTS UseUnknownServerQuirk
 ASSUME UseUnknownServerQuirk \in BOOLEAN
 
+\* UseMasterAbortOnMetaWriteQuirk: when TRUE, models 
+\* where RegionStateStore.updateRegionLocation() catches IOException
+\* and calls master.abort(msg, e), crashing the entire master when
+\* meta is temporarily unavailable (e.g., during SCP for the meta RS).
+\* When FALSE (default), the procedure suspends or blocks per
+\* UseBlockOnMetaWrite.
+\*
+\* Source: RegionStateStore.updateRegionLocation() L231-250,
+\*         private updateRegionLocation(RegionInfo, State, Put) catch
+\*         block calls master.abort() on IOException.
+CONSTANTS UseMasterAbortOnMetaWriteQuirk
+ASSUME UseMasterAbortOnMetaWriteQuirk \in BOOLEAN
+
 ---------------------------------------------------------------------------
 
 (* State definitions *)
@@ -245,8 +258,8 @@ ParentProcStep ==
 ParentProcType == { "SPLIT", "MERGE" }
 
 \* Sentinel: no parent procedure attached.
-NoParentProc == [ type |-> "NONE", step |-> "NONE",
-                  ref1 |-> NoRegion, ref2 |-> NoRegion ]
+NoParentProc ==
+  [ type |-> "NONE", step |-> "NONE", ref1 |-> NoRegion, ref2 |-> NoRegion ]
 
 \* Type definition for parentProc records (used in TypeOK).
 \*

@@ -1004,6 +1004,19 @@ master creates TRSP(ASSIGN). Wired into Next (no WF — non-deterministic
 event). All 3 configs updated. TLC 3r/2s: 368,662,744 distinct,
 1,328,348,760 generated, depth 92, clean.
 
+#### Iteration 30 — UseMasterAbortOnMetaWriteQuirk ✅ COMPLETE
+
+`RegionStateStore.updateRegionLocation()` catches `IOException` and calls
+`master.abort(msg, e)` — crashing the entire master when meta is temporarily
+unavailable (e.g., during SCP for the meta RS).  Added
+`UseMasterAbortOnMetaWriteQuirk ∈ BOOLEAN` (Types.tla) with three-way
+branch in all four meta-blocking disjuncts (`TRSPDispatchOpen`,
+`TRSPPersistToMetaOpen`, `TRSPDispatchClose`, `TRSPPersistToMetaClose`):
+when TRUE and `~MetaIsAvailable`, `masterAlive' = FALSE` (master aborts);
+when FALSE (default), existing suspend/block per `UseBlockOnMetaWrite`.
+All 3 configs updated with `UseMasterAbortOnMetaWriteQuirk = FALSE`.
+TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated, depth 92, clean.
+
 ---
 
 ## 8. Mapping from Code to TLA+ Actions

@@ -48,6 +48,7 @@ SPECIFICATION Spec
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
 | `UseBlockOnMetaWrite` | `FALSE` | Async suspension releases PEWorker (master/branch-3+ behavior) |
 | `UseUnknownServerQuirk` | `FALSE` | Master creates TRSP(ASSIGN) for Unknown Server orphans; `TRUE` models silent close gap |
+| `UseMasterAbortOnMetaWriteQuirk` | `FALSE` | No master abort on meta write failure; `TRUE` models `master.abort()` on `IOException` |
 
 ## Symmetry Reduction
 
