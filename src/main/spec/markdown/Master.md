@@ -2,7 +2,7 @@
 
 **Source:** [`Master.tla`](../Master.tla)
 
-Master-side actions: `GoOffline`, `MasterDetectCrash`, `MasterCrash`, `MasterRecover`.
+Master-side actions: `GoOffline`, `MasterDetectCrash`, `MasterCrash`, `MasterRecover`, `DetectUnknownServer`.
 
 ---
 
@@ -15,6 +15,7 @@ Master-side actions for the HBase AssignmentManager:
 - **`MasterDetectCrash`** — ZK expiry → server marked `CRASHED`, SCP started
 - **`MasterCrash`** — master JVM crash, in-memory state lost
 - **`MasterRecover`** — master restart, rebuild from `metaTable` + `procStore`
+- **`DetectUnknownServer`** — orphan region on Unknown Server
 
 ```tla
 EXTENDS Types
@@ -490,6 +491,133 @@ Durable state unchanged.
         procStore,
         rsOnlineRegions,
         walFenced,
+        zkNode,
+        regionKeyRange,
+        parentProc
+     >>
+```
+
+### `DetectUnknownServer(r)`
+
+Master discovers a region whose location references a server that has completed crash recovery (`CRASHED` + SCP `DONE`), modeling the "Unknown Server" condition.
+
+**Most common production path:**
+1. RS crashes → `serverState` becomes `CRASHED`, SCP scheduled.
+2. SCP runs, processes most regions. Some are skipped when `isMatchingRegionLocation()` finds that a concurrent TRSP already moved the region's location away from the crashed server.
+3. SCP completes (`DONE`). Skipped regions still reference the crashed server in meta.
+4. A new RS starts on the same host:port. During registration, `DeadServer.cleanPreviousInstance()` removes the old dead entry. The server is now neither ONLINE (old startcode) nor in the dead servers list → `ServerLiveState.UNKNOWN`.
+5. `checkOnlineRegionsReport()`, `DeadServerMetricRegionChore`, or `CatalogJanitor` detects regions pointing at the unknown server.
+6. `closeRegionSilently()` closes the region without creating a TRSP, leaving it `CLOSED`/`OFFLINE` forever (the bug).
+
+> *Source:* `AM.checkOnlineRegionsReport()` L1496–1546, `AM.closeRegionSilently()` L1482–1490, `DeadServer.cleanPreviousInstance()` L98–106, `CatalogJanitorReport` L50–54 (TODO: auto-fix), `HBCKServerCrashProcedure` L40–185 (manual fix).
+
+```tla
+DetectUnknownServer(r) ==
+```
+
+Master must be alive.
+
+```tla
+  /\ masterAlive = TRUE
+```
+
+A PEWorker thread must be available.
+
+```tla
+  /\ availableWorkers > 0
+```
+
+Region must exist (have an assigned keyspace).
+
+```tla
+  /\ regionKeyRange[r] # NoRange
+```
+
+Region must be OPEN with no active procedure.
+
+```tla
+  /\ regionState[r].state = "OPEN"
+  /\ regionState[r].procType = "NONE"
+```
+
+No parent procedure in progress.
+
+```tla
+  /\ parentProc[r].type = "NONE"
+```
+
+Region's location must reference a crashed server whose SCP has completed — the "Unknown Server" condition.
+
+```tla
+  /\ LET s == regionState[r].location
+     IN /\ s # NoServer
+        /\ serverState[s] = "CRASHED"
+        /\ scpState[s] = "DONE"
+```
+
+**`UseUnknownServerQuirk = TRUE`** (buggy path): close silently, no reassignment. Models `closeRegionSilently()` which sends an RPC to close but does NOT create a TRSP. Region ends up `CLOSED` with no procedure to drive reassignment.
+
+```tla
+        /\ IF UseUnknownServerQuirk
+           THEN /\ regionState' =
+                     [regionState EXCEPT
+                     ![r].state =
+                     "CLOSED",
+                     ![r].location =
+                     NoServer]
+                /\ metaTable' =
+                     [metaTable EXCEPT
+                     ![r] =
+                     [ state |-> "CLOSED", location |-> NoServer ]]
+                /\ serverRegions' =
+                     [serverRegions EXCEPT ![s] = @ \ { r }]
+                /\ UNCHANGED << procStore, dispatchedOps, pendingReports >>
+```
+
+**`UseUnknownServerQuirk = FALSE`** (correct path): close and schedule ASSIGN.
+
+```tla
+           ELSE /\ regionState' =
+                     [regionState EXCEPT
+                     ![r].state =
+                     "CLOSED",
+                     ![r].location =
+                     NoServer,
+                     ![r].procType =
+                     "ASSIGN",
+                     ![r].procStep =
+                     "GET_ASSIGN_CANDIDATE",
+                     ![r].targetServer =
+                     NoServer,
+                     ![r].retries =
+                     0]
+                /\ metaTable' =
+                     [metaTable EXCEPT
+                     ![r] =
+                     [ state |-> "CLOSED", location |-> NoServer ]]
+                /\ procStore' =
+                     [procStore EXCEPT
+                     ![r] =
+                     NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE",
+                                   NoServer, NoTransition)]
+                /\ serverRegions' =
+                     [serverRegions EXCEPT ![s] = @ \ { r }]
+                /\ UNCHANGED << dispatchedOps, pendingReports >>
+```
+
+Remaining variables unchanged.
+
+```tla
+  /\ UNCHANGED << scpState,
+        scpRegions,
+        walFenced,
+        carryingMeta,
+        rsOnlineRegions,
+        masterAlive,
+        serverState,
+        availableWorkers,
+        suspendedOnMeta,
+        blockedOnMeta,
         zkNode,
         regionKeyRange,
         parentProc
