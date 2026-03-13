@@ -23,128 +23,7 @@ by adding a `Use*Quirk` conditional to an existing action. Each entry includes:
 (a) the Java source path, (b) the TLA+ action affected, (c) the invariant
 expected to be violated, and (d) the spec change.
 
-### 2.1 `UseStateLoadAssertionQuirk` — HBASE-29552
-
-**Bug:** `RegionRemoteProcedureBase.stateLoaded()` wraps `restoreSucceedState()`
-exceptions in `AssertionError`, which aborts the master. When a `CloseRegionProcedure`
-has `REPORT_SUCCEED` state but the region's in-memory state (from meta) is OPENING
-(not CLOSING/CLOSED), the restoration throws `UnexpectedStateException` → `AssertionError`.
-
-```java
-// RegionRemoteProcedureBase.java (stateLoaded logic)
-// Wraps IOException in AssertionError — aborts master
-```
-
-**TLA+ Action:** `RestoreSucceedState` in `ProcStore.tla`
-
-**Spec Change:**
-- Add `UseStateLoadAssertionQuirk ∈ BOOLEAN` to `Types.tla`.
-- In `RestoreSucceedState`, when the persisted `transitionCode = "CLOSED"` but the
-  region's in-memory state (from `metaTable`) is `"OPENING"` (state mismatch):
-  - If `UseStateLoadAssertionQuirk = TRUE`: crash master (`masterAlive' = FALSE`).
-  - If FALSE (correct): skip restoration, leave the region as-is for SCP to handle.
-- This requires a sequence: (1) master crash during a CLOSE that has recorded
-  `REPORT_SUCCEED` in procStore but hasn't updated meta, (2) a concurrent OPEN updates
-  meta to OPENING, (3) master recovers and hits the mismatch.
-
-**Expected Violation:** `MasterEventuallyRecovers` liveness.
-
-### 2.2 `UseSCPStompQuirk` — HBASE-21623
-
-**Bug:** SCP at `SERVER_CRASH_ASSIGN` writes `ABNORMALLY_CLOSED` for a region
-in meta via `RegionStateStore`, but a concurrent TRSP has already retried the
-region on a *different* server and written `OPENING` with `location=newServer`.
-SCP clobbers this, leaving the region stuck in OPENING forever.
-
-```java
-// ServerCrashProcedure.assignRegions() — no coordination with TRSP meta updates
-// SCP writes ABNORMALLY_CLOSED overriding TRSP's OPENING on newServer
-```
-
-**TLA+ Action:** `SCPAssignRegion(s, r)` Path A in `SCP.tla`
-
-**Spec Change:**
-- Add `UseSCPStompQuirk ∈ BOOLEAN`.
-- In `SCPAssignRegion` Path A (proc attached), when the region's `location` has
-  already changed to a different server (i.e., `regionState[r].location ≠ s`
-  but a TRSP is still attached at a further step like `CONFIRM_OPENED`):
-  - If TRUE: SCP still proceeds to set `ABNORMALLY_CLOSED` and call
-    `TRSPServerCrashed`, overwriting the TRSP's progress on the new server.
-  - If FALSE (correct): SCP defers to the existing TRSP when it detects the
-    location has changed to a live server.
-- Note: This overlaps with the Iteration 16 skip path but covers the *Path A*
-  case specifically — when a proc IS attached but its target has changed.
-
-**Expected Violation:** `NoLostRegions`, region stuck in OPENING forever.
-
-### 2.3 `UseInfiniteRetryQuirk` — HBASE-29006, HBASE-27614
-
-**Bug(s):**
-- `AssignmentManager.processAssignmentPlans()` retries assignments without bound.
-- `OpenRegionProcedure.regionOpenedWithoutPersistingToMeta()` only updates seqnum
-  when new > old, creating an infinite reopen loop if old > new.
-
-```java
-// AssignmentManager.java — processAssignmentPlans() catch block
-// retries addToPendingAssignment() without limit
-
-// OpenRegionProcedure.java L82 — regionOpenedWithoutPersistingToMeta()
-// delegates to AM which conditionally updates seqnum only when new > old
-```
-
-**TLA+ Action:** `TRSPGetCandidate` / `TRSPHandleFailedOpen` in `TRSP.tla`
-
-**Spec Change:**
-- Add `UseInfiniteRetryQuirk ∈ BOOLEAN`.
-- The existing spec uses `MaxRetries` to bound open retries. If `UseInfiniteRetryQuirk
-  = TRUE`, remove the `retries ≥ MaxRetries` give-up path in `TRSPGiveUpOpen` — the
-  region retries forever.
-
-**Expected Violation:** Liveness — `AssignmentProgress` property violated (region
-never reaches OPEN). Also leads to workload amplification.
-
-### 2.4 `UseInfiniteWaitQuirk` — HBASE-28192, HBASE-26287
-
-**Bug:** `HMaster.isRegionOnline()` polls with `Integer.MAX_VALUE` retries and
-60-second backoff. If the meta/namespace region is on a dead server with a stale
-ZK reference, the master loops forever.
-
-```java
-// HMaster.java L1408 — isRegionOnline()
-// Loop polls RegionStates.isRegionOnline() with no upper bound
-```
-
-**TLA+ Action:** `MasterRecover` in `Master.tla`
-
-**Spec Change:**
-- Add `UseInfiniteWaitQuirk ∈ BOOLEAN`.
-- In `MasterRecover`, after reconstructing state from meta + procStore, add a
-  blocking condition: if meta's recorded location is a CRASHED server, either:
-  - If `UseInfiniteWaitQuirk = TRUE`: the master recovery action is permanently
-    disabled (blocks forever) — `masterAlive` stays `FALSE` after the crash.
-  - If FALSE (correct): master auto-schedules SCP for the dead server and
-    proceeds with recovery.
-
-**Expected Violation:** `MasterEventuallyRecovers` liveness. Cluster unavailable.
-
-### 2.5 `UseNoRecoveryOnUnknownServerQuirk` — HBASE-27711, HBASE-25142
-
-**Bug:** `AssignmentManager.checkOnlineRegionsReport()` closes regions on stale
-servers but does not schedule reassignment. `CatalogJanitor` reports "Unknown
-Server" indefinitely without auto-scheduling SCP.
-
-**TLA+ Modeling:**
-- Add `UseNoRecoveryOnUnknownServerQuirk ∈ BOOLEAN`.
-- New action `DetectUnknownServer(r)`: when a region's location references a
-  server that is CRASHED/NONE, the master detects the orphan:
-  - If TRUE (buggy): region is closed silently but no TRSP is created. Region
-    stays CLOSED/OFFLINE with no procedure forever.
-  - If FALSE (correct): master creates a TRSP(ASSIGN) for the orphaned region.
-- This action fires after SCP completes but leaves orphaned region mappings.
-
-**Expected Violation:** `NoLostRegions`.
-
-### 2.6 `UseMasterAbortOnMetaWriteQuirk` — HBASE-23595
+### 2.1 `UseMasterAbortOnMetaWriteQuirk` — HBASE-23595
 
 **Bug:** `RegionStateStore.updateRegionLocation()` catches `IOException` and calls
 `master.abort(msg, e)` — crashing the entire master when meta is temporarily
@@ -167,7 +46,7 @@ unavailable (e.g., during SCP for the meta RS).
 **Expected Violation:** `MasterEventuallyRecovers` liveness. Cascading failure:
 meta RS crash → SCP → concurrent TRSP → meta write → master abort.
 
-### 2.7 `UseSCPNoInterruptQuirk` — HBASE-20802, HBASE-21124
+### 2.2 `UseSCPNoInterruptQuirk` — HBASE-20802, HBASE-21124
 
 **Bug:** `RemoteProcedure` has no `interruptCall()` method. RPCs to zombie RS hang
 until timeout (3 minutes). `NoServerDispatchException` causes permanent stuck.
@@ -178,12 +57,12 @@ until timeout (3 minutes). `NoServerDispatchException` causes permanent stuck.
   - If TRUE: when the target server is CRASHED, the dispatch failure action is
     disabled (does not fire), modeling the hang. Only a timeout (modeled as a
     separate action with lower priority) eventually resolves it.
-  - If FALSE: dispatch failure fires immediately for crashed servers.
+  - If FALSE (already modeled): dispatch failure fires immediately for crashed servers.
 
 **Expected Violation:** Liveness — `AssignmentProgress` violated. Regions stuck
 in OPENING/CLOSING.
 
-### 2.8 `UseGCResurrectionQuirk` — HBASE-22631
+### 2.3 `UseGCResurrectionQuirk` — HBASE-22631
 
 **Bug:** `AssignProcedure.handleFailure()` calls `regionNode.offline()` which
 clears location to null, but `undoRegionAsOpening()` is a no-op because location
@@ -202,7 +81,7 @@ resurrects a GC'd region.
 parent region that was already SPLIT gets resurrected as OPENING, violating
 keyspace integrity.
 
-### 2.9 `UseStaleStateQuirk` — HBASE-23958, HBASE-22703
+### 2.4 `UseStaleStateQuirk` — HBASE-23958, HBASE-22703
 
 **Bug:** After restart with RIT, `RegionStateStore.visitMeta()` creates stale
 `ServerStateNode` entries for dead/restarted servers. The balancer loops
@@ -215,12 +94,12 @@ indefinitely moving regions to these stale servers.
     meta but not actually alive (stale entries). This enables `TRSPCreateMove`
     to target dead servers — `TRSPGetCandidate` picks them, `TRSPDispatchOpen`
     dispatches, `DispatchFail` fires, and the loop repeats.
-  - If FALSE: only populate for servers with `zkNode[s] = TRUE` (actually alive).
+  - If FALSE (already modeled): only populate for servers with `zkNode[s] = TRUE` (actually alive).
 
 **Expected Violation:** Liveness — balancer loops forever. Region churns
 OPEN → CLOSING → CLOSED → OPENING → FAILED_OPEN → OPENING on repeat.
 
-### 2.10 `UsePEStarvationQuirk` — HBASE-23593, HBASE-22334
+### 2.5 `UsePEStarvationQuirk` — HBASE-23593, HBASE-22334
 
 **Bug:** On heavily loaded clusters, ORP/CRP procedures are created and added to
 the scheduler but never picked up because all `PEWorker` threads are consumed by

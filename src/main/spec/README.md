@@ -190,7 +190,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
 | [Merge.tla](markdown/Merge.md) | Merge procedure forward path and pre-PONR rollback using parent-child framework (MergePrepare, MergeCheckClosed, MergeUpdateMeta, MergeDone, MergeFail) |
 | [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, close-not-found, stale report drop) |
-| [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover with PEWorker reset and regionKeyRange) |
+| [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover, DetectUnknownServer) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
 | [ZK.tla](markdown/ZK.md) | Minimal ZooKeeper model -- ephemeral node lifecycle (`ZKSessionExpire`) |
 
@@ -229,6 +229,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
+| `UseUnknownServerQuirk` | `TRUE` models `checkOnlineRegionsReport()` gap: orphans on Unknown Servers closed silently without TRSP. `FALSE` (default): master creates TRSP(ASSIGN) |
 
 ## Verification Configurations
 
@@ -408,6 +409,7 @@ Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 144
 - Merge forward path and pre-PONR rollback with parent-child procedure framework (`MergePrepare`, `MergeCheckClosed`, `MergeUpdateMeta`, `MergeDone`, `MergeFail`); gated by `UseMerge`
 - Parent-child procedure tracking (`parentProc` variable with `ref1`/`ref2` region references) across child TRSP lifecycles
 - Dispatch-failure server expiration (`DispatchFail`/`DispatchFailClose` disjunct 2: `scheduleForRetry()` → `expireServer()` atomically crashes server and starts SCP)
+- Unknown Server detection (`DetectUnknownServer`): orphaned regions on servers that completed SCP and were cleaned from dead list; configurable via `UseUnknownServerQuirk`
 
 **Deferred:**
 - Crash during split/merge

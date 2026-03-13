@@ -1129,6 +1129,7 @@ PrintConfig ==
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
   /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
+  /\ PrintT(<< "UseUnknownServerQuirk", UseUnknownServerQuirk >>)
   /\ PrintT("========================================")
 
 (* Initial state *)
@@ -1254,6 +1255,8 @@ Next ==
   \* -- Master crash and recovery --
   \/ master!MasterCrash
   \/ master!MasterRecover
+  \* -- Unknown Server detection --
+  \/ \E r \in Regions: master!DetectUnknownServer(r)
   \* -- ZK session expiry --
   \/ \E s \in Servers: zk!ZKSessionExpire(s)
   \* -- Split forward path --

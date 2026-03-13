@@ -1183,6 +1183,7 @@ PrintConfig ==
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
   /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
+  /\ PrintT(<< "UseUnknownServerQuirk", UseUnknownServerQuirk >>)
   /\ PrintT("========================================")
 ```
 
@@ -1438,6 +1439,12 @@ Next ==
   \/ master!MasterRecover
 ```
 
+**Unknown Server detection**
+
+```tla
+  \/ \E r \in Regions: master!DetectUnknownServer(r)
+```
+
 **ZK session expiry**
 
 ```tla
@@ -1539,7 +1546,7 @@ Fairness ==
   /\ \A s \in Servers: WF_vars(zk!ZKSessionExpire(s))
 ```
 
-No fairness on `MasterCrash` (non-deterministic environmental event). No fairness on `RSOpenDuplicate` (fires non-deterministically; conditional). No fairness on `RSCloseNotFound` (fires non-deterministically; conditional).
+No fairness on `MasterCrash` (non-deterministic environmental event). No fairness on `RSOpenDuplicate` (fires non-deterministically; conditional). No fairness on `RSCloseNotFound` (fires non-deterministically; conditional). No fairness on `DetectUnknownServer` (non-deterministic environmental event).
 
 **SCP state machine**
 

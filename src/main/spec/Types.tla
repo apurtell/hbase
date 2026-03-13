@@ -119,6 +119,19 @@ ASSUME MaxWorkers \in Nat /\ MaxWorkers > 0
 CONSTANTS UseBlockOnMetaWrite
 ASSUME UseBlockOnMetaWrite \in BOOLEAN
 
+\* UseUnknownServerQuirk: when TRUE, DetectUnknownServer silently
+\* closes the orphaned region without creating a TRSP(ASSIGN),
+\* modeling the checkOnlineRegionsReport() gap (AM.java L1496-1546)
+\* where regions on Unknown Servers are closed but never reassigned.
+\* Default FALSE: master creates a TRSP(ASSIGN) for the orphan.
+\*
+\* Source: AM.checkOnlineRegionsReport() L1496-1546,
+\*         AM.closeRegionSilently() L1482-1490,
+\*         CatalogJanitorReport L50-54 (TODO: auto-fix),
+\*         HBCKServerCrashProcedure L40-185 (manual fix).
+CONSTANTS UseUnknownServerQuirk
+ASSUME UseUnknownServerQuirk \in BOOLEAN
+
 ---------------------------------------------------------------------------
 
 (* State definitions *)
