@@ -165,6 +165,15 @@ CONSTANTS UseUnknownServerQuirk
 ASSUME UseUnknownServerQuirk \in BOOLEAN
 ```
 
+`UseMasterAbortOnMetaWriteQuirk` — when `TRUE`, models HBASE-23595 where `RegionStateStore.updateRegionLocation()` catches `IOException` and calls `master.abort(msg, e)`, crashing the entire master when meta is temporarily unavailable (e.g., during SCP for the meta RS). When `FALSE` (default), the procedure suspends or blocks per `UseBlockOnMetaWrite`.
+
+> *Source:* `RegionStateStore.updateRegionLocation()` L231–250, private `updateRegionLocation(RegionInfo, State, Put)` catch block calls `master.abort()` on `IOException`.
+
+```tla
+CONSTANTS UseMasterAbortOnMetaWriteQuirk
+ASSUME UseMasterAbortOnMetaWriteQuirk \in BOOLEAN
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```

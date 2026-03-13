@@ -230,6 +230,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
 | `UseUnknownServerQuirk` | `TRUE` models `checkOnlineRegionsReport()` gap: orphans on Unknown Servers closed silently without TRSP. `FALSE` (default): master creates TRSP(ASSIGN) |
+| `UseMasterAbortOnMetaWriteQuirk` | `TRUE` models HBASE-23595: `RegionStateStore.updateRegionLocation()` calls `master.abort()` on `IOException` during meta write, crashing the master. `FALSE` (default): suspend/block per `UseBlockOnMetaWrite` |
 
 ## Verification Configurations
 
@@ -390,27 +391,3 @@ java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
 ```
 
 Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 14400).
-
-## Scope and Limitations
-
-**Modeled:**
-- Full assign/unassign/move/reopen lifecycle
-- Server crash → SCP (detect, fence WALs, reassign regions)
-- Master crash and recovery with procedure store replay
-- ZooKeeper ephemeral node lifecycle
-- WAL fencing to prevent write-side split-brain
-- `hbase:meta` persistence and divergence resolution
-- Procedure store persistence and recovery
-- PEWorker thread pool (worker availability, meta-blocking, async suspension vs sync blocking)
-- Configurable implementation quirks (duplicate open, close-not-found, restore succeed)
-- Configurable meta-write behavior
-- Keyspace infrastructure (`regionKeyRange`, `DeployedRegions`, `MaxKey`) with `KeyspaceCoverage` invariant
-- Split forward path and pre-PONR rollback with parent-child procedure framework (`SplitPrepare`, `SplitResumeAfterClose`, `SplitUpdateMeta`, `SplitDone`, `SplitFail`)
-- Merge forward path and pre-PONR rollback with parent-child procedure framework (`MergePrepare`, `MergeCheckClosed`, `MergeUpdateMeta`, `MergeDone`, `MergeFail`); gated by `UseMerge`
-- Parent-child procedure tracking (`parentProc` variable with `ref1`/`ref2` region references) across child TRSP lifecycles
-- Dispatch-failure server expiration (`DispatchFail`/`DispatchFailClose` disjunct 2: `scheduleForRetry()` → `expireServer()` atomically crashes server and starts SCP)
-- Unknown Server detection (`DetectUnknownServer`): orphaned regions on servers that completed SCP and were cleaned from dead list; configurable via `UseUnknownServerQuirk`
-
-**Deferred:**
-- Crash during split/merge
-- FAILED_CLOSE (RS abort triggers crash detection instead)

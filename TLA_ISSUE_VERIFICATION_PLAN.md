@@ -23,30 +23,7 @@ by adding a `Use*Quirk` conditional to an existing action. Each entry includes:
 (a) the Java source path, (b) the TLA+ action affected, (c) the invariant
 expected to be violated, and (d) the spec change.
 
-### 2.1 `UseMasterAbortOnMetaWriteQuirk` — HBASE-23595
-
-**Bug:** `RegionStateStore.updateRegionLocation()` catches `IOException` and calls
-`master.abort(msg, e)` — crashing the entire master when meta is temporarily
-unavailable (e.g., during SCP for the meta RS).
-
-```java
-// RegionStateStore.java L231
-// catch (IOException) { master.abort("TODO: Revist!!!!", e); }
-```
-
-**TLA+ Action:** All meta-writing TRSP actions in `TRSP.tla`
-
-**Spec Change:**
-- Add `UseMasterAbortOnMetaWriteQuirk ∈ BOOLEAN`.
-- In the meta-blocking disjuncts (`TRSPPersistToMetaOpen`, `TRSPPersistToMetaClose`,
-  etc.), when `MetaIsAvailable = FALSE`:
-  - If TRUE: set `masterAlive' = FALSE` (master aborts).
-  - If FALSE (already modeled): block/suspend per `UseBlockOnMetaWrite`.
-
-**Expected Violation:** `MasterEventuallyRecovers` liveness. Cascading failure:
-meta RS crash → SCP → concurrent TRSP → meta write → master abort.
-
-### 2.2 `UseSCPNoInterruptQuirk` — HBASE-20802, HBASE-21124
+### 2.1 `UseSCPNoInterruptQuirk` — HBASE-20802, HBASE-21124
 
 **Bug:** `RemoteProcedure` has no `interruptCall()` method. RPCs to zombie RS hang
 until timeout (3 minutes). `NoServerDispatchException` causes permanent stuck.
@@ -62,7 +39,7 @@ until timeout (3 minutes). `NoServerDispatchException` causes permanent stuck.
 **Expected Violation:** Liveness — `AssignmentProgress` violated. Regions stuck
 in OPENING/CLOSING.
 
-### 2.3 `UseGCResurrectionQuirk` — HBASE-22631
+### 2.2 `UseGCResurrectionQuirk` — HBASE-22631
 
 **Bug:** `AssignProcedure.handleFailure()` calls `regionNode.offline()` which
 clears location to null, but `undoRegionAsOpening()` is a no-op because location
@@ -81,7 +58,7 @@ resurrects a GC'd region.
 parent region that was already SPLIT gets resurrected as OPENING, violating
 keyspace integrity.
 
-### 2.4 `UseStaleStateQuirk` — HBASE-23958, HBASE-22703
+### 2.3 `UseStaleStateQuirk` — HBASE-23958, HBASE-22703
 
 **Bug:** After restart with RIT, `RegionStateStore.visitMeta()` creates stale
 `ServerStateNode` entries for dead/restarted servers. The balancer loops
@@ -99,7 +76,7 @@ indefinitely moving regions to these stale servers.
 **Expected Violation:** Liveness — balancer loops forever. Region churns
 OPEN → CLOSING → CLOSED → OPENING → FAILED_OPEN → OPENING on repeat.
 
-### 2.5 `UsePEStarvationQuirk` — HBASE-23593, HBASE-22334
+### 2.4 `UsePEStarvationQuirk` — HBASE-23593, HBASE-22334
 
 **Bug:** On heavily loaded clusters, ORP/CRP procedures are created and added to
 the scheduler but never picked up because all `PEWorker` threads are consumed by
