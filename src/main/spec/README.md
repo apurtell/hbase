@@ -168,6 +168,38 @@ Configurable "quirk" flags allow toggling known implementation bugs to
 correctly adhere to implementation semantics, reproduce failures and
 validate fixes.
 
+### TLA+ vs Actor-Based Programming
+
+Both TLA+ and actor-based programming model systems as collections of
+state machines communicating through messages, with no shared mutable
+state. In TLA+, each process in PlusCal is essentially a labeled state
+machine. Each label is a state, and transitions happen atomically between
+labels. In actor systems each actor processes one message at a time,
+transitioning between internal states. TLA+ models distributed communication
+through message channels (sets, sequences, or bags of messages). Actor
+systems use mailboxes. In both, messages can be reordered, delayed, or lost
+(depending on model assumptions), and the system's behavior emerges from the
+interleaving of message processing.
+
+TLA+ is particularly effective for modeling systems like HBase's region
+assignment. The real system already has an actor-alike architecture, so the
+specification maps naturally onto the implementation architecture. Each
+RegionServer and the Master are effectively actors. They have local state,
+process events one at a time, and communicate via messages, and through
+ZooKeeper as a coordination channel.
+
+Despite the similarities, there are important distinctions. Key is TLA+ lets
+you state what should happen, establishing safety and liveness properties,
+and exhaustively checks all possible behaviors, while the actor model
+provides a runtime framework for building systems that behave that way but
+does not perform formal verification. TLA+ operates at a higher level of
+abstraction and does not produce executable code. In TLA+, you explicitly
+model nondeterminism. In actor systems, nondeterminism happens naturally from
+network timing, scheduling, etc. TLA+ makes the nondeterminism exhaustively
+explorable. TLA+ has formal fairness conditions. Actor frameworks have
+analogous but informal concepts: dispatcher fairness, mailbox prioritization,
+and back-pressure mechanisms.
+
 ---
 
 This is a formal TLA+ specification of the HBase AssignmentManager, covering the
