@@ -52,7 +52,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 ```
 
 ### Variable Shorthands
@@ -93,6 +94,17 @@ Does region `r` have an active parent procedure?
 
 ```tla
 HasActiveParent(r) == parentProc[r].type # "NONE"
+```
+
+No exclusive-type parent procedure (`CREATE`, `DELETE`, `TRUNCATE`) active on any region of the same table as `r`.
+
+```tla
+NoTableExclusiveLock(r) ==
+  LET t == regionTable[r]
+  IN t # NoTable =>
+       ~ \E r2 \in Regions:
+            /\ regionTable[r2] = t
+            /\ parentProc[r2].type \in TableExclusiveType
 ```
 
 Is meta available? (no server carrying meta is crashed)
@@ -172,6 +184,12 @@ At least 2 unused identifiers available for daughters.
   /\ Cardinality({d \in Regions: regionKeyRange[d] = NoRange}) >= 2
 ```
 
+No table-level exclusive lock on this region's table.
+
+```tla
+  /\ NoTableExclusiveLock(r)
+```
+
 Transition parent to `SPLITTING` and spawn child `UNASSIGN` TRSP.
 
 ```tla
@@ -225,6 +243,7 @@ Everything else unchanged.
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 ```
@@ -294,6 +313,7 @@ Advance parent to `PONR`.
         peVars,
         metaTable,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 ```
@@ -427,6 +447,13 @@ Store daughter references for `SplitDone` to read back.
   /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN",
                                       ![r].ref1 = dA,
                                       ![r].ref2 = dB]
+```
+
+Daughters inherit the parent's table identity.
+
+```tla
+  /\ regionTable' = [regionTable EXCEPT ![dA] = regionTable[r],
+                                        ![dB] = regionTable[r]]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -502,6 +529,12 @@ Clear parent procedure.
 
 ```tla
   /\ parentProc' = [parentProc EXCEPT ![r] = NoParentProc]
+```
+
+Parent releases its table identity (region "deleted").
+
+```tla
+  /\ regionTable' = [regionTable EXCEPT ![r] = NoTable]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -603,6 +636,7 @@ Everything else unchanged.
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 ```

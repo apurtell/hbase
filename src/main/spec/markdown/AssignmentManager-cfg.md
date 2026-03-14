@@ -35,9 +35,11 @@ SPECIFICATION Spec
 | `NoRange` | model value | Sentinel: unused region identifier (no keyspace) |
 | `NoServer` | model value | Sentinel: no server assigned |
 | `NoRegion` | model value | Sentinel: no region reference |
+| `NoTable` | model value | Sentinel: no table assigned |
 | `Servers` | `{s1, s2}` | Finite set of RegionServer identifiers |
 | `Regions` | `{r1, r2, r3}` | All region identifiers (1 deployed + 2 spare for split) |
 | `DeployedRegions` | `{r1}` | Regions that exist at system start |
+| `Tables` | `{T1}` | Finite set of table identifiers |
 | `MaxKey` | `2` | Upper bound of keyspace: keys range over `0..(MaxKey-1)` |
 | `MaxRetries` | `1` | Maximum open-retry count per procedure |
 | `MaxWorkers` | `2` | ProcedureExecutor worker-thread pool size |
@@ -62,7 +64,7 @@ SYMMETRY Symmetry
 
 ## Invariants
 
-All 30 safety invariants are checked:
+All 31 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -96,6 +98,7 @@ INVARIANT
     NoOrphanedMergedRegion
     MergeCompleteness
     MergeAtomicity
+    TableLockExclusivity
 ```
 
 ## Action Constraints

@@ -54,7 +54,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -79,6 +80,15 @@ RegionExists(r) == regionKeyRange[r] # NoRange
 
 \* Helper: does region r have an active parent procedure?
 HasActiveParent(r) == parentProc[r].type # "NONE"
+
+\* Helper: no exclusive-type parent procedure active on any region
+\* of the same table as r.
+NoTableExclusiveLock(r) ==
+  LET t == regionTable[r]
+  IN t # NoTable =>
+       ~ \E r2 \in Regions:
+            /\ regionTable[r2] = t
+            /\ parentProc[r2].type \in TableExclusiveType
 
 \* Helper: are two regions adjacent (r1's endKey = r2's startKey)?
 Adjacent(r1, r2) == /\ RegionExists(r1)
@@ -141,6 +151,8 @@ MergePrepare(r1, r2, m) ==
   /\ regionKeyRange[m] = NoRange
   \* No parent procedure on m either.
   /\ ~HasActiveParent(m)
+  \* No table-level exclusive lock on this region's table.
+  /\ NoTableExclusiveLock(r1)
   \* Transition both targets to MERGING and spawn child UNASSIGN TRSPs.
   /\ regionState' =
        [regionState EXCEPT
@@ -196,6 +208,7 @@ MergePrepare(r1, r2, m) ==
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 
@@ -252,6 +265,7 @@ MergeCheckClosed(r1) ==
         peVars,
         metaTable,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 
@@ -351,6 +365,9 @@ MergeUpdateMeta(r1) ==
              NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
   \* Parent advances to SPAWNED_OPEN (yielding to merged ASSIGN).
   /\ parentProc' = [parentProc EXCEPT ![r1].step = "SPAWNED_OPEN"]
+  \* Merged region inherits the targets' table.
+  /\ LET m2 == parentProc[r1].ref2
+     IN regionTable' = [regionTable EXCEPT ![m2] = regionTable[r1]]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -400,6 +417,11 @@ MergeDone(r1) ==
        [parentProc EXCEPT
        ![r1] = NoParentProc,
        ![parentProc[r1].ref1] = NoParentProc]
+  \* Targets release their table identity (regions "deleted").
+  /\ regionTable' =
+       [regionTable EXCEPT
+       ![r1] = NoTable,
+       ![parentProc[r1].ref1] = NoTable]
   \* regionState unchanged (targets already MERGED, m already OPEN).
   /\ UNCHANGED << scpVars,
         rpcVars,
@@ -505,6 +527,7 @@ MergeFail(r1) ==
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 

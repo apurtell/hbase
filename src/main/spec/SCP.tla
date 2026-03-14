@@ -27,7 +27,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -123,7 +124,8 @@ SCPAssignMeta(s) ==
         walFenced,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 \* SCP step 1: Snapshot the set of regions assigned to the crashed
@@ -180,7 +182,8 @@ SCPGetRegions(s) ==
         carryingMeta,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 \* SCP step 2: Revoke WAL leases for the crashed server.  After this
@@ -219,7 +222,8 @@ SCPFenceWALs(s) ==
         carryingMeta,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
@@ -273,7 +277,8 @@ SCPAssignRegion(s, r) ==
               peVars,
               zkNode,
               regionKeyRange,
-              parentProc
+              parentProc,
+              regionTable
            >>
      \/ \* --- Meta unavailable: suspend or block ---
         \* Paths A/B write to meta; if meta is unavailable,
@@ -284,7 +289,7 @@ SCPAssignRegion(s, r) ==
         /\ r \notin blockedOnMeta
         /\ IF UseBlockOnMetaWrite = FALSE
            THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc >>
+                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc, regionTable >>
            ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
                 /\ availableWorkers' = availableWorkers - 1
                 /\ UNCHANGED suspendedOnMeta
@@ -303,7 +308,8 @@ SCPAssignRegion(s, r) ==
               masterVars,
               zkNode,
               regionKeyRange,
-              parentProc
+              parentProc,
+              regionTable
            >>
      \/ \* --- Path A: TRSP already attached ---
         \* Meta must be available for Path A (writes to meta).
@@ -377,7 +383,8 @@ SCPAssignRegion(s, r) ==
               carryingMeta,
               zkNode,
               regionKeyRange,
-              parentProc
+              parentProc,
+              regionTable
            >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
         /\ suspendedOnMeta' = suspendedOnMeta \ { r }
@@ -444,7 +451,8 @@ SCPAssignRegion(s, r) ==
               carryingMeta,
               zkNode,
               regionKeyRange,
-              parentProc
+              parentProc,
+              regionTable
            >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
         /\ suspendedOnMeta' = suspendedOnMeta \ { r }
@@ -488,7 +496,8 @@ SCPDone(s) ==
         carryingMeta,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 ============================================================================

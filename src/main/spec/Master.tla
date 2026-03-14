@@ -31,7 +31,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -97,7 +98,8 @@ GoOffline(r) ==
         peVars,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 \* The master detects that a RegionServer has crashed.  The master's
@@ -152,7 +154,8 @@ MasterDetectCrash(s) ==
         serverRegions,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 ---------------------------------------------------------------------------
@@ -198,13 +201,15 @@ MasterCrash ==
         parentProc
      >>
   \* Durable state survives.
-  /\ UNCHANGED << metaTable, procStore, parentProc >>
+  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable >>
   \* RS-side state survives.
   /\ UNCHANGED rsOnlineRegions
   \* WAL fencing survives (HDFS-level).
   /\ UNCHANGED walFenced
   \* ZK ephemeral nodes survive (external to master).
   /\ UNCHANGED zkNode
+  \* Table identity survives (reconstructable from meta).
+  /\ UNCHANGED regionTable
 
 \* The master recovers after a crash.  Rebuilds in-memory state from
 \* durable storage (metaTable and procStore).
@@ -378,7 +383,8 @@ MasterRecover ==
         walFenced,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 \* DetectUnknownServer: Master discovers a region whose location
@@ -482,7 +488,8 @@ DetectUnknownServer(r) ==
         blockedOnMeta,
         zkNode,
         regionKeyRange,
-        parentProc
+        parentProc,
+        regionTable
      >>
 
 ============================================================================
