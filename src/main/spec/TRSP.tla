@@ -62,7 +62,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -80,7 +81,8 @@ scpVars ==
      carryingMeta,
      zkNode,
      regionKeyRange,
-     parentProc
+     parentProc,
+     regionTable
   >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
@@ -711,7 +713,8 @@ DispatchFail(r) ==
                           serverRegions,
                           zkNode,
                           regionKeyRange,
-                          parentProc
+                          parentProc,
+                          regionTable
                        >>
 
 \* Close command dispatch failed (non-deterministic RPC failure).
@@ -807,7 +810,8 @@ DispatchFailClose(r) ==
                           serverRegions,
                           zkNode,
                           regionKeyRange,
-                          parentProc
+                          parentProc,
+                          regionTable
                        >>
 
 ---------------------------------------------------------------------------

@@ -40,10 +40,12 @@ Same model values and universe sizing as the primary exhaustive config:
 | `NoTransition` | model value | Sentinel: no transition code recorded |
 | `NoRange` | model value | Sentinel: unused region identifier (no keyspace) |
 | `NoRegion` | model value | Sentinel: no region reference |
+| `NoTable` | model value | Sentinel: no table assigned |
 | `NoServer` | model value | Sentinel: no server assigned |
 | `Servers` | `{s1, s2}` | Finite set of RegionServer identifiers |
 | `Regions` | `{r1, r2, r3}` | All region identifiers (deployed + spare for split/merge) |
 | `DeployedRegions` | `{r1}` | Regions that exist at system start |
+| `Tables` | `{T1}` | Finite set of table identifiers |
 | `MaxKey` | `2` | Upper bound of keyspace: keys range over `0..(MaxKey-1)` |
 | `MaxRetries` | `1` | Maximum open-retry count per procedure |
 | `MaxWorkers` | `2` | ProcedureExecutor worker-thread pool size |
@@ -63,7 +65,7 @@ Same model values and universe sizing as the primary exhaustive config:
 
 ## Safety Invariants
 
-All 30 safety invariants are checked alongside liveness:
+All 31 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -97,6 +99,7 @@ INVARIANT
     NoOrphanedMergedRegion
     MergeCompleteness
     MergeAtomicity
+    TableLockExclusivity
 ```
 
 ## Action Constraints

@@ -57,6 +57,19 @@ ASSUME UseReopen \in BOOLEAN
 CONSTANTS NoRegion
 ASSUME NoRegion \notin Regions
 
+\* Tables: the finite set of table identifiers.  Each deployed region
+\* belongs to exactly one table.  At system start, all DeployedRegions
+\* map to the single element of Tables.  Future iterations (33+) will
+\* introduce CreateTable/DeleteTable/TruncateTable procedures that
+\* operate on entire tables.
+CONSTANTS Tables
+ASSUME Tables # {}
+
+\* NoTable: sentinel model value for "no table assigned".
+\* Used for unused region identifiers whose table has not been set.
+CONSTANTS NoTable
+ASSUME NoTable \notin Tables
+
 \* UseMerge: when TRUE, merge actions are enabled in Next and Fairness.
 \* With both split and merge active, the state space becomes unbounded
 \* (split -> daughters -> merge -> parent -> split -> ...).  Setting
@@ -266,8 +279,18 @@ ParentProcStep ==
   }
 
 \* Parent procedure types.  "NONE" means no parent procedure is
-\* attached.  Extensible: "MERGE" will be added in a future iteration.
-ParentProcType == { "SPLIT", "MERGE" }
+\* attached.  SPLIT/MERGE are region-level parent procedures.
+\* CREATE/DELETE/TRUNCATE are table-level parent procedures.
+ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE" }
+
+\* TableExclusiveType: the subset of parent procedure types that
+\* require exclusive access to all regions of a table.
+\* No SPLIT or MERGE can coexist with these on the same table.
+\*
+\* Source: CreateTableProcedure, DeleteTableProcedure,
+\*         TruncateTableProcedure each acquire a table-level
+\*         exclusive lock via TableLockManager.
+TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE" }
 
 \* Sentinel: no parent procedure attached.
 NoParentProc ==

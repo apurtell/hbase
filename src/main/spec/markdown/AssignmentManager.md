@@ -220,6 +220,14 @@ VARIABLE regionKeyRange
 
 ```tla
 VARIABLE parentProc
+```
+
+`regionTable[r]` is the table identifier that region `r` belongs to, or `NoTable` if the region identifier is not currently in use. `DeployedRegions` belong to the initial table (`T1`) at startup; unused identifiers start as `NoTable`. Split daughters inherit the parent's table; merge merged-regions inherit the targets' table. `regionTable` is durable (reconstructable from meta) and survives master crash.
+
+> *Source:* `RegionInfo.getTable()` — each region knows its table.
+
+```tla
+VARIABLE regionTable
 
 vars ==
   << regionState,
@@ -240,7 +248,8 @@ vars ==
      suspendedOnMeta,
      blockedOnMeta,
      regionKeyRange,
-     parentProc
+     parentProc,
+     regionTable
   >>
 ```
 
@@ -275,6 +284,32 @@ PEWorker pool variables (used in `UNCHANGED` clauses).
 
 ```tla
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+```
+
+### Table Lock Guard Predicates
+
+`NoTableExclusiveLock(r)` is `TRUE` when no exclusive-type parent procedure (`CREATE`, `DELETE`, `TRUNCATE`) is active on any region of the same table as region `r`. Used as a guard on `SplitPrepare` and `MergePrepare` to prevent split/merge from firing while a table-level exclusive operation is in progress.
+
+> *Source:* `TableLockManager` exclusive lock in `CreateTableProcedure`, `DeleteTableProcedure`, `TruncateTableProcedure`.
+
+```tla
+NoTableExclusiveLock(r) ==
+  LET t == regionTable[r]
+  IN t # NoTable =>
+       ~ \E r2 \in Regions:
+            /\ regionTable[r2] = t
+            /\ parentProc[r2].type \in TableExclusiveType
+```
+
+`TableLockFree(t)` is `TRUE` when no `parentProc` of any type is active on any region of table `t`. For future use by table-level procedures (`CreateTable`, `DeleteTable`, `TruncateTable`) as a precondition guard.
+
+> *Source:* `TableLockManager` in `ProcedureExecutor`.
+
+```tla
+TableLockFree(t) ==
+  ~ \E r \in Regions:
+       /\ regionTable[r] = t
+       /\ parentProc[r].type # "NONE"
 ```
 
 ## Module Instantiation
@@ -476,6 +511,8 @@ Keyspace range: assigned range or `NoRange` (unused identifier). Parent procedur
          [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }] \* Parent procedure progress per region.
        /\
        parentProc \in [Regions -> ParentProcRecord]
+   \* Table identity per region.
+   /\ regionTable \in [Regions -> Tables \cup { NoTable }]
 ```
 
 ```tla
@@ -1158,6 +1195,29 @@ SplitMergeConstraint ==
   Cardinality({r \in Regions: parentProc[r] # NoParentProc}) <= 1
 ```
 
+### `TableLockExclusivity`
+
+At most one exclusive-type `parentProc` (`CREATE`, `DELETE`, `TRUNCATE`) active per table, and no exclusive-type `parentProc` coexists with `SPLIT` or `MERGE` on the same table. This invariant is infrastructure for iteration 33+ table-level procedures. With `Tables = {T1}` and no table-level actions in `Next`, the invariant is vacuously true (no exclusive-type `parentProc` can be created). It validates the guard predicate framework and will become non-vacuous when `CreateTable`/`DeleteTable`/`Truncate` actions are wired into `Next`.
+
+> *Source:* `TableLockManager` in `ProcedureExecutor`.
+
+```tla
+TableLockExclusivity ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      /\ Cardinality({r \in Regions:
+              /\ regionTable[r] = t
+              /\ parentProc[r].type \in TableExclusiveType
+           }) <= 1
+      /\ ( \E r \in Regions:
+              /\ regionTable[r] = t
+              /\ parentProc[r].type \in TableExclusiveType
+         ) =>
+           ~ \E r2 \in Regions:
+                /\ regionTable[r2] = t
+                /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1174,6 +1234,7 @@ PrintConfig ==
   /\ PrintT(<< "Servers", Servers >>)
   /\ PrintT(<< "Regions", Regions >>)
   /\ PrintT(<< "DeployedRegions", DeployedRegions >>)
+  /\ PrintT(<< "Tables", Tables >>)
   /\ PrintT(<< "MaxKey", MaxKey >>)
   /\ PrintT(<< "MaxRetries", MaxRetries >>)
   /\ PrintT(<< "MaxWorkers", MaxWorkers >>)
@@ -1321,6 +1382,13 @@ No parent procedures are in progress.
 
 ```tla
   /\ parentProc = [r \in Regions |-> NoParentProc]
+```
+
+Table identity: deployed regions belong to a single table; unused identifiers have `NoTable`.
+
+```tla
+  /\ LET t1 == CHOOSE t \in Tables: TRUE
+     IN regionTable = [r \in Regions |-> IF r \in DeployedRegions THEN t1 ELSE NoTable]
 ```
 
 ```tla
@@ -1811,6 +1879,13 @@ Safety: pre-PONR merged region not materialized.
 
 ```tla
         THEOREM Spec => []MergeAtomicity
+```
+
+Safety: table-level exclusive lock mutual exclusion.
+
+```tla
+\* Safety: table-level exclusive lock mutual exclusion.
+        THEOREM Spec => []TableLockExclusivity
 ```
 
 Liveness: ASSIGN-bearing OFFLINE region eventually opens.

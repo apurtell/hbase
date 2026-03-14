@@ -944,40 +944,27 @@ distinct, 1,328,348,760 generated, depth 92, ~64min, clean.
 
 ### Phase 9: Table-Level Procedures
 
-#### Iteration 32 — Table identity infrastructure and exclusive table lock guards
+#### Iteration 32 — Table identity infrastructure and exclusive table lock guards ✅ COMPLETE
 
-Add table identity tracking and exclusive table lock guard predicates.
-No new table-level procedures — infrastructure only.  Independently
-verifiable as a refactoring pass (all existing invariants must still pass).
-
-- `Types.tla`: new `Tables` constant (set of table identifiers), `NoTable`
-  sentinel model value, `ParentProcType` extended with
-  `{"CREATE","DELETE","TRUNCATE"}`, new `TableExclusiveType ==
-  {"CREATE","DELETE","TRUNCATE"}` set.
-- `AssignmentManager.tla`: new `regionTable` variable
-  (`[Regions → Tables ∪ {NoTable}]`).  `Init`: `DeployedRegions → T1`
-  (element of `Tables`), unused identifiers `→ NoTable`.  `TypeOK`:
-  `regionTable` type assertion.  New guard predicates `NoTableExclusiveLock(r)`
-  and `TableLockFree(t)`.  New invariant `TableLockExclusivity` — at most
-  one exclusive-type `parentProc` active per table, and no exclusive-type
-  coexists with SPLIT/MERGE on same table.  `regionTable` added to `vars`
-  tuple and `UNCHANGED` clauses across all modules.
-- `Split.tla`: `SplitPrepare(r)` gains `NoTableExclusiveLock(r)` guard.
-  `SplitUpdateMeta(r, dA, dB)` sets `regionTable'[dA] = regionTable[r]`,
-  `regionTable'[dB] = regionTable[r]` (daughters inherit parent's table).
-  `SplitDone(r)` sets `regionTable'[r] = NoTable` (parent identifier freed).
-- `Merge.tla`: `MergePrepare(r1, r2, m)` gains `NoTableExclusiveLock(r1)`
-  guard.  `MergeUpdateMeta(p)` sets `regionTable'[m] = regionTable[r1]`
-  (merged region inherits table).  `MergeDone(p)` sets
-  `regionTable'[r1] = NoTable`, `regionTable'[r2] = NoTable` (target
-  identifiers freed).
-- All other modules (TRSP, SCP, Master, RegionServer, ProcStore, ZK):
-  `regionTable` added to `VARIABLE` declarations and `UNCHANGED` in every
-  action.
-- Configs: primary `Tables = {T1}`, `NoTable` model value.  Single table
-  suffices for this iteration (no table-level procedures yet).  State space
-  expected ≈ same as Iter 31 (`regionTable` is functionally dependent on
-  existing state for single-table model).
+Per-region table identity tracking and exclusive table-level lock guard
+predicates — infrastructure only, no new table-level procedures.  Added
+`Tables` constant, `NoTable` sentinel, extended `ParentProcType` with
+`{"CREATE","DELETE","TRUNCATE"}`, and `TableExclusiveType` set (Types.tla).
+New 20th variable `regionTable ∈ [Regions → Tables ∪ {NoTable}]`
+(AssignmentManager.tla): `Init` maps `DeployedRegions → T1`, unused `→
+NoTable`; `TypeOK` type assertion; guard predicates `NoTableExclusiveLock(r)`
+and `TableLockFree(t)`; new invariant `TableLockExclusivity` (at most one
+exclusive-type `parentProc` per table, no coexistence with SPLIT/MERGE).
+Split.tla: `SplitPrepare` guarded by `NoTableExclusiveLock`,
+`SplitUpdateMeta` daughters inherit parent table, `SplitDone` clears parent
+to `NoTable`.  Merge.tla: `MergePrepare` guarded by `NoTableExclusiveLock`,
+`MergeUpdateMeta` merged region inherits table, `MergeDone` clears targets
+to `NoTable`.  All other modules: `regionTable` in VARIABLE blocks and
+UNCHANGED clauses (including expanded clauses in `DispatchFail`/
+`DispatchFailClose` disjunct 2, `RSRestart`, `MasterCrash`, `SCPAssignRegion`
+meta-blocking).  Configs: `Tables = {T1}`, `NoTable` model value,
+`TableLockExclusivity` invariant (31st).  TLC 3r/2s: 368,662,744 distinct,
+1,328,348,760 generated, depth 92, ~71min, clean.
 
 #### Iteration 33 — CreateTableProcedure
 
