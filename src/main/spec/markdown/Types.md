@@ -92,11 +92,23 @@ CONSTANTS UseReopen
 ASSUME UseReopen \in BOOLEAN
 ```
 
-`NoRegion` — sentinel model value for "no region reference" in `parentProc` records. Used when a region-reference field is not applicable (e.g., split pre-PONR before daughters are chosen).
-
 ```tla
 CONSTANTS NoRegion
 ASSUME NoRegion \notin Regions
+```
+
+`Tables` — the finite set of table identifiers. Each deployed region belongs to exactly one table. At system start, all `DeployedRegions` map to the single element of `Tables`.
+
+```tla
+CONSTANTS Tables
+ASSUME Tables # {}
+```
+
+`NoTable` — sentinel model value for "no table assigned." Used for unused region identifiers whose table has not been set.
+
+```tla
+CONSTANTS NoTable
+ASSUME NoTable \notin Tables
 ```
 
 `UseMerge` — when `TRUE`, merge actions are enabled in `Next` and `Fairness`. With both split and merge active, the state space becomes unbounded (split → daughters → merge → parent → split → …). Setting `FALSE` keeps exhaustive model checking tractable (split-only). Setting `TRUE` enables merge in simulation mode.
@@ -323,10 +335,18 @@ ParentProcStep ==
 
 ### Parent Procedure Types
 
-Parent procedure types. `"NONE"` means no parent procedure is attached.
+Parent procedure types. `"NONE"` means no parent procedure is attached. `SPLIT`/`MERGE` are region-level parent procedures. `CREATE`/`DELETE`/`TRUNCATE` are table-level parent procedures.
 
 ```tla
-ParentProcType == { "SPLIT", "MERGE" }
+ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE" }
+```
+
+`TableExclusiveType` — the subset of parent procedure types that require exclusive access to all regions of a table. No `SPLIT` or `MERGE` can coexist with these on the same table.
+
+> *Source:* `CreateTableProcedure`, `DeleteTableProcedure`, `TruncateTableProcedure` each acquire a table-level exclusive lock via `TableLockManager`.
+
+```tla
+TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE" }
 ```
 
 `NoParentProc` — sentinel: no parent procedure attached.
