@@ -60,7 +60,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 ```
 
 ### Variable Shorthands
@@ -81,7 +82,7 @@ Variables unchanged by TRSP actions (includes SCP state and ZK ephemeral nodes �
 
 ```tla
 scpVars ==
-  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc >>
+  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc, regionTable >>
 ```
 
 Master lifecycle variables (used in `UNCHANGED` clauses).
@@ -1044,7 +1045,8 @@ TRSP stays at `CONFIRM_OPENED` — not reset. Matches `remoteCallFailed()` early
                           serverRegions,
                           zkNode,
                           regionKeyRange,
-                          parentProc
+                          parentProc,
+                          regionTable
                        >>
 
 ```
@@ -1187,7 +1189,8 @@ TRSP stays at `CONFIRM_CLOSED` — not reset. Matches `remoteCallFailed()` early
                           serverRegions,
                           zkNode,
                           regionKeyRange,
-                          parentProc
+                          parentProc,
+                          regionTable
                        >>
 
 ```

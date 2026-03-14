@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-19 state variables capturing:
+20 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -121,6 +121,10 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **Parent-child procedure framework** -- per-region `parentProc` record tracking
   parent procedure type and step (split or merge), persists across child TRSP
   lifecycles and survives master crash.
+- **Table identity infrastructure** -- per-region `regionTable` tracking which table
+  a region belongs to, with guard predicates (`NoTableExclusiveLock`, `TableLockFree`)
+  and an invariant (`TableLockExclusivity`) to ensure exclusive table-level locks
+  prevent concurrent region-level operations on the same table.
 - **Split procedure** -- `SplitTableRegionProcedure`
   modeled through the parent-child framework: `SplitPrepare` (set SPLITTING,
   spawn child UNASSIGN TRSP to close parent), `SplitResumeAfterClose` (detect
@@ -141,7 +145,7 @@ This TLA+ specification models the AssignmentManager as a state machine with
   `UseMerge` constant; disabled in exhaustive mode (unbounded state space
   with split+merge cycle), enabled in simulation mode.
 
-The specification defines 30 safety invariants verified at every reachable
+The specification defines 31 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
@@ -151,7 +155,9 @@ exactly one live region), `SplitMergeMutualExclusion` (split daughters and
 merged regions cannot have active parent procedures), `SplitAtomicity`
 (pre-PONR, no daughters materialized), `AtMostOneCarryingMeta` (at most one
 server carrying meta), `MergeCompleteness` (completed merge has cleaned-up
-targets), and `MergeAtomicity` (pre-PONR, merged region not materialized).
+targets), `MergeAtomicity` (pre-PONR, merged region not materialized), and
+`TableLockExclusivity` (exclusive table locks prevent concurrent region ops
+on the same table).
 
 Three liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
@@ -226,7 +232,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
 | [ZK.tla](markdown/ZK.md) | Minimal ZooKeeper model -- ephemeral node lifecycle (`ZKSessionExpire`) |
 
-## State Variables (19 total)
+## State Variables (20 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
 - **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
@@ -247,6 +253,7 @@ MERGING, MERGED, and MERGING_NEW states.
 - **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
 - **`regionKeyRange`** -- per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
 - **`parentProc`** -- per-region parent procedure record (`[type, step, ref1, ref2]`) tracking split/merge progress across child TRSP lifecycles; `ref1`/`ref2` hold region references (daughters for split, peer/merged for merge)
+- **`regionTable`** -- per-region table identity tracking which table each region belongs to (`Tables` or `NoTable` for unused identifiers); used by guard predicates to enforce exclusive table-level locks
 
 ## Configurable Behaviors
 
@@ -314,7 +321,7 @@ Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 ## Invariants
 
-All configurations check the same 30 safety invariants:
+All configurations check the same 31 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -348,6 +355,7 @@ All configurations check the same 30 safety invariants:
 | `NoOrphanedMergedRegion` | MERGING_NEW regions always have an ASSIGN procedure |
 | `MergeCompleteness` | After merge completes (targets MERGED + NoRange), parentProc is cleared |
 | `MergeAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), merged region not materialized |
+| `TableLockExclusivity` | No two regions of the same table can simultaneously hold exclusive-type parent procedures (CREATE, DELETE, TRUNCATE) |
 
 ## Liveness Properties
 
@@ -380,16 +388,16 @@ All configurations check the same 30 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-13 |
-| **TLC version** | 2026.03.12.002851 |
+| **Date** | 2026-03-14 |
+| **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused, split only) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 31 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 1,328,348,760 |
 | **States checked** | 368,662,744 distinct |
 | **Depth** | 92 |
-| **Duration** | ~64 min |
+| **Duration** | ~71 min |
 
 ### 9r/3s Simulation
 
@@ -400,7 +408,7 @@ All configurations check the same 30 safety invariants:
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
 | **Mode** | Random Simulation (seed -2625496395084300664) |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 30 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 31 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 1,297,736,623 |
 | **Duration** | 8 hours |
 

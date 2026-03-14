@@ -291,6 +291,17 @@ VARIABLE regionKeyRange
 \*         state machines (MasterProcedure.proto).
 VARIABLE parentProc
 
+\* regionTable[r] is the table identifier that region r belongs to,
+\* or NoTable if the region identifier is not currently in use.
+\* DeployedRegions belong to the initial table (T1) at startup;
+\* unused identifiers start as NoTable.  Split daughters inherit
+\* the parent's table; merge merged-regions inherit the targets'
+\* table.  regionTable is durable (reconstructable from meta) and
+\* survives master crash.
+\*
+\* Source: RegionInfo.getTable() — each region knows its table.
+VARIABLE regionTable
+
 vars ==
   << regionState,
      metaTable,
@@ -310,7 +321,8 @@ vars ==
      suspendedOnMeta,
      blockedOnMeta,
      regionKeyRange,
-     parentProc
+     parentProc,
+     regionTable
   >>
 
 ---------------------------------------------------------------------------
@@ -337,6 +349,28 @@ Adjacent(r1, r2) ==
 
 \* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
+
+\* NoTableExclusiveLock(r) is TRUE when no exclusive-type parent
+\* procedure (CREATE, DELETE, TRUNCATE) is active on any region
+\* of the same table as region r.  Used as a guard on SplitPrepare
+\* and MergePrepare to prevent split/merge from firing while a
+\* table-level exclusive operation is in progress.
+\*
+\* Source: TableLockManager exclusive lock in CreateTableProcedure,
+\*         DeleteTableProcedure, TruncateTableProcedure.
+NoTableExclusiveLock(r) ==
+  LET t == regionTable[r]
+  IN t # NoTable =>
+        ~\E r2 \in Regions: /\ regionTable[r2] = t
+                            /\ parentProc[r2].type \in TableExclusiveType
+
+\* TableLockFree(t) is TRUE when no parentProc of any type is active
+\* on any region of table t.  For future use by table-level procedures
+\* (CreateTable, DeleteTable, TruncateTable) as a precondition guard.
+\*
+\* Source: TableLockManager in ProcedureExecutor.
+TableLockFree(t) == ~\E r \in Regions: /\ regionTable[r] = t
+                                       /\ parentProc[r].type # "NONE"
 
 (* Module instantiation *)
 \* Instantiate action modules.  Each sub-module declares its shared
@@ -421,11 +455,13 @@ TypeOK ==
   /\ blockedOnMeta \subseteq Regions
   \* Keyspace range: assigned range or NoRange (unused identifier).
   /\ regionKeyRange \in
-         [Regions
-         ->
-         [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }] \* Parent procedure progress per region.
+           [Regions
+           ->
+           [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }] \* Parent procedure progress per region.
+         /\
+         parentProc \in [Regions -> ParentProcRecord] \* Table identity per region.
        /\
-       parentProc \in [Regions -> ParentProcRecord]
+       regionTable \in [Regions -> Tables \cup { NoTable }]
 
 ---------------------------------------------------------------------------
 
@@ -1110,6 +1146,33 @@ Symmetry == Permutations(Regions \ DeployedRegions) \union Permutations(Servers)
 SplitMergeConstraint ==
   Cardinality({r \in Regions: parentProc[r] # NoParentProc}) <= 1
 
+\* TableLockExclusivity: at most one exclusive-type parentProc
+\* (CREATE, DELETE, TRUNCATE) active per table, and no exclusive-type
+\* parentProc coexists with SPLIT or MERGE on the same table.
+\*
+\* This invariant is infrastructure for iteration 33+ table-level
+\* procedures.  With Tables = {T1} and no table-level actions in Next,
+\* the invariant is vacuously true (no exclusive-type parentProc can
+\* be created).  It validates the guard predicate framework and will
+\* become non-vacuous when CreateTable/DeleteTable/Truncate actions
+\* are wired into Next.
+\*
+\* Source: TableLockManager in ProcedureExecutor.
+TableLockExclusivity ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      \* At most one exclusive-type parentProc per table.
+      /\ Cardinality({r \in Regions:
+               /\ regionTable[r] = t
+               /\ parentProc[r].type \in TableExclusiveType
+             }) <=
+           1
+      \* No exclusive-type coexists with SPLIT or MERGE on same table.
+      /\ ( \E r \in Regions: /\ regionTable[r] = t
+                             /\ parentProc[r].type \in TableExclusiveType ) =>
+           ~\E r2 \in Regions: /\ regionTable[r2] = t
+                               /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
+
 ---------------------------------------------------------------------------
 
 (* Print configuration at start of TLC run *)
@@ -1120,6 +1183,7 @@ PrintConfig ==
   /\ PrintT(<< "Servers", Servers >>)
   /\ PrintT(<< "Regions", Regions >>)
   /\ PrintT(<< "DeployedRegions", DeployedRegions >>)
+  /\ PrintT(<< "Tables", Tables >>)
   /\ PrintT(<< "MaxKey", MaxKey >>)
   /\ PrintT(<< "MaxRetries", MaxRetries >>)
   /\ PrintT(<< "MaxWorkers", MaxWorkers >>)
@@ -1130,7 +1194,9 @@ PrintConfig ==
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
   /\ PrintT(<< "UseBlockOnMetaWrite", UseBlockOnMetaWrite >>)
   /\ PrintT(<< "UseUnknownServerQuirk", UseUnknownServerQuirk >>)
-  /\ PrintT(<< "UseMasterAbortOnMetaWriteQuirk", UseMasterAbortOnMetaWriteQuirk >>)
+  /\ PrintT(<< "UseMasterAbortOnMetaWriteQuirk",
+          UseMasterAbortOnMetaWriteQuirk
+       >>)
   /\ PrintT(<< "UseStaleStateQuirk", UseStaleStateQuirk >>)
   /\ PrintT("========================================")
 
@@ -1204,6 +1270,12 @@ Init ==
            ]
   \* No parent procedures are in progress.
   /\ parentProc = [r \in Regions |-> NoParentProc]
+  \* Table identity: deployed regions belong to a single table;
+  \* unused identifiers have NoTable.
+  /\ LET t1 == CHOOSE t \in Tables: TRUE
+     IN regionTable =
+           [r \in Regions |-> IF r \in DeployedRegions THEN t1 ELSE NoTable
+           ]
 
 ---------------------------------------------------------------------------
 
@@ -1367,9 +1439,10 @@ MetaEventuallyAssigned ==
 \* Source: TRSP pipeline liveness guarantee.
 OfflineEventuallyOpen ==
   \A r \in Regions:
-    ( RegionExists(r) /\ regionState[r].state = "OFFLINE"
-      /\ regionState[r].procType = "ASSIGN" ) ~>
-    regionState[r].state = "OPEN"
+    ( RegionExists(r) /\ regionState[r].state = "OFFLINE" /\
+          regionState[r].procType = "ASSIGN"
+      ) ~>
+      regionState[r].state = "OPEN"
 
 \* Liveness: once an SCP starts for a crashed server, it eventually
 \* completes.  All SCP steps have WF and the SCP state machine is
@@ -1378,7 +1451,7 @@ OfflineEventuallyOpen ==
 \* Source: SCP state machine (GET_REGIONS -> FENCE_WALS -> ASSIGN -> DONE).
 SCPEventuallyDone ==
   \A s \in Servers:
-    scpState[s] \notin {"NONE", "DONE"} ~> scpState[s] = "DONE"
+    scpState[s] \notin { "NONE", "DONE" } ~> scpState[s] = "DONE"
 
 ---------------------------------------------------------------------------
 
@@ -1466,6 +1539,9 @@ SCPEventuallyDone ==
 
 \* Safety: pre-PONR merged region not materialized.
         THEOREM Spec => []MergeAtomicity
+
+\* Safety: table-level exclusive lock mutual exclusion.
+        THEOREM Spec => []TableLockExclusivity
 
 \* Liveness: ASSIGN-bearing OFFLINE region eventually opens.
         THEOREM Spec => OfflineEventuallyOpen

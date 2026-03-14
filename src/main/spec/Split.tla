@@ -54,7 +54,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -79,6 +80,15 @@ RegionExists(r) == regionKeyRange[r] # NoRange
 
 \* Helper: does region r have an active parent procedure?
 HasActiveParent(r) == parentProc[r].type # "NONE"
+
+\* Helper: no exclusive-type parent procedure active on any region
+\* of the same table as r.
+NoTableExclusiveLock(r) ==
+  LET t == regionTable[r]
+  IN t # NoTable =>
+       ~ \E r2 \in Regions:
+            /\ regionTable[r2] = t
+            /\ parentProc[r2].type \in TableExclusiveType
 
 \* Helper: is meta available? (no server carrying meta is crashed)
 MetaIsAvailable ==
@@ -123,6 +133,8 @@ SplitPrepare(r) ==
   /\ regionKeyRange[r].endKey - regionKeyRange[r].startKey >= 2
   \* At least 2 unused identifiers available for daughters.
   /\ Cardinality({d \in Regions: regionKeyRange[d] = NoRange}) >= 2
+  \* No table-level exclusive lock on this region's table.
+  /\ NoTableExclusiveLock(r)
   \* Transition parent to SPLITTING and spawn child UNASSIGN TRSP.
   /\ regionState' =
        [regionState EXCEPT
@@ -159,6 +171,7 @@ SplitPrepare(r) ==
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 
@@ -207,6 +220,7 @@ SplitResumeAfterClose(r) ==
         peVars,
         metaTable,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 
@@ -312,6 +326,9 @@ SplitUpdateMeta(r, dA, dB) ==
   /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN",
                                       ![r].ref1 = dA,
                                       ![r].ref2 = dB]
+  \* Daughters inherit parent's table.
+  /\ regionTable' = [regionTable EXCEPT ![dA] = regionTable[r],
+                                        ![dB] = regionTable[r]]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -373,6 +390,8 @@ SplitDone(r) ==
   /\ procStore' = [procStore EXCEPT ![r] = NoProcedure]
   \* Clear parent procedure.
   /\ parentProc' = [parentProc EXCEPT ![r] = NoParentProc]
+  \* Parent releases its table identity (region "deleted").
+  /\ regionTable' = [regionTable EXCEPT ![r] = NoTable]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -453,6 +472,7 @@ SplitFail(r) ==
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 

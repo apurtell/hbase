@@ -52,7 +52,8 @@ VARIABLE regionState,
          suspendedOnMeta,
          blockedOnMeta,
          regionKeyRange,
-         parentProc
+         parentProc,
+         regionTable
 ```
 
 ### Variable Shorthands
@@ -93,6 +94,17 @@ Does region `r` have an active parent procedure?
 
 ```tla
 HasActiveParent(r) == parentProc[r].type # "NONE"
+```
+
+No exclusive-type parent procedure (`CREATE`, `DELETE`, `TRUNCATE`) active on any region of the same table as `r`.
+
+```tla
+NoTableExclusiveLock(r) ==
+  LET t == regionTable[r]
+  IN t # NoTable =>
+       ~ \E r2 \in Regions:
+            /\ regionTable[r2] = t
+            /\ parentProc[r2].type \in TableExclusiveType
 ```
 
 Are two regions adjacent (`r1`'s `endKey` = `r2`'s `startKey`)?
@@ -190,6 +202,12 @@ Regions must be adjacent. All three identifiers must be distinct.
   /\ ~HasActiveParent(m)
 ```
 
+No table-level exclusive lock on this pair's table.
+
+```tla
+  /\ NoTableExclusiveLock(r1)
+```
+
 Transition both targets to `MERGING` and spawn child `UNASSIGN` TRSPs.
 
 ```tla
@@ -246,6 +264,7 @@ Everything else unchanged.
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 ```
@@ -324,6 +343,7 @@ Advance r1 to `PONR`.
         peVars,
         metaTable,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 ```
@@ -418,6 +438,12 @@ Parent advances to `SPAWNED_OPEN` (yielding to merged `ASSIGN`).
 
 ```tla
   /\ parentProc' = [parentProc EXCEPT ![r1].step = "SPAWNED_OPEN"]
+```
+
+Merged region inherits the targets' table identity.
+
+```tla
+  /\ regionTable' = [regionTable EXCEPT ![m] = regionTable[r1]]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -474,6 +500,12 @@ Clear parent procedure on both targets.
        [parentProc EXCEPT
        ![r1] = NoParentProc,
        ![parentProc[r1].ref1] = NoParentProc]
+```
+
+Targets release their table identities (regions "deleted").
+
+```tla
+  /\ regionTable' = [regionTable EXCEPT ![r1] = NoTable, ![r2] = NoTable]
 ```
 
 `regionState` unchanged (targets already `MERGED`, m already `OPEN`).
@@ -598,6 +630,7 @@ Everything else unchanged.
         masterVars,
         peVars,
         regionKeyRange,
+        regionTable,
         zkNode
      >>
 ```
