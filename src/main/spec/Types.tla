@@ -90,6 +90,12 @@ ASSUME UseCreate \in BOOLEAN
 CONSTANTS UseDelete
 ASSUME UseDelete \in BOOLEAN
 
+\* UseTruncate: when TRUE, TruncateTable actions are enabled in Next and Fairness.
+\* Setting FALSE disables TruncateTable in exhaustive mode.
+\* Setting TRUE enables TruncateTable in simulation mode.
+CONSTANTS UseTruncate
+ASSUME UseTruncate \in BOOLEAN
+
 \* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
 \* enabled, modeling AssignRegionHandler.process() L107-115 where the
 \* RS silently drops OPEN requests for already-online regions without

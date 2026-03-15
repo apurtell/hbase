@@ -946,109 +946,47 @@ distinct, 1,328,348,760 generated, depth 92, ~64min, clean.
 
 #### Iteration 32 — Table identity infrastructure and exclusive table lock guards ✅ COMPLETE
 
-Per-region table identity tracking and exclusive table-level lock guard
-predicates — infrastructure only, no new table-level procedures.  Added
-`Tables` constant, `NoTable` sentinel, extended `ParentProcType` with
-`{"CREATE","DELETE","TRUNCATE"}`, and `TableExclusiveType` set (Types.tla).
-New 20th variable `regionTable ∈ [Regions → Tables ∪ {NoTable}]`
-(AssignmentManager.tla): `Init` maps `DeployedRegions → T1`, unused `→
-NoTable`; `TypeOK` type assertion; guard predicates `NoTableExclusiveLock(r)`
-and `TableLockFree(t)`; new invariant `TableLockExclusivity` (at most one
-exclusive-type `parentProc` per table, no coexistence with SPLIT/MERGE).
-Split.tla: `SplitPrepare` guarded by `NoTableExclusiveLock`,
-`SplitUpdateMeta` daughters inherit parent table, `SplitDone` clears parent
-to `NoTable`.  Merge.tla: `MergePrepare` guarded by `NoTableExclusiveLock`,
-`MergeUpdateMeta` merged region inherits table, `MergeDone` clears targets
-to `NoTable`.  All other modules: `regionTable` in VARIABLE blocks and
-UNCHANGED clauses (including expanded clauses in `DispatchFail`/
-`DispatchFailClose` disjunct 2, `RSRestart`, `MasterCrash`, `SCPAssignRegion`
-meta-blocking).  Configs: `Tables = {T1}`, `NoTable` model value,
-`TableLockExclusivity` invariant (31st).  TLC 3r/2s: 368,662,744 distinct,
-1,328,348,760 generated, depth 92, ~71min, clean.
+Per-region table identity tracking and exclusive table-level lock guards —
+infrastructure for table-level procedures.  Added `Tables`, `NoTable`,
+`TableExclusiveType = {"CREATE","DELETE","TRUNCATE"}` (Types.tla).  New
+20th variable `regionTable ∈ [Regions → Tables ∪ {NoTable}]`; guard
+predicates `NoTableExclusiveLock(r)`, `TableLockFree(t)`; invariant
+`TableLockExclusivity` (31st).  Split/Merge: `NoTableExclusiveLock` guard
+on Prepare, daughters/merged inherit table, Done clears to `NoTable`.
+All modules: `regionTable` in VARIABLE/UNCHANGED.  TLC 3r/2s: 368,662,744
+distinct, 1,328,348,760 generated, depth 92, ~71min, clean.
 
 #### Iteration 33 — CreateTableProcedure ✅ COMPLETE
 
-First table-level procedure, exercising Iter 32 infrastructure.  Source:
-`CreateTableProcedure.java` (`PRE_OPERATION → … → POST_OPERATION`);
-filesystem/descriptor/coprocessor operations abstracted.  New module
-`Create.tla` with 2 actions: `CreateTablePrepare(t, r)` — picks one unused
-region identifier `r` (`NoRange`/`NoTable`), assigns keyspace `[0, MaxKey)`,
-sets `regionTable[r] = t`, writes `metaTable` as `CLOSED`/`NoServer`, spawns
-child ASSIGN TRSP, sets `parentProc = [CREATE, SPAWNED_OPEN]`; guards:
-master alive, PEWorker available, meta available, table not in use
-(`~∃ r2: regionTable[r2] = t`), `TableLockFree(t)`.  `CreateTableDone(t)` —
-clears `parentProc` when all CREATE-bearing regions of table `t` are OPEN
-with `procType = "NONE"`.  `AssignmentManager.tla`: `create == INSTANCE Create`;
-`CreateTablePrepare`/`CreateTableDone` wired into `Next`; WF on
-`CreateTableDone` (no WF on `CreateTablePrepare`); `KeyspaceCoverage` rewritten
-to per-table (for each table `t` with ≥1 live region, live regions of `t` tile
-`[0, MaxKey)`); `TableLockExclusivity` now actively exercised.  Enabled with
-`UseCreate = TRUE`, excercised via simulation only. TLC 3r/2s: 368,662,744
-distinct, 1,328,348,760 generated, depth 92, ~71min, clean.
+First table-level procedure.  Source: `CreateTableProcedure.java`. New
+module `Create.tla`: `CreateTablePrepare(t, r)` picks unused `r`, assigns
+`[0, MaxKey)`, sets `regionTable[r] = t`, writes meta, spawns ASSIGN TRSP,
+`parentProc = [CREATE, SPAWNED_OPEN]`; `CreateTableDone(t)` clears when
+OPEN.  `KeyspaceCoverage` rewritten per-table.  `UseCreate` constant.
+TLC 3r/2s: same counts, clean.
 
 #### Iteration 34 — DeleteTableProcedure ✅ COMPLETE
 
-Second table-level procedure.  Source: `DeleteTableProcedure.java`
-(`PRE_OPERATION → … → POST_OPERATION`); filesystem/descriptor/coprocessor
-operations abstracted; `REMOVE_FROM_META` + `POST_OPERATION` collapsed.
-New module `Delete.tla` with 2 actions: `DeleteTablePrepare(t)` — guards:
-master alive, PEWorker available, meta available, `TableLockFree(t)`, ≥1
-region belongs to `t`, all regions of `t` in `{"CLOSED","OFFLINE"}` with
-`procType = "NONE"` (disabled-table precondition); sets `parentProc =
-[DELETE, COMPLETING]` on every region of `t`; no child TRSPs (regions
-already closed).  `DeleteTableDone(t)` — atomically clears `metaTable`,
-frees identifiers (`regionKeyRange → NoRange`), clears table identity
-(`regionTable → NoTable`), resets `regionState` to initial unused state,
-clears `parentProc`.  `AssignmentManager.tla`: `delete == INSTANCE Delete`;
-`DeleteTablePrepare`/`DeleteTableDone` wired into `Next`; WF on
-`DeleteTableDone` (no WF on `DeleteTablePrepare`); new invariant
-`DeleteTableAtomicity` (if any region of table `t` has
-`parentProc.type = "DELETE"`, then ALL regions of `t` have
-`parentProc.type = "DELETE"`; 32nd invariant).  `Types.tla`: `UseDelete`
-constant added.  Enabled with `UseDelete = TRUE`, exercised by simulation
-only. TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated, depth 92,
-~71min, clean.
+Second table-level procedure.  Source: `DeleteTableProcedure.java`. New
+module `Delete.tla`: `DeleteTablePrepare(t)` locks all regions of disabled
+table `t`, `parentProc = [DELETE, COMPLETING]`; `DeleteTableDone(t)`
+atomically clears meta, frees identifiers, resets state.  No child TRSPs.
+Invariant `DeleteTableAtomicity` (32nd).  `UseDelete` constant.  TLC
+3r/2s: same counts, clean.
 
-#### Iteration 35 — TruncateTableProcedure
+#### Iteration 35 — TruncateTableProcedure ✅ COMPLETE
 
-Model `TruncateTableProcedure` which atomically deletes old regions and
-creates new regions for the same table.  The crash between delete-from-meta
-and create-new-regions is the key bug: old regions deleted but new regions
-not yet created → data loss (all region identifiers for the table are freed
-with no replacements).
-
-Source: `TruncateTableProcedure.java` —
-`PRE_OPERATION → CLEAR_FS_LAYOUT → REMOVE_FROM_META → CREATE_FS_LAYOUT →
-ADD_TO_META → ASSIGN_REGIONS → POST_OPERATION`.  The implementation
-requires a **disabled** table (same precondition as Delete).
-
-Abstracted multi-step state machine:
-`TruncatePrepare → TruncateDeleteMeta → TruncateCreateMeta →
-(child ASSIGN TRSPs) → TruncateDone`
-
-- New module `Truncate.tla` with 4 actions:
-  - `TruncatePrepare(t)`: guard `TableLockFree(t)`, all regions of `t` in
-    `{"CLOSED","OFFLINE"}`, master alive.  Snapshots the table's region set.
-    Sets `parentProc` on all regions for lock protection.
-  - `TruncateDeleteMeta(t)`: deletes old regions from meta, clears old
-    `regionKeyRange → NoRange`, `regionTable → NoTable`.  Old region
-    identifiers freed.  Advances step.
-    **This is the crash-vulnerable point**: if master crashes here, old
-    regions are deleted from meta but new ones don't exist yet.
-  - `TruncateCreateMeta(t)`: picks new unused identifiers, assigns keyspaces
-    tiling `[0, MaxKey)`, sets `regionTable = t`, writes meta, spawns child
-    ASSIGN TRSPs.  Advances step to `"SPAWNED_OPEN"`.
-  - `TruncateDone(t)`: all new regions OPEN.  Clears `parentProc` on all
-    new regions.
-- `Types.tla`: new `UseTruncateCrashQuirk ∈ BOOLEAN` constant.
-  When TRUE, the crash guard between `TruncateDeleteMeta` and
-  `TruncateCreateMeta` is disabled (master crash allowed between these
-  steps, surfacing the data-loss bug).  When FALSE (default), these two
-  steps are made crash-safe.
-- `AssignmentManager.tla`: wire into `Next` and `Fairness`.  New invariants
-  `TruncateAtomicity` and `TruncateRecovery` (after truncate completes,
-  table has regions tiling `[0, MaxKey)`).
-- All 3 configs updated with `UseTruncateCrashQuirk = FALSE`.
+Third table-level procedure.  Source: `TruncateTableProcedure.java`. New
+module `Truncate.tla` with 4 actions: `TruncatePrepare(t)` locks all
+regions of disabled table `t`, `parentProc = [TRUNCATE, COMPLETING]`;
+`TruncateDeleteMeta(t)` frees identifiers, advances to PONR (availability-
+vulnerable point); `TruncateCreateMeta(t, r)` picks unused `r`, assigns
+`[0, MaxKey)`, spawns ASSIGN TRSP, clears floating PONR parentProcs;
+`TruncateDone(t)` clears when OPEN.  Invariants `TruncateAtomicity`,
+`TruncateNoOrphans`; `TruncateRecovery` covered by `KeyspaceCoverage`.
+`UseTruncate` constant.  Proc store durable. Recovery via `parentProc` +
+`MasterRecover`.  TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated,
+depth 92, ~71min, clean.
 
 ---
 

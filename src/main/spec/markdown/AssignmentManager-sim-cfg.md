@@ -104,6 +104,7 @@ SPECIFICATION Spec
 | `UseMerge` | `TRUE` | Merge procedure enabled; exercises interleaved split/merge |
 | `UseCreate` | `TRUE` | CreateTable procedure enabled; exercises table creation |
 | `UseDelete` | `TRUE` | DeleteTable procedure enabled; exercises table deletion |
+| `UseTruncate` | `TRUE` | TruncateTable procedure enabled; exercises table truncation |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
@@ -150,6 +151,8 @@ INVARIANT
     MergeAtomicity
     TableLockExclusivity
     DeleteTableAtomicity
+    TruncateAtomicity
+    TruncateNoOrphans
 ```
 
 ## Action Constraints
