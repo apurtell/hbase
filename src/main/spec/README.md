@@ -242,6 +242,23 @@ and back-pressure mechanisms.
 
 ---
 
+## Developer Guide
+
+If you are an HBase developer planning changes to the AssignmentManager, TRSP,
+SCP, split/merge, or table-level procedures, see **[DEVELOPING.md](DEVELOPING.md)**
+for a step-by-step guide on how to model and verify your changes against this
+specification. The guide covers:
+
+- **End-to-end verification workflow** — from identifying the feature area to
+  running exhaustive and simulation checks
+- **Five common change patterns** — adding a TRSP state, modifying SCP ordering,
+  adding a quirk flag, changing a split/merge step, and adding a new invariant
+- **Invariant reference** — which invariants to prioritize for each kind of change
+- **Module–implementation mapping** — which spec module corresponds to which
+  implementation class
+
+---
+
 This is a formal TLA+ specification of the HBase AssignmentManager, covering the
 region assignment lifecycle: state transitions, persistent metadata, procedure-
 driven operations, RPC dispatch, RegionServer-side behavior, server crash recovery,
