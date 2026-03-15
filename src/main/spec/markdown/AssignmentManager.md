@@ -27,6 +27,7 @@ Action logic is factored into sub-modules:
 | **ZK**           | ZooKeeper ephemeral-node lifecycle (session expiry)                            |
 | **Split**        | `SplitTableRegionProcedure` forward path and rollback                          |
 | **Merge**        | `MergeTableRegionsProcedure` forward path and rollback                         |
+| **Create**       | `CreateTableProcedure` (single-region table creation)                          |
 
 ### Region Assignment Lifecycle
 
@@ -325,6 +326,7 @@ ps == INSTANCE ProcStore
 zk == INSTANCE ZK
 split == INSTANCE Split
 merge == INSTANCE Merge
+create == INSTANCE Create
 ```
 
 ```tla
@@ -1052,25 +1054,30 @@ SCPMonotonicity ==
 
 ### `KeyspaceCoverage`
 
-Every key in `[0, MaxKey)` is covered by exactly one live region. A region covers a key if:
-1. It exists (`regionKeyRange ≠ NoRange`)
-2. The key falls within its range `[startKey, endKey)`
-3. It is not in a terminal split/merge state (`SPLIT`, `MERGED`)
+Per-table keyspace integrity. For each table `t` that has at least one live region (not in terminal `SPLIT`/`MERGED` state), every key in `[0, MaxKey)` is covered by exactly one live region of that table.
+
+With multiple tables (e.g., `T1` pre-existing, `T2` created by `CreateTableProcedure`), each table independently tiles `[0, MaxKey)`. Tables with no live regions (e.g., `T2` before `CreateTablePrepare`) are not checked.
 
 `SPLITTING_NEW` and `MERGING_NEW` regions **are** counted as covering their keyspaces — they have been materialized at PONR and will become `OPEN` when their child TRSP completes.
 
-During a split: the parent's keyspace is preserved until `SplitDone` clears it to `NoRange`. At PONR, the parent transitions to `SPLIT` state (excluded from coverage), and daughters are materialized in `SPLITTING_NEW` (included in coverage). So coverage is maintained across the PONR boundary.
+During a split: the parent transitions to `SPLIT` (excluded), and daughters are materialized in `SPLITTING_NEW` (included). Coverage is maintained across the PONR boundary. `SplitDone` clears the parent's keyspace to `NoRange` and table to `NoTable`.
 
 ```tla
 KeyspaceCoverage ==
-  \A k \in 0 .. ( MaxKey - 1 ):
-    Cardinality({r \in Regions:
-          /\ RegionExists(r)
-          /\ regionKeyRange[r].startKey <= k
-          /\ k < regionKeyRange[r].endKey
-          /\ regionState[r].state \notin { "SPLIT", "MERGED" }
-        }) =
-      1
+  \A t \in Tables:
+    (\E r \in Regions:
+       /\ regionTable[r] = t
+       /\ RegionExists(r)
+       /\ regionState[r].state \notin { "SPLIT", "MERGED" }) =>
+    \A k \in 0 .. ( MaxKey - 1 ):
+      Cardinality({r \in Regions:
+            /\ regionTable[r] = t
+            /\ RegionExists(r)
+            /\ regionKeyRange[r].startKey <= k
+            /\ k < regionKeyRange[r].endKey
+            /\ regionState[r].state \notin { "SPLIT", "MERGED" }
+          }) =
+        1
 ```
 
 ### `SplitMergeMutualExclusion`
@@ -1197,7 +1204,7 @@ SplitMergeConstraint ==
 
 ### `TableLockExclusivity`
 
-At most one exclusive-type `parentProc` (`CREATE`, `DELETE`, `TRUNCATE`) active per table, and no exclusive-type `parentProc` coexists with `SPLIT` or `MERGE` on the same table. This invariant is infrastructure for iteration 33+ table-level procedures. With `Tables = {T1}` and no table-level actions in `Next`, the invariant is vacuously true (no exclusive-type `parentProc` can be created). It validates the guard predicate framework and will become non-vacuous when `CreateTable`/`DeleteTable`/`Truncate` actions are wired into `Next`.
+At most one exclusive-type `parentProc` (`CREATE`, `DELETE`, `TRUNCATE`) active per table, and no exclusive-type `parentProc` coexists with `SPLIT` or `MERGE` on the same table. With `CreateTablePrepare` wired into `Next`, this invariant is now actively exercised: `CreateTablePrepare` sets `parentProc.type = "CREATE"` on the newly created region, and the invariant verifies that no concurrent split/merge operates on the same table.
 
 > *Source:* `TableLockManager` in `ProcedureExecutor`.
 
@@ -1240,6 +1247,7 @@ PrintConfig ==
   /\ PrintT(<< "MaxWorkers", MaxWorkers >>)
   /\ PrintT(<< "UseReopen", UseReopen >>)
   /\ PrintT(<< "UseMerge", UseMerge >>)
+  /\ PrintT(<< "UseCreate", UseCreate >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1551,6 +1559,14 @@ Next ==
   \/ (UseMerge /\ \E r \in Regions: merge!MergeFail(r))
 ```
 
+**CreateTable forward path** (gated on `UseCreate`; no WF on `CreateTablePrepare`)
+
+```tla
+  \* -- CreateTable forward path (gated on UseCreate) --
+  \/ ( UseCreate /\ \E t \in Tables: \E r \in Regions: create!CreateTablePrepare(t, r) )
+  \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1656,6 +1672,13 @@ No fairness on `MasterCrash` (non-deterministic environmental event). No fairnes
   /\ ( UseMerge => \A r \in Regions: WF_vars(merge!MergeCheckClosed(r)) )
   /\ ( UseMerge => \A r \in Regions: WF_vars(merge!MergeUpdateMeta(r)) )
   /\ ( UseMerge => \A r \in Regions: WF_vars(merge!MergeDone(r)) )
+```
+
+**CreateTable completion** (deterministic; gated on `UseCreate`; no WF on `CreateTablePrepare`)
+
+```tla
+  \* CreateTable completion (deterministic; gated on UseCreate; no WF on CreateTablePrepare)
+  /\ ( UseCreate => \A t \in Tables: WF_vars(create!CreateTableDone(t)) )
 ```
 
 ```tla
