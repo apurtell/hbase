@@ -966,42 +966,26 @@ meta-blocking).  Configs: `Tables = {T1}`, `NoTable` model value,
 `TableLockExclusivity` invariant (31st).  TLC 3r/2s: 368,662,744 distinct,
 1,328,348,760 generated, depth 92, ~71min, clean.
 
-#### Iteration 33 — CreateTableProcedure
+#### Iteration 33 — CreateTableProcedure ✅ COMPLETE
 
-Model `CreateTableProcedure` which creates new regions for a new table,
-consuming free region identifiers from the pool and assigning keyspaces.
-
-Source: `CreateTableProcedure.java` —
-`PRE_OPERATION → WRITE_FS_LAYOUT → ADD_TO_META → ASSIGN_REGIONS →
-UPDATE_DESC_CACHE → POST_OPERATION`.  Filesystem and descriptor operations
-abstracted.
-
-Abstracted model state machine:
-`CreateTablePrepare → (child ASSIGN TRSPs execute) → CreateTableDone`
-
-- New module `CreateTable.tla` with 2 actions:
-  - `CreateTablePrepare(t)`: non-deterministically picks N unused region
-    identifiers (N ≥ 1, ≤ available count), tiles `[0, MaxKey)` across them,
-    sets `regionTable = t`, writes `metaTable` as `CLOSED`/`NoServer`, spawns
-    child ASSIGN TRSPs (`procType = "ASSIGN"`), sets
-    `parentProc[r] = [type |-> "CREATE", step |-> "SPAWNED_OPEN", ...]` on
-    each created region.  Guard: `t` not in use
-    (`~ ∃ r: regionTable[r] = t`), unused identifiers available, master alive,
-    PEWorker available.
-  - `CreateTableDone(t)`: all regions of table `t` are OPEN with
-    `procType = "NONE"`.  Clears `parentProc` on all regions of the table.
-    Guard: master alive, PEWorker available, all regions OPEN and unattached.
-- `Types.tla`: `ParentProcType` already includes `"CREATE"` from Iter 32;
-  reuse `"SPAWNED_OPEN"` from `ParentProcStep`.
-- `AssignmentManager.tla`: wire `CreateTablePrepare`, `CreateTableDone` into
-  `Next` and `Fairness`.  New invariant `CreateTableCompleteness` — if
-  `parentProc[r].type = "CREATE"` and step = `"SPAWNED_OPEN"`, all same-table
-  regions must also have `parentProc.type = "CREATE"` (table-level atomicity).
-  `KeyspaceCoverage` invariant extended to per-table: for each table `t` with
-  existing regions, deployed regions of `t` tile `[0, MaxKey)`.
-- Configs: `Tables = {T1, T2}`, regions expanded (e.g., 5r/2s primary:
-  2 deployed for T1, 3 unused for split daughters or T2 creation).
-  `SplitMergeConstraint` extended to limit concurrent table-level ops.
+First table-level procedure, exercising Iter 32 infrastructure.  Source:
+`CreateTableProcedure.java` (`PRE_OPERATION → … → POST_OPERATION`);
+filesystem/descriptor/coprocessor operations abstracted.  New module
+`Create.tla` with 2 actions: `CreateTablePrepare(t, r)` — picks one unused
+region identifier `r` (`NoRange`/`NoTable`), assigns keyspace `[0, MaxKey)`,
+sets `regionTable[r] = t`, writes `metaTable` as `CLOSED`/`NoServer`, spawns
+child ASSIGN TRSP, sets `parentProc = [CREATE, SPAWNED_OPEN]`; guards:
+master alive, PEWorker available, meta available, table not in use
+(`~∃ r2: regionTable[r2] = t`), `TableLockFree(t)`.  `CreateTableDone(t)` —
+clears `parentProc` when all CREATE-bearing regions of table `t` are OPEN
+with `procType = "NONE"`.  `AssignmentManager.tla`: `create == INSTANCE Create`;
+`CreateTablePrepare`/`CreateTableDone` wired into `Next`; WF on
+`CreateTableDone` (no WF on `CreateTablePrepare`); `KeyspaceCoverage` rewritten
+to per-table (for each table `t` with ≥1 live region, live regions of `t` tile
+`[0, MaxKey)`); `TableLockExclusivity` now actively exercised.  Configs:
+primary 3r/2s (`Tables = {T1}`, exhaustive on core TRSP/SCP/split/crash;
+CreateTable exercised via simulation only.  TLC 3r/2s: 368,662,744
+distinct, 1,328,348,760 generated, depth 92, ~71min, clean.
 
 #### Iteration 34 — DeleteTableProcedure
 
