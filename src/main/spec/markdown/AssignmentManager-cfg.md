@@ -37,14 +37,15 @@ SPECIFICATION Spec
 | `NoRegion` | model value | Sentinel: no region reference |
 | `NoTable` | model value | Sentinel: no table assigned |
 | `Servers` | `{s1, s2}` | Finite set of RegionServer identifiers |
-| `Regions` | `{r1, r2, r3}` | All region identifiers (1 deployed + 2 spare for split) |
+| `Regions` | `{r1, r2, r3}` | All region identifiers (1 deployed + 2 spare for split or create) |
 | `DeployedRegions` | `{r1}` | Regions that exist at system start |
-| `Tables` | `{T1}` | Finite set of table identifiers |
+| `Tables` | `{T1}` | Finite set of table identifiers; T2 exercised in simulation |
 | `MaxKey` | `2` | Upper bound of keyspace: keys range over `0..(MaxKey-1)` |
 | `MaxRetries` | `1` | Maximum open-retry count per procedure |
 | `MaxWorkers` | `2` | ProcedureExecutor worker-thread pool size |
 | `UseReopen` | `FALSE` | REOPEN procedure (branch-2) disabled for state-space reasons |
 | `UseMerge` | `FALSE` | Merge procedure disabled in exhaustive mode |
+| `UseCreate` | `FALSE` | CreateTable procedure disabled in exhaustive mode |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |

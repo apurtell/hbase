@@ -17,6 +17,7 @@
  *   - ZK:             ZooKeeper ephemeral-node lifecycle (session expiry)
  *   - Split:          SplitTableRegionProcedure forward path and rollback
  *   - Merge:          MergeTableRegionsProcedure forward path and rollback
+ *   - Create:         CreateTableProcedure (single-region table creation)
  *
  * Models the region assignment lifecycle: state transitions, persistent
  * metadata, procedure-driven operations, RPC dispatch, RegionServer-side
@@ -386,6 +387,7 @@ ps == INSTANCE ProcStore
 zk == INSTANCE ZK
 split == INSTANCE Split
 merge == INSTANCE Merge
+create == INSTANCE Create
 
 ---------------------------------------------------------------------------
 
@@ -1016,30 +1018,39 @@ SCPMonotonicity ==
           }
 
 
-\* KeyspaceCoverage: every key in [0, MaxKey) is covered by exactly
-\* one live region.  A region covers a key if:
-\*   1. It exists (regionKeyRange # NoRange)
-\*   2. The key falls within its range [startKey, endKey)
-\*   3. It is not in a terminal split/merge state (SPLIT, MERGED)
+\* KeyspaceCoverage: per-table keyspace integrity.  For each table t
+\* that has at least one live region (not in terminal SPLIT/MERGED
+\* state), every key in [0, MaxKey) is covered by exactly one live
+\* region of that table.
+\*
+\* With multiple tables (e.g., T1 pre-existing, T2 created by
+\* CreateTableProcedure), each table independently tiles [0, MaxKey).
+\* Tables with no live regions (e.g., T2 before CreateTablePrepare)
+\* are not checked.
 \*
 \* SPLITTING_NEW and MERGING_NEW regions ARE counted as covering
 \* their keyspaces -- they have been materialized at PONR and will
 \* become OPEN when their child TRSP completes.
 \*
-\* During a split: the parent's keyspace is preserved until SplitDone
-\* clears it to NoRange.  At PONR, the parent transitions to SPLIT
-\* state (excluded from coverage), and daughters are materialized in
-\* SPLITTING_NEW (included in coverage).  So coverage is maintained
-\* across the PONR boundary.
+\* During a split: the parent transitions to SPLIT (excluded), and
+\* daughters are materialized in SPLITTING_NEW (included).  Coverage
+\* is maintained across the PONR boundary.  SplitDone clears the
+\* parent's keyspace to NoRange and table to NoTable.
 KeyspaceCoverage ==
-  \A k \in 0 .. ( MaxKey - 1 ):
-    Cardinality({r \in Regions:
-          /\ RegionExists(r)
-          /\ regionKeyRange[r].startKey <= k
-          /\ k < regionKeyRange[r].endKey
-          /\ regionState[r].state \notin { "SPLIT", "MERGED" }
-        }) =
-      1
+  \A t \in Tables:
+    (\E r \in Regions:
+       /\ regionTable[r] = t
+       /\ RegionExists(r)
+       /\ regionState[r].state \notin { "SPLIT", "MERGED" }) =>
+    \A k \in 0 .. ( MaxKey - 1 ):
+      Cardinality({r \in Regions:
+            /\ regionTable[r] = t
+            /\ RegionExists(r)
+            /\ regionKeyRange[r].startKey <= k
+            /\ k < regionKeyRange[r].endKey
+            /\ regionState[r].state \notin { "SPLIT", "MERGED" }
+          }) =
+        1
 
 \* SplitMergeMutualExclusion: per-region mutual exclusion.
 \*   1. A daughter region (SPLITTING_NEW) cannot be a parent
@@ -1173,6 +1184,7 @@ TableLockExclusivity ==
            ~\E r2 \in Regions: /\ regionTable[r2] = t
                                /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
 
+
 ---------------------------------------------------------------------------
 
 (* Print configuration at start of TLC run *)
@@ -1189,6 +1201,7 @@ PrintConfig ==
   /\ PrintT(<< "MaxWorkers", MaxWorkers >>)
   /\ PrintT(<< "UseReopen", UseReopen >>)
   /\ PrintT(<< "UseMerge", UseMerge >>)
+  /\ PrintT(<< "UseCreate", UseCreate >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1346,6 +1359,9 @@ Next ==
   \/ ( UseMerge /\ \E r1 \in Regions: merge!MergeUpdateMeta(r1) )
   \/ ( UseMerge /\ \E r1 \in Regions: merge!MergeDone(r1) )
   \/ ( UseMerge /\ \E r1 \in Regions: merge!MergeFail(r1) )
+  \* -- CreateTable forward path (gated on UseCreate) --
+  \/ ( UseCreate /\ \E t \in Tables: \E r \in Regions: create!CreateTablePrepare(t, r) )
+  \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
 
 ---------------------------------------------------------------------------
 
@@ -1411,6 +1427,8 @@ Fairness ==
   /\ ( UseMerge => \A r1 \in Regions: WF_vars(merge!MergeCheckClosed(r1)) )
   /\ ( UseMerge => \A r1 \in Regions: WF_vars(merge!MergeUpdateMeta(r1)) )
   /\ ( UseMerge => \A r1 \in Regions: WF_vars(merge!MergeDone(r1)) )
+  \* CreateTable completion (deterministic; gated on UseCreate; no WF on CreateTablePrepare)
+  /\ ( UseCreate => \A t \in Tables: WF_vars(create!CreateTableDone(t)) )
 
 ---------------------------------------------------------------------------
 
@@ -1542,6 +1560,7 @@ SCPEventuallyDone ==
 
 \* Safety: table-level exclusive lock mutual exclusion.
         THEOREM Spec => []TableLockExclusivity
+
 
 \* Liveness: ASSIGN-bearing OFFLINE region eventually opens.
         THEOREM Spec => OfflineEventuallyOpen

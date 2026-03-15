@@ -96,12 +96,13 @@ SPECIFICATION Spec
 | `Servers` | `{s1, s2, s3}` | Finite set of RegionServer identifiers |
 | `Regions` | `{r1, r2, r3, r4, r5, r6, r7, r8, r9}` | All region identifiers (3 deployed + 6 spare for split/merge) |
 | `DeployedRegions` | `{r1, r2, r3}` | Regions that exist at system start; tile `[0, 12)` with width 4 |
-| `Tables` | `{T1}` | Finite set of table identifiers |
+| `Tables` | `{T1, T2}` | Finite set of table identifiers; T2 available for CreateTable |
 | `MaxKey` | `12` | Upper bound of keyspace: keys range over `0..(MaxKey-1)` |
 | `MaxRetries` | `2` | Maximum open-retry count (deeper than exhaustive's 1) |
 | `MaxWorkers` | `3` | ProcedureExecutor worker-thread pool size (realistic for 3 servers) |
 | `UseReopen` | `TRUE` | REOPEN procedure (branch-2) enabled in simulation |
 | `UseMerge` | `TRUE` | Merge procedure enabled; exercises interleaved split/merge |
+| `UseCreate` | `TRUE` | CreateTable procedure enabled; exercises table creation |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |

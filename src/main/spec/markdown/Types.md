@@ -118,6 +118,13 @@ CONSTANTS UseMerge
 ASSUME UseMerge \in BOOLEAN
 ```
 
+`UseCreate` — when `TRUE`, CreateTable actions are enabled in `Next` and `Fairness`. Setting `FALSE` disables CreateTable in exhaustive mode (where `Tables = {T1}` already makes it vacuous). Setting `TRUE` enables CreateTable in simulation mode (with `Tables = {T1, T2}`).
+
+```tla
+CONSTANTS UseCreate
+ASSUME UseCreate \in BOOLEAN
+```
+
 `UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling `AssignRegionHandler.process()` L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
 
 ```tla
