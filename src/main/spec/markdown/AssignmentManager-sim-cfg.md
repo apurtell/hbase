@@ -103,6 +103,7 @@ SPECIFICATION Spec
 | `UseReopen` | `TRUE` | REOPEN procedure (branch-2) enabled in simulation |
 | `UseMerge` | `TRUE` | Merge procedure enabled; exercises interleaved split/merge |
 | `UseCreate` | `TRUE` | CreateTable procedure enabled; exercises table creation |
+| `UseDelete` | `TRUE` | DeleteTable procedure enabled; exercises table deletion |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
@@ -113,7 +114,7 @@ SPECIFICATION Spec
 
 ## Invariants
 
-All 28 safety invariants are checked:
+All 32 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -148,6 +149,7 @@ INVARIANT
     MergeCompleteness
     MergeAtomicity
     TableLockExclusivity
+    DeleteTableAtomicity
 ```
 
 ## Action Constraints
