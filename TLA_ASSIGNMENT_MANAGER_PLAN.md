@@ -988,6 +988,55 @@ vulnerable point); `TruncateCreateMeta(t, r)` picks unused `r`, assigns
 `MasterRecover`.  TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated,
 depth 92, ~71min, clean.
 
+#### Iteration 36 — Disable/EnableTableProcedure 
+
+Fourth and fifth table-level procedures. Sources: `DisableTableProcedure.java`
+(7-state machine: PREPARE → PRE_OP → SET_DISABLING → MARK_OFFLINE →
+ADD_REPLICATION_BARRIER → SET_DISABLED → POST_OP; spawns
+`CloseTableRegionsProcedure` child to close all regions),
+`EnableTableProcedure.java` (6-state machine: PREPARE → PRE_OP →
+SET_ENABLING → MARK_ONLINE → SET_ENABLED → POST_OP; calls
+`createAssignProcedures()` to open all regions).
+**Abstraction**: Each procedure collapsed to 2 actions (Prepare + Done),
+following the Create/Delete/Truncate pattern. Transitional states
+(DISABLING/ENABLING) modeled implicitly via `parentProc` activity.
+Coprocessor hooks and replication barriers omitted (orthogonal).
+**New variable**: `tableEnabled` — `[Tables → BOOLEAN]`.  `TRUE` = ENABLED,
+`FALSE` = DISABLED.  Per-table boolean tracking table lifecycle.  Persists
+across master crash (part of `TableStateManager`, stored in meta).  21st
+state variable.
+**New modules**: `Disable.tla`, `Enable.tla`.
+**Disable actions**:
+- `DisableTablePrepare(t)` — guards: master alive, PEWorker, meta available,
+  `tableEnabled[t] = TRUE`, `TableLockFree(t)`, all regions OPEN with no proc.
+  Sets `parentProc = [DISABLE, SPAWNED_CLOSE]` for all regions, spawns UNASSIGN
+  TRSPs, sets `tableEnabled[t] = FALSE`.
+- `DisableTableDone(t)` — guards: all regions of `t` CLOSED/OFFLINE with no proc.
+  Clears `parentProc`.
+**Enable actions**:
+- `EnableTablePrepare(t)` — guards: master alive, PEWorker, meta available,
+  `tableEnabled[t] = FALSE`, `TableLockFree(t)`, all regions CLOSED/OFFLINE
+  with no proc.  Sets `parentProc = [ENABLE, SPAWNED_OPEN]` for all regions,
+  spawns ASSIGN TRSPs, sets `tableEnabled[t] = TRUE`.
+- `EnableTableDone(t)` — guards: all regions of `t` OPEN with no proc.
+  Clears `parentProc`.
+**Guard update**: `TRSPCreate` gains `tableEnabled[regionTable[r]] = TRUE`
+guard to prevent auto-assigning regions of disabled tables.
+**New safety invariants**:
+- `DisabledTableRegionsStayClosed` (35th) — when `tableEnabled[t] = FALSE`
+  and no ENABLE procedure is active for `t`, all regions must be closed.
+- `EnableDisableMutualExclusion` (36th) — no table can simultaneously have
+  ENABLE and DISABLE parent procedures active.
+- `EnableDisableTableStateConsistency` (37th) — when table is enabled and
+  no exclusive lock is held, at least one region is OPEN.
+**New liveness property**: `RegionEventuallyAssigned` — a region with an
+ASSIGN procedure belonging to an enabled table eventually reaches OPEN.
+Excludes disabled tables (whose regions by design stay closed).  Subsumes
+`OfflineEventuallyOpen` with table-enabled guard.
+**Config**: `UseDisable`/`UseEnable` constants. `FALSE` in exhaustive mode,
+`TRUE` in simulation mode.  Types: `"DISABLE"`/`"ENABLE"` added to
+`ParentProcType` and `TableExclusiveType`.
+
 ---
 
 ## 8. Mapping from Code to TLA+ Actions
