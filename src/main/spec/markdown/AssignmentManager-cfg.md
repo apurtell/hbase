@@ -47,6 +47,7 @@ SPECIFICATION Spec
 | `UseMerge` | `FALSE` | Merge procedure disabled in exhaustive mode |
 | `UseCreate` | `FALSE` | CreateTable procedure disabled in exhaustive mode |
 | `UseDelete` | `FALSE` | DeleteTable procedure disabled in exhaustive mode |
+| `UseTruncate` | `FALSE` | TruncateTable procedure disabled in exhaustive mode |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
@@ -66,7 +67,7 @@ SYMMETRY Symmetry
 
 ## Invariants
 
-All 32 safety invariants are checked:
+All 34 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -102,6 +103,8 @@ INVARIANT
     MergeAtomicity
     TableLockExclusivity
     DeleteTableAtomicity
+    TruncateAtomicity
+    TruncateNoOrphans
 ```
 
 ## Action Constraints

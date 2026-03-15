@@ -29,6 +29,7 @@ Action logic is factored into sub-modules:
 | **Merge**        | `MergeTableRegionsProcedure` forward path and rollback                         |
 | **Create**       | `CreateTableProcedure` (single-region table creation)                          |
 | **Delete**       | `DeleteTableProcedure` (table deletion, identifier freeing)                    |
+| **Truncate**     | `TruncateTableProcedure` (delete old + create new regions)                     |
 
 ### Region Assignment Lifecycle
 
@@ -329,6 +330,7 @@ split == INSTANCE Split
 merge == INSTANCE Merge
 create == INSTANCE Create
 delete == INSTANCE Delete
+truncate == INSTANCE Truncate
 ```
 
 ```tla
@@ -1247,6 +1249,37 @@ DeleteTableAtomicity ==
           regionTable[r2] = t => parentProc[r2].type = "DELETE"
 ```
 
+### `TruncateAtomicity`
+
+If any region of table `t` has `parentProc.type = "TRUNCATE"` and `step = "COMPLETING"`, then ALL regions of that table must also have `parentProc.type = "TRUNCATE"`. The truncate procedure locks the entire table atomically in `TruncatePrepare`; no region of the table can escape the lock.
+
+> *Source:* `TruncateTableProcedure` acquires exclusive table lock for all regions before any state mutation.
+
+```tla
+TruncateAtomicity ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      ( \E r \in Regions: /\ regionTable[r] = t
+                          /\ parentProc[r].type = "TRUNCATE"
+                          /\ parentProc[r].step = "COMPLETING" ) =>
+        \A r2 \in Regions:
+          regionTable[r2] = t => parentProc[r2].type = "TRUNCATE"
+```
+
+### `TruncateNoOrphans`
+
+A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` (child TRSP was spawned by `TruncateCreateMeta`). Same pattern as `NoOrphanedDaughters`.
+
+> *Source:* `TruncateCreateMeta` spawns a child ASSIGN TRSP on the new region.
+
+```tla
+TruncateNoOrphans ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( parentProc[r].type = "TRUNCATE" /\ parentProc[r].step = "SPAWNED_OPEN" ) =>
+        regionState[r].procType = "ASSIGN"
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1271,6 +1304,7 @@ PrintConfig ==
   /\ PrintT(<< "UseMerge", UseMerge >>)
   /\ PrintT(<< "UseCreate", UseCreate >>)
   /\ PrintT(<< "UseDelete", UseDelete >>)
+  /\ PrintT(<< "UseTruncate", UseTruncate >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1598,6 +1632,16 @@ Next ==
   \/ ( UseDelete /\ \E t \in Tables: delete!DeleteTableDone(t) )
 ```
 
+**TruncateTable forward path** (gated on `UseTruncate`; no WF on `TruncatePrepare`)
+
+```tla
+  \* -- TruncateTable forward path (gated on UseTruncate) --
+  \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncatePrepare(t) )
+  \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncateDeleteMeta(t) )
+  \/ ( UseTruncate /\ \E t \in Tables: \E r \in Regions: truncate!TruncateCreateMeta(t, r) )
+  \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncateDone(t) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1717,6 +1761,15 @@ No fairness on `MasterCrash` (non-deterministic environmental event). No fairnes
 ```tla
   \* DeleteTable completion (deterministic; gated on UseDelete; no WF on DeleteTablePrepare)
   /\ ( UseDelete => \A t \in Tables: WF_vars(delete!DeleteTableDone(t)) )
+```
+
+**TruncateTable steps** (deterministic; gated on `UseTruncate`; no WF on `TruncatePrepare`)
+
+```tla
+  \* TruncateTable steps (deterministic; gated on UseTruncate; no WF on TruncatePrepare)
+  /\ ( UseTruncate => \A t \in Tables: WF_vars(truncate!TruncateDeleteMeta(t)) )
+  /\ ( UseTruncate => \A t \in Tables: \A r \in Regions: WF_vars(truncate!TruncateCreateMeta(t, r)) )
+  /\ ( UseTruncate => \A t \in Tables: WF_vars(truncate!TruncateDone(t)) )
 ```
 
 ```tla
@@ -1954,6 +2007,20 @@ Safety: DELETE procedure is all-or-nothing per table.
 ```tla
 \* Safety: DELETE procedure is all-or-nothing per table.
         THEOREM Spec => []DeleteTableAtomicity
+```
+
+Safety: TRUNCATE procedure is all-or-nothing per table (at COMPLETING step).
+
+```tla
+\* Safety: TRUNCATE procedure is all-or-nothing per table (at COMPLETING step).
+        THEOREM Spec => []TruncateAtomicity
+```
+
+Safety: TRUNCATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
+
+```tla
+\* Safety: TRUNCATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
+        THEOREM Spec => []TruncateNoOrphans
 ```
 
 Liveness: ASSIGN-bearing OFFLINE region eventually opens.

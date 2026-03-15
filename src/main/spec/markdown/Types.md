@@ -132,6 +132,13 @@ CONSTANTS UseDelete
 ASSUME UseDelete \in BOOLEAN
 ```
 
+`UseTruncate` — when `TRUE`, TruncateTable actions are enabled in `Next` and `Fairness`. Setting `FALSE` disables TruncateTable in exhaustive mode. Setting `TRUE` enables TruncateTable in simulation mode.
+
+```tla
+CONSTANTS UseTruncate
+ASSUME UseTruncate \in BOOLEAN
+```
+
 `UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling `AssignRegionHandler.process()` L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
 
 ```tla

@@ -53,6 +53,7 @@ Same model values and universe sizing as the primary exhaustive config:
 | `UseMerge` | `FALSE` | Merge procedure disabled in liveness mode |
 | `UseCreate` | `FALSE` | CreateTable procedure disabled in liveness mode |
 | `UseDelete` | `FALSE` | DeleteTable procedure disabled in liveness mode |
+| `UseTruncate` | `FALSE` | TruncateTable procedure disabled in liveness mode |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
@@ -103,6 +104,8 @@ INVARIANT
     MergeAtomicity
     TableLockExclusivity
     DeleteTableAtomicity
+    TruncateAtomicity
+    TruncateNoOrphans
 ```
 
 ## Action Constraints
