@@ -986,41 +986,28 @@ to per-table (for each table `t` with ≥1 live region, live regions of `t` tile
 `UseCreate = TRUE`, excercised via simulation only. TLC 3r/2s: 368,662,744
 distinct, 1,328,348,760 generated, depth 92, ~71min, clean.
 
-#### Iteration 34 — DeleteTableProcedure
+#### Iteration 34 — DeleteTableProcedure ✅ COMPLETE
 
-Model `DeleteTableProcedure` which deletes all regions of a table, freeing
-region identifiers back to the pool.
-
-Source: `DeleteTableProcedure.java` —
-`PRE_OPERATION → CLEAR_FS_LAYOUT → REMOVE_FROM_META → UNASSIGN_REGIONS →
-POST_OPERATION`.  The implementation requires a **disabled** table (all
-regions CLOSED/OFFLINE).  Since Enable/Disable table is not modeled, the
-precondition is that all regions of the table are in `{"CLOSED","OFFLINE"}`
-with `procType = "NONE"`.
-
-Abstracted model state machine:
-`DeleteTablePrepare → DeleteTableRemoveMeta → DeleteTableDone`
-
-- New module `DeleteTable.tla` with 3 actions:
-  - `DeleteTablePrepare(t)`: guard `TableLockFree(t)` (exclusive lock — no
-    `parentProc` active on any region of table `t`), all regions of `t` in
-    `{"CLOSED","OFFLINE"}` with `procType = "NONE"`, master alive.  Sets
-    `parentProc[r] = [type |-> "DELETE", step |-> "DELETE_META", ...]` on
-    every region of the table.  No child TRSPs — regions are already closed.
-  - `DeleteTableRemoveMeta(t)`: atomically clears `metaTable[r]` for all
-    regions of table `t`.  Advances `parentProc` step to `"COMPLETING"`.
-  - `DeleteTableDone(t)`: clears `regionKeyRange[r] = NoRange`,
-    `regionTable[r] = NoTable`, resets `regionState[r]` to initial unused
-    state, clears `parentProc[r] = NoParentProc` for all regions of `t`.
-    Frees identifiers back to the unused pool.
-- `Types.tla`: `ParentProcStep` extended with `"DELETE_META"`.
-- `AssignmentManager.tla`: wire into `Next` and `Fairness`.  New invariant
-  `DeleteTableAtomicity` — if any region of table `t` has
-  `parentProc.type = "DELETE"`, then ALL regions of `t` have
-  `parentProc.type = "DELETE"`.  New invariant `IdentifierConservation` —
-  `|{r: regionKeyRange[r] ≠ NoRange}| + |{r: regionKeyRange[r] = NoRange}|
-  = |Regions|` (identifiers are never created or destroyed, just
-  reallocated).
+Second table-level procedure.  Source: `DeleteTableProcedure.java`
+(`PRE_OPERATION → … → POST_OPERATION`); filesystem/descriptor/coprocessor
+operations abstracted; `REMOVE_FROM_META` + `POST_OPERATION` collapsed.
+New module `Delete.tla` with 2 actions: `DeleteTablePrepare(t)` — guards:
+master alive, PEWorker available, meta available, `TableLockFree(t)`, ≥1
+region belongs to `t`, all regions of `t` in `{"CLOSED","OFFLINE"}` with
+`procType = "NONE"` (disabled-table precondition); sets `parentProc =
+[DELETE, COMPLETING]` on every region of `t`; no child TRSPs (regions
+already closed).  `DeleteTableDone(t)` — atomically clears `metaTable`,
+frees identifiers (`regionKeyRange → NoRange`), clears table identity
+(`regionTable → NoTable`), resets `regionState` to initial unused state,
+clears `parentProc`.  `AssignmentManager.tla`: `delete == INSTANCE Delete`;
+`DeleteTablePrepare`/`DeleteTableDone` wired into `Next`; WF on
+`DeleteTableDone` (no WF on `DeleteTablePrepare`); new invariant
+`DeleteTableAtomicity` (if any region of table `t` has
+`parentProc.type = "DELETE"`, then ALL regions of `t` have
+`parentProc.type = "DELETE"`; 32nd invariant).  `Types.tla`: `UseDelete`
+constant added.  Enabled with `UseDelete = TRUE`, exercised by simulation
+only. TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated, depth 92,
+~71min, clean.
 
 #### Iteration 35 — TruncateTableProcedure
 

@@ -84,6 +84,12 @@ ASSUME UseMerge \in BOOLEAN
 CONSTANTS UseCreate
 ASSUME UseCreate \in BOOLEAN
 
+\* UseDelete: when TRUE, DeleteTable actions are enabled in Next and Fairness.
+\* Setting FALSE disables DeleteTable in exhaustive mode.
+\* Setting TRUE enables DeleteTable in simulation mode.
+CONSTANTS UseDelete
+ASSUME UseDelete \in BOOLEAN
+
 \* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
 \* enabled, modeling AssignRegionHandler.process() L107-115 where the
 \* RS silently drops OPEN requests for already-online regions without
