@@ -28,6 +28,7 @@ Action logic is factored into sub-modules:
 | **Split**        | `SplitTableRegionProcedure` forward path and rollback                          |
 | **Merge**        | `MergeTableRegionsProcedure` forward path and rollback                         |
 | **Create**       | `CreateTableProcedure` (single-region table creation)                          |
+| **Delete**       | `DeleteTableProcedure` (table deletion, identifier freeing)                    |
 
 ### Region Assignment Lifecycle
 
@@ -327,6 +328,7 @@ zk == INSTANCE ZK
 split == INSTANCE Split
 merge == INSTANCE Merge
 create == INSTANCE Create
+delete == INSTANCE Delete
 ```
 
 ```tla
@@ -1204,7 +1206,7 @@ SplitMergeConstraint ==
 
 ### `TableLockExclusivity`
 
-At most one exclusive-type `parentProc` (`CREATE`, `DELETE`, `TRUNCATE`) active per table, and no exclusive-type `parentProc` coexists with `SPLIT` or `MERGE` on the same table. With `CreateTablePrepare` wired into `Next`, this invariant is now actively exercised: `CreateTablePrepare` sets `parentProc.type = "CREATE"` on the newly created region, and the invariant verifies that no concurrent split/merge operates on the same table.
+At most one exclusive type active per table: all exclusive-bearing regions of the same table must agree on the same `parentProc.type`. `CreateTable` sets one region; `DeleteTable`/`TruncateTable` set all regions; the invariant accommodates both patterns. No exclusive-type `parentProc` coexists with `SPLIT` or `MERGE` on the same table.
 
 > *Source:* `TableLockManager` in `ProcedureExecutor`.
 
@@ -1212,17 +1214,37 @@ At most one exclusive-type `parentProc` (`CREATE`, `DELETE`, `TRUNCATE`) active 
 TableLockExclusivity ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      /\ Cardinality({r \in Regions:
-              /\ regionTable[r] = t
-              /\ parentProc[r].type \in TableExclusiveType
-           }) <= 1
-      /\ ( \E r \in Regions:
-              /\ regionTable[r] = t
-              /\ parentProc[r].type \in TableExclusiveType
-         ) =>
-           ~ \E r2 \in Regions:
-                /\ regionTable[r2] = t
-                /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
+      \* At most one exclusive type active per table: all exclusive-bearing
+      \* regions of table t must agree on the same type.  (CreateTable sets
+      \* one region; DeleteTable/TruncateTable set all regions; the invariant
+      \* must accommodate both patterns.)
+      /\ \A r1, r2 \in Regions:
+           ( /\ regionTable[r1] = t
+             /\ regionTable[r2] = t
+             /\ parentProc[r1].type \in TableExclusiveType
+             /\ parentProc[r2].type \in TableExclusiveType
+           ) => parentProc[r1].type = parentProc[r2].type
+      \* No exclusive-type coexists with SPLIT or MERGE on same table.
+      /\ ( \E r \in Regions: /\ regionTable[r] = t
+                             /\ parentProc[r].type \in TableExclusiveType ) =>
+           ~\E r2 \in Regions: /\ regionTable[r2] = t
+                               /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
+```
+
+### `DeleteTableAtomicity`
+
+If any region of table `t` has `parentProc.type = "DELETE"`, then ALL regions of that table must also have `parentProc.type = "DELETE"`. The delete procedure locks the entire table atomically in `DeleteTablePrepare`; no region of the table can escape the lock.
+
+> *Source:* `DeleteTableProcedure` acquires exclusive table lock for all regions before any state mutation.
+
+```tla
+DeleteTableAtomicity ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      ( \E r \in Regions: /\ regionTable[r] = t
+                          /\ parentProc[r].type = "DELETE" ) =>
+        \A r2 \in Regions:
+          regionTable[r2] = t => parentProc[r2].type = "DELETE"
 ```
 
 ```tla
@@ -1248,6 +1270,7 @@ PrintConfig ==
   /\ PrintT(<< "UseReopen", UseReopen >>)
   /\ PrintT(<< "UseMerge", UseMerge >>)
   /\ PrintT(<< "UseCreate", UseCreate >>)
+  /\ PrintT(<< "UseDelete", UseDelete >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1567,6 +1590,14 @@ Next ==
   \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
 ```
 
+**DeleteTable forward path** (gated on `UseDelete`; no WF on `DeleteTablePrepare`)
+
+```tla
+  \* -- DeleteTable forward path (gated on UseDelete) --
+  \/ ( UseDelete /\ \E t \in Tables: delete!DeleteTablePrepare(t) )
+  \/ ( UseDelete /\ \E t \in Tables: delete!DeleteTableDone(t) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1679,6 +1710,13 @@ No fairness on `MasterCrash` (non-deterministic environmental event). No fairnes
 ```tla
   \* CreateTable completion (deterministic; gated on UseCreate; no WF on CreateTablePrepare)
   /\ ( UseCreate => \A t \in Tables: WF_vars(create!CreateTableDone(t)) )
+```
+
+**DeleteTable completion** (deterministic; gated on `UseDelete`; no WF on `DeleteTablePrepare`)
+
+```tla
+  \* DeleteTable completion (deterministic; gated on UseDelete; no WF on DeleteTablePrepare)
+  /\ ( UseDelete => \A t \in Tables: WF_vars(delete!DeleteTableDone(t)) )
 ```
 
 ```tla
@@ -1909,6 +1947,13 @@ Safety: table-level exclusive lock mutual exclusion.
 ```tla
 \* Safety: table-level exclusive lock mutual exclusion.
         THEOREM Spec => []TableLockExclusivity
+```
+
+Safety: DELETE procedure is all-or-nothing per table.
+
+```tla
+\* Safety: DELETE procedure is all-or-nothing per table.
+        THEOREM Spec => []DeleteTableAtomicity
 ```
 
 Liveness: ASSIGN-bearing OFFLINE region eventually opens.

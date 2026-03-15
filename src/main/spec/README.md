@@ -153,8 +153,17 @@ This TLA+ specification models the AssignmentManager as a state machine with
   available, meta available, table not in use, `TableLockFree(t)`.  Gated by
   `UseCreate` constant; disabled in exhaustive mode, enabled in simulation
   mode (`Tables = {T1, T2}`).
+- **DeleteTable procedure** -- `DeleteTableProcedure`
+  modeled with two actions: `DeleteTablePrepare(t)` acquires exclusive table lock
+  on all regions of table `t` (guards: all regions CLOSED/OFFLINE with no active
+  procedure, `TableLockFree(t)`), setting `parentProc = [DELETE, COMPLETING]`.
+  `DeleteTableDone(t)` atomically clears meta, frees identifiers (`regionKeyRange
+  → NoRange`), clears table identity (`regionTable → NoTable`), resets
+  `regionState` to initial unused state, and clears `parentProc`.  No child TRSPs
+  are spawned — regions are already closed.  Gated by `UseDelete` constant;
+  disabled in exhaustive mode, enabled in simulation mode.
 
-The specification defines 31 safety invariants verified at every reachable
+The specification defines 32 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
@@ -166,7 +175,8 @@ merged regions cannot have active parent procedures), `SplitAtomicity`
 server carrying meta), `MergeCompleteness` (completed merge has cleaned-up
 targets), `MergeAtomicity` (pre-PONR, merged region not materialized), and
 `TableLockExclusivity` (exclusive table locks prevent concurrent region ops
-on the same table).
+on the same table), and `DeleteTableAtomicity` (if any region of a table is
+marked for deletion, all regions of that table must also be marked).
 
 Three liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
@@ -237,6 +247,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
 | [Merge.tla](markdown/Merge.md) | Merge procedure forward path and pre-PONR rollback using parent-child framework (MergePrepare, MergeCheckClosed, MergeUpdateMeta, MergeDone, MergeFail) |
 | [Create.tla](markdown/Create.md) | CreateTableProcedure: single-region table creation (CreateTablePrepare, CreateTableDone) |
+| [Delete.tla](markdown/Delete.md) | DeleteTableProcedure: table deletion, identifier freeing (DeleteTablePrepare, DeleteTableDone) |
 | [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, close-not-found, stale report drop) |
 | [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover, DetectUnknownServer) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
@@ -276,6 +287,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
 | `UseMerge` | `TRUE` enables merge actions in `Next`/`Fairness`. `FALSE` (default) keeps exhaustive mode tractable (split-only) |
 | `UseCreate` | `TRUE` enables CreateTable actions in `Next`/`Fairness`. `FALSE` (default) disables CreateTable in exhaustive mode. `TRUE` enables it in simulation mode |
+| `UseDelete` | `TRUE` enables DeleteTable actions in `Next`/`Fairness`. `FALSE` (default) disables DeleteTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
@@ -332,7 +344,7 @@ Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 ## Invariants
 
-All configurations check the same 31 safety invariants:
+All configurations check the same 32 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -367,6 +379,7 @@ All configurations check the same 31 safety invariants:
 | `MergeCompleteness` | After merge completes (targets MERGED + NoRange), parentProc is cleared |
 | `MergeAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), merged region not materialized |
 | `TableLockExclusivity` | No two regions of the same table can simultaneously hold exclusive-type parent procedures (CREATE, DELETE, TRUNCATE) |
+| `DeleteTableAtomicity` | If any region of a table has `parentProc.type = "DELETE"`, then ALL regions of that table must also have `parentProc.type = "DELETE"` |
 
 ## Liveness Properties
 
@@ -414,13 +427,13 @@ All configurations check the same 31 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-13 |
-| **TLC version** | 2026.03.12.002851 |
+| **Date** | 2026-03-15 |
+| **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
-| **Mode** | Random Simulation (seed -2625496395084300664) |
+| **Mode** | Random Simulation (seed -8405536033383709680) |
 | **Workers** | 128 on 128 cores |
 | **Result** | All 31 invariants, 2 action constraints, and state constraint passed |
-| **States generated** | 1,297,736,623 |
+| **States generated** | 1,247,314,282 |
 | **Duration** | 8 hours |
 
 ## Running the Spec

@@ -18,6 +18,7 @@
  *   - Split:          SplitTableRegionProcedure forward path and rollback
  *   - Merge:          MergeTableRegionsProcedure forward path and rollback
  *   - Create:         CreateTableProcedure (single-region table creation)
+ *   - DeleteTable:    DeleteTableProcedure (table deletion, identifier freeing)
  *
  * Models the region assignment lifecycle: state transitions, persistent
  * metadata, procedure-driven operations, RPC dispatch, RegionServer-side
@@ -388,6 +389,7 @@ zk == INSTANCE ZK
 split == INSTANCE Split
 merge == INSTANCE Merge
 create == INSTANCE Create
+delete == INSTANCE Delete
 
 ---------------------------------------------------------------------------
 
@@ -1172,17 +1174,37 @@ SplitMergeConstraint ==
 TableLockExclusivity ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      \* At most one exclusive-type parentProc per table.
-      /\ Cardinality({r \in Regions:
-               /\ regionTable[r] = t
-               /\ parentProc[r].type \in TableExclusiveType
-             }) <=
-           1
+      \* At most one exclusive type active per table: all exclusive-bearing
+      \* regions of table t must agree on the same type.  (CreateTable sets
+      \* one region; DeleteTable/TruncateTable set all regions; the invariant
+      \* must accommodate both patterns.)
+      /\ \A r1, r2 \in Regions:
+           ( /\ regionTable[r1] = t
+             /\ regionTable[r2] = t
+             /\ parentProc[r1].type \in TableExclusiveType
+             /\ parentProc[r2].type \in TableExclusiveType
+           ) => parentProc[r1].type = parentProc[r2].type
       \* No exclusive-type coexists with SPLIT or MERGE on same table.
       /\ ( \E r \in Regions: /\ regionTable[r] = t
                              /\ parentProc[r].type \in TableExclusiveType ) =>
            ~\E r2 \in Regions: /\ regionTable[r2] = t
                                /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
+
+\* DeleteTableAtomicity: if any region of table t has
+\* parentProc.type = "DELETE", then ALL regions of that table must also
+\* have parentProc.type = "DELETE".  The delete procedure locks the
+\* entire table atomically in DeleteTablePrepare; no region of the
+\* table can escape the lock.
+\*
+\* Source: DeleteTableProcedure acquires exclusive table lock for all
+\*         regions before any state mutation.
+DeleteTableAtomicity ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      ( \E r \in Regions: /\ regionTable[r] = t
+                          /\ parentProc[r].type = "DELETE" ) =>
+        \A r2 \in Regions:
+          regionTable[r2] = t => parentProc[r2].type = "DELETE"
 
 
 ---------------------------------------------------------------------------
@@ -1202,6 +1224,7 @@ PrintConfig ==
   /\ PrintT(<< "UseReopen", UseReopen >>)
   /\ PrintT(<< "UseMerge", UseMerge >>)
   /\ PrintT(<< "UseCreate", UseCreate >>)
+  /\ PrintT(<< "UseDelete", UseDelete >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1362,6 +1385,9 @@ Next ==
   \* -- CreateTable forward path (gated on UseCreate) --
   \/ ( UseCreate /\ \E t \in Tables: \E r \in Regions: create!CreateTablePrepare(t, r) )
   \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
+  \* -- DeleteTable forward path (gated on UseDelete) --
+  \/ ( UseDelete /\ \E t \in Tables: delete!DeleteTablePrepare(t) )
+  \/ ( UseDelete /\ \E t \in Tables: delete!DeleteTableDone(t) )
 
 ---------------------------------------------------------------------------
 
@@ -1429,6 +1455,8 @@ Fairness ==
   /\ ( UseMerge => \A r1 \in Regions: WF_vars(merge!MergeDone(r1)) )
   \* CreateTable completion (deterministic; gated on UseCreate; no WF on CreateTablePrepare)
   /\ ( UseCreate => \A t \in Tables: WF_vars(create!CreateTableDone(t)) )
+  \* DeleteTable completion (deterministic; gated on UseDelete; no WF on DeleteTablePrepare)
+  /\ ( UseDelete => \A t \in Tables: WF_vars(delete!DeleteTableDone(t)) )
 
 ---------------------------------------------------------------------------
 
@@ -1560,6 +1588,9 @@ SCPEventuallyDone ==
 
 \* Safety: table-level exclusive lock mutual exclusion.
         THEOREM Spec => []TableLockExclusivity
+
+\* Safety: DELETE procedure is all-or-nothing per table.
+        THEOREM Spec => []DeleteTableAtomicity
 
 
 \* Liveness: ASSIGN-bearing OFFLINE region eventually opens.

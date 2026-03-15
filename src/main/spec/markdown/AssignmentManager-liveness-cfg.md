@@ -52,6 +52,7 @@ Same model values and universe sizing as the primary exhaustive config:
 | `UseReopen` | `FALSE` | REOPEN procedure (branch-2) disabled |
 | `UseMerge` | `FALSE` | Merge procedure disabled in liveness mode |
 | `UseCreate` | `FALSE` | CreateTable procedure disabled in liveness mode |
+| `UseDelete` | `FALSE` | DeleteTable procedure disabled in liveness mode |
 | `UseRSOpenDuplicateQuirk` | `FALSE` | RS duplicate-open silent-drop disabled (deadlock avoidance) |
 | `UseRSCloseNotFoundQuirk` | `FALSE` | RS close-not-found silent-drop disabled (deadlock avoidance) |
 | `UseRestoreSucceedQuirk` | `FALSE` | Correct recovery; `TRUE` reproduces `restoreSucceedState()` bug |
@@ -66,7 +67,7 @@ Same model values and universe sizing as the primary exhaustive config:
 
 ## Safety Invariants
 
-All 31 safety invariants are checked alongside liveness:
+All 32 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -101,6 +102,7 @@ INVARIANT
     MergeCompleteness
     MergeAtomicity
     TableLockExclusivity
+    DeleteTableAtomicity
 ```
 
 ## Action Constraints
