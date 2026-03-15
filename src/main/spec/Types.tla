@@ -78,6 +78,12 @@ ASSUME NoTable \notin Tables
 CONSTANTS UseMerge
 ASSUME UseMerge \in BOOLEAN
 
+\* UseCreate: when TRUE, CreateTable actions are enabled in Next and Fairness.
+\* Setting FALSE disables CreateTable in exhaustive mode.
+\* Setting TRUE enables CreateTable in simulation mode.
+CONSTANTS UseCreate
+ASSUME UseCreate \in BOOLEAN
+
 \* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
 \* enabled, modeling AssignRegionHandler.process() L107-115 where the
 \* RS silently drops OPEN requests for already-online regions without

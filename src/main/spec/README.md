@@ -144,6 +144,15 @@ This TLA+ specification models the AssignmentManager as a state machine with
   rollback: create fresh ASSIGN TRSPs to reopen both targets).  Gated by
   `UseMerge` constant; disabled in exhaustive mode (unbounded state space
   with split+merge cycle), enabled in simulation mode.
+- **CreateTable procedure** -- `CreateTableProcedure`
+  modeled through the parent-child framework: `CreateTablePrepare(t, r)` picks
+  an unused region identifier, assigns keyspace `[0, MaxKey)`, writes meta as
+  `CLOSED`/`NoServer`, spawns a child ASSIGN TRSP, and sets `parentProc =
+  [CREATE, SPAWNED_OPEN]`.  `CreateTableDone(t)` clears `parentProc` when all
+  CREATE-bearing regions of table `t` are OPEN.  Guards: master alive, PEWorker
+  available, meta available, table not in use, `TableLockFree(t)`.  Gated by
+  `UseCreate` constant; disabled in exhaustive mode, enabled in simulation
+  mode (`Tables = {T1, T2}`).
 
 The specification defines 31 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
@@ -227,6 +236,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [SCP.tla](markdown/SCP.md) | ServerCrashProcedure state machine (detect crash -> assign meta -> get regions -> fence WALs -> assign regions -> done, with meta-blocking) |
 | [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
 | [Merge.tla](markdown/Merge.md) | Merge procedure forward path and pre-PONR rollback using parent-child framework (MergePrepare, MergeCheckClosed, MergeUpdateMeta, MergeDone, MergeFail) |
+| [Create.tla](markdown/Create.md) | CreateTableProcedure: single-region table creation (CreateTablePrepare, CreateTableDone) |
 | [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, close-not-found, stale report drop) |
 | [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover, DetectUnknownServer) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
@@ -265,6 +275,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | `UseRestoreSucceedQuirk` | `TRUE` reproduces `OpenRegionProcedure.restoreSucceedState()` bug where FAILED_OPEN reports replay as OPENED (causes constraint violations) |
 | `UseBlockOnMetaWrite` | `FALSE` (default): async suspension releases PEWorker. `TRUE` (branch-2.6): sync blocking holds PEWorker |
 | `UseMerge` | `TRUE` enables merge actions in `Next`/`Fairness`. `FALSE` (default) keeps exhaustive mode tractable (split-only) |
+| `UseCreate` | `TRUE` enables CreateTable actions in `Next`/`Fairness`. `FALSE` (default) disables CreateTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
@@ -388,7 +399,7 @@ All configurations check the same 31 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-14 |
+| **Date** | 2026-03-15 |
 | **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused, split only) |
 | **Mode** | Exhaustive with symmetry reduction |
