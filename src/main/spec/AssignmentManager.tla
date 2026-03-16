@@ -296,10 +296,13 @@ VARIABLE blockedOnMeta
 \*         state machines (MasterProcedure.proto).
 VARIABLE parentProc
 
-\* tableEnabled[t] \in BOOLEAN — TRUE = table is ENABLED, FALSE = DISABLED.
-\* Part of TableStateManager, stored in meta, persists across master crash.
-\* DisableTablePrepare sets tableEnabled[t] = FALSE;
-\* EnableTablePrepare sets tableEnabled[t] = TRUE.
+\* tableEnabled[t] \in TableStateSet — tracks the table lifecycle state.
+\* Values: "ENABLED" (default), "DISABLING" (disable in progress),
+\*         "DISABLED" (disabled), "ENABLING" (enable in progress).
+\* DisableTablePrepare sets tableEnabled[t] = "DISABLING";
+\* DisableTableDone sets tableEnabled[t] = "DISABLED";
+\* EnableTablePrepare sets tableEnabled[t] = "ENABLING";
+\* EnableTableDone sets tableEnabled[t] = "ENABLED".
 \*
 \* Source: TableStateManager.setTableState().
 VARIABLE tableEnabled
@@ -466,7 +469,7 @@ TypeOK ==
   \* Parent procedure progress per region.
   /\ parentProc \in [Regions -> ParentProcRecord]
   \* Table enabled state: TRUE = enabled, FALSE = disabled.
-  /\ tableEnabled \in [Tables -> BOOLEAN]
+  /\ tableEnabled \in [Tables -> TableStateSet]
 
 ---------------------------------------------------------------------------
 
@@ -1249,7 +1252,7 @@ TruncateNoOrphans ==
 TableEnabledStateConsistency ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      ( tableEnabled[t] = FALSE
+      ( tableEnabled[t] = "DISABLED"
         /\ \E r \in Regions: metaTable[r].table = t
         /\ ~\E r2 \in Regions: metaTable[r2].table = t
                                /\ parentProc[r2].type \in TableExclusiveType )
@@ -1359,7 +1362,7 @@ Init ==
   \* No parent procedures are in progress.
   /\ parentProc = [r \in Regions |-> NoParentProc]
   \* All tables start enabled.
-  /\ tableEnabled = [t \in Tables |-> TRUE]
+  /\ tableEnabled = [t \in Tables |-> "ENABLED"]
 
 ---------------------------------------------------------------------------
 
@@ -1582,9 +1585,23 @@ RegionEventuallyAssigned ==
   \A r \in Regions:
     ( RegionExists(r) /\ regionState[r].procType = "ASSIGN" /\
             metaTable[r].table # NoTable /\
-          tableEnabled[metaTable[r].table] = TRUE
+          tableEnabled[metaTable[r].table] = "ENABLED"
       ) ~>
       regionState[r].state = "OPEN"
+
+\* Liveness: regions in transitional states (OPENING, CLOSING)
+\* eventually leave those states.  A stuck region would indicate
+\* a lost procedure, missing fairness, or RS liveness failure.
+\*
+\* Gated on RegionExists: non-existent regions (NoRange) are
+\* excluded from the liveness check.
+\*
+\* Source: TRSP dispatch/confirm pipeline, RS open/close handlers,
+\*         SCP crash recovery.
+NoStuckRegions ==
+  \A r \in Regions:
+    ( RegionExists(r) /\ regionState[r].state \in {"OPENING", "CLOSING"} )
+      ~> regionState[r].state \notin {"OPENING", "CLOSING"}
 
 ---------------------------------------------------------------------------
 
@@ -1697,6 +1714,14 @@ RegionEventuallyAssigned ==
 
 \* Liveness: ASSIGN on enabled table eventually opens.
         THEOREM Spec => RegionEventuallyAssigned
+
+\* Liveness: regions in transitional states (OPENING, CLOSING) eventually
+\* leave those states.  A region stuck in OPENING or CLOSING indefinitely
+\* indicates a lost procedure, missing fairness, or RS liveness failure.
+\*
+\* Source: TRSP dispatch/confirm pipeline; RS open/close handlers;
+\*         SCP crash recovery re-assigns stuck regions.
+        THEOREM Spec => NoStuckRegions
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.

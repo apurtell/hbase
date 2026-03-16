@@ -69,7 +69,7 @@ Three-tier simulation durations:
 ```sh
 /usr/bin/java -XX:+UseParallelGC \
   -Dtlc2.TLC.stopAfter=3600 \
-  -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+  -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.122210-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.122210-universal/tools/CommunityModules-deps.jar" \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate -workers auto
 ```
 
