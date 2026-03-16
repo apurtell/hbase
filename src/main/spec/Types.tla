@@ -320,6 +320,15 @@ ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE",
 \*         exclusive lock via TableLockManager.
 TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
 
+\* The set of valid table-level states, matching the Java
+\* TableState.State enum (ENABLED, DISABLED, DISABLING, ENABLING).
+\* DISABLING and ENABLING are intermediate states set early in the
+\* DisableTable/EnableTable procedure flow and serve as concurrent
+\* client request rejection gates.
+\*
+\* Source: org.apache.hadoop.hbase.client.TableState.State
+TableStateSet == { "ENABLED", "DISABLED", "DISABLING", "ENABLING" }
+
 \* Sentinel: no parent procedure attached.
 NoParentProc ==
   [ type |-> "NONE", step |-> "NONE", ref1 |-> NoRegion, ref2 |-> NoRegion ]

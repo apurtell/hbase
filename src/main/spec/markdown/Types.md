@@ -366,15 +366,25 @@ ParentProcStep ==
 Parent procedure types. `"NONE"` means no parent procedure is attached. `SPLIT`/`MERGE` are region-level parent procedures. `CREATE`/`DELETE`/`TRUNCATE` are table-level parent procedures.
 
 ```tla
-ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE" }
+ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
 ```
 
 `TableExclusiveType` — the subset of parent procedure types that require exclusive access to all regions of a table. No `SPLIT` or `MERGE` can coexist with these on the same table.
 
-> *Source:* `CreateTableProcedure`, `DeleteTableProcedure`, `TruncateTableProcedure` each acquire a table-level exclusive lock via `TableLockManager`.
+> *Source:* `CreateTableProcedure`, `DeleteTableProcedure`, `TruncateTableProcedure`, `DisableTableProcedure`, `EnableTableProcedure` each acquire a table-level exclusive lock via `TableLockManager`.
 
 ```tla
-TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE" }
+TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
+```
+
+### Table State Set
+
+`TableStateSet` — the set of valid table-level states, matching the Java `TableState.State` enum. `DISABLING` and `ENABLING` are intermediate states set early in the disable/enable procedure flow and serve as concurrent client request rejection gates.
+
+> *Source:* `org.apache.hadoop.hbase.client.TableState.State`
+
+```tla
+TableStateSet == { "ENABLED", "DISABLED", "DISABLING", "ENABLING" }
 ```
 
 `NoParentProc` — sentinel: no parent procedure attached.

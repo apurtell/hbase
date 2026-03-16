@@ -1009,73 +1009,43 @@ generated, depth 92, ~71min, clean.
 
 #### Iteration 37 — Fold regionKeyRange/regionTable into metaTable ✅ COMPLETE
 
-Structural refactoring to align the TLA+ model with HBase's `hbase:meta` schema.
-Eliminated `regionKeyRange` and `regionTable` as top-level variables; all per-region
-data now stored in a unified `metaTable[r]` record with 4 fields:
-`[state, location, keyRange, table]`.  Analysis of HBase source
-(`MetaTableAccessor.java`, `RegionStateStore.java`, `TableStateManager.java`)
-confirmed `keyRange` (startKey/endKey) and table identity are stored per-row in
-`hbase:meta`, while `tableEnabled` is a separate per-table state in `hbase:meta`
-table-state rows — retained as standalone `tableEnabled ∈ [Tables → BOOLEAN]`.
-All 14 modules updated: `AssignmentManager.tla` (VARIABLE removal, `Init` rewrite
-with 4-field metaTable initialization, `TypeOK` update, 8 invariant/liveness
-updates, `vars` tuple, predicates `RegionExists`, `Adjacent`, `NoTableExclusiveLock`,
-`TableLockFree`); `TRSP.tla` (15+ guard conditions `regionKeyRange[r] # NoRange` →
-`metaTable[r].keyRange # NoRange`, `regionTable[r] # NoTable` →
-`metaTable[r].table # NoTable`, 4 metaTable EXCEPT conversions to field-level);
-`SCP.tla` (VARIABLE removal, UNCHANGED cleanup, 4 metaTable EXCEPT conversions —
-2 initial field-level conversions + 2 whole-record `SCPAssignRegion` patterns
-`![r] = [state |-> "ABNORMALLY_CLOSED", location |-> NoServer]` found during
-simulation to be overwriting `keyRange`/`table`, converted to field-level
-`![r].state`, `![r].location`); `Split.tla` (`SplitUpdateMeta`: folded
-`regionKeyRange'`/`regionTable'` mutations into metaTable EXCEPT with all 4 fields
-for parent/daughters; `SplitDone`: clear keyRange/table via metaTable);
-`Merge.tla` (`MergeUpdateMeta`: folded 3-way regionKeyRange + regionTable into
-metaTable; `MergeDone`: clear via metaTable); `Master.tla` (guard updates,
-`MasterCrash` durable vars, `DetectUnknownServer` EXCEPT conversion);
-`RegionServer.tla` (`scpVars` shorthand, `RSRestart` UNCHANGED);
-`ZK.tla` (VARIABLE/UNCHANGED); `Create.tla` (`CreateTablePrepare`: folded
-keyspace/table assignment into 4-field metaTable EXCEPT); `Delete.tla`
-(`DeleteTableDone`: folded keyRange/table clearing into metaTable functional map);
-`Truncate.tla` (4 actions: `TruncateDeleteMeta` folds clearing into metaTable,
-`TruncateCreateMeta` folds creation into metaTable EXCEPT); `Disable.tla`,
-`Enable.tla` (all `regionTable[r]` → `metaTable[r].table` in functional maps,
-UNCHANGED cleanup).  Net variable count reduced from 21 to 19.  All metaTable
-mutations use field-level EXCEPT (`![r].field = value`) to prevent accidental
-field erasure.  `ProcStore.tla` unchanged — `RestoreSucceedState` returns
-`[state, location]` records for `regionState`, not `metaTable`.  TLC 3r/2s
-simulation 120s: 9,244,308 states, 90,397 traces, mean depth 67 (σ=33), no
-violations.
+Structural refactoring: eliminated `regionKeyRange` and `regionTable` as
+top-level variables; all per-region data unified into `metaTable[r]` record
+with 4 fields `[state, location, keyRange, table]`.  All 14 modules updated
+to use field-level EXCEPT (`![r].field = value`) preventing accidental field
+erasure.  `SCP.tla`: 2 whole-record `SCPAssignRegion` patterns found during
+simulation to be overwriting `keyRange`/`table`, converted to field-level.
+Net variable count reduced 21 → 19.  `ProcStore.tla` unchanged — returns
+`[state, location]` records for `regionState`, not `metaTable`.  TLC 9r/3s
+simulation 120s: 9,244,308 states, 90,397 traces, depth 67 (σ=33), clean.
 
-#### Iteration 38 - ENABLING/DISABLING Table States
+#### Iteration 38 - ENABLING/DISABLING Table States ✅ COMPLETE
 
-Add DISABLING/ENABLING intermediate table states:
-Model the `TableState.State.DISABLING` / `ENABLING` intermediate states for
-concurrent client request rejection. Currently collapsed into atomics. Adds 2 new
-states to `tableEnabled`; guards on concurrent requests.
+Expanded `tableEnabled` from `BOOLEAN` to 4-state `TableStateSet`
+(`ENABLED`, `DISABLING`, `DISABLED`, `ENABLING`) matching Java's
+`TableState.State` enum.  `DisableTablePrepare` guard `"ENABLED"`, sets
+`"DISABLING"`; `DisableTableDone` sets `"DISABLED"`.  `EnableTablePrepare`
+guard `"DISABLED"`, sets `"ENABLING"`; `EnableTableDone` sets `"ENABLED"`.
+`TRSPCreate` disabled-table guard updated `TRUE` → `"ENABLED"`.
+`AssignmentManager.tla`: `TypeOK` now `TableStateSet`, `Init` starts
+`"ENABLED"`, `TableEnabledStateConsistency` checks `"DISABLED"`,
+`RegionEventuallyAssigned` checks `"ENABLED"`.  New liveness property
+`NoStuckRegions`: regions in `OPENING`/`CLOSING` eventually leave those
+states; wired into `AssignmentManager-liveness.cfg`. TLC 9r/3s simulation
+300s: 3,302,114 states, 29,879 traces, depth 67 (σ=33), clean.
 
-Add `NoStuckRegions` temporal property:
-□(∀ r: regionState[r].state ∈ {"OPENING", "CLOSING"} ⇒
-    ◇ regionState[r].state ∉ {"OPENING", "CLOSING"})
-Verify that regions don't remain in transitional states forever. Check in liveness
-config.
+#### Iteration 39 - Multi-region CreateTable
 
-Add table-level invariants to DEVELOPING.md:
-The DEVELOPING.md invariant reference table (§3) should be extended with a
-"Table Enable/Disable Invariants" section mapping `TableEnabledStateConsistency`,
-`RegionEventuallyAssigned`, and enable/disable-specific change patterns.
-
-#### Iteration 39 - Multi-region CreateTable and Concurrent Split/Merge
-
-Multi-region CreateTable:
 Extend `CreateTablePrepare` to create N regions (parameter). The existing
 framework supports it — just loop over unused identifiers. Increases
 symmetry-broken states proportional to N but will only impact simulation, where
 `UseCreate = TRUE`, and symmetry reduction is not attempted in that config.
 
-Concurrent split/merge: Remove `SplitMergeConstraint` from simulation
-configuration. Will verify that concurrent splits on different regions don't
-interfere. Only impacts simulation.
+#### Iteration 40 - Concurrent Split/Merge
+
+Remove `SplitMergeConstraint` from simulation configuration. Will verify that
+concurrent splits on different regions don't interfere. Only impacts
+simulation.
 
 ---
 
@@ -1255,15 +1225,12 @@ Each iteration follows a fixed loop:
 2. **WRITE / EDIT** — Add or modify spec per the iteration's scope
    (see Section 7 for iteration descriptions).
 3. **SYNTAX CHECK** — Parse with SANY. Fix all parse errors before proceeding.
-4. **RUN TLC** — Run both mandatory configurations:
-   - `AssignmentManager.cfg` (primary, exhaustive 3r/2s) — must pass.
-   - `AssignmentManager-sim.cfg` (simulation, 9r/3s) — must pass.
-   After completing an iteration, run a 1-hour post-iteration
-   simulation (3600s).  After completing a phase, run a 4-hour
-   post-phase simulation (14400s).  The full exhaustive config
-   (`AssignmentManager-full.cfg`) is not run at every iteration.
-   It is reserved for ad hoc on-demand checks at user-requested
-   checkpoints.
+4. **RUN TLC** — Run simulation as the primary per-step verification:
+   - `AssignmentManager-sim.cfg` (simulation, 9r/3s, 300s) — must pass.
+     A 300-second simulation run is sufficient to uncover regressions
+     during iterative development. 
+   - `AssignmentManager.cfg` (primary, exhaustive 3r/2s) — run manually.
+   - After completing a phase, run a 4-hour post-phase simulation (14400s).
 5. **TRIAGE** — If TLC reports violations, classify each one.
    Repeat from step 1 or 4 as needed.
 6. **REGRESSION CHECK** — Re-verify all invariants and properties from

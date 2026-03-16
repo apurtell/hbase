@@ -78,14 +78,14 @@ TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
 \* All regions of table t must be OPEN with no active procedure —
 \* modeling the enabled-table precondition from the implementation.
 \* Atomically spawns UNASSIGN TRSPs for each region and sets
-\* tableEnabled[t] = FALSE.
+\* tableEnabled[t] = "DISABLING".
 \*
 \* Pre: master alive, PEWorker available, meta available,
-\*      tableEnabled[t] = TRUE, TableLockFree(t),
+\*      tableEnabled[t] = "ENABLED", TableLockFree(t),
 \*      at least one region belongs to t,
 \*      all regions of t OPEN with procType = "NONE".
 \* Post: parentProc set to [DISABLE, SPAWNED_CLOSE] on all regions,
-\*       UNASSIGN TRSPs spawned, tableEnabled[t] = FALSE.
+\*       UNASSIGN TRSPs spawned, tableEnabled[t] = "DISABLING".
 \*
 \* Source: DisableTableProcedure.executeFromState()
 \*         PREPARE -> PRE_OP -> SET_DISABLING steps (collapsed).
@@ -97,7 +97,7 @@ DisableTablePrepare(t) ==
   \* Meta region must be accessible (not on a crashed server).
   /\ MetaIsAvailable
   \* Table must be currently enabled.
-  /\ tableEnabled[t] = TRUE
+  /\ tableEnabled[t] = "ENABLED"
   \* TableLockFree: no parentProc active on table t.
   /\ TableLockFree(t)
   \* At least one region belongs to table t.
@@ -134,8 +134,9 @@ DisableTablePrepare(t) ==
          IF metaTable[r].table = t
          THEN NewProcRecord("UNASSIGN", "CLOSE", regionState[r].location, NoTransition)
          ELSE procStore[r]]
-  \* Set tableEnabled[t] = FALSE.
-  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = FALSE]
+  \* Set tableEnabled[t] = "DISABLING" (intermediate state).
+  \* Source: DisableTableProcedure.SET_DISABLING_TABLE_STATE.
+  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = "DISABLING"]
   \* Everything else unchanged.
   /\ UNCHANGED << metaTable,
         scpVars,
@@ -179,7 +180,10 @@ DisableTableDone(t) ==
          IF metaTable[r].table = t /\ parentProc[r].type = "DISABLE"
          THEN NoParentProc
          ELSE parentProc[r]]
-  \* Everything else unchanged (tableEnabled already FALSE).
+  \* Set tableEnabled[t] = "DISABLED" (final state).
+  \* Source: DisableTableProcedure.SET_DISABLED_TABLE_STATE.
+  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = "DISABLED"]
+  \* Everything else unchanged.
   /\ UNCHANGED << regionState,
         metaTable,
         scpVars,
@@ -189,7 +193,6 @@ DisableTableDone(t) ==
         masterVars,
         peVars,
         procStore,
-        tableEnabled,
         zkNode
      >>
 

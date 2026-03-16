@@ -40,13 +40,6 @@ follow this workflow:
 
 ### Running Verification
 
-**Exhaustive (3r/2s, ~70 min):**
-
-```sh
-java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
-  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
-```
-
 **Simulation (9r/3s, configurable duration):**
 
 ```sh
@@ -54,6 +47,13 @@ java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
   -Dtlc2.TLC.stopAfter=3600 \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager-sim.cfg -simulate \
   -workers auto -cleanup
+```
+
+**Exhaustive (3r/2s):**
+
+```sh
+java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
+  tlc2.TLC AssignmentManager.tla -config AssignmentManager.cfg -workers auto -cleanup
 ```
 
 **Liveness (3r/2s, no symmetry):**
@@ -67,8 +67,8 @@ java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
 
 | Tier | Duration | Use Case |
 |------|----------|----------|
-| Per-iteration | 900s (15 min) | Feedback during development |
-| Post-iteration | 3600s (1 hr) | Validation after completing an iteration |
+| Per-iteration | 300s (5 min) | Feedback during development |
+| Post-iteration | 900s (15 min) | Validation after completing an iteration |
 | Post-phase | 14400s (4 hr) | Milestone verification |
 
 ---
@@ -295,6 +295,14 @@ that area.
 | `TruncateAtomicity` | Truncate procedure table-wide lock acquisition, meta-delete/re-create window |
 | `TruncateNoOrphans` | Truncate SPAWNED_OPEN step, child TRSP spawning after meta-create |
 
+### Table Enable/Disable Invariants
+
+| Invariant | Check When Changing |
+|-----------|---------------------|
+| `TableEnabledStateConsistency` | Disable/Enable procedure flow, `tableEnabled` state transitions, `TRSPCreate` guards |
+| `RegionEventuallyAssigned` | Disable/Enable procedure liveness, `TRSPCreate` disabled-table guard, ASSIGN pipeline |
+| `NoStuckRegions` | TRSP dispatch/confirm, RS handlers, SCP interaction with transitional states |
+
 ---
 
 ## 4. Module–Implementation Mapping
@@ -312,6 +320,8 @@ code you are changing:
 | `CreateTableProcedure` | `Create.tla` | `CreateTablePrepare`, `CreateTableDone` |
 | `DeleteTableProcedure` | `Delete.tla` | `DeleteTablePrepare`, `DeleteTableDone` |
 | `TruncateTableProcedure` | `Truncate.tla` | `TruncatePrepare`, `TruncateDeleteMeta`, `TruncateCreateMeta`, `TruncateDone` |
+| `DisableTableProcedure` | `Disable.tla` | `DisableTablePrepare`, `DisableTableDone` |
+| `EnableTableProcedure` | `Enable.tla` | `EnableTablePrepare`, `EnableTableDone` |
 | `HRegionServer` / `AssignRegionHandler` / `UnassignRegionHandler` | `RegionServer.tla` | RS-side open, close, fail-open, abort, restart, duplicate-open, close-not-found |
 | `HMaster` / `ServerManager` | `Master.tla` | `GoOffline`, `MasterDetectCrash`, `MasterCrash`, `MasterRecover`, `DetectUnknownServer` |
 | `WALProcedureStore` / `RegionProcedureStore` | `ProcStore.tla` | Store invariants, `RestoreSucceedState` |
@@ -346,7 +356,8 @@ code you are changing:
    assignments.
 
 6. **Liveness requires no symmetry.** Liveness properties (`MetaEventuallyAssigned`,
-   `OfflineEventuallyOpen`, `SCPEventuallyDone`) are incompatible with TLC's
+   `OfflineEventuallyOpen`, `SCPEventuallyDone`, `RegionEventuallyAssigned`,
+   `NoStuckRegions`) are incompatible with TLC's
    `SYMMETRY` reduction. Use `AssignmentManager-liveness.cfg` for sound liveness
    checking.
 

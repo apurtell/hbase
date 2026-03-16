@@ -18,7 +18,7 @@ intended for overnight / batch runs.
 
 ```sh
 /usr/bin/java -XX:+UseParallelGC \
-  -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.52117-universal/tools/CommunityModules-deps.jar" \
+  -cp "$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.122210-universal/tools/tla2tools.jar:$HOME/.antigravity/extensions/tlaplus.vscode-ide-2026.3.122210-universal/tools/CommunityModules-deps.jar" \
   tlc2.TLC AssignmentManager.tla -config AssignmentManager-liveness.cfg -workers auto -cleanup
 ```
 
@@ -61,6 +61,7 @@ Same model values and universe sizing as the primary exhaustive config:
 | `UseUnknownServerQuirk` | `FALSE` | Master creates TRSP(ASSIGN) for Unknown Server orphans; `TRUE` models silent close gap |
 | `UseMasterAbortOnMetaWriteQuirk` | `FALSE` | No master abort on meta write failure; `TRUE` models `master.abort()` on `IOException` |
 | `UseStaleStateQuirk` | `FALSE` | No stale server state on recovery; `TRUE` models `AM.start()` stale `ServerStateNode` creation |
+| `UseDisable` | `FALSE` | Disable/EnableTable procedures disabled in liveness mode |
 
 ## Symmetry
 
@@ -68,7 +69,7 @@ Same model values and universe sizing as the primary exhaustive config:
 
 ## Safety Invariants
 
-All 32 safety invariants are checked alongside liveness:
+All 35 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -106,6 +107,7 @@ INVARIANT
     DeleteTableAtomicity
     TruncateAtomicity
     TruncateNoOrphans
+    TableEnabledStateConsistency
 ```
 
 ## Action Constraints
@@ -133,6 +135,8 @@ be disabled:
 - **`MetaEventuallyAssigned`**: Meta eventually reassigned after crash.
 - **`OfflineEventuallyOpen`**: ASSIGN-bearing OFFLINE region eventually opens.
 - **`SCPEventuallyDone`**: Started SCP eventually completes.
+- **`RegionEventuallyAssigned`**: ASSIGN on enabled table eventually opens.
+- **`NoStuckRegions`**: Regions in OPENING/CLOSING eventually leave those states.
 
 ```tla
 \* Liveness properties (the reason this config exists)
@@ -140,4 +144,6 @@ PROPERTY
     MetaEventuallyAssigned
     OfflineEventuallyOpen
     SCPEventuallyDone
+    RegionEventuallyAssigned
+    NoStuckRegions
 ```
