@@ -43,7 +43,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 Shorthand for PEWorker pool variables (used in `UNCHANGED` clauses).
@@ -108,7 +109,8 @@ Everything else is unchanged. The zombie RS may still hold regions in `rsOnlineR
         peVars,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 

@@ -32,7 +32,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -99,7 +100,8 @@ GoOffline(r) ==
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 
 \* The master detects that a RegionServer has crashed.  The master's
@@ -155,7 +157,8 @@ MasterDetectCrash(s) ==
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 
 ---------------------------------------------------------------------------
@@ -201,15 +204,15 @@ MasterCrash ==
         parentProc
      >>
   \* Durable state survives.
-  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable >>
+  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable, tableEnabled >>
   \* RS-side state survives.
   /\ UNCHANGED rsOnlineRegions
   \* WAL fencing survives (HDFS-level).
   /\ UNCHANGED walFenced
   \* ZK ephemeral nodes survive (external to master).
   /\ UNCHANGED zkNode
-  \* Table identity survives (reconstructable from meta).
-  /\ UNCHANGED regionTable
+  \* Table identity and enabled state survive (reconstructable from meta).
+  /\ UNCHANGED << regionTable, tableEnabled >>
 
 \* The master recovers after a crash.  Rebuilds in-memory state from
 \* durable storage (metaTable and procStore).
@@ -384,7 +387,8 @@ MasterRecover ==
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 
 \* DetectUnknownServer: Master discovers a region whose location
@@ -489,7 +493,8 @@ DetectUnknownServer(r) ==
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 
 ============================================================================
