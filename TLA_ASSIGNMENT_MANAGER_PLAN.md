@@ -988,54 +988,28 @@ vulnerable point); `TruncateCreateMeta(t, r)` picks unused `r`, assigns
 `MasterRecover`.  TLC 3r/2s: 368,662,744 distinct, 1,328,348,760 generated,
 depth 92, ~71min, clean.
 
-#### Iteration 36 — Disable/EnableTableProcedure 
+#### Iteration 36 — Disable/EnableTableProcedure ✅ COMPLETE
 
-Fourth and fifth table-level procedures. Sources: `DisableTableProcedure.java`
-(7-state machine: PREPARE → PRE_OP → SET_DISABLING → MARK_OFFLINE →
-ADD_REPLICATION_BARRIER → SET_DISABLED → POST_OP; spawns
-`CloseTableRegionsProcedure` child to close all regions),
-`EnableTableProcedure.java` (6-state machine: PREPARE → PRE_OP →
-SET_ENABLING → MARK_ONLINE → SET_ENABLED → POST_OP; calls
-`createAssignProcedures()` to open all regions).
-**Abstraction**: Each procedure collapsed to 2 actions (Prepare + Done),
-following the Create/Delete/Truncate pattern. Transitional states
-(DISABLING/ENABLING) modeled implicitly via `parentProc` activity.
-Coprocessor hooks and replication barriers omitted (orthogonal).
-**New variable**: `tableEnabled` — `[Tables → BOOLEAN]`.  `TRUE` = ENABLED,
-`FALSE` = DISABLED.  Per-table boolean tracking table lifecycle.  Persists
-across master crash (part of `TableStateManager`, stored in meta).  21st
-state variable.
-**New modules**: `Disable.tla`, `Enable.tla`.
-**Disable actions**:
-- `DisableTablePrepare(t)` — guards: master alive, PEWorker, meta available,
-  `tableEnabled[t] = TRUE`, `TableLockFree(t)`, all regions OPEN with no proc.
-  Sets `parentProc = [DISABLE, SPAWNED_CLOSE]` for all regions, spawns UNASSIGN
-  TRSPs, sets `tableEnabled[t] = FALSE`.
-- `DisableTableDone(t)` — guards: all regions of `t` CLOSED/OFFLINE with no proc.
-  Clears `parentProc`.
-**Enable actions**:
-- `EnableTablePrepare(t)` — guards: master alive, PEWorker, meta available,
-  `tableEnabled[t] = FALSE`, `TableLockFree(t)`, all regions CLOSED/OFFLINE
-  with no proc.  Sets `parentProc = [ENABLE, SPAWNED_OPEN]` for all regions,
-  spawns ASSIGN TRSPs, sets `tableEnabled[t] = TRUE`.
-- `EnableTableDone(t)` — guards: all regions of `t` OPEN with no proc.
-  Clears `parentProc`.
-**Guard update**: `TRSPCreate` gains `tableEnabled[regionTable[r]] = TRUE`
-guard to prevent auto-assigning regions of disabled tables.
-**New safety invariants**:
-- `DisabledTableRegionsStayClosed` (35th) — when `tableEnabled[t] = FALSE`
-  and no ENABLE procedure is active for `t`, all regions must be closed.
-- `EnableDisableMutualExclusion` (36th) — no table can simultaneously have
-  ENABLE and DISABLE parent procedures active.
-- `EnableDisableTableStateConsistency` (37th) — when table is enabled and
-  no exclusive lock is held, at least one region is OPEN.
-**New liveness property**: `RegionEventuallyAssigned` — a region with an
-ASSIGN procedure belonging to an enabled table eventually reaches OPEN.
-Excludes disabled tables (whose regions by design stay closed).  Subsumes
-`OfflineEventuallyOpen` with table-enabled guard.
-**Config**: `UseDisable`/`UseEnable` constants. `FALSE` in exhaustive mode,
-`TRUE` in simulation mode.  Types: `"DISABLE"`/`"ENABLE"` added to
-`ParentProcType` and `TableExclusiveType`.
+Fourth and fifth table-level procedures.  Sources: `DisableTableProcedure.java`,
+`EnableTableProcedure.java` (each collapsed to Prepare + Done).  New 21st
+variable `tableEnabled ∈ [Tables → BOOLEAN]`; persists across master crash.
+New modules `Disable.tla`, `Enable.tla`.  `DisableTablePrepare(t)`: guards
+enabled table, `TableLockFree`, all regions OPEN/no proc; spawns UNASSIGN
+TRSPs, sets `tableEnabled[t] = FALSE`.  `EnableTablePrepare(t)`: symmetric
+for disabled table, spawns ASSIGN TRSPs.  Done actions clear `parentProc`
+when all regions reach target state.  `TRSPCreate` gains disabled-table
+guard (`NoTable` exempt).  `"DISABLE"`/`"ENABLE"` added to `ParentProcType`
+and `TableExclusiveType` (mutual exclusion via existing `TableLockExclusivity`).
+Invariant `TableEnabledStateConsistency`: disabled table with no exclusive
+lock ⇒ all regions CLOSED/OFFLINE.  Liveness `RegionEventuallyAssigned`:
+ASSIGN on enabled table leads-to OPEN.  Single `UseDisable` constant gates
+both; `FALSE` exhaustive/liveness, `TRUE` simulation.  `tableEnabled` plumbed
+through all 12 modules.  TLC 3r/2s: 368,662,744 distinct, 1,328,348,760
+generated, depth 92, ~71min, clean.
+
+#### Iteration 37 - Refactor metaTable
+
+Can regionKeyRange state be modeled as fields of metaTable? This aligns with implementation and shouldn't affect correctness or state space. tableEnabled state is also represented in the metaTable in implementation and should also be modeled as fields of metaTable if possible.
 
 ---
 
@@ -1103,16 +1077,21 @@ is shown.
 | `TRSP.confirmOpened()` UNASSIGN continuation (L289-301) | `TRSPConfirmOpened` UNASSIGN→CLOSE branch | 25 | ✅ |
 | `UnassignRegionHandler.process()` silent return (L111-117, L132-138) | `RSCloseNotFound(s, r)` gated by `UseRSCloseNotFoundQuirk` | 26 | ✅ |
 | `RSProcedureDispatcher.scheduleForRetry()` → `expireServer()` (L326-336) | `DispatchFail`/`DispatchFailClose` second disjunct (unconditional) | 27 | ✅ |
-| Table identity tracking (`regionTable`) | `regionTable[r]`, `NoTableExclusiveLock(r)`, `TableLockFree(t)` | 32 | ⏳ |
-| `CreateTableProcedure.executeFromState()` ADD_TO_META+ASSIGN | `CreateTablePrepare(t)` | 33 | ⏳ |
-| `CreateTableProcedure` POST_OPERATION | `CreateTableDone(t)` | 33 | ⏳ |
-| `DeleteTableProcedure.executeFromState()` PRE_OPERATION | `DeleteTablePrepare(t)` | 34 | ⏳ |
-| `DeleteTableProcedure` REMOVE_FROM_META | `DeleteTableRemoveMeta(t)` | 34 | ⏳ |
-| `DeleteTableProcedure` POST_OPERATION | `DeleteTableDone(t)` | 34 | ⏳ |
-| `TruncateTableProcedure.executeFromState()` PRE_OPERATION | `TruncatePrepare(t)` | 35 | ⏳ |
-| `TruncateTableProcedure` REMOVE_FROM_META | `TruncateDeleteMeta(t)` | 35 | ⏳ |
-| `TruncateTableProcedure` ADD_TO_META+ASSIGN | `TruncateCreateMeta(t)` | 35 | ⏳ |
-| `TruncateTableProcedure` POST_OPERATION | `TruncateDone(t)` | 35 | ⏳ |
+| Table identity tracking (`regionTable`) | `regionTable[r]`, `NoTableExclusiveLock(r)`, `TableLockFree(t)` | 32 | ✅ |
+| `CreateTableProcedure.executeFromState()` ADD_TO_META+ASSIGN | `CreateTablePrepare(t)` | 33 | ✅ |
+| `CreateTableProcedure` POST_OPERATION | `CreateTableDone(t)` | 33 | ✅ |
+| `DeleteTableProcedure.executeFromState()` PRE_OPERATION | `DeleteTablePrepare(t)` | 34 | ✅ |
+| `DeleteTableProcedure` REMOVE_FROM_META | `DeleteTableRemoveMeta(t)` | 34 | ✅ |
+| `DeleteTableProcedure` POST_OPERATION | `DeleteTableDone(t)` | 34 | ✅ |
+| `TruncateTableProcedure.executeFromState()` PRE_OPERATION | `TruncatePrepare(t)` | 35 | ✅ |
+| `TruncateTableProcedure` REMOVE_FROM_META | `TruncateDeleteMeta(t)` | 35 | ✅ |
+| `TruncateTableProcedure` ADD_TO_META+ASSIGN | `TruncateCreateMeta(t)` | 35 | ✅ |
+| `TruncateTableProcedure` POST_OPERATION | `TruncateDone(t)` | 35 | ✅ |
+| `DisableTableProcedure.executeFromState()` PREPARE→SET_DISABLED | `DisableTablePrepare(t)` | 36 | ✅ |
+| `DisableTableProcedure` POST_OP | `DisableTableDone(t)` | 36 | ✅ |
+| `EnableTableProcedure.executeFromState()` PREPARE→SET_ENABLED | `EnableTablePrepare(t)` | 36 | ✅ |
+| `EnableTableProcedure` POST_OP | `EnableTableDone(t)` | 36 | ✅ |
+| `tableEnabled` guard on `TRSPCreate` | `TRSPCreate` disabled-table guard | 36 | ✅ |
 
 ---
 

@@ -55,7 +55,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -209,6 +210,7 @@ MergePrepare(r1, r2, m) ==
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -266,6 +268,7 @@ MergeCheckClosed(r1) ==
         metaTable,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -374,6 +377,7 @@ MergeUpdateMeta(r1) ==
         rsVars,
         masterVars,
         peVars,
+        tableEnabled,
         zkNode
      >>
 
@@ -411,7 +415,7 @@ MergeDone(r1) ==
              ![r1] = NoRange,
              ![r2] = NoRange]
   \* No procStore change needed (r1 already cleared at MergeUpdateMeta).
-  /\ UNCHANGED procStore
+  /\ UNCHANGED << procStore, tableEnabled >>
   \* Clear parent procedure on both targets.
   /\ parentProc' =
        [parentProc EXCEPT
@@ -431,6 +435,7 @@ MergeDone(r1) ==
         peVars,
         regionState,
         metaTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -528,6 +533,7 @@ MergeFail(r1) ==
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 

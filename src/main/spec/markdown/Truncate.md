@@ -49,7 +49,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 ### Variable Shorthands
@@ -178,6 +179,7 @@ Everything else unchanged.
         procStore,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -289,6 +291,7 @@ Everything else unchanged.
         masterVars,
         peVars,
         procStore,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -412,6 +415,7 @@ Everything else unchanged.
         rsVars,
         masterVars,
         peVars,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -484,6 +488,7 @@ Everything else unchanged.
         procStore,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```
