@@ -37,7 +37,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
@@ -89,7 +90,8 @@ ZKSessionExpire(s) ==
         peVars,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 
 ============================================================================

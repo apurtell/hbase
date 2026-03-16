@@ -305,6 +305,14 @@ VARIABLE parentProc
 \* Source: RegionInfo.getTable() — each region knows its table.
 VARIABLE regionTable
 
+\* tableEnabled[t] \in BOOLEAN — TRUE = table is ENABLED, FALSE = DISABLED.
+\* Part of TableStateManager, stored in meta, persists across master crash.
+\* DisableTablePrepare sets tableEnabled[t] = FALSE;
+\* EnableTablePrepare sets tableEnabled[t] = TRUE.
+\*
+\* Source: TableStateManager.setTableState().
+VARIABLE tableEnabled
+
 vars ==
   << regionState,
      metaTable,
@@ -325,7 +333,8 @@ vars ==
      blockedOnMeta,
      regionKeyRange,
      parentProc,
-     regionTable
+     regionTable,
+     tableEnabled
   >>
 
 ---------------------------------------------------------------------------
@@ -392,6 +401,8 @@ merge == INSTANCE Merge
 create == INSTANCE Create
 delete == INSTANCE Delete
 truncate == INSTANCE Truncate
+disable == INSTANCE Disable
+enable == INSTANCE Enable
 
 ---------------------------------------------------------------------------
 
@@ -468,6 +479,8 @@ TypeOK ==
          parentProc \in [Regions -> ParentProcRecord] \* Table identity per region.
        /\
        regionTable \in [Regions -> Tables \cup { NoTable }]
+  \* Table enabled state: TRUE = enabled, FALSE = disabled.
+  /\ tableEnabled \in [Tables -> BOOLEAN]
 
 ---------------------------------------------------------------------------
 
@@ -1042,19 +1055,18 @@ SCPMonotonicity ==
 \* parent's keyspace to NoRange and table to NoTable.
 KeyspaceCoverage ==
   \A t \in Tables:
-    (\E r \in Regions:
-       /\ regionTable[r] = t
-       /\ RegionExists(r)
-       /\ regionState[r].state \notin { "SPLIT", "MERGED" }) =>
-    \A k \in 0 .. ( MaxKey - 1 ):
-      Cardinality({r \in Regions:
-            /\ regionTable[r] = t
-            /\ RegionExists(r)
-            /\ regionKeyRange[r].startKey <= k
-            /\ k < regionKeyRange[r].endKey
-            /\ regionState[r].state \notin { "SPLIT", "MERGED" }
-          }) =
-        1
+    ( \E r \in Regions: /\ regionTable[r] = t
+                        /\ RegionExists(r)
+                        /\ regionState[r].state \notin { "SPLIT", "MERGED" } ) =>
+      \A k \in 0 .. ( MaxKey - 1 ):
+        Cardinality({r \in Regions:
+              /\ regionTable[r] = t
+              /\ RegionExists(r)
+              /\ regionKeyRange[r].startKey <= k
+              /\ k < regionKeyRange[r].endKey
+              /\ regionState[r].state \notin { "SPLIT", "MERGED" }
+            }) =
+          1
 
 \* SplitMergeMutualExclusion: per-region mutual exclusion.
 \*   1. A daughter region (SPLITTING_NEW) cannot be a parent
@@ -1184,8 +1196,8 @@ TableLockExclusivity ==
            ( /\ regionTable[r1] = t
              /\ regionTable[r2] = t
              /\ parentProc[r1].type \in TableExclusiveType
-             /\ parentProc[r2].type \in TableExclusiveType
-           ) => parentProc[r1].type = parentProc[r2].type
+             /\ parentProc[r2].type \in TableExclusiveType ) =>
+             parentProc[r1].type = parentProc[r2].type
       \* No exclusive-type coexists with SPLIT or MERGE on same table.
       /\ ( \E r \in Regions: /\ regionTable[r] = t
                              /\ parentProc[r].type \in TableExclusiveType ) =>
@@ -1205,8 +1217,7 @@ DeleteTableAtomicity ==
     \A t \in Tables:
       ( \E r \in Regions: /\ regionTable[r] = t
                           /\ parentProc[r].type = "DELETE" ) =>
-        \A r2 \in Regions:
-          regionTable[r2] = t => parentProc[r2].type = "DELETE"
+        \A r2 \in Regions: regionTable[r2] = t => parentProc[r2].type = "DELETE"
 
 \* TruncateAtomicity: if any region of table t has
 \* parentProc.type = "TRUNCATE" and step = "COMPLETING", then ALL regions
@@ -1236,6 +1247,30 @@ TruncateNoOrphans ==
       ( parentProc[r].type = "TRUNCATE" /\ parentProc[r].step = "SPAWNED_OPEN" ) =>
         regionState[r].procType = "ASSIGN"
 
+\* TableEnabledStateConsistency: when no exclusive lock is held on a
+\*  table with regions, disabled tables must have all their regions
+\*  in {CLOSED, OFFLINE}.  This is the safety counterpart to
+\*  DisableTableProcedure: once a table is disabled and the procedure
+\*  completes, no region should be OPEN or in any opening state.
+\*
+\*  The enabled-table side (at least one region OPEN) is NOT checked
+\*  here because regions start OFFLINE at Init and after master
+\*  recovery, before TRSPCreate fires.  Enabled-table liveness is
+\*  covered by the RegionEventuallyAssigned temporal property.
+\*
+\* Source: TableStateManager maintains table enabled state;
+\*         DisableTableProcedure drives the ENABLED -> DISABLED transition.
+TableEnabledStateConsistency ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      ( tableEnabled[t] = FALSE
+        /\ \E r \in Regions: regionTable[r] = t
+        /\ ~\E r2 \in Regions: regionTable[r2] = t
+                               /\ parentProc[r2].type \in TableExclusiveType )
+      =>
+        \A r \in Regions: regionTable[r] = t =>
+          regionState[r].state \in {"CLOSED", "OFFLINE"}
+
 
 ---------------------------------------------------------------------------
 
@@ -1256,6 +1291,7 @@ PrintConfig ==
   /\ PrintT(<< "UseCreate", UseCreate >>)
   /\ PrintT(<< "UseDelete", UseDelete >>)
   /\ PrintT(<< "UseTruncate", UseTruncate >>)
+  /\ PrintT(<< "UseDisable", UseDisable >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1343,6 +1379,8 @@ Init ==
      IN regionTable =
            [r \in Regions |-> IF r \in DeployedRegions THEN t1 ELSE NoTable
            ]
+  \* All tables start enabled.
+  /\ tableEnabled = [t \in Tables |-> TRUE]
 
 ---------------------------------------------------------------------------
 
@@ -1414,7 +1452,9 @@ Next ==
   \/ ( UseMerge /\ \E r1 \in Regions: merge!MergeDone(r1) )
   \/ ( UseMerge /\ \E r1 \in Regions: merge!MergeFail(r1) )
   \* -- CreateTable forward path (gated on UseCreate) --
-  \/ ( UseCreate /\ \E t \in Tables: \E r \in Regions: create!CreateTablePrepare(t, r) )
+  \/ ( UseCreate /\
+         \E t \in Tables: \E r \in Regions: create!CreateTablePrepare(t, r)
+     )
   \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
   \* -- DeleteTable forward path (gated on UseDelete) --
   \/ ( UseDelete /\ \E t \in Tables: delete!DeleteTablePrepare(t) )
@@ -1422,8 +1462,16 @@ Next ==
   \* -- TruncateTable forward path (gated on UseTruncate) --
   \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncatePrepare(t) )
   \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncateDeleteMeta(t) )
-  \/ ( UseTruncate /\ \E t \in Tables: \E r \in Regions: truncate!TruncateCreateMeta(t, r) )
+  \/ ( UseTruncate /\
+         \E t \in Tables: \E r \in Regions: truncate!TruncateCreateMeta(t, r)
+     )
   \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncateDone(t) )
+  \* -- DisableTable forward path (gated on UseDisable) --
+  \/ ( UseDisable /\ \E t \in Tables: disable!DisableTablePrepare(t) )
+  \/ ( UseDisable /\ \E t \in Tables: disable!DisableTableDone(t) )
+  \* -- EnableTable forward path (gated on UseDisable) --
+  \/ ( UseDisable /\ \E t \in Tables: enable!EnableTablePrepare(t) )
+  \/ ( UseDisable /\ \E t \in Tables: enable!EnableTableDone(t) )
 
 ---------------------------------------------------------------------------
 
@@ -1495,8 +1543,15 @@ Fairness ==
   /\ ( UseDelete => \A t \in Tables: WF_vars(delete!DeleteTableDone(t)) )
   \* TruncateTable steps (deterministic; gated on UseTruncate; no WF on TruncatePrepare)
   /\ ( UseTruncate => \A t \in Tables: WF_vars(truncate!TruncateDeleteMeta(t)) )
-  /\ ( UseTruncate => \A t \in Tables: \A r \in Regions: WF_vars(truncate!TruncateCreateMeta(t, r)) )
+  /\ ( UseTruncate =>
+         \A t \in Tables:
+           \A r \in Regions: WF_vars(truncate!TruncateCreateMeta(t, r))
+     )
   /\ ( UseTruncate => \A t \in Tables: WF_vars(truncate!TruncateDone(t)) )
+  \* DisableTable completion (deterministic; gated on UseDisable; no WF on DisableTablePrepare)
+  /\ ( UseDisable => \A t \in Tables: WF_vars(disable!DisableTableDone(t)) )
+  \* EnableTable completion (deterministic; gated on UseDisable; no WF on EnableTablePrepare)
+  /\ ( UseDisable => \A t \in Tables: WF_vars(enable!EnableTableDone(t)) )
 
 ---------------------------------------------------------------------------
 
@@ -1538,6 +1593,19 @@ OfflineEventuallyOpen ==
 SCPEventuallyDone ==
   \A s \in Servers:
     scpState[s] \notin { "NONE", "DONE" } ~> scpState[s] = "DONE"
+
+\* Liveness: once an ASSIGN procedure is attached to a region of an
+\* enabled table, the region eventually reaches OPEN.  Subsumes
+\* OfflineEventuallyOpen with an enabled-table guard.
+\*
+\* Source: TRSP pipeline liveness guarantee + DisableTable guard.
+RegionEventuallyAssigned ==
+  \A r \in Regions:
+    ( RegionExists(r) /\ regionState[r].procType = "ASSIGN" /\
+            regionTable[r] # NoTable /\
+          tableEnabled[regionTable[r]] = TRUE
+      ) ~>
+      regionState[r].state = "OPEN"
 
 ---------------------------------------------------------------------------
 
@@ -1638,12 +1706,18 @@ SCPEventuallyDone ==
 \* Safety: TRUNCATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
         THEOREM Spec => []TruncateNoOrphans
 
+\* Safety: table enabled state consistent with region lifecycle states.
+        THEOREM Spec => []TableEnabledStateConsistency
+
 
 \* Liveness: ASSIGN-bearing OFFLINE region eventually opens.
         THEOREM Spec => OfflineEventuallyOpen
 
 \* Liveness: started SCP eventually completes.
         THEOREM Spec => SCPEventuallyDone
+
+\* Liveness: ASSIGN on enabled table eventually opens.
+        THEOREM Spec => RegionEventuallyAssigned
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.

@@ -50,7 +50,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -132,6 +133,7 @@ TruncatePrepare(t) ==
         procStore,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -221,6 +223,7 @@ TruncateDeleteMeta(t) ==
         masterVars,
         peVars,
         procStore,
+        tableEnabled,
         zkNode
      >>
 
@@ -307,6 +310,7 @@ TruncateCreateMeta(t, r) ==
         rsVars,
         masterVars,
         peVars,
+        tableEnabled,
         zkNode
      >>
 
@@ -354,6 +358,7 @@ TruncateDone(t) ==
         procStore,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 

@@ -53,7 +53,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 ### Variable Shorthands
@@ -244,6 +245,7 @@ Everything else unchanged.
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -314,6 +316,7 @@ Advance parent to `PONR`.
         metaTable,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -460,6 +463,7 @@ Daughters inherit the parent's table identity.
         rsVars,
         masterVars,
         peVars,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -542,6 +546,7 @@ Parent releases its table identity (region "deleted").
         masterVars,
         peVars,
         metaTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -637,6 +642,7 @@ Everything else unchanged.
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```

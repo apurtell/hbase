@@ -231,6 +231,14 @@ VARIABLE parentProc
 
 ```tla
 VARIABLE regionTable
+```
+
+`tableEnabled[t] ∈ BOOLEAN` — `TRUE` = table is ENABLED, `FALSE` = DISABLED. Part of `TableStateManager`, stored in meta, persists across master crash. `DisableTablePrepare` sets `tableEnabled[t] = FALSE`; `EnableTablePrepare` sets `tableEnabled[t] = TRUE`.
+
+> *Source:* `TableStateManager.setTableState()`.
+
+```tla
+VARIABLE tableEnabled
 
 vars ==
   << regionState,
@@ -252,7 +260,8 @@ vars ==
      blockedOnMeta,
      regionKeyRange,
      parentProc,
-     regionTable
+     regionTable,
+     tableEnabled
   >>
 ```
 
@@ -331,6 +340,8 @@ merge == INSTANCE Merge
 create == INSTANCE Create
 delete == INSTANCE Delete
 truncate == INSTANCE Truncate
+disable == INSTANCE Disable
+enable == INSTANCE Enable
 ```
 
 ```tla
@@ -519,6 +530,8 @@ Keyspace range: assigned range or `NoRange` (unused identifier). Parent procedur
        parentProc \in [Regions -> ParentProcRecord]
    \* Table identity per region.
    /\ regionTable \in [Regions -> Tables \cup { NoTable }]
+  \* Table enabled state: TRUE = enabled, FALSE = disabled.
+  /\ tableEnabled \in [Tables -> BOOLEAN]
 ```
 
 ```tla
@@ -1280,6 +1293,27 @@ TruncateNoOrphans ==
         regionState[r].procType = "ASSIGN"
 ```
 
+### `TableEnabledStateConsistency`
+
+When no exclusive lock is held on a table with regions, disabled tables must have all their regions in `{CLOSED, OFFLINE}`. This is the safety counterpart to `DisableTableProcedure`: once a table is disabled and the procedure completes, no region should be `OPEN` or in any opening state.
+
+The enabled-table side (at least one region `OPEN`) is NOT checked here because regions start `OFFLINE` at Init and after master recovery, before `TRSPCreate` fires. Enabled-table liveness is covered by the `RegionEventuallyAssigned` temporal property.
+
+> *Source:* `TableStateManager` maintains table enabled state; `DisableTableProcedure` drives the ENABLED → DISABLED transition.
+
+```tla
+TableEnabledStateConsistency ==
+  masterAlive = TRUE =>
+    \A t \in Tables:
+      ( tableEnabled[t] = FALSE
+        /\ \E r \in Regions: regionTable[r] = t
+        /\ ~\E r2 \in Regions: regionTable[r2] = t
+                               /\ parentProc[r2].type \in TableExclusiveType )
+      =>
+        \A r \in Regions: regionTable[r] = t =>
+          regionState[r].state \in {"CLOSED", "OFFLINE"}
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1305,6 +1339,7 @@ PrintConfig ==
   /\ PrintT(<< "UseCreate", UseCreate >>)
   /\ PrintT(<< "UseDelete", UseDelete >>)
   /\ PrintT(<< "UseTruncate", UseTruncate >>)
+  /\ PrintT(<< "UseDisable", UseDisable >>)
   /\ PrintT(<< "UseRSOpenDuplicateQuirk", UseRSOpenDuplicateQuirk >>)
   /\ PrintT(<< "UseRSCloseNotFoundQuirk", UseRSCloseNotFoundQuirk >>)
   /\ PrintT(<< "UseRestoreSucceedQuirk", UseRestoreSucceedQuirk >>)
@@ -1453,7 +1488,15 @@ Table identity: deployed regions belong to a single table; unused identifiers ha
 
 ```tla
   /\ LET t1 == CHOOSE t \in Tables: TRUE
-     IN regionTable = [r \in Regions |-> IF r \in DeployedRegions THEN t1 ELSE NoTable]
+     IN regionTable =
+            [r \in Regions |-> IF r \in DeployedRegions THEN t1 ELSE NoTable
+            ]
+```
+
+All tables start enabled.
+
+```tla
+  /\ tableEnabled = [t \in Tables |-> TRUE]
 ```
 
 ```tla
@@ -1642,6 +1685,22 @@ Next ==
   \/ ( UseTruncate /\ \E t \in Tables: truncate!TruncateDone(t) )
 ```
 
+**DisableTable forward path** (gated on `UseDisable`)
+
+```tla
+  \* -- DisableTable forward path (gated on UseDisable) --
+  \/ ( UseDisable /\ \E t \in Tables: disable!DisableTablePrepare(t) )
+  \/ ( UseDisable /\ \E t \in Tables: disable!DisableTableDone(t) )
+```
+
+**EnableTable forward path** (gated on `UseDisable`)
+
+```tla
+  \* -- EnableTable forward path (gated on UseDisable) --
+  \/ ( UseDisable /\ \E t \in Tables: enable!EnableTablePrepare(t) )
+  \/ ( UseDisable /\ \E t \in Tables: enable!EnableTableDone(t) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1772,6 +1831,20 @@ No fairness on `MasterCrash` (non-deterministic environmental event). No fairnes
   /\ ( UseTruncate => \A t \in Tables: WF_vars(truncate!TruncateDone(t)) )
 ```
 
+**DisableTable completion** (deterministic; gated on `UseDisable`; no WF on `DisableTablePrepare`)
+
+```tla
+  \* DisableTable completion (deterministic; gated on UseDisable; no WF on DisableTablePrepare)
+  /\ ( UseDisable => \A t \in Tables: WF_vars(disable!DisableTableDone(t)) )
+```
+
+**EnableTable completion** (deterministic; gated on `UseDisable`; no WF on `EnableTablePrepare`)
+
+```tla
+  \* EnableTable completion (deterministic; gated on UseDisable; no WF on EnableTablePrepare)
+  /\ ( UseDisable => \A t \in Tables: WF_vars(enable!EnableTableDone(t)) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1807,6 +1880,22 @@ OfflineEventuallyOpen ==
     ( RegionExists(r) /\ regionState[r].state = "OFFLINE"
       /\ regionState[r].procType = "ASSIGN" ) ~>
     regionState[r].state = "OPEN"
+```
+
+### Liveness: `RegionEventuallyAssigned`
+
+Once an ASSIGN procedure is attached to a region of an enabled table, the region eventually reaches OPEN. Subsumes `OfflineEventuallyOpen` with an enabled-table guard.
+
+> *Source:* TRSP pipeline liveness guarantee + `DisableTable` guard.
+
+```tla
+RegionEventuallyAssigned ==
+  \A r \in Regions:
+    ( RegionExists(r) /\ regionState[r].procType = "ASSIGN" /\
+            regionTable[r] # NoTable /\
+          tableEnabled[regionTable[r]] = TRUE
+      ) ~>
+      regionState[r].state = "OPEN"
 ```
 
 ### Liveness: `SCPEventuallyDone`
@@ -2023,6 +2112,13 @@ Safety: TRUNCATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
         THEOREM Spec => []TruncateNoOrphans
 ```
 
+Safety: table enabled state consistent with region lifecycle states.
+
+```tla
+\* Safety: table enabled state consistent with region lifecycle states.
+        THEOREM Spec => []TableEnabledStateConsistency
+```
+
 Liveness: ASSIGN-bearing OFFLINE region eventually opens.
 
 ```tla
@@ -2035,6 +2131,13 @@ Liveness: started SCP eventually completes.
 ```tla
 \* Liveness: started SCP eventually completes.
         THEOREM Spec => SCPEventuallyDone
+```
+
+Liveness: ASSIGN on enabled table eventually opens.
+
+```tla
+\* Liveness: ASSIGN on enabled table eventually opens.
+        THEOREM Spec => RegionEventuallyAssigned
 ```
 
 ### `TransitionValid` *(action property)*

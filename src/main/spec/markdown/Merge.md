@@ -53,7 +53,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 ### Variable Shorthands
@@ -265,6 +266,7 @@ Everything else unchanged.
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -344,6 +346,7 @@ Advance r1 to `PONR`.
         metaTable,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -450,6 +453,7 @@ Merged region inherits the targets' table identity.
         rsVars,
         masterVars,
         peVars,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -490,7 +494,7 @@ Read peer and merged region from `parentProc`.
 No `procStore` change needed (r1 already cleared at `MergeUpdateMeta`).
 
 ```tla
-  /\ UNCHANGED procStore
+  /\ UNCHANGED << procStore, tableEnabled >>
 ```
 
 Clear parent procedure on both targets.
@@ -519,6 +523,7 @@ Targets release their table identities (regions "deleted").
         peVars,
         regionState,
         metaTable,
+        tableEnabled,
         zkNode
      >>
 ```
@@ -631,6 +636,7 @@ Everything else unchanged.
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 ```

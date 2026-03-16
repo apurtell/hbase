@@ -43,7 +43,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 ### Variable Shorthands
@@ -146,7 +147,8 @@ Meta is **not** updated: `RegionStateNode.offline()` does not write to meta. `me
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 
@@ -210,7 +212,8 @@ Guard: only one server can be carrying meta at a time. `hbase:meta` is hosted on
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 
@@ -271,7 +274,7 @@ In-memory master state becomes stale (gated on `masterAlive`).
 Durable state survives.
 
 ```tla
-  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable >>
+  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable, tableEnabled >>
 ```
 
 RS-side state survives.
@@ -290,6 +293,12 @@ ZK ephemeral nodes survive (external to master).
 
 ```tla
   /\ UNCHANGED zkNode
+```
+
+Table identity and enabled state survive (reconstructable from meta).
+
+```tla
+  /\ UNCHANGED << regionTable, tableEnabled >>
 ```
 
 ### `MasterRecover`
@@ -512,7 +521,8 @@ Durable state unchanged.
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 
@@ -640,7 +650,8 @@ Remaining variables unchanged.
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 

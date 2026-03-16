@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-20 state variables capturing:
+21 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -116,64 +116,34 @@ This TLA+ specification models the AssignmentManager as a state machine with
   `hbase:meta` is unavailable during SCP meta-reassignment.
 - **Keyspace infrastructure** -- per-region key range (`regionKeyRange`) mapping
   each region to a `[startKey, endKey)` interval or `NoRange` for unused
-  identifiers.  `DeployedRegions` tile `[0, MaxKey)` at Init; unused identifiers
-  are available for future split/merge.
+  identifiers, with `DeployedRegions` tiling `[0, MaxKey)` at Init.
 - **Parent-child procedure framework** -- per-region `parentProc` record tracking
-  parent procedure type and step (split or merge), persists across child TRSP
-  lifecycles and survives master crash.
-- **Table identity infrastructure** -- per-region `regionTable` tracking which table
-  a region belongs to, with guard predicates (`NoTableExclusiveLock`, `TableLockFree`)
-  and an invariant (`TableLockExclusivity`) to ensure exclusive table-level locks
-  prevent concurrent region-level operations on the same table.
-- **Split procedure** -- `SplitTableRegionProcedure`
-  modeled through the parent-child framework: `SplitPrepare` (set SPLITTING,
-  spawn child UNASSIGN TRSP to close parent), `SplitResumeAfterClose` (detect
-  child completion, advance to point-of-no-return), `SplitUpdateMeta` (PONR:
-  write meta, materialize two daughters with computed `[startKey, mid)` and
-  `[mid, endKey)` keyspaces, spawn child ASSIGN TRSPs), `SplitDone`
-  (daughters OPEN, clear parent keyspace and procedure state), and `SplitFail`
-  (pre-PONR rollback: abort the split, create a fresh ASSIGN TRSP to reopen
-  the parent).  Crash-during-split is deferred.
-- **Merge procedure** -- `MergeTableRegionsProcedure`
-  modeled through the parent-child framework: `MergePrepare` (set MERGING on
-  two adjacent targets, spawn child UNASSIGN TRSPs to close both),
-  `MergeCheckClosed` (detect child completion, advance to PONR),
-  `MergeUpdateMeta` (PONR: write meta, materialize merged region with union
-  keyspace `[r1.startKey, r2.endKey)`, spawn child ASSIGN TRSP), `MergeDone`
-  (merged region OPEN, clear target keyspaces), and `MergeFail` (pre-PONR
-  rollback: create fresh ASSIGN TRSPs to reopen both targets).  Gated by
-  `UseMerge` constant; disabled in exhaustive mode (unbounded state space
-  with split+merge cycle), enabled in simulation mode.
-- **CreateTable procedure** -- `CreateTableProcedure`
-  modeled through the parent-child framework: `CreateTablePrepare(t, r)` picks
-  an unused region identifier, assigns keyspace `[0, MaxKey)`, writes meta as
-  `CLOSED`/`NoServer`, spawns a child ASSIGN TRSP, and sets `parentProc =
-  [CREATE, SPAWNED_OPEN]`.  `CreateTableDone(t)` clears `parentProc` when all
-  CREATE-bearing regions of table `t` are OPEN.  Guards: master alive, PEWorker
-  available, meta available, table not in use, `TableLockFree(t)`.  Gated by
-  `UseCreate` constant; disabled in exhaustive mode, enabled in simulation
-  mode (`Tables = {T1, T2}`).
-- **DeleteTable procedure** -- `DeleteTableProcedure`
-  modeled with two actions: `DeleteTablePrepare(t)` acquires exclusive table lock
-  on all regions of table `t` (guards: all regions CLOSED/OFFLINE with no active
-  procedure, `TableLockFree(t)`), setting `parentProc = [DELETE, COMPLETING]`.
-  `DeleteTableDone(t)` atomically clears meta, frees identifiers (`regionKeyRange
-  → NoRange`), clears table identity (`regionTable → NoTable`), resets
-  `regionState` to initial unused state, and clears `parentProc`.  No child TRSPs
-  are spawned — regions are already closed.  Gated by `UseDelete` constant;
-  disabled in exhaustive mode, enabled in simulation mode.
-- **TruncateTable procedure** -- `TruncateTableProcedure`
-  modeled with four actions: `TruncatePrepare(t)` acquires exclusive table lock
-  on all regions, setting `parentProc = [TRUNCATE, COMPLETING]`.
-  `TruncateDeleteMeta(t)` atomically clears meta, frees identifiers, advances to
-  `PONR`.  `TruncateCreateMeta(t, r)` picks a new unused identifier, assigns
-  keyspace `[0, MaxKey)`, writes meta, spawns a child ASSIGN TRSP, and clears old
-  TRUNCATE/PONR parentProcs.  `TruncateDone(t)` clears `parentProc` when new
-  region is OPEN.  The crash-vulnerable window between `TruncateDeleteMeta` and
-  `TruncateCreateMeta` is an availability issue (table has zero regions in meta),
-  not data loss.  WAL procedure store durable state enables crash recovery.  Gated
-  by `UseTruncate` constant; disabled in exhaustive mode, enabled in simulation
-  mode.
+  parent procedure type and step (split, merge, or table-level), persisting
+  across child TRSP lifecycles and surviving master crash.
+- **Table identity infrastructure** -- per-region `regionTable` tracking which
+  table a region belongs to, with guard predicates and an invariant
+  (`TableLockExclusivity`) enforcing exclusive table-level locks.
+- **Split procedure** -- `SplitTableRegionProcedure` forward path
+  (prepare → close parent → PONR meta write → materialize daughters → done)
+  and pre-PONR rollback, using the parent-child framework.
+- **Merge procedure** -- `MergeTableRegionsProcedure` forward path
+  (prepare → close targets → PONR meta write → materialize merged region → done)
+  and pre-PONR rollback, gated by the `UseMerge` constant.
+- **CreateTable procedure** -- `CreateTableProcedure` allocates an unused region
+  identifier, writes meta, and spawns a child ASSIGN TRSP to bring the new
+  table online, gated by the `UseCreate` constant.
+- **DeleteTable procedure** -- `DeleteTableProcedure` acquires an exclusive table
+  lock, then atomically clears meta, frees identifiers, and resets region
+  state, gated by the `UseDelete` constant.
+- **TruncateTable procedure** -- `TruncateTableProcedure` deletes existing
+  regions and creates fresh replacements via child ASSIGN TRSPs, with a
+  crash-vulnerable window between delete and create, gated by `UseTruncate`.
+- **Disable/EnableTable procedures** -- `DisableTableProcedure` transitions all
+  regions of an enabled table to CLOSED/OFFLINE and marks the table disabled;
+  `EnableTableProcedure` re-enables a disabled table by creating ASSIGN TRSPs
+  on all OFFLINE/CLOSED regions. Both gated by `UseDisable`.
+- **Table enabled state** -- per-table `tableEnabled` boolean tracking whether
+  each table is enabled or disabled, persisted in meta via `TableStateManager`.
 
 The specification defines 34 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
@@ -191,12 +161,15 @@ on the same table), and `DeleteTableAtomicity` (if any region of a table is
 marked for deletion, all regions of that table must also be marked),
 `TruncateAtomicity` (if any region is marked for truncation at COMPLETING step,
 all regions of that table must also be marked), and `TruncateNoOrphans` (new
-region at SPAWNED_OPEN step has a child ASSIGN TRSP).
+region at SPAWNED_OPEN step has a child ASSIGN TRSP), and
+`TableEnabledStateConsistency` (disabled tables have all regions in
+{CLOSED, OFFLINE} when no exclusive lock is held).
 
-Three liveness properties verify temporal guarantees:
+Four liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
 `OfflineEventuallyOpen` (ASSIGN-bearing OFFLINE region eventually opens),
-and `SCPEventuallyDone` (started SCP eventually completes).  Two action
+`SCPEventuallyDone` (started SCP eventually completes), and
+`RegionEventuallyAssigned` (ASSIGN on enabled table eventually opens).  Two action
 constraints enforce transition validity and SCP monotonicity.  One state
 constraint (`SplitMergeConstraint`) bounds concurrent split/merge procedures
 for TLC tractability.
@@ -285,8 +258,10 @@ MERGING, MERGED, and MERGING_NEW states.
 | [Master.tla](markdown/Master.md) | Master-side actions (GoOffline, MasterDetectCrash, MasterCrash, MasterRecover, DetectUnknownServer) |
 | [ProcStore.tla](markdown/ProcStore.md) | Procedure store invariants, bijection, and `RestoreSucceedState` recovery operator |
 | [ZK.tla](markdown/ZK.md) | Minimal ZooKeeper model -- ephemeral node lifecycle (`ZKSessionExpire`) |
+| [Disable.tla](markdown/Disable.md) | DisableTableProcedure: mark table disabled, close all regions (DisableTablePrepare, DisableTableDone) |
+| [Enable.tla](markdown/Enable.md) | EnableTableProcedure: mark table enabled, assign all regions (EnableTablePrepare, EnableTableDone) |
 
-## State Variables (20 total)
+## State Variables (21 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
 - **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
@@ -308,6 +283,7 @@ MERGING, MERGED, and MERGING_NEW states.
 - **`regionKeyRange`** -- per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
 - **`parentProc`** -- per-region parent procedure record (`[type, step, ref1, ref2]`) tracking split/merge progress across child TRSP lifecycles; `ref1`/`ref2` hold region references (daughters for split, peer/merged for merge)
 - **`regionTable`** -- per-region table identity tracking which table each region belongs to (`Tables` or `NoTable` for unused identifiers); used by guard predicates to enforce exclusive table-level locks
+- **`tableEnabled`** -- per-table enabled/disabled state (`BOOLEAN`); part of `TableStateManager`, stored in meta, persists across master crash
 
 ## Configurable Behaviors
 
@@ -322,6 +298,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | `UseCreate` | `TRUE` enables CreateTable actions in `Next`/`Fairness`. `FALSE` (default) disables CreateTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `UseDelete` | `TRUE` enables DeleteTable actions in `Next`/`Fairness`. `FALSE` (default) disables DeleteTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `UseTruncate` | `TRUE` enables TruncateTable actions in `Next`/`Fairness`. `FALSE` (default) disables TruncateTable in exhaustive mode. `TRUE` enables it in simulation mode |
+| `UseDisable` | `TRUE` enables DisableTable and EnableTable actions in `Next`/`Fairness`. A single toggle controls both. `FALSE` (default) disables both in exhaustive mode |
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
@@ -378,7 +355,7 @@ Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 ## Invariants
 
-All configurations check the same 34 safety invariants:
+All configurations check the same 35 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -416,6 +393,7 @@ All configurations check the same 34 safety invariants:
 | `DeleteTableAtomicity` | If any region of a table has `parentProc.type = "DELETE"`, then ALL regions of that table must also have `parentProc.type = "DELETE"` |
 | `TruncateAtomicity` | If any region of a table has `parentProc.type = "TRUNCATE"` and `step = "COMPLETING"`, then ALL regions of that table must also have `parentProc.type = "TRUNCATE"` |
 | `TruncateNoOrphans` | A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` (child TRSP spawned) |
+| `TableEnabledStateConsistency` | Disabled tables with no exclusive lock held have all regions in `{CLOSED, OFFLINE}` |
 
 ## Liveness Properties
 
@@ -424,6 +402,7 @@ All configurations check the same 34 safety invariants:
 | `MetaEventuallyAssigned` | When meta becomes unavailable (`ASSIGN_META`), the SCP eventually reassigns it |
 | `OfflineEventuallyOpen` | Once an ASSIGN procedure is attached to an OFFLINE region, the region eventually reaches OPEN |
 | `SCPEventuallyDone` | Once an SCP starts for a crashed server (`scpState ∉ {NONE, DONE}`), it eventually completes (`scpState = DONE`) |
+| `RegionEventuallyAssigned` | Once an ASSIGN procedure is attached to a region of an enabled table, the region eventually reaches OPEN |
 
 > Liveness properties are incompatible with TLC's `SYMMETRY` reduction.
 > Use [`AssignmentManager-liveness.cfg`](markdown/AssignmentManager-liveness-cfg.md)

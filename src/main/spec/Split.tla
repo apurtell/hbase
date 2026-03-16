@@ -55,7 +55,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -172,6 +173,7 @@ SplitPrepare(r) ==
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -221,6 +223,7 @@ SplitResumeAfterClose(r) ==
         metaTable,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -335,6 +338,7 @@ SplitUpdateMeta(r, dA, dB) ==
         rsVars,
         masterVars,
         peVars,
+        tableEnabled,
         zkNode
      >>
 
@@ -399,6 +403,7 @@ SplitDone(r) ==
         masterVars,
         peVars,
         metaTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -473,6 +478,7 @@ SplitFail(r) ==
         peVars,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 

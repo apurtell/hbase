@@ -43,7 +43,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -122,6 +123,7 @@ DeleteTablePrepare(t) ==
         procStore,
         regionKeyRange,
         regionTable,
+        tableEnabled,
         zkNode
      >>
 
@@ -194,6 +196,7 @@ DeleteTableDone(t) ==
         masterVars,
         peVars,
         procStore,
+        tableEnabled,
         zkNode
      >>
 

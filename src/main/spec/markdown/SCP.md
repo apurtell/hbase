@@ -43,7 +43,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 ### Variable Shorthands
@@ -156,7 +157,8 @@ Meta is now online; clear the `carryingMeta` flag.
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 
@@ -229,7 +231,8 @@ Region state, meta, RPCs, RS-side state, and WAL fencing unchanged.
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 
@@ -298,7 +301,8 @@ Region state, meta, RPCs, RS-side state, and region snapshot unchanged.
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 
@@ -374,7 +378,8 @@ Skip: only shrink the SCP snapshot; no state changes.
               zkNode,
               regionKeyRange,
               parentProc,
-              regionTable
+              regionTable,
+              tableEnabled
            >>
      \/ \* --- Meta unavailable: suspend or block ---
 ```
@@ -388,7 +393,7 @@ Paths A/B write to meta; if meta is unavailable, suspend (async) or block (sync)
         /\ r \notin blockedOnMeta
         /\ IF UseBlockOnMetaWrite = FALSE
            THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc, regionTable >>
+                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc, regionTable, tableEnabled >>
            ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
                 /\ availableWorkers' = availableWorkers - 1
                 /\ UNCHANGED suspendedOnMeta
@@ -408,7 +413,8 @@ Paths A/B write to meta; if meta is unavailable, suspend (async) or block (sync)
               zkNode,
               regionKeyRange,
               parentProc,
-              regionTable
+              regionTable,
+              tableEnabled
            >>
      \/ \* --- Path A: TRSP already attached ---
 ```
@@ -510,7 +516,8 @@ Server state, WAL fencing, SCP state, and meta-carrying flag unchanged.
               zkNode,
               regionKeyRange,
               parentProc,
-              regionTable
+              regionTable,
+              tableEnabled
            >>
 ```
 
@@ -635,7 +642,8 @@ Dispatched ops, server state, WAL fencing, SCP state, and meta-carrying flag unc
               zkNode,
               regionKeyRange,
               parentProc,
-              regionTable
+              regionTable,
+              tableEnabled
            >>
 ```
 
@@ -713,7 +721,8 @@ All other state unchanged — region reassignments already applied.
         zkNode,
         regionKeyRange,
         parentProc,
-        regionTable
+        regionTable,
+        tableEnabled
      >>
 ```
 

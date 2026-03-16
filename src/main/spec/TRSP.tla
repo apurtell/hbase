@@ -63,7 +63,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
 rpcVars == << dispatchedOps, pendingReports >>
@@ -82,7 +83,8 @@ scpVars ==
      zkNode,
      regionKeyRange,
      parentProc,
-     regionTable
+     regionTable,
+     tableEnabled
   >>
 
 \* Shorthand for master lifecycle variables (used in UNCHANGED clauses).
@@ -127,6 +129,11 @@ TRSPCreate(r) ==
   /\ regionState[r].procType = "NONE"
   \* No parent procedure in progress (models ProcedureExecutor region-level locking).
   /\ parentProc[r].type = "NONE"
+  \* Don't auto-create ASSIGN for regions of disabled tables.
+  \* Unused identifiers (NoTable) are exempt.
+  \* Source: DisableTableProcedure sets tableEnabled[t] = FALSE;
+  \*         no assignment should target regions of disabled tables.
+  /\ regionTable[r] # NoTable => tableEnabled[regionTable[r]] = TRUE
   \* Don't auto-create ASSIGN for ABNORMALLY_CLOSED regions while any SCP
   \* is actively processing a crash.  In the implementation, SCP owns
   \* crash recovery; no background daemon races to create procedures for
@@ -714,7 +721,8 @@ DispatchFail(r) ==
                           zkNode,
                           regionKeyRange,
                           parentProc,
-                          regionTable
+                          regionTable,
+                          tableEnabled
                        >>
 
 \* Close command dispatch failed (non-deterministic RPC failure).
@@ -811,7 +819,8 @@ DispatchFailClose(r) ==
                           zkNode,
                           regionKeyRange,
                           parentProc,
-                          regionTable
+                          regionTable,
+                          tableEnabled
                        >>
 
 ---------------------------------------------------------------------------

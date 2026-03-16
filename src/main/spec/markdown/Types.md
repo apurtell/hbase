@@ -139,6 +139,13 @@ CONSTANTS UseTruncate
 ASSUME UseTruncate \in BOOLEAN
 ```
 
+`UseDisable` — when `TRUE`, `DisableTable` and `EnableTable` actions are enabled in `Next` and `Fairness`. A single toggle controls both procedures — enabling one without the other is an obvious deadlock (once disabled, regions could never be re-enabled). Setting `FALSE` disables both in exhaustive mode. Setting `TRUE` enables both in simulation mode.
+
+```tla
+CONSTANTS UseDisable
+ASSUME UseDisable \in BOOLEAN
+```
+
 `UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling `AssignRegionHandler.process()` L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
 
 ```tla

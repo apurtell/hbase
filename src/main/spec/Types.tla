@@ -96,6 +96,15 @@ ASSUME UseDelete \in BOOLEAN
 CONSTANTS UseTruncate
 ASSUME UseTruncate \in BOOLEAN
 
+\* UseDisable: when TRUE, DisableTable and EnableTable actions are enabled
+\* in Next and Fairness.  A single toggle controls both procedures —
+\* enabling one without the other is an obvious deadlock (once disabled,
+\* regions could never be re-enabled).
+\* Setting FALSE disables both in exhaustive mode.
+\* Setting TRUE enables both in simulation mode.
+CONSTANTS UseDisable
+ASSUME UseDisable \in BOOLEAN
+
 \* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
 \* enabled, modeling AssignRegionHandler.process() L107-115 where the
 \* RS silently drops OPEN requests for already-online regions without
@@ -299,16 +308,17 @@ ParentProcStep ==
 \* Parent procedure types.  "NONE" means no parent procedure is
 \* attached.  SPLIT/MERGE are region-level parent procedures.
 \* CREATE/DELETE/TRUNCATE are table-level parent procedures.
-ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE" }
+ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
 
 \* TableExclusiveType: the subset of parent procedure types that
 \* require exclusive access to all regions of a table.
 \* No SPLIT or MERGE can coexist with these on the same table.
 \*
 \* Source: CreateTableProcedure, DeleteTableProcedure,
-\*         TruncateTableProcedure each acquire a table-level
+\*         TruncateTableProcedure, DisableTableProcedure,
+\*         EnableTableProcedure each acquire a table-level
 \*         exclusive lock via TableLockManager.
-TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE" }
+TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
 
 \* Sentinel: no parent procedure attached.
 NoParentProc ==

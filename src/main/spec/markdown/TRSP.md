@@ -61,7 +61,8 @@ VARIABLE regionState,
          blockedOnMeta,
          regionKeyRange,
          parentProc,
-         regionTable
+         regionTable,
+         tableEnabled
 ```
 
 ### Variable Shorthands
@@ -82,7 +83,7 @@ Variables unchanged by TRSP actions (includes SCP state and ZK ephemeral nodes �
 
 ```tla
 scpVars ==
-  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc, regionTable >>
+  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc, regionTable, tableEnabled >>
 ```
 
 Master lifecycle variables (used in `UNCHANGED` clauses).
@@ -163,6 +164,14 @@ No parent procedure in progress (models `ProcedureExecutor` region-level locking
 
 ```tla
   /\ parentProc[r].type = "NONE"
+```
+
+Don't auto-create `ASSIGN` for regions of disabled tables. Unused identifiers (`NoTable`) are exempt.
+
+> *Source:* `DisableTableProcedure` sets `tableEnabled[t] = FALSE`; no assignment should target regions of disabled tables.
+
+```tla
+  /\ regionTable[r] # NoTable => tableEnabled[regionTable[r]] = TRUE
 ```
 
 Don't auto-create `ASSIGN` for `ABNORMALLY_CLOSED` regions while any SCP is actively processing a crash. In the implementation, SCP owns crash recovery; no background daemon races to create procedures for crashed regions during the SCP assign loop.
@@ -1046,7 +1055,8 @@ TRSP stays at `CONFIRM_OPENED` — not reset. Matches `remoteCallFailed()` early
                           zkNode,
                           regionKeyRange,
                           parentProc,
-                          regionTable
+                          regionTable,
+                          tableEnabled
                        >>
 
 ```
@@ -1190,7 +1200,8 @@ TRSP stays at `CONFIRM_CLOSED` — not reset. Matches `remoteCallFailed()` early
                           zkNode,
                           regionKeyRange,
                           parentProc,
-                          regionTable
+                          regionTable,
+                          tableEnabled
                        >>
 
 ```
