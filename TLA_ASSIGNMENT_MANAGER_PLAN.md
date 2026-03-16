@@ -1043,9 +1043,39 @@ keyspace/table assignment into 4-field metaTable EXCEPT); `Delete.tla`
 UNCHANGED cleanup).  Net variable count reduced from 21 to 19.  All metaTable
 mutations use field-level EXCEPT (`![r].field = value`) to prevent accidental
 field erasure.  `ProcStore.tla` unchanged — `RestoreSucceedState` returns
-`[state, location]` records for `regionState`, not `metaTable`.  SANY: all 14
-modules parse/lint clean.  TLC simulation 120s: 9,244,308 states, 90,397 traces,
-mean depth 67 (σ=33), exit code 0, zero violations.
+`[state, location]` records for `regionState`, not `metaTable`.  TLC 3r/2s
+simulation 120s: 9,244,308 states, 90,397 traces, mean depth 67 (σ=33), no
+violations.
+
+#### Iteration 38 - ENABLING/DISABLING Table States
+
+Add DISABLING/ENABLING intermediate table states:
+Model the `TableState.State.DISABLING` / `ENABLING` intermediate states for
+concurrent client request rejection. Currently collapsed into atomics. Adds 2 new
+states to `tableEnabled`; guards on concurrent requests.
+
+Add `NoStuckRegions` temporal property:
+□(∀ r: regionState[r].state ∈ {"OPENING", "CLOSING"} ⇒
+    ◇ regionState[r].state ∉ {"OPENING", "CLOSING"})
+Verify that regions don't remain in transitional states forever. Check in liveness
+config.
+
+Add table-level invariants to DEVELOPING.md:
+The DEVELOPING.md invariant reference table (§3) should be extended with a
+"Table Enable/Disable Invariants" section mapping `TableEnabledStateConsistency`,
+`RegionEventuallyAssigned`, and enable/disable-specific change patterns.
+
+#### Iteration 39 - Multi-region CreateTable and Concurrent Split/Merge
+
+Multi-region CreateTable:
+Extend `CreateTablePrepare` to create N regions (parameter). The existing
+framework supports it — just loop over unused identifiers. Increases
+symmetry-broken states proportional to N but will only impact simulation, where
+`UseCreate = TRUE`, and symmetry reduction is not attempted in that config.
+
+Concurrent split/merge: Remove `SplitMergeConstraint` from simulation
+configuration. Will verify that concurrent splits on different regions don't
+interfere. Only impacts simulation.
 
 ---
 
