@@ -43,9 +43,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -56,7 +54,7 @@ rsVars == << rsOnlineRegions >>
 ```
 
 ```tla
-scpVars == << scpState, scpRegions, walFenced, carryingMeta, regionKeyRange, parentProc, regionTable, tableEnabled >>
+scpVars == << scpState, scpRegions, walFenced, carryingMeta, parentProc, tableEnabled >>
 ```
 
 ```tla
@@ -693,7 +691,7 @@ Register a fresh ZK ephemeral node for the restarted server.
 Region state and META unchanged.
 
 ```tla
-  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable, regionKeyRange, parentProc, regionTable, tableEnabled >>
+  /\ UNCHANGED << procStore, masterVars, peVars, regionState, metaTable, parentProc, tableEnabled >>
 ```
 
 ```tla

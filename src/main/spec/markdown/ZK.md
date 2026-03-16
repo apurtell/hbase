@@ -41,9 +41,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -107,9 +105,7 @@ Everything else is unchanged. The zombie RS may still hold regions in `rsOnlineR
         procStore,
         masterAlive,
         peVars,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```

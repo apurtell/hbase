@@ -43,9 +43,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -70,7 +68,7 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
 
 \* Helper: no parentProc of any type active on any region of table t.
-TableLockFree(t) == ~\E r2 \in Regions: /\ regionTable[r2] = t
+TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
                                          /\ parentProc[r2].type # "NONE"
 
 ---------------------------------------------------------------------------
@@ -100,20 +98,23 @@ CreateTablePrepare(t, r) ==
   \* Meta region must be accessible (not on a crashed server).
   /\ MetaIsAvailable
   \* Table t must not be in use (no region belongs to it).
-  /\ ~ \E r2 \in Regions: regionTable[r2] = t
+  /\ ~ \E r2 \in Regions: metaTable[r2].table = t
   \* TableLockFree: no parentProc active on table t.
   \* (Vacuously true when no region belongs to t, but kept for
   \* completeness and consistency with Split/Merge guards.)
   /\ TableLockFree(t)
   \* r must be an unused identifier.
-  /\ regionKeyRange[r] = NoRange
-  /\ regionTable[r] = NoTable
-  \* Assign keyspace [0, MaxKey) to the single region.
-  /\ regionKeyRange' = [regionKeyRange EXCEPT ![r] = [startKey |-> 0, endKey |-> MaxKey]]
-  \* Set table identity.
-  /\ regionTable' = [regionTable EXCEPT ![r] = t]
-  \* Write meta as CLOSED/NoServer (ADD_TO_META step).
-  /\ metaTable' = [metaTable EXCEPT ![r] = [state |-> "CLOSED", location |-> NoServer]]
+  /\ metaTable[r].keyRange = NoRange
+  /\ metaTable[r].table = NoTable
+  \* Assign keyspace [0, MaxKey), set table identity, and write meta
+  \* as CLOSED/NoServer.  Folds old regionKeyRange/regionTable mutations
+  \* into a single metaTable EXCEPT.
+  /\ metaTable' =
+       [metaTable EXCEPT
+       ![r].state = "CLOSED",
+       ![r].location = NoServer,
+       ![r].keyRange = [startKey |-> 0, endKey |-> MaxKey],
+       ![r].table = t ]
   \* Set in-memory state: CLOSED with child ASSIGN TRSP spawned.
   /\ regionState' =
        [regionState EXCEPT
@@ -165,17 +166,17 @@ CreateTableDone(t) ==
   /\ availableWorkers > 0
   \* At least one region of table t has a CREATE parent procedure.
   /\ \E r \in Regions:
-       /\ regionTable[r] = t
+       /\ metaTable[r].table = t
        /\ parentProc[r].type = "CREATE"
   \* All regions of table t with CREATE parentProc are OPEN and unattached.
   /\ \A r \in Regions:
-       (regionTable[r] = t /\ parentProc[r].type = "CREATE") =>
+       (metaTable[r].table = t /\ parentProc[r].type = "CREATE") =>
          /\ regionState[r].state = "OPEN"
          /\ regionState[r].procType = "NONE"
   \* Clear parentProc on all regions of table t with CREATE.
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "CREATE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "CREATE"
          THEN NoParentProc
          ELSE parentProc[r]]
   \* Everything else unchanged.
@@ -188,8 +189,6 @@ CreateTableDone(t) ==
         masterVars,
         peVars,
         procStore,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>

@@ -44,9 +44,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -87,7 +85,7 @@ MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
 No `parentProc` of any type active on any region of table `t`.
 
 ```tla
-TableLockFree(t) == ~\E r2 \in Regions: /\ regionTable[r2] = t
+TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
                                          /\ parentProc[r2].type # "NONE"
 ```
 
@@ -145,14 +143,14 @@ Table must be currently enabled.
 At least one region belongs to table `t`.
 
 ```tla
-  /\ \E r \in Regions: regionTable[r] = t
+  /\ \E r \in Regions: metaTable[r].table = t
 ```
 
 All regions of table `t` must be `OPEN` with no active procedure.
 
 ```tla
   /\ \A r \in Regions:
-       regionTable[r] = t =>
+       metaTable[r].table = t =>
          /\ regionState[r].state = "OPEN"
          /\ regionState[r].procType = "NONE"
 ```
@@ -162,7 +160,7 @@ Set `parentProc` for table-level tracking on all regions of `t` and spawn child 
 ```tla
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t
+         IF metaTable[r].table = t
          THEN [ type |-> "DISABLE", step |-> "SPAWNED_CLOSE",
                 ref1 |-> NoRegion, ref2 |-> NoRegion ]
          ELSE parentProc[r]]
@@ -173,7 +171,7 @@ Spawn UNASSIGN TRSP on each region: set `procType=UNASSIGN`, `procStep=CLOSE`, `
 ```tla
   /\ regionState' =
        [r \in Regions |->
-         IF regionTable[r] = t
+         IF metaTable[r].table = t
          THEN [ state |-> regionState[r].state,
                 location |-> regionState[r].location,
                 procType |-> "UNASSIGN",
@@ -189,7 +187,7 @@ Persist child UNASSIGN procedures to `procStore`.
 ```tla
   /\ procStore' =
        [r \in Regions |->
-         IF regionTable[r] = t
+         IF metaTable[r].table = t
          THEN NewProcRecord("UNASSIGN", "CLOSE", regionState[r].location, NoTransition)
          ELSE procStore[r]]
 ```
@@ -210,8 +208,6 @@ Everything else unchanged.
         rsVars,
         masterVars,
         peVars,
-        regionKeyRange,
-        regionTable,
         zkNode
      >>
 ```
@@ -247,7 +243,7 @@ At least one region of table `t` has a `DISABLE` parent procedure.
 
 ```tla
   /\ \E r \in Regions:
-       /\ regionTable[r] = t
+       /\ metaTable[r].table = t
        /\ parentProc[r].type = "DISABLE"
 ```
 
@@ -255,7 +251,7 @@ All regions of table `t` with `DISABLE` `parentProc` are closed and unattached.
 
 ```tla
   /\ \A r \in Regions:
-       (regionTable[r] = t /\ parentProc[r].type = "DISABLE") =>
+       (metaTable[r].table = t /\ parentProc[r].type = "DISABLE") =>
          /\ regionState[r].state \in { "CLOSED", "OFFLINE" }
          /\ regionState[r].procType = "NONE"
 ```
@@ -265,7 +261,7 @@ Clear `parentProc` on all regions of table `t` with `DISABLE`.
 ```tla
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "DISABLE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "DISABLE"
          THEN NoParentProc
          ELSE parentProc[r]]
 ```
@@ -282,8 +278,6 @@ Everything else unchanged (`tableEnabled` already `FALSE`).
         masterVars,
         peVars,
         procStore,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>

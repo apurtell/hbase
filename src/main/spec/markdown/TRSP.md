@@ -59,9 +59,9 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
+
          parentProc,
-         regionTable,
+
          tableEnabled
 ```
 
@@ -83,7 +83,7 @@ Variables unchanged by TRSP actions (includes SCP state and ZK ephemeral nodes �
 
 ```tla
 scpVars ==
-  << scpState, scpRegions, walFenced, carryingMeta, zkNode, regionKeyRange, parentProc, regionTable, tableEnabled >>
+  << scpState, scpRegions, walFenced, carryingMeta, zkNode, parentProc, tableEnabled >>
 ```
 
 Master lifecycle variables (used in `UNCHANGED` clauses).
@@ -144,7 +144,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Region must be in a state eligible for assignment.
@@ -171,7 +171,7 @@ Don't auto-create `ASSIGN` for regions of disabled tables. Unused identifiers (`
 > *Source:* `DisableTableProcedure` sets `tableEnabled[t] = FALSE`; no assignment should target regions of disabled tables.
 
 ```tla
-  /\ regionTable[r] # NoTable => tableEnabled[regionTable[r]] = TRUE
+  /\ metaTable[r].table # NoTable => tableEnabled[metaTable[r].table] = TRUE
 ```
 
 Don't auto-create `ASSIGN` for `ABNORMALLY_CLOSED` regions while any SCP is actively processing a crash. In the implementation, SCP owns crash recovery; no background daemon races to create procedures for crashed regions during the SCP assign loop.
@@ -246,7 +246,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN` (`UNASSIGN` reaches `GET_ASSIGN_CANDIDATE` during two-phase crash recovery: reopen then re-close).
@@ -323,7 +323,7 @@ Procedure is `ASSIGN` or `MOVE`, in `OPEN` step, with a target server. Master mu
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
   /\ regionState[r].procType \in { "ASSIGN", "MOVE", "REOPEN", "UNASSIGN" }
   /\ regionState[r].procStep = "OPEN"
   /\ regionState[r].targetServer # NoServer
@@ -414,8 +414,7 @@ Persist the `OPENING` state and server assignment in META.
 ```tla
               /\ metaTable' =
                    [metaTable EXCEPT
-                   ![r] =
-                   [ state |-> "OPENING", location |-> s ]]
+                   ![r].state = "OPENING", ![r].location = s ]
 ```
 
 Enqueue an `OPEN` command to the target server's dispatched ops.
@@ -481,7 +480,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN`.
@@ -624,7 +623,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN`.
@@ -733,8 +732,7 @@ Persist `OPEN` to `metaTable`. Write final `OPEN` state and server location to m
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "OPEN", location |-> metaTable[r].location ]]
+             ![r].state = "OPEN", ![r].location = metaTable[r].location ]
 ```
 
 Branch on procedure type. **UNASSIGN two-phase recovery:** reopen succeeded, now continue to `CLOSE` phase to complete the unassignment. Models `confirmOpened()` L289-301 where `lastState == CONFIRM_CLOSED` triggers `nextState = CLOSE`, returns `HAS_MORE_STATE`. **ASSIGN/MOVE/REOPEN:** procedure complete.
@@ -887,8 +885,7 @@ Persist `FAILED_OPEN` to `metaTable`.
 ```tla
            /\ metaTable' =
                 [metaTable EXCEPT
-                ![r] =
-                [ state |-> "FAILED_OPEN", location |-> NoServer ]]
+                ![r].state = "FAILED_OPEN", ![r].location = NoServer ]
 ```
 
 Delete completed procedure from store.
@@ -947,7 +944,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `ASSIGN`, `MOVE`, `REOPEN`, or `UNASSIGN`.
@@ -1053,9 +1050,9 @@ TRSP stays at `CONFIRM_OPENED` — not reset. Matches `remoteCallFailed()` early
                           walFenced,
                           serverRegions,
                           zkNode,
-                          regionKeyRange,
+                 
                           parentProc,
-                          regionTable,
+                 
                           tableEnabled
                        >>
 
@@ -1097,7 +1094,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `UNASSIGN`, `MOVE`, or `REOPEN`.
@@ -1198,9 +1195,9 @@ TRSP stays at `CONFIRM_CLOSED` — not reset. Matches `remoteCallFailed()` early
                           walFenced,
                           serverRegions,
                           zkNode,
-                          regionKeyRange,
+                 
                           parentProc,
-                          regionTable,
+                 
                           tableEnabled
                        >>
 
@@ -1240,7 +1237,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Region must be in `OPEN` state.
@@ -1333,7 +1330,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Region must be in `OPEN` state.
@@ -1433,7 +1430,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 `REOPEN` feature must be enabled.
@@ -1532,7 +1529,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `UNASSIGN`, `MOVE`, or `REOPEN`.
@@ -1632,8 +1629,7 @@ Persist `CLOSING` state in META, preserving the location.
 ```tla
               /\ metaTable' =
                    [metaTable EXCEPT
-                   ![r] =
-                   [ state |-> "CLOSING", location |-> metaTable[r].location ]]
+                   ![r].state = "CLOSING" ]
 ```
 
 Enqueue a `CLOSE` command to the target server's dispatched ops.
@@ -1656,8 +1652,6 @@ Update persisted procedure step.
                     peVars,
                     pendingReports
                  >>
-
-
 ```
 ### `TRSPReportSucceedClose(r)`
 
@@ -1687,7 +1681,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `UNASSIGN`, `MOVE`, or `REOPEN`.
@@ -1822,7 +1816,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `UNASSIGN`, `MOVE`, or `REOPEN`.
@@ -1914,8 +1908,7 @@ Persist `CLOSED` to `metaTable`.
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "CLOSED", location |-> NoServer ]]
+             ![r].state = "CLOSED", ![r].location = NoServer ]
 ```
 
 Branch on procedure type.
@@ -1985,7 +1978,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Procedure type must be `UNASSIGN`, `MOVE`, or `REOPEN`.
@@ -2095,7 +2088,7 @@ A PEWorker thread must be available to execute this procedure step.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 A procedure must be attached to this region.
@@ -2174,8 +2167,6 @@ Clear `r` from suspended/blocked sets if it was waiting on meta.
 ```tla
 ---------------------------------------------------------------------------
 ```
-
-
 ## PEWorker Meta-Resume
 
 ### `ResumeFromMeta(r)`

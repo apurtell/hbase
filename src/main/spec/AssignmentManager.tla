@@ -153,12 +153,24 @@ EXTENDS Types
 \* sufficient for report/command matching.
 VARIABLE regionState
 
-\* metaTable[r] is a record [state : State, location : Servers \cup {NoServer}]
+\* metaTable[r] is a record
+\*   [state    : State,
+\*    location : Servers \cup {NoServer},
+\*    keyRange : [startKey:0..MaxKey, endKey:0..MaxKey] \cup {NoRange},
+\*    table    : Tables \cup {NoTable}]
 \* for each r in Regions.  This is persistent state in hbase:meta.
 \* Survives master crash; regionState does not.
 \*
+\* In HBase, the region row in hbase:meta contains:
+\*   info:regioninfo  -> serialized RegionInfo (tableName, startKey, endKey)
+\*   info:state       -> region lifecycle state
+\*   info:server/sn   -> hosting server
+\* The keyRange and table fields model info:regioninfo's startKey/endKey
+\* and tableName respectively.  A region "exists" iff
+\* metaTable[r].keyRange # NoRange.
+\*
 \* Procedure fields are NOT persisted to meta -- procedures are
-\* master in-memory state, recovered from ProcedureStore on restart.
+\* master in-memory only, recovered from ProcedureStore on restart.
 VARIABLE metaTable
 
 \* dispatchedOps[s] is a set of command records pending delivery to
@@ -272,16 +284,6 @@ VARIABLE suspendedOnMeta
 \* on an unavailable meta table.
 VARIABLE blockedOnMeta
 
-\* regionKeyRange[r] is the keyspace range assigned to region r, or
-\* NoRange if the region identifier is not currently in use (does not
-\* exist).  A region "exists" iff regionKeyRange[r] # NoRange.
-\* At Init: DeployedRegions tile [0, MaxKey) with contiguous,
-\* non-overlapping ranges; all other identifiers are NoRange.
-\* Split materializes daughter keyspaces at PONR;
-\* merge materializes the union keyspace at PONR;
-\* parent/target deletion clears to NoRange.
-VARIABLE regionKeyRange
-
 \* parentProc[r] tracks the parent procedure (split or merge) whose
 \* target region is r.  NoParentProc means no parent procedure is
 \* active.  During child TRSP execution (close parent, open daughters),
@@ -293,17 +295,6 @@ VARIABLE regionKeyRange
 \* Source: SplitTableRegionProcedure / MergeTableRegionsProcedure
 \*         state machines (MasterProcedure.proto).
 VARIABLE parentProc
-
-\* regionTable[r] is the table identifier that region r belongs to,
-\* or NoTable if the region identifier is not currently in use.
-\* DeployedRegions belong to the initial table (T1) at startup;
-\* unused identifiers start as NoTable.  Split daughters inherit
-\* the parent's table; merge merged-regions inherit the targets'
-\* table.  regionTable is durable (reconstructable from meta) and
-\* survives master crash.
-\*
-\* Source: RegionInfo.getTable() — each region knows its table.
-VARIABLE regionTable
 
 \* tableEnabled[t] \in BOOLEAN — TRUE = table is ENABLED, FALSE = DISABLED.
 \* Part of TableStateManager, stored in meta, persists across master crash.
@@ -331,9 +322,7 @@ vars ==
      availableWorkers,
      suspendedOnMeta,
      blockedOnMeta,
-     regionKeyRange,
      parentProc,
-     regionTable,
      tableEnabled
   >>
 
@@ -346,10 +335,10 @@ vars ==
 MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
 
 \* A region "exists" iff its keyspace range has been assigned.
-\* Unused region identifiers have regionKeyRange = NoRange.
+\* Unused region identifiers have metaTable[r].keyRange = NoRange.
 \* All existing actions guard on this predicate so that only
 \* regions with assigned keyspaces can participate in transitions.
-RegionExists(r) == regionKeyRange[r] # NoRange
+RegionExists(r) == metaTable[r].keyRange # NoRange
 
 \* Two regions are adjacent when the first's endKey equals the
 \* second's startKey.  Both must exist (have assigned keyspaces).
@@ -357,7 +346,7 @@ RegionExists(r) == regionKeyRange[r] # NoRange
 Adjacent(r1, r2) ==
   /\ RegionExists(r1)
   /\ RegionExists(r2)
-  /\ regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
+  /\ metaTable[r1].keyRange.endKey = metaTable[r2].keyRange.startKey
 
 \* Shorthand for PEWorker pool variables (used in UNCHANGED clauses).
 peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
@@ -371,9 +360,9 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 \* Source: TableLockManager exclusive lock in CreateTableProcedure,
 \*         DeleteTableProcedure, TruncateTableProcedure.
 NoTableExclusiveLock(r) ==
-  LET t == regionTable[r]
+  LET t == metaTable[r].table
   IN t # NoTable =>
-        ~\E r2 \in Regions: /\ regionTable[r2] = t
+        ~\E r2 \in Regions: /\ metaTable[r2].table = t
                             /\ parentProc[r2].type \in TableExclusiveType
 
 \* TableLockFree(t) is TRUE when no parentProc of any type is active
@@ -381,7 +370,7 @@ NoTableExclusiveLock(r) ==
 \* (CreateTable, DeleteTable, TruncateTable) as a precondition guard.
 \*
 \* Source: TableLockManager in ProcedureExecutor.
-TableLockFree(t) == ~\E r \in Regions: /\ regionTable[r] = t
+TableLockFree(t) == ~\E r \in Regions: /\ metaTable[r].table = t
                                        /\ parentProc[r].type # "NONE"
 
 (* Module instantiation *)
@@ -434,9 +423,13 @@ TypeOK ==
        /\ regionState[r].procType = "SPLIT" => regionState[r].procStep = "IDLE"
        \* Active MERGE procedure has IDLE step (parent lock marker).
        /\ regionState[r].procType = "MERGE" => regionState[r].procStep = "IDLE"
-  \* META table maps every region to a persistent (state, location) record.
+  \* META table maps every region to a persistent record with state,
+  \* location, keyspace range (from RegionInfo), and table identity.
   /\ metaTable \in
-       [Regions -> [state:State, location:Servers \cup { NoServer } ]]
+       [Regions -> [state:State,
+                    location:Servers \cup { NoServer },
+                    keyRange:[startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange },
+                    table:Tables \cup { NoTable } ]]
   \* Each server has a set of dispatched operation commands (open/close).
   /\ dispatchedOps \in [Servers -> SUBSET [type:CommandType, region:Regions ]]
   \* Pending reports are a set of region-transition outcome messages.
@@ -470,15 +463,8 @@ TypeOK ==
   /\ suspendedOnMeta \subseteq Regions
   \* Regions blocked on meta (sync, worker held).
   /\ blockedOnMeta \subseteq Regions
-  \* Keyspace range: assigned range or NoRange (unused identifier).
-  /\ regionKeyRange \in
-           [Regions
-           ->
-           [startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange }] \* Parent procedure progress per region.
-         /\
-         parentProc \in [Regions -> ParentProcRecord] \* Table identity per region.
-       /\
-       regionTable \in [Regions -> Tables \cup { NoTable }]
+  \* Parent procedure progress per region.
+  /\ parentProc \in [Regions -> ParentProcRecord]
   \* Table enabled state: TRUE = enabled, FALSE = disabled.
   /\ tableEnabled \in [Tables -> BOOLEAN]
 
@@ -1055,15 +1041,15 @@ SCPMonotonicity ==
 \* parent's keyspace to NoRange and table to NoTable.
 KeyspaceCoverage ==
   \A t \in Tables:
-    ( \E r \in Regions: /\ regionTable[r] = t
+    ( \E r \in Regions: /\ metaTable[r].table = t
                         /\ RegionExists(r)
                         /\ regionState[r].state \notin { "SPLIT", "MERGED" } ) =>
       \A k \in 0 .. ( MaxKey - 1 ):
         Cardinality({r \in Regions:
-              /\ regionTable[r] = t
+              /\ metaTable[r].table = t
               /\ RegionExists(r)
-              /\ regionKeyRange[r].startKey <= k
-              /\ k < regionKeyRange[r].endKey
+              /\ metaTable[r].keyRange.startKey <= k
+              /\ k < metaTable[r].keyRange.endKey
               /\ regionState[r].state \notin { "SPLIT", "MERGED" }
             }) =
           1
@@ -1097,14 +1083,14 @@ SplitAtomicity ==
   masterAlive = TRUE =>
     \A r \in Regions:
       parentProc[r].step = "SPAWNED_CLOSE" =>
-        LET startK == regionKeyRange[r].startKey
-            endK == regionKeyRange[r].endKey
+        LET startK == metaTable[r].keyRange.startKey
+            endK == metaTable[r].keyRange.endKey
             mid == ( startK + endK ) \div 2
         IN ~\E d \in Regions:
               /\ regionState[d].state = "SPLITTING_NEW"
               /\ RegionExists(d)
-              /\ \/ regionKeyRange[d] = [ startKey |-> startK, endKey |-> mid ]
-                 \/ regionKeyRange[d] = [ startKey |-> mid, endKey |-> endK ]
+              /\ \/ metaTable[d].keyRange = [ startKey |-> startK, endKey |-> mid ]
+                 \/ metaTable[d].keyRange = [ startKey |-> mid, endKey |-> endK ]
 
 \* NoOrphanedDaughters: a region in SPLITTING_NEW state always has
 \* an ASSIGN procedure (child TRSP from SplitUpdateMeta).
@@ -1154,7 +1140,7 @@ MergeAtomicity ==
     \A r \in Regions:
       ( parentProc[r].type = "MERGE" /\ parentProc[r].step = "SPAWNED_CLOSE" ) =>
         LET m == parentProc[r].ref2
-        IN m = NoRegion \/ regionKeyRange[m] = NoRange
+        IN m = NoRegion \/ metaTable[m].keyRange = NoRange
 
 (* State constraints for TLC *)
 \* Symmetry reduction: only unused region identifiers are interchangeable
@@ -1193,15 +1179,15 @@ TableLockExclusivity ==
       \* one region; DeleteTable/TruncateTable set all regions; the invariant
       \* must accommodate both patterns.)
       /\ \A r1, r2 \in Regions:
-           ( /\ regionTable[r1] = t
-             /\ regionTable[r2] = t
+           ( /\ metaTable[r1].table = t
+             /\ metaTable[r2].table = t
              /\ parentProc[r1].type \in TableExclusiveType
              /\ parentProc[r2].type \in TableExclusiveType ) =>
              parentProc[r1].type = parentProc[r2].type
       \* No exclusive-type coexists with SPLIT or MERGE on same table.
-      /\ ( \E r \in Regions: /\ regionTable[r] = t
+      /\ ( \E r \in Regions: /\ metaTable[r].table = t
                              /\ parentProc[r].type \in TableExclusiveType ) =>
-           ~\E r2 \in Regions: /\ regionTable[r2] = t
+           ~\E r2 \in Regions: /\ metaTable[r2].table = t
                                /\ parentProc[r2].type \in { "SPLIT", "MERGE" }
 
 \* DeleteTableAtomicity: if any region of table t has
@@ -1215,9 +1201,9 @@ TableLockExclusivity ==
 DeleteTableAtomicity ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      ( \E r \in Regions: /\ regionTable[r] = t
+      ( \E r \in Regions: /\ metaTable[r].table = t
                           /\ parentProc[r].type = "DELETE" ) =>
-        \A r2 \in Regions: regionTable[r2] = t => parentProc[r2].type = "DELETE"
+        \A r2 \in Regions: metaTable[r2].table = t => parentProc[r2].type = "DELETE"
 
 \* TruncateAtomicity: if any region of table t has
 \* parentProc.type = "TRUNCATE" and step = "COMPLETING", then ALL regions
@@ -1230,11 +1216,11 @@ DeleteTableAtomicity ==
 TruncateAtomicity ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      ( \E r \in Regions: /\ regionTable[r] = t
+      ( \E r \in Regions: /\ metaTable[r].table = t
                           /\ parentProc[r].type = "TRUNCATE"
                           /\ parentProc[r].step = "COMPLETING" ) =>
         \A r2 \in Regions:
-          regionTable[r2] = t => parentProc[r2].type = "TRUNCATE"
+          metaTable[r2].table = t => parentProc[r2].type = "TRUNCATE"
 
 \* TruncateNoOrphans: a region with parentProc = [TRUNCATE, SPAWNED_OPEN]
 \* must have procType = "ASSIGN" (child TRSP was spawned by
@@ -1264,11 +1250,11 @@ TableEnabledStateConsistency ==
   masterAlive = TRUE =>
     \A t \in Tables:
       ( tableEnabled[t] = FALSE
-        /\ \E r \in Regions: regionTable[r] = t
-        /\ ~\E r2 \in Regions: regionTable[r2] = t
+        /\ \E r \in Regions: metaTable[r].table = t
+        /\ ~\E r2 \in Regions: metaTable[r2].table = t
                                /\ parentProc[r2].type \in TableExclusiveType )
       =>
-        \A r \in Regions: regionTable[r] = t =>
+        \A r \in Regions: metaTable[r].table = t =>
           regionState[r].state \in {"CLOSED", "OFFLINE"}
 
 
@@ -1318,10 +1304,31 @@ Init ==
            retries |-> 0
          ]
        ]
-  \* META table mirrors the initial in-memory state: all regions OFFLINE.
-  /\ metaTable =
-       [r \in Regions |-> [ state |-> "OFFLINE", location |-> NoServer ]
-       ]
+  \* META table: state, location, keyRange (tiling), and table identity.
+  \* DeployedRegions tile [0, MaxKey) evenly with contiguous, non-overlapping
+  \* sub-ranges; unused identifiers get NoRange/NoTable.
+  /\ LET n == Cardinality(DeployedRegions)
+         width == MaxKey \div n
+         \* Bijection from DeployedRegions to 0..(n-1).  CHOOSE picks
+         \* an arbitrary injective function (TLC-compatible: no ordering
+         \* on model values required).
+         rank ==
+           CHOOSE f \in [DeployedRegions -> 0 .. ( n - 1 )]:
+             \A r1, r2 \in DeployedRegions: r1 # r2 => f[r1] # f[r2]
+         t1 == CHOOSE t \in Tables: TRUE
+     IN metaTable =
+           [r \in Regions |->
+             IF r \in DeployedRegions
+             THEN [ state |-> "OFFLINE",
+                    location |-> NoServer,
+                    keyRange |-> [ startKey |-> rank[r] * width,
+                                   endKey |-> ( rank[r] + 1 ) * width ],
+                    table |-> t1 ]
+             ELSE [ state |-> "OFFLINE",
+                    location |-> NoServer,
+                    keyRange |-> NoRange,
+                    table |-> NoTable ]
+           ]
   \* No operation commands have been dispatched to any server.
   /\ dispatchedOps = [s \in Servers |-> {}]
   \* No region-transition reports are pending.
@@ -1349,36 +1356,8 @@ Init ==
   \* No procedures are suspended or blocked on meta.
   /\ suspendedOnMeta = {}
   /\ blockedOnMeta = {}
-  \* Keyspace tiling: DeployedRegions tile [0, MaxKey) evenly.
-  \* Unused identifiers get NoRange.
-  \* The tiling assigns contiguous, equal-width sub-ranges to deployed
-  \* regions.  Each deployed region r gets [rank * width, (rank+1) * width)
-  \* where rank is its position in an arbitrary bijection and
-  \* width = MaxKey div |DeployedRegions|.
-  /\ LET n == Cardinality(DeployedRegions)
-         width == MaxKey \div n
-         \* Bijection from DeployedRegions to 0..(n-1).  CHOOSE picks
-         \* an arbitrary injective function (TLC-compatible: no ordering
-         \* on model values required).
-         rank ==
-           CHOOSE f \in [DeployedRegions -> 0 .. ( n - 1 )]:
-             \A r1, r2 \in DeployedRegions: r1 # r2 => f[r1] # f[r2]
-     IN regionKeyRange =
-           [r \in Regions |->
-             IF r \in DeployedRegions
-             THEN [ startKey |-> rank[r] * width,
-                 endKey |-> ( rank[r] + 1 ) * width
-               ]
-             ELSE NoRange
-           ]
   \* No parent procedures are in progress.
   /\ parentProc = [r \in Regions |-> NoParentProc]
-  \* Table identity: deployed regions belong to a single table;
-  \* unused identifiers have NoTable.
-  /\ LET t1 == CHOOSE t \in Tables: TRUE
-     IN regionTable =
-           [r \in Regions |-> IF r \in DeployedRegions THEN t1 ELSE NoTable
-           ]
   \* All tables start enabled.
   /\ tableEnabled = [t \in Tables |-> TRUE]
 
@@ -1602,8 +1581,8 @@ SCPEventuallyDone ==
 RegionEventuallyAssigned ==
   \A r \in Regions:
     ( RegionExists(r) /\ regionState[r].procType = "ASSIGN" /\
-            regionTable[r] # NoTable /\
-          tableEnabled[regionTable[r]] = TRUE
+            metaTable[r].table # NoTable /\
+          tableEnabled[metaTable[r].table] = TRUE
       ) ~>
       regionState[r].state = "OPEN"
 

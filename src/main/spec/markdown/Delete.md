@@ -44,9 +44,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -87,7 +85,7 @@ MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
 No `parentProc` of any type active on any region of table `t`.
 
 ```tla
-TableLockFree(t) == ~\E r2 \in Regions: /\ regionTable[r2] = t
+TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
                                          /\ parentProc[r2].type # "NONE"
 ```
 
@@ -139,14 +137,14 @@ Meta region must be accessible (not on a crashed server).
 At least one region belongs to table `t`.
 
 ```tla
-  /\ \E r \in Regions: regionTable[r] = t
+  /\ \E r \in Regions: metaTable[r].table = t
 ```
 
 All regions of table `t` must be disabled (`CLOSED` or `OFFLINE`) with no active procedure.
 
 ```tla
   /\ \A r \in Regions:
-       regionTable[r] = t =>
+       metaTable[r].table = t =>
          /\ regionState[r].state \in { "CLOSED", "OFFLINE" }
          /\ regionState[r].procType = "NONE"
 ```
@@ -156,7 +154,7 @@ Set `parentProc` for table-level tracking on all regions of `t`.
 ```tla
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t
+         IF metaTable[r].table = t
          THEN [ type |-> "DELETE", step |-> "COMPLETING",
                 ref1 |-> NoRegion, ref2 |-> NoRegion ]
          ELSE parentProc[r]]
@@ -174,8 +172,6 @@ Everything else unchanged.
         masterVars,
         peVars,
         procStore,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>
@@ -185,10 +181,10 @@ Everything else unchanged.
 
 Complete the `DeleteTable` procedure: clear meta, free identifiers, reset state.
 
-Atomically resets all DELETE-bearing regions of table `t` to the initial unused state: meta cleared, keyspace freed, table identity removed, in-memory state reset, `parentProc` cleared. Region identifiers return to the unused pool (`regionKeyRange = NoRange`, `regionTable = NoTable`).
+Atomically resets all DELETE-bearing regions of table `t` to the initial unused state: meta cleared (state, location, keyRange, table), in-memory state reset, `parentProc` cleared. Region identifiers return to the unused pool (`metaTable[r].keyRange = NoRange`, `metaTable[r].table = NoTable`).
 
 **Pre:** master alive, PEWorker available, at least one region of table `t` has `parentProc = [DELETE, COMPLETING]`.
-**Post:** `metaTable`, `regionKeyRange`, `regionTable`, `regionState`, `parentProc` all reset for DELETE-bearing regions of `t`.
+**Post:** `metaTable`, `regionState`, `parentProc` all reset for DELETE-bearing regions of `t`.
 
 > *Source:* `DeleteTableProcedure.executeFromState()` — `REMOVE_FROM_META` + `POST_OPERATION` steps (collapsed).
 
@@ -212,39 +208,20 @@ At least one region of table `t` has a `DELETE` parent procedure in `COMPLETING`
 
 ```tla
   /\ \E r \in Regions:
-       /\ regionTable[r] = t
+       /\ metaTable[r].table = t
        /\ parentProc[r].type = "DELETE"
        /\ parentProc[r].step = "COMPLETING"
 ```
 
-Reset `metaTable` for all DELETE-bearing regions of `t`.
+Reset `metaTable` for all DELETE-bearing regions of `t`: clear state, location, keyRange, and table.
 
 ```tla
   /\ metaTable' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "DELETE"
-         THEN [state |-> "OFFLINE", location |-> NoServer]
+         IF metaTable[r].table = t /\ parentProc[r].type = "DELETE"
+         THEN [state |-> "OFFLINE", location |-> NoServer,
+               keyRange |-> NoRange, table |-> NoTable]
          ELSE metaTable[r]]
-```
-
-Free keyspace: clear `regionKeyRange` to `NoRange`.
-
-```tla
-  /\ regionKeyRange' =
-       [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "DELETE"
-         THEN NoRange
-         ELSE regionKeyRange[r]]
-```
-
-Clear table identity: set `regionTable` to `NoTable`.
-
-```tla
-  /\ regionTable' =
-       [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "DELETE"
-         THEN NoTable
-         ELSE regionTable[r]]
 ```
 
 Reset in-memory state to initial unused state.
@@ -252,7 +229,7 @@ Reset in-memory state to initial unused state.
 ```tla
   /\ regionState' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "DELETE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "DELETE"
          THEN [ state |-> "OFFLINE",
                 location |-> NoServer,
                 procType |-> "NONE",
@@ -268,7 +245,7 @@ Clear `parentProc` on all DELETE-bearing regions.
 ```tla
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "DELETE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "DELETE"
          THEN NoParentProc
          ELSE parentProc[r]]
 ```

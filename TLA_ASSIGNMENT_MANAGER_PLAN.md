@@ -1007,9 +1007,45 @@ both; `FALSE` exhaustive/liveness, `TRUE` simulation.  `tableEnabled` plumbed
 through all 12 modules.  TLC 3r/2s: 368,662,744 distinct, 1,328,348,760
 generated, depth 92, ~71min, clean.
 
-#### Iteration 37 - Refactor metaTable
+#### Iteration 37 — Fold regionKeyRange/regionTable into metaTable ✅ COMPLETE
 
-Can regionKeyRange state be modeled as fields of metaTable? This aligns with implementation and shouldn't affect correctness or state space. tableEnabled state is also represented in the metaTable in implementation and should also be modeled as fields of metaTable if possible.
+Structural refactoring to align the TLA+ model with HBase's `hbase:meta` schema.
+Eliminated `regionKeyRange` and `regionTable` as top-level variables; all per-region
+data now stored in a unified `metaTable[r]` record with 4 fields:
+`[state, location, keyRange, table]`.  Analysis of HBase source
+(`MetaTableAccessor.java`, `RegionStateStore.java`, `TableStateManager.java`)
+confirmed `keyRange` (startKey/endKey) and table identity are stored per-row in
+`hbase:meta`, while `tableEnabled` is a separate per-table state in `hbase:meta`
+table-state rows — retained as standalone `tableEnabled ∈ [Tables → BOOLEAN]`.
+All 14 modules updated: `AssignmentManager.tla` (VARIABLE removal, `Init` rewrite
+with 4-field metaTable initialization, `TypeOK` update, 8 invariant/liveness
+updates, `vars` tuple, predicates `RegionExists`, `Adjacent`, `NoTableExclusiveLock`,
+`TableLockFree`); `TRSP.tla` (15+ guard conditions `regionKeyRange[r] # NoRange` →
+`metaTable[r].keyRange # NoRange`, `regionTable[r] # NoTable` →
+`metaTable[r].table # NoTable`, 4 metaTable EXCEPT conversions to field-level);
+`SCP.tla` (VARIABLE removal, UNCHANGED cleanup, 4 metaTable EXCEPT conversions —
+2 initial field-level conversions + 2 whole-record `SCPAssignRegion` patterns
+`![r] = [state |-> "ABNORMALLY_CLOSED", location |-> NoServer]` found during
+simulation to be overwriting `keyRange`/`table`, converted to field-level
+`![r].state`, `![r].location`); `Split.tla` (`SplitUpdateMeta`: folded
+`regionKeyRange'`/`regionTable'` mutations into metaTable EXCEPT with all 4 fields
+for parent/daughters; `SplitDone`: clear keyRange/table via metaTable);
+`Merge.tla` (`MergeUpdateMeta`: folded 3-way regionKeyRange + regionTable into
+metaTable; `MergeDone`: clear via metaTable); `Master.tla` (guard updates,
+`MasterCrash` durable vars, `DetectUnknownServer` EXCEPT conversion);
+`RegionServer.tla` (`scpVars` shorthand, `RSRestart` UNCHANGED);
+`ZK.tla` (VARIABLE/UNCHANGED); `Create.tla` (`CreateTablePrepare`: folded
+keyspace/table assignment into 4-field metaTable EXCEPT); `Delete.tla`
+(`DeleteTableDone`: folded keyRange/table clearing into metaTable functional map);
+`Truncate.tla` (4 actions: `TruncateDeleteMeta` folds clearing into metaTable,
+`TruncateCreateMeta` folds creation into metaTable EXCEPT); `Disable.tla`,
+`Enable.tla` (all `regionTable[r]` → `metaTable[r].table` in functional maps,
+UNCHANGED cleanup).  Net variable count reduced from 21 to 19.  All metaTable
+mutations use field-level EXCEPT (`![r].field = value`) to prevent accidental
+field erasure.  `ProcStore.tla` unchanged — `RestoreSucceedState` returns
+`[state, location]` records for `regionState`, not `metaTable`.  SANY: all 14
+modules parse/lint clean.  TLC simulation 120s: 9,244,308 states, 90,397 traces,
+mean depth 67 (σ=33), exit code 0, zero violations.
 
 ---
 

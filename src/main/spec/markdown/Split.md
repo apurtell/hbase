@@ -51,9 +51,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -88,7 +86,7 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 Does region `r` have an assigned keyspace?
 
 ```tla
-RegionExists(r) == regionKeyRange[r] # NoRange
+RegionExists(r) == metaTable[r].keyRange # NoRange
 ```
 
 Does region `r` have an active parent procedure?
@@ -101,10 +99,10 @@ No exclusive-type parent procedure (`CREATE`, `DELETE`, `TRUNCATE`) active on an
 
 ```tla
 NoTableExclusiveLock(r) ==
-  LET t == regionTable[r]
+  LET t == metaTable[r].table
   IN t # NoTable =>
        ~ \E r2 \in Regions:
-            /\ regionTable[r2] = t
+            /\ metaTable[r2].table = t
             /\ parentProc[r2].type \in TableExclusiveType
 ```
 
@@ -176,13 +174,13 @@ No parent procedure in progress on this region.
 Keyspace wide enough to halve.
 
 ```tla
-  /\ regionKeyRange[r].endKey - regionKeyRange[r].startKey >= 2
+  /\ metaTable[r].keyRange.endKey - metaTable[r].keyRange.startKey >= 2
 ```
 
 At least 2 unused identifiers available for daughters.
 
 ```tla
-  /\ Cardinality({d \in Regions: regionKeyRange[d] = NoRange}) >= 2
+  /\ Cardinality({d \in Regions: metaTable[d].keyRange = NoRange}) >= 2
 ```
 
 No table-level exclusive lock on this region's table.
@@ -213,8 +211,7 @@ Update meta to `SPLITTING` (preserving location).
 ```tla
   /\ metaTable' =
        [metaTable EXCEPT
-       ![r] =
-       [ state |-> "SPLITTING", location |-> metaTable[r].location ]]
+       ![r].state = "SPLITTING"]
 ```
 
 Persist the child `UNASSIGN` procedure to `procStore`.
@@ -243,8 +240,6 @@ Everything else unchanged.
         rsVars,
         masterVars,
         peVars,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>
@@ -314,8 +309,6 @@ Advance parent to `PONR`.
         masterVars,
         peVars,
         metaTable,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>
@@ -353,15 +346,15 @@ SplitUpdateMeta(r, dA, dB) ==
   /\ dA # dB
   /\ dA # r
   /\ dB # r
-  /\ regionKeyRange[dA] = NoRange
-  /\ regionKeyRange[dB] = NoRange
+  /\ metaTable[dA].keyRange = NoRange
+  /\ metaTable[dB].keyRange = NoRange
 ```
 
 Compute the midpoint of the parent's keyspace.
 
 ```tla
-  /\ LET startK == regionKeyRange[r].startKey
-         endK == regionKeyRange[r].endKey
+  /\ LET startK == metaTable[r].keyRange.startKey
+         endK == metaTable[r].keyRange.endKey
          mid == ( startK + endK ) \div 2
      IN \* Update regionState: parent -> SPLIT, daughters -> SPLITTING_NEW
 ```
@@ -408,28 +401,21 @@ Daughter B: `SPLITTING_NEW` with child `ASSIGN` TRSP.
              ]]
 ```
 
-Update meta: parent → `SPLIT`, daughters → `CLOSED` (Appendix C.8).
+Update meta: parent → `SPLIT`, daughters → `CLOSED` with keyRanges and table identity. All `metaTable` fields are set via field-level EXCEPT.
 
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "SPLIT", location |-> NoServer ],
-             ![dA] =
-             [ state |-> "CLOSED", location |-> NoServer ],
-             ![dB] =
-             [ state |-> "CLOSED", location |-> NoServer ]]
-```
-
-Materialize daughter keyspaces.
-
-```tla
-        /\ regionKeyRange' =
-             [regionKeyRange EXCEPT
-             ![dA] =
-             [ startKey |-> startK, endKey |-> mid ],
-             ![dB] =
-             [ startKey |-> mid, endKey |-> endK ]]
+             ![r].state = "SPLIT",
+             ![r].location = NoServer,
+             ![dA].state = "CLOSED",
+             ![dA].location = NoServer,
+             ![dA].keyRange = [ startKey |-> startK, endKey |-> mid ],
+             ![dA].table = metaTable[r].table,
+             ![dB].state = "CLOSED",
+             ![dB].location = NoServer,
+             ![dB].keyRange = [ startKey |-> mid, endKey |-> endK ],
+             ![dB].table = metaTable[r].table ]
 ```
 
 Persist daughter `ASSIGN` procedures to `procStore`.
@@ -450,13 +436,6 @@ Store daughter references for `SplitDone` to read back.
   /\ parentProc' = [parentProc EXCEPT ![r].step = "SPAWNED_OPEN",
                                       ![r].ref1 = dA,
                                       ![r].ref2 = dB]
-```
-
-Daughters inherit the parent's table identity.
-
-```tla
-  /\ regionTable' = [regionTable EXCEPT ![dA] = regionTable[r],
-                                        ![dB] = regionTable[r]]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -517,10 +496,12 @@ Clear parent procedure state.
              0]
 ```
 
-Clear parent keyspace — region *"deleted."*
+Clear parent keyspace and table via `metaTable` — region *"deleted."*
 
 ```tla
-        /\ regionKeyRange' = [regionKeyRange EXCEPT ![r] = NoRange]
+        /\ metaTable' =
+             [metaTable EXCEPT ![r].keyRange = NoRange,
+                               ![r].table = NoTable ]
 ```
 
 Clear parent from `procStore`.
@@ -533,19 +514,12 @@ Clear parent procedure.
 
 ```tla
   /\ parentProc' = [parentProc EXCEPT ![r] = NoParentProc]
-```
-
-Parent releases its table identity (region "deleted").
-
-```tla
-  /\ regionTable' = [regionTable EXCEPT ![r] = NoTable]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
         rsVars,
         masterVars,
         peVars,
-        metaTable,
         tableEnabled,
         zkNode
      >>
@@ -563,7 +537,7 @@ Fires non-deterministically at the same precondition as `SplitResumeAfterClose` 
 3. Reverts meta from `SPLITTING` to `CLOSED` (parent's actual state; the `ASSIGN` TRSP will update meta to `OPENING` → `OPEN` later).
 4. Persists the new `ASSIGN` procedure to `procStore`.
 
-No daughters are created pre-PONR (`SplitAtomicity` invariant), so no daughter cleanup is needed. `regionKeyRange` is unchanged (parent keeps its keyspace).
+No daughters are created pre-PONR (`SplitAtomicity` invariant), so no daughter cleanup is needed. `metaTable` keyRange is unchanged (parent keeps its keyspace).
 
 **Pre:** master alive, PEWorker available, region exists, parent `CLOSED`, no procedure attached, `parentProc = SPAWNED_CLOSE`.
 **Post:** `ASSIGN` TRSP spawned, `parentProc` cleared, meta reverted.
@@ -626,9 +600,7 @@ Revert meta from `SPLITTING` to `CLOSED` (parent's actual state).
 
 ```tla
   /\ metaTable' =
-       [metaTable EXCEPT
-       ![r] =
-       [ state |-> "CLOSED", location |-> NoServer ]]
+       [metaTable EXCEPT ![r].state = "CLOSED", ![r].location = NoServer ]
 ```
 
 Everything else unchanged.
@@ -640,8 +612,6 @@ Everything else unchanged.
         rsVars,
         masterVars,
         peVars,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>

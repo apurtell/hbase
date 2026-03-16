@@ -26,9 +26,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -124,9 +122,7 @@ SCPAssignMeta(s) ==
         scpRegions,
         walFenced,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
@@ -183,9 +179,7 @@ SCPGetRegions(s) ==
         walFenced,
         carryingMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
@@ -224,9 +218,7 @@ SCPFenceWALs(s) ==
         scpRegions,
         carryingMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
@@ -280,9 +272,7 @@ SCPAssignRegion(s, r) ==
               carryingMeta,
               peVars,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
      \/ \* --- Meta unavailable: suspend or block ---
@@ -297,7 +287,6 @@ SCPAssignRegion(s, r) ==
                 /\ UNCHANGED << availableWorkers,
                       blockedOnMeta,
                       parentProc,
-                      regionTable,
                       tableEnabled
                    >>
            ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
@@ -317,9 +306,7 @@ SCPAssignRegion(s, r) ==
               procStore,
               masterVars,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
      \/ \* --- Path A: TRSP already attached ---
@@ -374,8 +361,8 @@ SCPAssignRegion(s, r) ==
         \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
+             ![r].state = "ABNORMALLY_CLOSED",
+             ![r].location = NoServer ]
         \* Remove r from the SCP snapshot (processed).
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Update persisted procedure: convert to ASSIGN.
@@ -393,9 +380,7 @@ SCPAssignRegion(s, r) ==
               walFenced,
               carryingMeta,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
@@ -442,8 +427,8 @@ SCPAssignRegion(s, r) ==
         \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
+             ![r].state = "ABNORMALLY_CLOSED",
+             ![r].location = NoServer ]
         \* Remove r from the SCP snapshot (processed).
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Insert a fresh ASSIGN procedure into the store.
@@ -462,9 +447,7 @@ SCPAssignRegion(s, r) ==
               walFenced,
               carryingMeta,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
         \* Clear r from suspended/blocked sets if it was waiting on meta.
@@ -508,9 +491,7 @@ SCPDone(s) ==
         walFenced,
         carryingMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 

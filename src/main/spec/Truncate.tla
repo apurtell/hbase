@@ -48,9 +48,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -76,7 +74,7 @@ MetaIsAvailable == \A s \in Servers: scpState[s] # "ASSIGN_META"
 
 \* Helper: no parentProc of any type active on any region of table t.
 TableLockFree(t) ==
-  ~\E r2 \in Regions: /\ regionTable[r2] = t /\ parentProc[r2].type # "NONE"
+  ~\E r2 \in Regions: /\ metaTable[r2].table = t /\ parentProc[r2].type # "NONE"
 
 ---------------------------------------------------------------------------
 
@@ -104,16 +102,16 @@ TruncatePrepare(t) ==
   \* TableLockFree: no parentProc active on table t.
   /\ TableLockFree(t)
   \* At least one region belongs to table t.
-  /\ \E r \in Regions: regionTable[r] = t
+  /\ \E r \in Regions: metaTable[r].table = t
   \* All regions of table t must be disabled (CLOSED or OFFLINE)
   \* with no active procedure.
   /\ \A r \in Regions:
-       regionTable[r] = t => /\ regionState[r].state \in { "CLOSED", "OFFLINE" }
+       metaTable[r].table = t => /\ regionState[r].state \in { "CLOSED", "OFFLINE" }
                              /\ regionState[r].procType = "NONE"
   \* Set parentProc for table-level tracking on all regions of t.
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t
+         IF metaTable[r].table = t
          THEN [ type |-> "TRUNCATE",
              step |-> "COMPLETING",
              ref1 |-> NoRegion,
@@ -131,8 +129,6 @@ TruncatePrepare(t) ==
         masterVars,
         peVars,
         procStore,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>
@@ -153,7 +149,7 @@ TruncatePrepare(t) ==
 \*
 \* Pre: master alive, PEWorker available, at least one region of
 \*      table t has parentProc = [TRUNCATE, COMPLETING].
-\* Post: metaTable, regionKeyRange, regionTable, regionState cleared;
+\* Post: metaTable (state, keyRange, table), regionState cleared;
 \*       parentProc.step advanced to "PONR".
 \*
 \* Source: TruncateTableProcedure.executeFromState()
@@ -165,34 +161,22 @@ TruncateDeleteMeta(t) ==
   /\ availableWorkers > 0
   \* At least one region of table t has a TRUNCATE parent procedure
   \* in COMPLETING step.
-  /\ \E r \in Regions: /\ regionTable[r] = t
+  /\ \E r \in Regions: /\ metaTable[r].table = t
                        /\ parentProc[r].type = "TRUNCATE"
                        /\ parentProc[r].step = "COMPLETING"
-  \* Reset metaTable for all TRUNCATE-bearing regions of t.
+  \* Reset metaTable for all TRUNCATE-bearing regions of t:
+  \* clear state, location, keyRange, and table.
   /\ metaTable' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "TRUNCATE"
-         THEN [ state |-> "OFFLINE", location |-> NoServer ]
+         IF metaTable[r].table = t /\ parentProc[r].type = "TRUNCATE"
+         THEN [ state |-> "OFFLINE", location |-> NoServer,
+                keyRange |-> NoRange, table |-> NoTable ]
          ELSE metaTable[r]
-       ]
-  \* Free keyspace: clear regionKeyRange to NoRange.
-  /\ regionKeyRange' =
-       [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "TRUNCATE"
-         THEN NoRange
-         ELSE regionKeyRange[r]
-       ]
-  \* Clear table identity: set regionTable to NoTable.
-  /\ regionTable' =
-       [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "TRUNCATE"
-         THEN NoTable
-         ELSE regionTable[r]
        ]
   \* Reset in-memory state to initial unused state.
   /\ regionState' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "TRUNCATE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "TRUNCATE"
          THEN [ state |-> "OFFLINE",
              location |-> NoServer,
              procType |-> "NONE",
@@ -203,11 +187,11 @@ TruncateDeleteMeta(t) ==
          ELSE regionState[r]
        ]
   \* Advance parentProc.step to "PONR" on all TRUNCATE-bearing regions.
-  \* Note: the guard checks regionTable[r] = t, which is evaluated
-  \* BEFORE regionTable' is applied (TLA+ semantics).
+  \* Note: the guard checks metaTable[r].table = t, which is evaluated
+  \* BEFORE metaTable' is applied (TLA+ semantics).
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "TRUNCATE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "TRUNCATE"
          THEN [ type |-> "TRUNCATE",
              step |-> "PONR",
              ref1 |-> NoRegion,
@@ -258,19 +242,20 @@ TruncateCreateMeta(t, r) ==
   \* all old regions to NoTable.  This binds the existentially quantified
   \* t to the table that was actually truncated, preventing the creation
   \* of new regions for an unrelated table.
-  /\ ~ \E r2 \in Regions: regionTable[r2] = t
+  /\ ~ \E r2 \in Regions: metaTable[r2].table = t
   \* r must be an unused identifier.
-  /\ regionKeyRange[r] = NoRange
-  /\ regionTable[r] = NoTable
+  /\ metaTable[r].keyRange = NoRange
+  /\ metaTable[r].table = NoTable
   /\ parentProc[r].type = "NONE"
-  \* Assign keyspace [0, MaxKey) to the single new region.
-  /\ regionKeyRange' =
-       [regionKeyRange EXCEPT ![r] = [ startKey |-> 0, endKey |-> MaxKey ]]
-  \* Set table identity.
-  /\ regionTable' = [regionTable EXCEPT ![r] = t]
-  \* Write meta as CLOSED/NoServer (ADD_TO_META step).
+  \* Assign keyspace [0, MaxKey), set table identity, and write meta
+  \* as CLOSED/NoServer.  Folds old regionKeyRange/regionTable into
+  \* a single metaTable EXCEPT.
   /\ metaTable' =
-       [metaTable EXCEPT ![r] = [ state |-> "CLOSED", location |-> NoServer ]]
+       [metaTable EXCEPT
+       ![r].state = "CLOSED",
+       ![r].location = NoServer,
+       ![r].keyRange = [ startKey |-> 0, endKey |-> MaxKey ],
+       ![r].table = t ]
   \* Set in-memory state: CLOSED with child ASSIGN TRSP spawned.
   /\ regionState' =
        [regionState EXCEPT
@@ -332,17 +317,17 @@ TruncateDone(t) ==
   \* PEWorker thread available to execute this step.
   /\ availableWorkers > 0
   \* At least one region of table t has a TRUNCATE parent procedure.
-  /\ \E r \in Regions: /\ regionTable[r] = t
+  /\ \E r \in Regions: /\ metaTable[r].table = t
                        /\ parentProc[r].type = "TRUNCATE"
   \* All regions of table t with TRUNCATE parentProc are OPEN and unattached.
   /\ \A r \in Regions:
-       ( regionTable[r] = t /\ parentProc[r].type = "TRUNCATE" ) =>
+       ( metaTable[r].table = t /\ parentProc[r].type = "TRUNCATE" ) =>
          /\ regionState[r].state = "OPEN"
          /\ regionState[r].procType = "NONE"
   \* Clear parentProc on all regions of table t with TRUNCATE.
   /\ parentProc' =
        [r \in Regions |->
-         IF regionTable[r] = t /\ parentProc[r].type = "TRUNCATE"
+         IF metaTable[r].table = t /\ parentProc[r].type = "TRUNCATE"
          THEN NoParentProc
          ELSE parentProc[r]
        ]
@@ -356,8 +341,6 @@ TruncateDone(t) ==
         masterVars,
         peVars,
         procStore,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>

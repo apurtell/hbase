@@ -41,9 +41,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -104,7 +102,7 @@ Master must be alive for in-memory state operations.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Guards: region is `CLOSED` and has no active procedure.
@@ -145,9 +143,7 @@ Meta is **not** updated: `RegionStateNode.offline()` does not write to meta. `me
         metaTable,
         peVars,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
@@ -210,9 +206,7 @@ Guard: only one server can be carrying meta at a time. `hbase:meta` is hosted on
         walFenced,
         serverRegions,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
@@ -265,16 +259,14 @@ In-memory master state becomes stale (gated on `masterAlive`).
         availableWorkers,
         suspendedOnMeta,
         blockedOnMeta,
-        regionKeyRange,
-        parentProc,
-        regionTable
+        parentProc
      >>
 ```
 
 Durable state survives.
 
 ```tla
-  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable, tableEnabled >>
+  /\ UNCHANGED << metaTable, procStore, parentProc, tableEnabled >>
 ```
 
 RS-side state survives.
@@ -293,12 +285,6 @@ ZK ephemeral nodes survive (external to master).
 
 ```tla
   /\ UNCHANGED zkNode
-```
-
-Table identity and enabled state survive (reconstructable from meta).
-
-```tla
-  /\ UNCHANGED << regionTable, tableEnabled >>
 ```
 
 ### `MasterRecover`
@@ -519,9 +505,7 @@ Durable state unchanged.
         rsOnlineRegions,
         walFenced,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
@@ -559,7 +543,7 @@ A PEWorker thread must be available.
 Region must exist (have an assigned keyspace).
 
 ```tla
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
 ```
 
 Region must be OPEN with no active procedure.
@@ -596,8 +580,7 @@ Region's location must reference a crashed server whose SCP has completed — th
                      NoServer]
                 /\ metaTable' =
                      [metaTable EXCEPT
-                     ![r] =
-                     [ state |-> "CLOSED", location |-> NoServer ]]
+                     ![r].state = "CLOSED", ![r].location = NoServer ]
                 /\ serverRegions' =
                      [serverRegions EXCEPT ![s] = @ \ { r }]
                 /\ UNCHANGED << procStore, dispatchedOps, pendingReports >>
@@ -622,8 +605,7 @@ Region's location must reference a crashed server whose SCP has completed — th
                      0]
                 /\ metaTable' =
                      [metaTable EXCEPT
-                     ![r] =
-                     [ state |-> "CLOSED", location |-> NoServer ]]
+                     ![r].state = "CLOSED", ![r].location = NoServer ]
                 /\ procStore' =
                      [procStore EXCEPT
                      ![r] =
@@ -648,9 +630,7 @@ Remaining variables unchanged.
         suspendedOnMeta,
         blockedOnMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
