@@ -431,7 +431,7 @@ All configurations check the same 35 safety invariants:
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused, split only) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 31 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 35 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 1,328,348,760 |
 | **States checked** | 368,662,744 distinct |
 | **Depth** | 92 |
@@ -441,13 +441,13 @@ All configurations check the same 35 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-15 |
+| **Date** | 2026-03-16 |
 | **TLC version** | 2026.03.02.213938 |
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
-| **Mode** | Random Simulation (seed -8405536033383709680) |
+| **Mode** | Random Simulation (seed -1702499423105596566, aril 0) |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 31 invariants, 2 action constraints, and state constraint passed |
-| **States generated** | 1,247,314,282 |
+| **Result** | All 35 invariants, 2 action constraints, and state constraint passed |
+| **States generated** | 1,314,483,362 |
 | **Duration** | 8 hours |
 
 ## Running the Spec
