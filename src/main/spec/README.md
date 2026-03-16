@@ -143,8 +143,10 @@ This TLA+ specification models the AssignmentManager as a state machine with
   regions of an enabled table to CLOSED/OFFLINE and marks the table disabled;
   `EnableTableProcedure` re-enables a disabled table by creating ASSIGN TRSPs
   on all OFFLINE/CLOSED regions. Both gated by `UseDisable`.
-- **Table enabled state** -- per-table `tableEnabled` boolean tracking whether
-  each table is enabled or disabled, persisted in meta via `TableStateManager`.
+- **Table enabled state** -- per-table `tableEnabled` tracking the 4-state table
+  lifecycle (`ENABLED`, `DISABLING`, `DISABLED`, `ENABLING`), matching Java's
+  `TableState.State` enum. Persisted in meta via `TableStateManager`.  Intermediate
+  states (`DISABLING`/`ENABLING`) serve as concurrent client request rejection gates.
 
 The specification defines 34 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
@@ -166,11 +168,12 @@ region at SPAWNED_OPEN step has a child ASSIGN TRSP), and
 `TableEnabledStateConsistency` (disabled tables have all regions in
 {CLOSED, OFFLINE} when no exclusive lock is held).
 
-Four liveness properties verify temporal guarantees:
+Five liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
 `OfflineEventuallyOpen` (ASSIGN-bearing OFFLINE region eventually opens),
-`SCPEventuallyDone` (started SCP eventually completes), and
-`RegionEventuallyAssigned` (ASSIGN on enabled table eventually opens).  Two action
+`SCPEventuallyDone` (started SCP eventually completes),
+`RegionEventuallyAssigned` (ASSIGN on enabled table eventually opens), and
+`NoStuckRegions` (regions in OPENING/CLOSING eventually leave those states).  Two action
 constraints enforce transition validity and SCP monotonicity.  One state
 constraint (`SplitMergeConstraint`) bounds concurrent split/merge procedures
 for TLC tractability.
@@ -282,7 +285,7 @@ MERGING, MERGED, and MERGING_NEW states.
 - **`suspendedOnMeta`** — regions whose procedures are async-suspended on meta unavailability
 - **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
 - **`parentProc`** -- per-region parent procedure record (`[type, step, ref1, ref2]`) tracking split/merge progress across child TRSP lifecycles; `ref1`/`ref2` hold region references (daughters for split, peer/merged for merge)
-- **`tableEnabled`** -- per-table enabled/disabled state (`BOOLEAN`); part of `TableStateManager`, stored in meta, persists across master crash
+- **`tableEnabled`** -- per-table state (`ENABLED`, `DISABLING`, `DISABLED`, `ENABLING`); part of `TableStateManager`, stored in meta, persists across master crash
 
 ## Configurable Behaviors
 
@@ -402,6 +405,7 @@ All configurations check the same 35 safety invariants:
 | `OfflineEventuallyOpen` | Once an ASSIGN procedure is attached to an OFFLINE region, the region eventually reaches OPEN |
 | `SCPEventuallyDone` | Once an SCP starts for a crashed server (`scpState ∉ {NONE, DONE}`), it eventually completes (`scpState = DONE`) |
 | `RegionEventuallyAssigned` | Once an ASSIGN procedure is attached to a region of an enabled table, the region eventually reaches OPEN |
+| `NoStuckRegions` | Regions in transitional states (OPENING, CLOSING) eventually leave those states |
 
 > Liveness properties are incompatible with TLC's `SYMMETRY` reduction.
 > Use [`AssignmentManager-liveness.cfg`](markdown/AssignmentManager-liveness-cfg.md)
@@ -427,7 +431,7 @@ All configurations check the same 35 safety invariants:
 | Detail | Value |
 |--------|-------|
 | **Date** | 2026-03-15 |
-| **TLC version** | 2026.03.02.213938 |
+| **TLC version** | 2026.03.12.221037 |
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused, split only) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 128 on 128 cores |
@@ -442,7 +446,7 @@ All configurations check the same 35 safety invariants:
 | Detail | Value |
 |--------|-------|
 | **Date** | 2026-03-16 |
-| **TLC version** | 2026.03.02.213938 |
+| **TLC version** | 2026.03.12.221037 |
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
 | **Mode** | Random Simulation (seed -1702499423105596566, aril 0) |
 | **Workers** | 128 on 128 cores |

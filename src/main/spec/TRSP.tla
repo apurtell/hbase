@@ -127,9 +127,9 @@ TRSPCreate(r) ==
   /\ parentProc[r].type = "NONE"
   \* Don't auto-create ASSIGN for regions of disabled tables.
   \* Unused identifiers (NoTable) are exempt.
-  \* Source: DisableTableProcedure sets tableEnabled[t] = FALSE;
-  \*         no assignment should target regions of disabled tables.
-  /\ metaTable[r].table # NoTable => tableEnabled[metaTable[r].table] = TRUE
+  \* Source: DisableTableProcedure sets tableEnabled[t] = "DISABLING";
+  \*         no assignment should target regions of disabled/disabling tables.
+  /\ metaTable[r].table # NoTable => tableEnabled[metaTable[r].table] = "ENABLED"
   \* Don't auto-create ASSIGN for ABNORMALLY_CLOSED regions while any SCP
   \* is actively processing a crash.  In the implementation, SCP owns
   \* crash recovery; no background daemon races to create procedures for

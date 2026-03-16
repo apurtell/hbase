@@ -78,14 +78,14 @@ TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
 \*
 \* All regions of table t must be in {CLOSED, OFFLINE} with no active
 \* procedure — modeling the disabled-table precondition.  Atomically
-\* spawns ASSIGN TRSPs for each region and sets tableEnabled[t] = TRUE.
+\* spawns ASSIGN TRSPs for each region and sets tableEnabled[t] = "ENABLING".
 \*
 \* Pre: master alive, PEWorker available, meta available,
-\*      tableEnabled[t] = FALSE, TableLockFree(t),
+\*      tableEnabled[t] = "DISABLED", TableLockFree(t),
 \*      at least one region belongs to t,
 \*      all regions of t in {CLOSED, OFFLINE} with procType = "NONE".
 \* Post: parentProc set to [ENABLE, SPAWNED_OPEN] on all regions,
-\*       ASSIGN TRSPs spawned, tableEnabled[t] = TRUE.
+\*       ASSIGN TRSPs spawned, tableEnabled[t] = "ENABLING".
 \*
 \* Source: EnableTableProcedure.executeFromState()
 \*         PREPARE -> PRE_OP -> SET_ENABLING steps (collapsed).
@@ -97,7 +97,7 @@ EnableTablePrepare(t) ==
   \* Meta region must be accessible (not on a crashed server).
   /\ MetaIsAvailable
   \* Table must be currently disabled.
-  /\ tableEnabled[t] = FALSE
+  /\ tableEnabled[t] = "DISABLED"
   \* TableLockFree: no parentProc active on table t.
   /\ TableLockFree(t)
   \* At least one region belongs to table t.
@@ -134,8 +134,9 @@ EnableTablePrepare(t) ==
          IF metaTable[r].table = t
          THEN NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)
          ELSE procStore[r]]
-  \* Set tableEnabled[t] = TRUE.
-  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = TRUE]
+  \* Set tableEnabled[t] = "ENABLING" (intermediate state).
+  \* Source: EnableTableProcedure.SET_ENABLING_TABLE_STATE.
+  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = "ENABLING"]
   \* Everything else unchanged.
   /\ UNCHANGED << metaTable,
         scpVars,
@@ -179,7 +180,10 @@ EnableTableDone(t) ==
          IF metaTable[r].table = t /\ parentProc[r].type = "ENABLE"
          THEN NoParentProc
          ELSE parentProc[r]]
-  \* Everything else unchanged (tableEnabled already TRUE).
+  \* Set tableEnabled[t] = "ENABLED" (final state).
+  \* Source: EnableTableProcedure.SET_ENABLED_TABLE_STATE.
+  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = "ENABLED"]
+  \* Everything else unchanged.
   /\ UNCHANGED << regionState,
         metaTable,
         scpVars,
@@ -189,7 +193,6 @@ EnableTableDone(t) ==
         masterVars,
         peVars,
         procStore,
-        tableEnabled,
         zkNode
      >>
 

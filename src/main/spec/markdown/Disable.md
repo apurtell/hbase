@@ -13,7 +13,7 @@ DisableTable procedure actions — disables a table by closing all its regions.
 Models `DisableTableProcedure`: disables a table by closing all its regions. All regions must be `OPEN` with `procType = "NONE"` (enabled-table precondition). Spawns `UNASSIGN` TRSPs to close each region.
 
 **Forward-path actions:**
-- **`DisableTablePrepare`** — acquire table lock, set `tableEnabled[t] = FALSE`, spawn child UNASSIGN TRSPs for all regions
+- **`DisableTablePrepare`** — acquire table lock, set `tableEnabled[t] = "DISABLING"`, spawn child UNASSIGN TRSPs for all regions
 - **`DisableTableDone`** — all regions `CLOSED`/`OFFLINE`, clear `parentProc`
 
 The `parentProc[r]` variable tracks the `DISABLE` procedure's state. Child TRSPs use the normal TRSP machinery (`procType`/`procStep`).
@@ -99,10 +99,10 @@ TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
 
 Disable a table by closing all its regions.
 
-All regions of table `t` must be `OPEN` with no active procedure — modeling the enabled-table precondition from the implementation. Atomically spawns `UNASSIGN` TRSPs for each region and sets `tableEnabled[t] = FALSE`.
+All regions of table `t` must be `OPEN` with no active procedure — modeling the enabled-table precondition from the implementation. Atomically spawns `UNASSIGN` TRSPs for each region and sets `tableEnabled[t] = "DISABLING"`.
 
-**Pre:** master alive, PEWorker available, meta available, `tableEnabled[t] = TRUE`, `TableLockFree(t)`, at least one region belongs to `t`, all regions of `t` `OPEN` with `procType = "NONE"`.
-**Post:** `parentProc` set to `[DISABLE, SPAWNED_CLOSE]` on all regions, UNASSIGN TRSPs spawned, `tableEnabled[t] = FALSE`.
+**Pre:** master alive, PEWorker available, meta available, `tableEnabled[t] = "ENABLED"`, `TableLockFree(t)`, at least one region belongs to `t`, all regions of `t` `OPEN` with `procType = "NONE"`.
+**Post:** `parentProc` set to `[DISABLE, SPAWNED_CLOSE]` on all regions, UNASSIGN TRSPs spawned, `tableEnabled[t] = "DISABLING"`.
 
 > *Source:* `DisableTableProcedure.executeFromState()` — `PREPARE → PRE_OP → SET_DISABLING` steps (collapsed).
 
@@ -131,7 +131,7 @@ Meta region must be accessible (not on a crashed server).
 Table must be currently enabled.
 
 ```tla
-  /\ tableEnabled[t] = TRUE
+  /\ tableEnabled[t] = "ENABLED"
 ```
 
 `TableLockFree`: no `parentProc` active on table `t`.
@@ -192,10 +192,12 @@ Persist child UNASSIGN procedures to `procStore`.
          ELSE procStore[r]]
 ```
 
-Set `tableEnabled[t] = FALSE`.
+Set `tableEnabled[t] = "DISABLING"` (intermediate state).
+
+> *Source:* `DisableTableProcedure.SET_DISABLING_TABLE_STATE`.
 
 ```tla
-  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = FALSE]
+  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = "DISABLING"]
 ```
 
 Everything else unchanged.
@@ -266,7 +268,15 @@ Clear `parentProc` on all regions of table `t` with `DISABLE`.
          ELSE parentProc[r]]
 ```
 
-Everything else unchanged (`tableEnabled` already `FALSE`).
+Set `tableEnabled[t] = "DISABLED"` (final state).
+
+> *Source:* `DisableTableProcedure.SET_DISABLED_TABLE_STATE`.
+
+```tla
+  /\ tableEnabled' = [tableEnabled EXCEPT ![t] = "DISABLED"]
+```
+
+Everything else unchanged.
 
 ```tla
   /\ UNCHANGED << regionState,
@@ -278,7 +288,6 @@ Everything else unchanged (`tableEnabled` already `FALSE`).
         masterVars,
         peVars,
         procStore,
-        tableEnabled,
         zkNode
      >>
 ```
