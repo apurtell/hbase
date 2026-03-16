@@ -41,9 +41,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -155,9 +153,7 @@ Meta is now online; clear the `carryingMeta` flag.
         scpRegions,
         walFenced,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
@@ -229,9 +225,7 @@ Region state, meta, RPCs, RS-side state, and WAL fencing unchanged.
         walFenced,
         carryingMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
@@ -299,9 +293,7 @@ Region state, meta, RPCs, RS-side state, and region snapshot unchanged.
         scpRegions,
         carryingMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```
@@ -376,9 +368,7 @@ Skip: only shrink the SCP snapshot; no state changes.
               carryingMeta,
               peVars,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
      \/ \* --- Meta unavailable: suspend or block ---
@@ -393,7 +383,7 @@ Paths A/B write to meta; if meta is unavailable, suspend (async) or block (sync)
         /\ r \notin blockedOnMeta
         /\ IF UseBlockOnMetaWrite = FALSE
            THEN /\ suspendedOnMeta' = suspendedOnMeta \cup { r }
-                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc, regionTable, tableEnabled >>
+                /\ UNCHANGED << availableWorkers, blockedOnMeta, parentProc, tableEnabled >>
            ELSE /\ blockedOnMeta' = blockedOnMeta \cup { r }
                 /\ availableWorkers' = availableWorkers - 1
                 /\ UNCHANGED suspendedOnMeta
@@ -411,9 +401,7 @@ Paths A/B write to meta; if meta is unavailable, suspend (async) or block (sync)
               procStore,
               masterVars,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
      \/ \* --- Path A: TRSP already attached ---
@@ -480,8 +468,8 @@ Persist `ABNORMALLY_CLOSED` state to `metaTable` with cleared location.
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
+             ![r].state = "ABNORMALLY_CLOSED",
+             ![r].location = NoServer ]
 ```
 
 Remove `r` from the SCP snapshot (processed).
@@ -514,9 +502,7 @@ Server state, WAL fencing, SCP state, and meta-carrying flag unchanged.
               walFenced,
               carryingMeta,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
 ```
@@ -605,8 +591,8 @@ Persist `ABNORMALLY_CLOSED` state to `metaTable` with cleared location.
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r] =
-             [ state |-> "ABNORMALLY_CLOSED", location |-> NoServer ]]
+             ![r].state = "ABNORMALLY_CLOSED",
+             ![r].location = NoServer ]
 ```
 
 Remove `r` from the SCP snapshot (processed).
@@ -640,9 +626,7 @@ Dispatched ops, server state, WAL fencing, SCP state, and meta-carrying flag unc
               walFenced,
               carryingMeta,
               zkNode,
-              regionKeyRange,
               parentProc,
-              regionTable,
               tableEnabled
            >>
 ```
@@ -719,9 +703,7 @@ All other state unchanged — region reassignments already applied.
         walFenced,
         carryingMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 ```

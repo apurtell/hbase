@@ -94,7 +94,7 @@ split-brain writes), data unavailability (lost or stuck regions), or cluster
 hangs (deadlocked procedures).
 
 This TLA+ specification models the AssignmentManager as a state machine with
-21 state variables capturing:
+19 state variables capturing:
 
 - **Region lifecycle** — in-memory master state (`regionState`) and persistent
   `hbase:meta` state (`metaTable`), tracking regions through OFFLINE → OPENING
@@ -114,15 +114,16 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **PEWorker thread pool** — available worker count (`availableWorkers`), async
   suspension (`suspendedOnMeta`), and sync blocking (`blockedOnMeta`) when
   `hbase:meta` is unavailable during SCP meta-reassignment.
-- **Keyspace infrastructure** -- per-region key range (`regionKeyRange`) mapping
-  each region to a `[startKey, endKey)` interval or `NoRange` for unused
+- **Keyspace infrastructure** -- per-region key range (`metaTable[r].keyRange`)
+  mapping each region to a `[startKey, endKey)` interval or `NoRange` for unused
   identifiers, with `DeployedRegions` tiling `[0, MaxKey)` at Init.
 - **Parent-child procedure framework** -- per-region `parentProc` record tracking
   parent procedure type and step (split, merge, or table-level), persisting
   across child TRSP lifecycles and surviving master crash.
-- **Table identity infrastructure** -- per-region `regionTable` tracking which
-  table a region belongs to, with guard predicates and an invariant
-  (`TableLockExclusivity`) enforcing exclusive table-level locks.
+- **Table identity infrastructure** -- per-region table identity
+  (`metaTable[r].table`) tracking which table a region belongs to, with guard
+  predicates and an invariant (`TableLockExclusivity`) enforcing exclusive
+  table-level locks.
 - **Split procedure** -- `SplitTableRegionProcedure` forward path
   (prepare → close parent → PONR meta write → materialize daughters → done)
   and pre-PONR rollback, using the parent-child framework.
@@ -261,10 +262,10 @@ MERGING, MERGED, and MERGING_NEW states.
 | [Disable.tla](markdown/Disable.md) | DisableTableProcedure: mark table disabled, close all regions (DisableTablePrepare, DisableTableDone) |
 | [Enable.tla](markdown/Enable.md) | EnableTableProcedure: mark table enabled, assign all regions (EnableTablePrepare, EnableTableDone) |
 
-## State Variables (21 total)
+## State Variables (19 total)
 
 - **`regionState`** — volatile in-memory master state per region (state, location, procedure fields)
-- **`metaTable`** — persistent `hbase:meta` state per region (survives master crash)
+- **`metaTable`** — persistent `hbase:meta` state per region: `[state, location, keyRange, table]` (survives master crash)
 - **`dispatchedOps`** — master→RS command channel per server
 - **`pendingReports`** — RS→master report channel
 - **`rsOnlineRegions`** — RS-side view of locally online regions
@@ -280,9 +281,7 @@ MERGING, MERGED, and MERGING_NEW states.
 - **`availableWorkers`** — number of idle PEWorker threads
 - **`suspendedOnMeta`** — regions whose procedures are async-suspended on meta unavailability
 - **`blockedOnMeta`** — regions whose procedures are sync-blocked on meta unavailability
-- **`regionKeyRange`** -- per-region keyspace assignment (`[startKey, endKey)` or `NoRange` for unused identifiers)
 - **`parentProc`** -- per-region parent procedure record (`[type, step, ref1, ref2]`) tracking split/merge progress across child TRSP lifecycles; `ref1`/`ref2` hold region references (daughters for split, peer/merged for merge)
-- **`regionTable`** -- per-region table identity tracking which table each region belongs to (`Tables` or `NoTable` for unused identifiers); used by guard predicates to enforce exclusive table-level locks
 - **`tableEnabled`** -- per-table enabled/disabled state (`BOOLEAN`); part of `TableStateManager`, stored in meta, persists across master crash
 
 ## Configurable Behaviors
