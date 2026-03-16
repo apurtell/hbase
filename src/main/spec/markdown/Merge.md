@@ -51,9 +51,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 ```
 
@@ -88,7 +86,7 @@ peVars == << availableWorkers, suspendedOnMeta, blockedOnMeta >>
 Does region `r` have an assigned keyspace?
 
 ```tla
-RegionExists(r) == regionKeyRange[r] # NoRange
+RegionExists(r) == metaTable[r].keyRange # NoRange
 ```
 
 Does region `r` have an active parent procedure?
@@ -101,10 +99,10 @@ No exclusive-type parent procedure (`CREATE`, `DELETE`, `TRUNCATE`) active on an
 
 ```tla
 NoTableExclusiveLock(r) ==
-  LET t == regionTable[r]
+  LET t == metaTable[r].table
   IN t # NoTable =>
        ~ \E r2 \in Regions:
-            /\ regionTable[r2] = t
+            /\ metaTable[r2].table = t
             /\ parentProc[r2].type \in TableExclusiveType
 ```
 
@@ -113,7 +111,7 @@ Are two regions adjacent (`r1`'s `endKey` = `r2`'s `startKey`)?
 ```tla
 Adjacent(r1, r2) == /\ RegionExists(r1)
                     /\ RegionExists(r2)
-                    /\ regionKeyRange[r1].endKey = regionKeyRange[r2].startKey
+                    /\ metaTable[r1].keyRange.endKey = metaTable[r2].keyRange.startKey
 ```
 
 Is meta available? (no server carrying meta is crashed)
@@ -135,7 +133,7 @@ Initiate a merge on two adjacent `OPEN` regions. Atomically sets both targets to
 
 In the implementation, `prepareMergeRegion()` and `addChildProcedure(createUnassignProcedures())` execute within the same `executeFromState()` call under region locks — effectively atomic.
 
-**Pre:** master alive, PEWorker available, `UseMerge = TRUE`, r1 and r2 are `OPEN` with locations, no procedures attached, no parent procedures in progress, `Adjacent(r1, r2)`, m is an unused identifier (`regionKeyRange = NoRange`).
+**Pre:** master alive, PEWorker available, `UseMerge = TRUE`, r1 and r2 are `OPEN` with locations, no procedures attached, no parent procedures in progress, `Adjacent(r1, r2)`, m is an unused identifier (`metaTable[m].keyRange = NoRange`).
 **Post:** both targets state = `MERGING`, `parentProc = [MERGE, SPAWNED_CLOSE, ref1=peer, ref2=m]`. Child `UNASSIGN` TRSPs spawned on both.
 
 > *Source:* `prepareMergeRegion()` sets `MERGING`; `CLOSE_REGIONS`: `addChildProcedure(createUnassignProcedures)`.
@@ -199,7 +197,7 @@ Regions must be adjacent. All three identifiers must be distinct.
 `m` must be an unused identifier with no parent procedure.
 
 ```tla
-  /\ regionKeyRange[m] = NoRange
+  /\ metaTable[m].keyRange = NoRange
   /\ ~HasActiveParent(m)
 ```
 
@@ -231,8 +229,8 @@ Update meta to `MERGING` (preserving locations).
 ```tla
   /\ metaTable' =
        [metaTable EXCEPT
-       ![r1] = [ state |-> "MERGING", location |-> metaTable[r1].location ],
-       ![r2] = [ state |-> "MERGING", location |-> metaTable[r2].location ]]
+       ![r1].state = "MERGING",
+       ![r2].state = "MERGING"]
 ```
 
 Persist child `UNASSIGN` procedures to `procStore`.
@@ -264,8 +262,6 @@ Everything else unchanged.
         rsVars,
         masterVars,
         peVars,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>
@@ -344,8 +340,6 @@ Advance r1 to `PONR`.
         masterVars,
         peVars,
         metaTable,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>
@@ -381,10 +375,10 @@ Read peer and merged region from `parentProc`.
 ```tla
   /\ LET r2 == parentProc[r1].ref1
          m == parentProc[r1].ref2
-         startK == regionKeyRange[r1].startKey
-         endK == regionKeyRange[r2].endKey
+         startK == metaTable[r1].keyRange.startKey
+         endK == metaTable[r2].keyRange.endKey
      IN /\ regionState[r2].state = "CLOSED"
-        /\ regionKeyRange[m] = NoRange
+        /\ metaTable[m].keyRange = NoRange
 ```
 
 Update `regionState`: targets → `MERGED`, merged → `MERGING_NEW` with child `ASSIGN` TRSP spawned.
@@ -410,22 +404,19 @@ Update `regionState`: targets → `MERGED`, merged → `MERGING_NEW` with child 
              ]]
 ```
 
-Update meta: targets → `MERGED`, merged → `CLOSED` (Appendix C.8 analogy).
+Update meta: targets → `MERGED`, merged → `CLOSED` with keyRange and table identity. All `metaTable` fields are set via field-level EXCEPT.
 
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r1] = [ state |-> "MERGED", location |-> NoServer ],
-             ![r2] = [ state |-> "MERGED", location |-> NoServer ],
-             ![m] = [ state |-> "CLOSED", location |-> NoServer ]]
-```
-
-Materialize merged region keyspace.
-
-```tla
-        /\ regionKeyRange' =
-             [regionKeyRange EXCEPT
-             ![m] = [ startKey |-> startK, endKey |-> endK ]]
+             ![r1].state = "MERGED",
+             ![r1].location = NoServer,
+             ![r2].state = "MERGED",
+             ![r2].location = NoServer,
+             ![m].state = "CLOSED",
+             ![m].location = NoServer,
+             ![m].keyRange = [ startKey |-> startK, endKey |-> endK ],
+             ![m].table = metaTable[r1].table ]
 ```
 
 Persist merged region `ASSIGN` procedure to `procStore`. Clear r1's `procStore` (`MERGE` lock was removed above).
@@ -441,12 +432,6 @@ Parent advances to `SPAWNED_OPEN` (yielding to merged `ASSIGN`).
 
 ```tla
   /\ parentProc' = [parentProc EXCEPT ![r1].step = "SPAWNED_OPEN"]
-```
-
-Merged region inherits the targets' table identity.
-
-```tla
-  /\ regionTable' = [regionTable EXCEPT ![m] = regionTable[r1]]
   /\ UNCHANGED << scpVars,
         rpcVars,
         serverVars,
@@ -462,10 +447,10 @@ Merged region inherits the targets' table identity.
 
 Complete the merge after the merged region is `OPEN`.
 
-Clears the targets' keyspaces to `NoRange` (regions *"deleted"* — models the post-compaction cleanup) and clears all parent procedure state.
+Clears the targets' keyspaces and table identity to free them (regions *"deleted"* — models the post-compaction cleanup) and clears all parent procedure state.
 
 **Pre:** master alive, PEWorker available, `parentProc[r1].type = "MERGE"` and `.step = "SPAWNED_OPEN"`, merged region m is `OPEN` with `procType = NONE` (ASSIGN completed).
-**Post:** target keyspaces cleared (`NoRange`), `parentProc` cleared on both. Targets stay in `MERGED` state (terminal).
+**Post:** target keyspaces and table identity cleared (`NoRange`, `NoTable`), `parentProc` cleared on both. Targets stay in `MERGED` state (terminal).
 
 > *Source:* `POST_OPERATION` state (procedure completes).
 
@@ -485,10 +470,17 @@ Read peer and merged region from `parentProc`.
          m == parentProc[r1].ref2
      IN /\ regionState[m].state = "OPEN"
         /\ regionState[m].procType = "NONE"
-        /\ regionKeyRange' =
-             [regionKeyRange EXCEPT
-             ![r1] = NoRange,
-             ![r2] = NoRange]
+```
+
+Clear target keyspaces and table identity via `metaTable` — regions *"deleted."*
+
+```tla
+         /\ metaTable' =
+              [metaTable EXCEPT
+              ![r1].keyRange = NoRange,
+              ![r1].table = NoTable,
+              ![r2].keyRange = NoRange,
+              ![r2].table = NoTable ]
 ```
 
 No `procStore` change needed (r1 already cleared at `MergeUpdateMeta`).
@@ -506,12 +498,6 @@ Clear parent procedure on both targets.
        ![parentProc[r1].ref1] = NoParentProc]
 ```
 
-Targets release their table identities (regions "deleted").
-
-```tla
-  /\ regionTable' = [regionTable EXCEPT ![r1] = NoTable, ![r2] = NoTable]
-```
-
 `regionState` unchanged (targets already `MERGED`, m already `OPEN`).
 
 ```tla
@@ -522,7 +508,6 @@ Targets release their table identities (regions "deleted").
         masterVars,
         peVars,
         regionState,
-        metaTable,
         tableEnabled,
         zkNode
      >>
@@ -540,7 +525,7 @@ Fires non-deterministically at the same precondition as `MergeCheckClosed` (both
 3. Reverts meta from `MERGING` to `CLOSED` (targets' actual state; the `ASSIGN` TRSPs will update meta to `OPENING` → `OPEN` later).
 4. Persists the new `ASSIGN` procedures to `procStore`.
 
-No merged region was created pre-PONR (`MergeAtomicity` invariant), so no merged region cleanup is needed. `regionKeyRange` unchanged (targets keep their keyspaces, m stays `NoRange`).
+No merged region was created pre-PONR (`MergeAtomicity` invariant), so no merged region cleanup is needed. `metaTable` keyRange/table unchanged (targets keep their keyspaces, m stays `NoRange`).
 
 **Pre:** master alive, PEWorker available, r1 and r2 exist, both `CLOSED`, no procedure attached, `parentProc = SPAWNED_CLOSE`.
 **Post:** `ASSIGN` TRSPs spawned on both, `parentProc` cleared, meta reverted.
@@ -612,8 +597,8 @@ Revert meta from `MERGING` to `CLOSED` (targets' actual state).
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r1] = [ state |-> "CLOSED", location |-> NoServer ],
-             ![r2] = [ state |-> "CLOSED", location |-> NoServer ]]
+             ![r1].state = "CLOSED", ![r1].location = NoServer,
+             ![r2].state = "CLOSED", ![r2].location = NoServer ]
 ```
 
 Clear parent procedure on both targets — merge is terminated.
@@ -634,8 +619,6 @@ Everything else unchanged.
         rsVars,
         masterVars,
         peVars,
-        regionKeyRange,
-        regionTable,
         tableEnabled,
         zkNode
      >>

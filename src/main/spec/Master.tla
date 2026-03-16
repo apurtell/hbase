@@ -30,9 +30,7 @@ VARIABLE regionState,
          availableWorkers,
          suspendedOnMeta,
          blockedOnMeta,
-         regionKeyRange,
          parentProc,
-         regionTable,
          tableEnabled
 
 \* Shorthand for the RPC channel variables (used in UNCHANGED clauses).
@@ -71,7 +69,7 @@ GoOffline(r) ==
   \* Master must be alive for in-memory state operations.
   /\ masterAlive = TRUE
   \* Region must exist (have an assigned keyspace).
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
   \* Guards: region is CLOSED and has no active procedure.
   /\ regionState[r].state = "CLOSED"
   /\ regionState[r].procType = "NONE"
@@ -98,9 +96,7 @@ GoOffline(r) ==
         metaTable,
         peVars,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
@@ -155,9 +151,7 @@ MasterDetectCrash(s) ==
         walFenced,
         serverRegions,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
@@ -200,19 +194,16 @@ MasterCrash ==
         availableWorkers,
         suspendedOnMeta,
         blockedOnMeta,
-        regionKeyRange,
         parentProc
      >>
   \* Durable state survives.
-  /\ UNCHANGED << metaTable, procStore, parentProc, regionTable, tableEnabled >>
+  /\ UNCHANGED << metaTable, procStore, parentProc, tableEnabled >>
   \* RS-side state survives.
   /\ UNCHANGED rsOnlineRegions
   \* WAL fencing survives (HDFS-level).
   /\ UNCHANGED walFenced
   \* ZK ephemeral nodes survive (external to master).
   /\ UNCHANGED zkNode
-  \* Table identity and enabled state survive (reconstructable from meta).
-  /\ UNCHANGED << regionTable, tableEnabled >>
 
 \* The master recovers after a crash.  Rebuilds in-memory state from
 \* durable storage (metaTable and procStore).
@@ -385,9 +376,7 @@ MasterRecover ==
         rsOnlineRegions,
         walFenced,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
@@ -423,7 +412,7 @@ DetectUnknownServer(r) ==
   \* A PEWorker thread must be available.
   /\ availableWorkers > 0
   \* Region must exist (have an assigned keyspace).
-  /\ regionKeyRange[r] # NoRange
+  /\ metaTable[r].keyRange # NoRange
   \* Region must be OPEN with no active procedure.
   /\ regionState[r].state = "OPEN"
   /\ regionState[r].procType = "NONE"
@@ -448,8 +437,7 @@ DetectUnknownServer(r) ==
                      NoServer]
                 /\ metaTable' =
                      [metaTable EXCEPT
-                     ![r] =
-                     [ state |-> "CLOSED", location |-> NoServer ]]
+                     ![r].state = "CLOSED", ![r].location = NoServer ]
                 /\ serverRegions' =
                      [serverRegions EXCEPT ![s] = @ \ { r }]
                 /\ UNCHANGED << procStore, dispatchedOps, pendingReports >>
@@ -470,8 +458,7 @@ DetectUnknownServer(r) ==
                      0]
                 /\ metaTable' =
                      [metaTable EXCEPT
-                     ![r] =
-                     [ state |-> "CLOSED", location |-> NoServer ]]
+                     ![r].state = "CLOSED", ![r].location = NoServer ]
                 /\ procStore' =
                      [procStore EXCEPT
                      ![r] =
@@ -491,9 +478,7 @@ DetectUnknownServer(r) ==
         suspendedOnMeta,
         blockedOnMeta,
         zkNode,
-        regionKeyRange,
         parentProc,
-        regionTable,
         tableEnabled
      >>
 
