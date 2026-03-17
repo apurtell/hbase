@@ -10,6 +10,26 @@ EnableTable procedure actions — enables a table by opening all its regions.
 ------------------------------ MODULE Enable -----------------------------------
 ```
 
+Models `EnableTableProcedure` actions: Enable a table by transitioning it from `DISABLED` → `ENABLING` → `ENABLED`, opening all its regions via child ASSIGN TRSPs.
+
+### Implementation State Simplification
+
+The implementation's [`EnableTableProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/EnableTableProcedure.java) uses the `EnableTableState` enum with 6 values: `PREPARE`, `PRE_OPERATION`, `SET_ENABLING_TABLE_STATE`, `MARK_REGIONS_ONLINE`, `SET_ENABLED_TABLE_STATE`, `POST_OPERATION`. The model collapses these into three actions:
+
+- **`EnablePrepare`** — `PREPARE` + `PRE_OPERATION` + `SET_ENABLING_TABLE_STATE` (set table `ENABLING`)
+- **`EnableAssign`** — `MARK_REGIONS_ONLINE` (spawn child ASSIGN TRSPs)
+- **`EnableDone`** — `SET_ENABLED_TABLE_STATE` + `POST_OPERATION` (set table `ENABLED`)
+
+Omitted: `PRE_OPERATION` fires coprocessor `preEnableTable` hook. `POST_OPERATION` fires coprocessor `postEnableTable` hook. Both are orthogonal to the assignment protocol.
+
+### Table State Machine
+
+The transition path is `DISABLED → ENABLING → ENABLED`, with `ENABLING` persisted in `hbase:meta` via `TableStateManager.setTableState()` before any regions are opened. This matches the model's `tableEnabled[t]` variable: `EnablePrepare` sets it to `"ENABLING"`, and `EnableDone` sets it to `"ENABLED"`.
+
+### Load Balancer Abstraction
+
+[`EnableTableProcedure.createAssignProcedures()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/EnableTableProcedure.java) calls `assignmentManager.createRoundRobinAssignProcedures()` for balanced server placement. The model abstracts load balancing to **non-deterministic server selection** in `TRSPGetCandidate` — any `ONLINE` server may be chosen. This is a sound over-approximation: TLC explores all possible placements, including unbalanced ones, ensuring safety holds regardless of the balancer's output.
+
 Models `EnableTableProcedure`: enables a table by opening all its regions. All regions must be in `{"CLOSED","OFFLINE"}` with `procType = "NONE"` (disabled-table precondition). Spawns `ASSIGN` TRSPs to open each region.
 
 **Forward-path actions:**

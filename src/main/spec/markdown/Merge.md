@@ -23,6 +23,20 @@ Models `MergeTableRegionsProcedure`: forward path (merge two adjacent regions in
 
 The `parentProc[r]` variable tracks the parent procedure's state on BOTH target regions. It persists across child TRSP lifecycles and survives master crash. The `ref1` field cross-references the other target (peer); `ref2` references the merged region identifier.
 
+### Dual-Region Coordination
+
+Unlike split (which operates on a single parent), merge coordinates TWO input regions atomically. The implementation's [`MergeTableRegionsProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/MergeTableRegionsProcedure.java) acquires locks on both regions in `acquireLock()` and performs the merge under those locks. The model captures this by setting `parentProc` on BOTH targets at `MergePrepare`, with cross-references: `parentProc[r1].ref1 = r2` and `parentProc[r2].ref1 = r1`. This ensures the `NoTableExclusiveLock` guard on other procedures (split, create, delete) blocks on either target.
+
+The `ref2` field on both targets stores the merged region identifier `m`, which is selected non-deterministically from unused identifiers. This models the implementation's `RegionInfoBuilder.newRegionInfo()` call that creates a new `RegionInfo` for the merged output.
+
+### Implementation State Simplification
+
+The implementation's `MergeTableRegionsState` enum has 10 values, collapsed to 5 model steps. Omitted states are filesystem (move HFile store files) and coprocessor operations, identical to the Split collapse rationale.
+
+### GC Procedure Omission 
+
+The implementation creates [`GCMergedRegionsProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/GCMergedRegionsProcedure.java) / [`GCMultipleMergedRegionsProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/GCMultipleMergedRegionsProcedure.java) after merge completion to clean up compaction references and delete the merged-from regions' HFile directories. These GC procedures are post-merge cleanup and do not modify `RegionState`, `ServerStateNode`, or any assignment-related variable. The model's `MergeDone` action clears the target keyspaces to `NoRange` (modeling the GC outcome) without the intermediate GC procedure.
+
 `MergeFail` fires non-deterministically at the same precondition as `MergeCheckClosed` (both targets `CLOSED`, children complete). TLC explores both the success path (`MergeCheckClosed`) and the failure path (`MergeFail`) for every reachable merge state.
 
 > *Source:* `MergeTableRegionsProcedure.executeFromState()` L189–255; `MergeTableRegionsProcedure.rollbackState()` L266–310.

@@ -10,6 +10,26 @@ CreateTable procedure actions — single-region table creation.
 ------------------------------- MODULE Create ---------------------------------
 ```
 
+Models `CreateTableProcedure` actions: Create a new table with a single region.
+
+### Implementation State Simplification
+
+The implementation's [`CreateTableProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/CreateTableProcedure.java) uses the `CreateTableState` enum with 7 values: `PRE_OPERATION`, `WRITE_FS_LAYOUT`, `ADD_TO_META`, `ASSIGN_REGIONS`, `UPDATE_DESC_CACHE`, `SET_ENABLED_TABLE_STATE`, `POST_OPERATION`. The model collapses these into two actions:
+
+- **`CreateTablePrepare`** — `PRE_OPERATION` + `WRITE_FS_LAYOUT` + `ADD_TO_META` + `ASSIGN_REGIONS` + `SET_ENABLED_TABLE_STATE` (set table enabled)
+- **`CreateTableDone`** — `UPDATE_DESC_CACHE` + `POST_OPERATION`
+
+Omitted operations: `WRITE_FS_LAYOUT` creates HRegion directories and column-family subdirectories on HDFS. `UPDATE_DESC_CACHE` refreshes the `TableDescriptor` cache. `POST_OPERATION` fires coprocessor `postCreateTable` hooks. All are orthogonal to the assignment/state-tracking protocol.
+
+### Single-Region Simplification
+
+The real `CreateTableProcedure` creates N regions (N ≥ 1) from pre-split keys via `ModifyRegionUtils.createRegionInfos()`. The model creates a single region covering `[0, MaxKey)`. This simplification preserves the essential correctness properties:
+1. **Table-level locking** — the `parentProc` exclusive lock prevents concurrent operations on the same table (split, merge, delete, truncate).
+2. **ASSIGN TRSP spawning** — child ASSIGN TRSPs are created for the new region.
+3. **Table enabled state** — `tableEnabled[t]` transitions to `ENABLED`.
+
+Multi-region creation adds O(N) child TRSPs but does not introduce new state machine transitions or safety concerns beyond what the single-region model covers.
+
 Models `CreateTableProcedure`: creates a new table with a single region covering the full keyspace `[0, MaxKey)`, writes meta, and spawns a child `ASSIGN` TRSP to open the region.
 
 **Forward-path actions:**

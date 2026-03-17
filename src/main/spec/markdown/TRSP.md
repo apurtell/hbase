@@ -26,7 +26,7 @@ The `TRSPState` set maps 1:1 to the `RegionStateTransitionState` protobuf enum (
 
 ### RegionRemoteProcedureBase Child Procedure Absorption
 
-The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionProcedure`) that extend `RegionRemoteProcedureBase` and have their own 4-state machine (`RegionRemoteProcedureBaseState` in `MasterProcedure.proto`). The model merges these into TRSP actions:
+The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionProcedure`) that extend [`RegionRemoteProcedureBase`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionRemoteProcedureBase.java) and have their own 4-state machine (`RegionRemoteProcedureBaseState` in `MasterProcedure.proto`). The model merges these into TRSP actions:
 
 | RRPB state            | Absorbed by TLA+ action(s)                                                          |
 |-----------------------|-------------------------------------------------------------------------------------|
@@ -34,6 +34,32 @@ The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionPro
 | `REPORT_SUCCEED` (=2) | `TRSPConfirmOpened`, `TRSPConfirmClosed` — decomposed to model crash window         |
 | `DISPATCH_FAIL` (=3)  | `DispatchFail`, `DispatchFailClose` — RPC failure resets TRSP to retry (disjunct 1) or expires server and starts SCP (disjunct 2) |
 | `SERVER_CRASH` (=4)   | `TRSPServerCrashed` — server crash recovery (type-preserving)                       |
+
+The RRPB child procedure pattern introduces a 2-level procedure hierarchy: TRSP (parent) → ORP/CRP (child, extending RRPB). The child's 4 states correspond exactly to TRSP sub-steps, and the child never runs independently — it is created by TRSP, executes one state transition, and wakes the parent. The model collapses this to a single level because:
+1. **No independent lifecycle.** RRPB children are always spawned by TRSP and complete within TRSP's context.
+2. **Same crash semantics.** RRPB's `restoreSucceedState()` is modeled in `ProcStore.md`; the parent TRSP's `CONFIRM_OPENED`/`CONFIRM_CLOSED` step corresponds to the child's `REPORT_SUCCEED` state.
+3. **State space reduction.** A 2-level hierarchy would double the state variables per region without adding reachable behaviors.
+
+### Two-Phase Report/Persist Split
+
+The specification decomposes the implementation's `reportTransition()` → `executeFromState()` sequence into two separate TLA+ actions (e.g., `TRSPReportSucceedOpen` + `TRSPPersistToMetaOpen`). This decomposition exposes the **crash window** between report consumption (in-memory state updated) and meta persistence (durable state updated). If the master crashes in this window, `restoreSucceedState()` must reconstruct the correct in-memory state from `procStore` — which is exactly what the model verifies.
+
+The implementation path is: `RSProcedureDispatcher.reportTransition()` → `AM.reportRegionStateTransition()` → `RRPB.reportSucceed()` → sets state `REPORT_SUCCEED` → `ProcedureExecutor` re-enqueues TRSP → TRSP's `executeFromState(CONFIRM_OPENED)` → `RegionStateStore.updateRegionLocation()` (meta write). The `procStore` is written BEFORE the meta write (via procedure WAL persistence in the executor loop), creating the window.
+
+### Failed-Open Handling
+
+When an RS reports `FAILED_OPEN` (via `reportRegionStateTransition()` with transition type `FAILED_OPEN`), the master's [`AM.regionFailedOpen()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java) is called. This method:
+1. Removes the region from the server's `ServerStateNode` region list (`removeRegionFromServer()`)
+2. Sets `RegionStateNode.state = FAILED_OPEN`
+3. Wakes the TRSP parent to retry (if retries remaining) or give up
+
+The model's `TRSPConfirmFailedOpen` action captures steps 2–3; the `removeRegionFromServer` is modeled by `serverRegions` update.
+
+### Meta-Blocking (Branch-2.6 vs Master)
+
+`UseBlockOnMetaWrite` comparison:
+- **`TRUE` (branch-2.6)**: `RegionStateStore.updateRegionLocation()` uses `Table.put()` — a synchronous HBase client call. The procedure thread blocks until the meta write completes. The model represents this as direct meta variable update within `TRSPPersistToMetaOpen` / `TRSPPersistToMetaClose`.
+- **`FALSE` (master branch)**: `RegionStateStore.updateRegionLocation()` uses `AsyncTable.put()` — the procedure thread does not block. Instead, the TRSP suspends via `ProcedureFutureUtil.suspendIfNecessary()`, yielding the PEWorker thread. When the async meta write completes, the TRSP is woken and re-enqueued. The model represents this as a two-phase pattern: `TRSPPersistToMetaOpen` updates meta BUT the TRSP enters `suspendedOnMeta` and must be woken by `TRSPCompleteMetaSuspend`.
 
 ```tla
 EXTENDS Types

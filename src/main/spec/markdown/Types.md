@@ -4,6 +4,14 @@
 
 Pure-definition module: constants, type sets, and state definitions for the HBase AssignmentManager specification.
 
+### Implementation Mapping
+
+Every type set and constant in this module maps to a specific implementation artifact. The design philosophy is **1:1 enum correspondence** where possible: each string literal in a TLA+ type set corresponds to exactly one enum value in the Java source or protobuf definition. This enables direct traceability between model-checked properties and implementation code paths.
+
+Sentinel constants (`NoServer`, `NoRange`, `NoTable`, `NoProcedure`, `NoTransition`, `NoRegion`) are declared as TLC **model values** — distinct atoms that are guaranteed unequal to any domain element. Model values are critical for TLC's symmetry reduction: they cannot participate in arithmetic or string comparison, preventing TLC from confusing sentinel absence with a valid domain element.
+
+> *Key implementation classes:* [`RegionState.java`](file:///Users/andrewpurtell/src/hbase/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java) (State enum), [`TableState.java`](file:///Users/andrewpurtell/src/hbase/hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableState.java) (table lifecycle), [`MasterProcedure.proto`](file:///Users/andrewpurtell/src/hbase/hbase-protocol-shaded/src/main/protobuf/server/master/MasterProcedure.proto) (TRSP state, procedure type, split/merge state enums), [`RegionStateNode.java`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStateNode.java) (in-memory procedure attachment).
+
 ---
 
 ```tla
@@ -80,6 +88,8 @@ CONSTANTS NoProcedure
 
 `MaxRetries` — maximum open-retry attempts before giving up (`FAILED_OPEN`).
 
+> *Source:* `hbase.assignment.maximum.attempts` (default 10). In the specification, this is typically set to a small value (0 or 1) for exhaustive model checking to keep the state space tractable. In simulation mode, it can be set higher to exercise more retry paths.
+
 ```tla
 CONSTANTS MaxRetries
 ASSUME MaxRetries \in Nat /\ MaxRetries >= 0
@@ -146,21 +156,27 @@ CONSTANTS UseDisable
 ASSUME UseDisable \in BOOLEAN
 ```
 
-`UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling `AssignRegionHandler.process()` L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
+`UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling [`AssignRegionHandler.process()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/AssignRegionHandler.java) L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
+
+The RS checks `getRegion(encodedName) != null` and returns early without calling `reportRegionStateTransition()`. The master-side `OpenRegionProcedure` suspends indefinitely at `REPORT_SUCCEED` waiting for a report that will never arrive. This is a genuine implementation bug that can cause region unavailability; the `UseRSOpenDuplicateQuirk` toggle lets TLC generate counterexample traces demonstrating the deadlock.
 
 ```tla
 CONSTANTS UseRSOpenDuplicateQuirk
 ASSUME UseRSOpenDuplicateQuirk \in BOOLEAN
 ```
 
-`UseRSCloseNotFoundQuirk` — when `TRUE`, the `RSCloseNotFound` action is enabled, modeling `UnassignRegionHandler.process()` L111–117 where the RS silently drops `CLOSE` requests for regions that are not online without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_CLOSED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
+`UseRSCloseNotFoundQuirk` — when `TRUE`, the `RSCloseNotFound` action is enabled, modeling [`UnassignRegionHandler.process()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/UnassignRegionHandler.java) L111–117 where the RS silently drops `CLOSE` requests for regions that are not online without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_CLOSED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
+
+The RS checks `rs.getRegion(encodedName) == null` and returns early. Also covers L94–109 where `regionsInTransitionInRS` has a conflicting entry (already closing/opening). In both cases, no `CLOSED` report is sent, causing the master-side `CloseRegionProcedure` to suspend indefinitely.
 
 ```tla
 CONSTANTS UseRSCloseNotFoundQuirk
 ASSUME UseRSCloseNotFoundQuirk \in BOOLEAN
 ```
 
-`UseRestoreSucceedQuirk` — when `TRUE`, `RestoreSucceedState` faithfully reproduces the `OpenRegionProcedure.restoreSucceedState()` L128–136 bug where `OPEN`-type procedures always replay as `OPENED` regardless of the persisted `transitionCode` (even `FAILED_OPEN`). Default `FALSE` so that recovery correctly checks `transitionCode` and branches; set `TRUE` to demonstrate the violation and generate counterexample traces.
+`UseRestoreSucceedQuirk` — when `TRUE`, `RestoreSucceedState` faithfully reproduces the [`OpenRegionProcedure.restoreSucceedState()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/OpenRegionProcedure.java) L128–136 bug where `OPEN`-type procedures always replay as `OPENED` regardless of the persisted `transitionCode` (even `FAILED_OPEN`). Default `FALSE` so that recovery correctly checks `transitionCode` and branches; set `TRUE` to demonstrate the violation and generate counterexample traces.
+
+`OpenRegionProcedure.restoreSucceedState()` unconditionally calls `env.getAssignmentManager().regionOpenedWithoutPersistingToMeta(regionNode)` — it never inspects `transitionCode` to distinguish `OPENED` from `FAILED_OPEN`. After a master crash at `REPORT_SUCCEED` with `transitionCode=FAILED_OPEN`, recovery marks the failed region as `OPEN`, potentially causing data-serving from a region with incomplete initialization.
 
 ```tla
 CONSTANTS UseRestoreSucceedQuirk
@@ -231,7 +247,7 @@ ASSUME UseStaleStateQuirk \in BOOLEAN
 
 ### Region Lifecycle States
 
-The `State` set covers the full `RegionState.State` enum:
+The `State` set covers the full `RegionState.State` enum (declared in [`RegionState.java`](file:///Users/andrewpurtell/src/hbase/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java) L38–59):
 
 | Modeled               | Impl enum value           |
 |-----------------------|---------------------------|
@@ -248,6 +264,10 @@ The `State` set covers the full `RegionState.State` enum:
 | `"ABNORMALLY_CLOSED"` | `ABNORMALLY_CLOSED` (=10) |
 | `"MERGED"`            | `MERGED` (=11)            |
 | `"MERGING_NEW"`       | `MERGING_NEW` (=12)       |
+
+**Omitted:** `FAILED_CLOSE` (=9 in implementation) is declared in the Java enum but has **no reachable code path** that transitions any region into this state. When a close RPC fails, the RS either retries internally or crashes — in both cases, the master observes `ABNORMALLY_CLOSED` (via `ServerCrashProcedure`), never `FAILED_CLOSE`. Including it would add an unreachable state to the model and expand the state space without covering any real behavior. The implementation's `RegionState.isFailedClose()` method exists but is never called in the assignment path.
+
+The specification enumerates only *reachable* states — not the full declared set. The Java `RegionState.State` enum contains `FAILED_CLOSE` for historical/forward-compatibility reasons, but no TRSP, SCP, or RS handler ever calls `setState(FAILED_CLOSE)`. Omitting it from the TLA+ model is both correct (no behavior is lost) and beneficial (smaller state space for exhaustive model checking).
 
 ```tla
 State ==
@@ -269,7 +289,9 @@ State ==
 
 ### Valid Transitions
 
-The set of valid *(from, to)* state transitions:
+The set of valid *(from, to)* state transitions. Unlike the implementation (which does not declare a formal transition table — transitions are enforced implicitly by action guards in each procedure), the specification makes the valid transition set *explicit*. This set was derived by analyzing all code paths through `TransitRegionStateProcedure`, `SplitTableRegionProcedure`, `MergeTableRegionsProcedure`, `ServerCrashProcedure`, and the RS handlers.
+
+The `TransitionValid` action constraint (in `AssignmentManager.md`) checks every state change against this set. If any action produces a transition not in `ValidTransition`, TLC reports a violation. This is a **specification-level** enforcement of state-machine discipline that the implementation achieves implicitly through the procedural flow of `executeFromState()` case statements.
 
 ```tla
 ValidTransition ==
@@ -333,11 +355,11 @@ TRSPState ==
 
 ### Parent Procedure Step States
 
-Parent procedure step states track the progress of a parent procedure (`SplitTableRegionProcedure`, future merge) that owns one or more child TRSPs via `addChildProcedure()`.
+Parent procedure step states track the progress of a parent procedure (`SplitTableRegionProcedure`, `MergeTableRegionsProcedure`) that owns one or more child TRSPs via `addChildProcedure()`.
 
 The parent *yields* by spawning child TRSPs (`SPAWNED_CLOSE`, `SPAWNED_OPEN`) and *resumes* when all children complete. `parentProc[r]` persists across the child TRSP lifecycle.
 
-These map to the `SplitTableRegionState` enum (`MasterProcedure.proto`), collapsed from 11 states to 5 (filesystem + coprocessor ops abstracted). They generalize to `MergeTableRegionsState` later.
+These map to the `SplitTableRegionState` enum (`MasterProcedure.proto`), collapsed from 11 states to 5 (filesystem + coprocessor ops abstracted). They generalize to `MergeTableRegionsState` identically.
 
 | Step            | Implementation mapping                                                |
 |-----------------|-----------------------------------------------------------------------|
@@ -346,6 +368,12 @@ These map to the `SplitTableRegionState` enum (`MasterProcedure.proto`), collaps
 | `PONR`          | `CHECK_CLOSED` → `CREATE_DAUGHTERS` → `WRITE_SEQ` → `PRE_BEFORE_META` → `UPDATE_META` (PONR) |
 | `SPAWNED_OPEN`  | `OPEN_CHILD_REGIONS`: `addChildProcedure(assign)`                    |
 | `COMPLETING`    | `POST_OPERATION`                                                      |
+
+The implementation's `SplitTableRegionState` enum includes `SPLIT_TABLE_REGION_PRE_OPERATION`, `SPLIT_TABLE_REGION_CREATE_DAUGHTER_REGIONS` (HFile reference creation), `SPLIT_TABLE_REGION_WRITE_MAX_SEQUENCE_ID_FILE` (WAL sequence ID persistence), `SPLIT_TABLE_REGION_PRE_OPERATION_BEFORE_META` (coprocessor hook), and `SPLIT_TABLE_REGION_UPDATE_META` (meta write for daughters). These filesystem and coprocessor operations are **orthogonal** to the assignment/state-tracking protocol: they do not modify `RegionState`, `ServerStateNode`, `dispatchedOps`, or any variable in the model. Collapsing them into `PONR` captures the essential property — the procedure crosses a point-of-no-return where daughter regions become visible — without modeling HFile manipulation or coprocessor hooks.
+
+Similarly, `MergeTableRegionsState` has `MERGE_TABLE_REGIONS_PRE_MERGE_OPERATION`, `MERGE_TABLE_REGIONS_MOVE_REGION_STORE_FILES`, `MERGE_TABLE_REGIONS_PRE_MERGE_COMMIT`, `MERGE_TABLE_REGIONS_UPDATE_META` — all collapsed into `PONR` for the same reason.
+
+> *Source:* `SplitTableRegionProcedure.executeFromState()` (11 case branches), `MergeTableRegionsProcedure.executeFromState()` (10 case branches).
 
 ```tla
 ParentProcStep ==
@@ -379,9 +407,11 @@ TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
 
 ### Table State Set
 
-`TableStateSet` — the set of valid table-level states, matching the Java `TableState.State` enum. `DISABLING` and `ENABLING` are intermediate states set early in the disable/enable procedure flow and serve as concurrent client request rejection gates.
+`TableStateSet` — the set of valid table-level states, matching the Java [`TableState.State`](file:///Users/andrewpurtell/src/hbase/hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableState.java) enum (L35–45). `DISABLING` and `ENABLING` are intermediate states set early in the disable/enable procedure flow and serve as concurrent client request rejection gates.
 
-> *Source:* `org.apache.hadoop.hbase.client.TableState.State`
+The implementation stores table state in `hbase:meta` via `TableStateManager.setTableState()`, persisting a protobuf `HBaseProtos.TableState` record. The TLA+ model abstracts this to the `tableEnabled` variable, which is declared as durable (survives master crash via `UNCHANGED` in `MasterCrash`). This faithfully models the implementation's storage of table state in meta.
+
+> *Source:* `org.apache.hadoop.hbase.client.TableState.State`, [`TableStateManager.java`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java)
 
 ```tla
 TableStateSet == { "ENABLED", "DISABLED", "DISABLING", "ENABLING" }
@@ -434,6 +464,10 @@ ReportCode == { "OPENED", "FAILED_OPEN", "CLOSED" }
 ### Procedure Store Record
 
 Type definition for persisted procedure records. `transitionCode` records the RS report outcome when `step = REPORT_SUCCEED`; set to `NoTransition` for all other steps.
+
+Each `ProcStoreRecord` abstracts the state of a procedure as persisted by `WALProcedureStore` (master) or `RegionProcedureStore` (branch-3+). The implementation serializes the full `Procedure` object (including subclass-specific state like `TransitRegionStateProcedure`'s `lastState`, `assignCandidate`, and `RegionRemoteProcedureBase`'s `state` + `transitionCode`) to a WAL entry. The model captures only the 4 assignment-critical fields: `type`, `step`, `targetServer`, and `transitionCode`. Serialization format, procedure IDs, parent-child linkage in the store, WAL slot reuse, and store compaction are all abstracted.
+
+The `transitionCode` field is the key to **crash recovery fidelity**: when the master crashes between consuming an RS report (`TRSPReportSucceedOpen`/`TRSPReportSucceedClose` sets in-memory state) and persisting to meta, the `transitionCode` in `procStore` preserves the report outcome across the crash. `MasterRecover` reads `transitionCode` to reconstruct the in-memory state via `restoreSucceedState()`.
 
 ```tla
 ProcStoreRecord ==
