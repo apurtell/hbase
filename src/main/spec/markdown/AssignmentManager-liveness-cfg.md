@@ -69,7 +69,7 @@ Same model values and universe sizing as the primary exhaustive config:
 
 ## Safety Invariants
 
-All 35 safety invariants are checked alongside liveness:
+All 36 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -107,6 +107,7 @@ INVARIANT
     DeleteTableAtomicity
     TruncateAtomicity
     TruncateNoOrphans
+    CreateNoOrphans
     TableEnabledStateConsistency
 ```
 

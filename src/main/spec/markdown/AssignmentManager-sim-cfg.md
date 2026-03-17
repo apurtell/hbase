@@ -115,7 +115,7 @@ SPECIFICATION Spec
 
 ## Invariants
 
-All 32 safety invariants are checked:
+All 33 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -153,6 +153,7 @@ INVARIANT
     DeleteTableAtomicity
     TruncateAtomicity
     TruncateNoOrphans
+    CreateNoOrphans
 ```
 
 ## Action Constraints

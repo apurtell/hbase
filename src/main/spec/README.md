@@ -130,9 +130,9 @@ This TLA+ specification models the AssignmentManager as a state machine with
 - **Merge procedure** -- `MergeTableRegionsProcedure` forward path
   (prepare → close targets → PONR meta write → materialize merged region → done)
   and pre-PONR rollback, gated by the `UseMerge` constant.
-- **CreateTable procedure** -- `CreateTableProcedure` allocates an unused region
-  identifier, writes meta, and spawns a child ASSIGN TRSP to bring the new
-  table online, gated by the `UseCreate` constant.
+- **CreateTable procedure** -- `CreateTableProcedure` allocates one or more unused
+  region identifiers, tiles the keyspace into equal-width sub-ranges, writes meta,
+  and spawns child ASSIGN TRSPs to bring the new table online, gated by `UseCreate`.
 - **DeleteTable procedure** -- `DeleteTableProcedure` acquires an exclusive table
   lock, then atomically clears meta, frees identifiers, and resets region
   state, gated by the `UseDelete` constant.
@@ -148,7 +148,7 @@ This TLA+ specification models the AssignmentManager as a state machine with
   `TableState.State` enum. Persisted in meta via `TableStateManager`.  Intermediate
   states (`DISABLING`/`ENABLING`) serve as concurrent client request rejection gates.
 
-The specification defines 34 safety invariants verified at every reachable
+The specification defines 36 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
@@ -163,10 +163,11 @@ targets), `MergeAtomicity` (pre-PONR, merged region not materialized), and
 on the same table), and `DeleteTableAtomicity` (if any region of a table is
 marked for deletion, all regions of that table must also be marked),
 `TruncateAtomicity` (if any region is marked for truncation at COMPLETING step,
-all regions of that table must also be marked), and `TruncateNoOrphans` (new
-region at SPAWNED_OPEN step has a child ASSIGN TRSP), and
-`TableEnabledStateConsistency` (disabled tables have all regions in
-{CLOSED, OFFLINE} when no exclusive lock is held).
+all regions of that table must also be marked), `TruncateNoOrphans` (new
+region at SPAWNED_OPEN step has a child ASSIGN TRSP or has completed it),
+`CreateNoOrphans` (CREATE/SPAWNED_OPEN region has a child ASSIGN TRSP or
+has completed it), and `TableEnabledStateConsistency` (disabled tables have
+all regions in {CLOSED, OFFLINE} when no exclusive lock is held).
 
 Five liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
@@ -255,7 +256,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [SCP.tla](markdown/SCP.md) | ServerCrashProcedure state machine (detect crash -> assign meta -> get regions -> fence WALs -> assign regions -> done, with meta-blocking) |
 | [Split.tla](markdown/Split.md) | Split procedure forward path and pre-PONR rollback using parent-child framework (SplitPrepare, SplitResumeAfterClose, SplitUpdateMeta, SplitDone, SplitFail) |
 | [Merge.tla](markdown/Merge.md) | Merge procedure forward path and pre-PONR rollback using parent-child framework (MergePrepare, MergeCheckClosed, MergeUpdateMeta, MergeDone, MergeFail) |
-| [Create.tla](markdown/Create.md) | CreateTableProcedure: single-region table creation (CreateTablePrepare, CreateTableDone) |
+| [Create.tla](markdown/Create.md) | CreateTableProcedure: multi-region table creation (CreateTablePrepare, CreateTableDone) |
 | [Delete.tla](markdown/Delete.md) | DeleteTableProcedure: table deletion, identifier freeing (DeleteTablePrepare, DeleteTableDone) |
 | [Truncate.tla](markdown/Truncate.md) | TruncateTableProcedure: delete old + create new regions (TruncatePrepare, TruncateDeleteMeta, TruncateCreateMeta, TruncateDone) |
 | [RegionServer.tla](markdown/RegionServer.md) | RS-side handlers (open, fail-open, close, abort, restart, duplicate-open, close-not-found, stale report drop) |
@@ -357,7 +358,7 @@ Simulation is the only tier that verifies deeper retry behavior and REOPEN.
 
 ## Invariants
 
-All configurations check the same 35 safety invariants:
+All configurations check the same 36 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -394,7 +395,8 @@ All configurations check the same 35 safety invariants:
 | `TableLockExclusivity` | No two regions of the same table can simultaneously hold exclusive-type parent procedures (CREATE, DELETE, TRUNCATE) |
 | `DeleteTableAtomicity` | If any region of a table has `parentProc.type = "DELETE"`, then ALL regions of that table must also have `parentProc.type = "DELETE"` |
 | `TruncateAtomicity` | If any region of a table has `parentProc.type = "TRUNCATE"` and `step = "COMPLETING"`, then ALL regions of that table must also have `parentProc.type = "TRUNCATE"` |
-| `TruncateNoOrphans` | A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` (child TRSP spawned) |
+| `TruncateNoOrphans` | A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
+| `CreateNoOrphans` | A region with `parentProc = [CREATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
 | `TableEnabledStateConsistency` | Disabled tables with no exclusive lock held have all regions in `{CLOSED, OFFLINE}` |
 
 ## Liveness Properties
@@ -435,7 +437,7 @@ All configurations check the same 35 safety invariants:
 | **Config** | `AssignmentManager.cfg` (3r/2s: 1 deployed + 2 unused, split only) |
 | **Mode** | Exhaustive with symmetry reduction |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 35 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 36 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 1,328,348,760 |
 | **States checked** | 368,662,744 distinct |
 | **Depth** | 92 |
@@ -450,7 +452,7 @@ All configurations check the same 35 safety invariants:
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
 | **Mode** | Random Simulation (seed -1702499423105596566, aril 0) |
 | **Workers** | 128 on 128 cores |
-| **Result** | All 35 invariants, 2 action constraints, and state constraint passed |
+| **Result** | All 36 invariants, 2 action constraints, and state constraint passed |
 | **States generated** | 1,314,483,362 |
 | **Duration** | 8 hours |
 

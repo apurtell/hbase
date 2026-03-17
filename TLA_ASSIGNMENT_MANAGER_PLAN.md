@@ -1034,12 +1034,20 @@ guard `"DISABLED"`, sets `"ENABLING"`; `EnableTableDone` sets `"ENABLED"`.
 states; wired into `AssignmentManager-liveness.cfg`. TLC 9r/3s simulation
 300s: 3,302,114 states, 29,879 traces, depth 67 (σ=33), clean.
 
-#### Iteration 39 - Multi-region CreateTable
+#### Iteration 39 - Multi-region CreateTable ✅ COMPLETE
 
-Extend `CreateTablePrepare` to create N regions (parameter). The existing
-framework supports it — just loop over unused identifiers. Increases
-symmetry-broken states proportional to N but will only impact simulation, where
-`UseCreate = TRUE`, and symmetry reduction is not attempted in that config.
+Extended `CreateTablePrepare(t, r)` → `CreateTablePrepare(t, S)` where `S` is
+a non-deterministically chosen non-empty set of unused region identifiers with
+`MaxKey % |S| = 0`.  Atomically tiles `[0, MaxKey)` into `|S|` equal-width
+sub-ranges via CHOOSE bijection, writes `metaTable`, `regionState`, `procStore`,
+and `parentProc` for all `r ∈ S`.  No new constants — region count bounded by
+available unused identifiers and `MaxKey` divisibility (`MaxKey = 12` yields
+valid sizes {1, 2, 3, 4, 6}).  `CreateTableDone` unchanged (already uses `∀`
+over all CREATE regions).  `AssignmentManager.tla`: Next disjunct updated
+(`\E S \in SUBSET Regions`); new `CreateNoOrphans` invariant (33rd);
+`TruncateNoOrphans` strengthened to also allow OPEN/NONE completion window.
+All 3 configs updated (+`CreateNoOrphans`).  TLC 9r/3s simulation 300s:
+2,286,210 states, 14,111 traces, depth 67 (σ=33), clean.
 
 #### Iteration 40 - Concurrent Split/Merge
 
