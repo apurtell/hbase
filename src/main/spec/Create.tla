@@ -2,18 +2,24 @@
 (*
  * CreateTable procedure actions for the HBase AssignmentManager.
  *
- * Models CreateTableProcedure: creates a new table with a single region
- * covering the full keyspace [0, MaxKey), writes meta, and spawns a
- * child ASSIGN TRSP to open the region.
+ * Models CreateTableProcedure: creates a new table with one or more
+ * regions covering the full keyspace [0, MaxKey).  The number of
+ * regions depends on the cardinality of the set of currently unused
+ * region identifiers: TLC non-deterministically picks any non-empty
+ * subset S of unused identifiers such that MaxKey is evenly divisible
+ * by |S|.  With a single unused identifier, the action creates a
+ * single-region table; with multiple, it tiles the keyspace into
+ * equal-width sub-ranges, one per region.  For each region, the action
+ * writes meta and spawns a child ASSIGN TRSP to open the region.
  *
  * Forward-path actions:
- *   CreateTablePrepare  -- pick unused identifier, assign keyspace,
- *                          write meta, spawn child ASSIGN TRSP
- *   CreateTableDone     -- region OPEN, clear parentProc
+ *   CreateTablePrepare  -- pick unused identifiers, assign keyspace,
+ *                          write meta, spawn child ASSIGN TRSPs
+ *   CreateTableDone     -- all regions OPEN, clear parentProc
  *
  * The parentProc[r] variable tracks the CREATE procedure's state.
  * It persists across the child TRSP lifecycle and survives master crash.
- * The child TRSP uses the normal TRSP machinery (procType/procStep).
+ * The child TRSPs use the normal TRSP machinery (procType/procStep).
  *
  * Source: CreateTableProcedure.java
  *         PRE_OPERATION -> WRITE_FS_LAYOUT -> ADD_TO_META -> ASSIGN_REGIONS ->
@@ -74,68 +80,103 @@ TableLockFree(t) == ~\E r2 \in Regions: /\ metaTable[r2].table = t
 ---------------------------------------------------------------------------
 
 (* Actions *)
-\* Create a new table with a single region covering [0, MaxKey).
+\* Create a new table with one or more regions covering [0, MaxKey).
 \*
-\* Picks an unused region identifier r, assigns the full keyspace,
-\* writes meta as CLOSED/NoServer, spawns a child ASSIGN TRSP,
-\* and sets parentProc for table-level tracking.
+\* The number of regions depends on the set S of unused region identifiers
+\* provided by the caller (non-deterministically chosen by TLC via the
+\* \E S \in SUBSET Regions quantifier in the Next disjunct).  When only
+\* one unused identifier is available, S is a singleton and the action
+\* creates a single-region table spanning [0, MaxKey).  When multiple
+\* unused identifiers are available, S may contain up to all of them,
+\* and the keyspace is tiled into |S| equal-width sub-ranges.
+\*
+\* The set S must satisfy:
+\*   - S # {} (at least one region)
+\*   - all elements are unused (NoRange, NoTable)
+\*   - MaxKey % |S| = 0 (evenly divisible keyspace)
+\*
+\* For each r in S, the action atomically:
+\*   - writes metaTable[r] as CLOSED/NoServer with the sub-range keyspace
+\*   - sets regionState[r] with child ASSIGN TRSP
+\*   - persists procStore[r]
+\*   - sets parentProc[r] = [CREATE, SPAWNED_OPEN]
 \*
 \* Pre: master alive, PEWorker available, meta available,
 \*      table t not in use (no region belongs to it),
-\*      r is an unused identifier (NoRange, NoTable),
-\*      TableLockFree(t).
-\* Post: region r belongs to table t, has keyspace [0, MaxKey),
+\*      S is a non-empty set of unused identifiers,
+\*      MaxKey % |S| = 0, TableLockFree(t).
+\* Post: each region r in S belongs to table t, has its sub-range,
 \*       state = CLOSED with ASSIGN TRSP spawned,
 \*       parentProc = [CREATE, SPAWNED_OPEN].
 \*
 \* Source: CreateTableProcedure.executeFromState()
 \*         ADD_TO_META + ASSIGN_REGIONS steps.
-CreateTablePrepare(t, r) ==
+\*         addChildProcedure(createRoundRobinAssignProcedures(newRegions))
+\*         spawns child ASSIGN TRSPs for all regions in the list.
+CreateTablePrepare(t, S) ==
+  LET n == Cardinality(S)
+      width == MaxKey \div n
+      \* Bijection from S to 0..(n-1).  CHOOSE picks an arbitrary injective
+      \* function (TLC-compatible: no ordering on model values required).
+      \* Same tiling pattern used in Init for DeployedRegions.
+      rank == CHOOSE f \in [S -> 0 .. (n - 1)]:
+                \A r1, r2 \in S: r1 # r2 => f[r1] # f[r2]
+  IN
   \* Master must be alive to execute the procedure.
   /\ masterAlive = TRUE
   \* PEWorker thread available to execute this step.
   /\ availableWorkers > 0
   \* Meta region must be accessible (not on a crashed server).
   /\ MetaIsAvailable
+  \* S must be non-empty.
+  /\ S # {}
+  \* MaxKey must be evenly divisible by the number of regions.
+  /\ MaxKey % n = 0
   \* Table t must not be in use (no region belongs to it).
   /\ ~ \E r2 \in Regions: metaTable[r2].table = t
   \* TableLockFree: no parentProc active on table t.
   \* (Vacuously true when no region belongs to t, but kept for
   \* completeness and consistency with Split/Merge guards.)
   /\ TableLockFree(t)
-  \* r must be an unused identifier.
-  /\ metaTable[r].keyRange = NoRange
-  /\ metaTable[r].table = NoTable
-  \* Assign keyspace [0, MaxKey), set table identity, and write meta
-  \* as CLOSED/NoServer.  Folds old regionKeyRange/regionTable mutations
-  \* into a single metaTable EXCEPT.
+  \* All elements of S must be unused identifiers.
+  /\ \A r \in S: /\ metaTable[r].keyRange = NoRange
+                 /\ metaTable[r].table = NoTable
+  \* Assign keyspace sub-ranges, set table identity, and write meta
+  \* as CLOSED/NoServer for each region in S.
   /\ metaTable' =
-       [metaTable EXCEPT
-       ![r].state = "CLOSED",
-       ![r].location = NoServer,
-       ![r].keyRange = [startKey |-> 0, endKey |-> MaxKey],
-       ![r].table = t ]
+       [r \in Regions |->
+         IF r \in S
+         THEN [ state |-> "CLOSED",
+                location |-> NoServer,
+                keyRange |-> [ startKey |-> rank[r] * width,
+                               endKey |-> (rank[r] + 1) * width ],
+                table |-> t ]
+         ELSE metaTable[r] ]
   \* Set in-memory state: CLOSED with child ASSIGN TRSP spawned.
   /\ regionState' =
-       [regionState EXCEPT
-       ![r] =
-       [ state |-> "CLOSED",
-         location |-> NoServer,
-         procType |-> "ASSIGN",
-         procStep |-> "GET_ASSIGN_CANDIDATE",
-         targetServer |-> NoServer,
-         retries |-> 0
-       ]]
+       [r \in Regions |->
+         IF r \in S
+         THEN [ state |-> "CLOSED",
+                location |-> NoServer,
+                procType |-> "ASSIGN",
+                procStep |-> "GET_ASSIGN_CANDIDATE",
+                targetServer |-> NoServer,
+                retries |-> 0 ]
+         ELSE regionState[r] ]
   \* Persist the child ASSIGN procedure to procStore.
   /\ procStore' =
-       [procStore EXCEPT
-       ![r] =
-       NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)]
+       [r \in Regions |->
+         IF r \in S
+         THEN NewProcRecord("ASSIGN", "GET_ASSIGN_CANDIDATE", NoServer, NoTransition)
+         ELSE procStore[r] ]
   \* Set parentProc for table-level tracking.
-  \* ref1/ref2 are NoRegion (single-region creation needs no cross-references).
+  \* ref1/ref2 are NoRegion (no cross-references needed for create).
   /\ parentProc' =
-       [parentProc EXCEPT ![r] = [ type |-> "CREATE", step |-> "SPAWNED_OPEN",
-                                    ref1 |-> NoRegion, ref2 |-> NoRegion ]]
+       [r \in Regions |->
+         IF r \in S
+         THEN [ type |-> "CREATE", step |-> "SPAWNED_OPEN",
+                ref1 |-> NoRegion, ref2 |-> NoRegion ]
+         ELSE parentProc[r] ]
   \* Everything else unchanged.
   /\ UNCHANGED << scpVars,
         rpcVars,
@@ -147,10 +188,10 @@ CreateTablePrepare(t, r) ==
         zkNode
      >>
 
-\* Complete the CreateTable procedure after the region is OPEN.
+\* Complete the CreateTable procedure after all regions are OPEN.
 \*
 \* All regions of table t with parentProc.type = "CREATE" must be OPEN
-\* with no active procedure (the ASSIGN TRSP has completed).
+\* with no active procedure (all child ASSIGN TRSPs have completed).
 \* Clears parentProc on all such regions.
 \*
 \* Pre: master alive, PEWorker available, at least one region of
