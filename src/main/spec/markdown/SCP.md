@@ -17,6 +17,24 @@ ServerCrashProcedure (SCP) actions for the HBase AssignmentManager:
 - **`SCPAssignRegion`** — process regions one at a time
 - **`SCPDone`** — all regions processed
 
+### Implementation Mapping
+
+The SCP is implemented in [`ServerCrashProcedure.java`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ServerCrashProcedure.java), a `StateMachineProcedure` that extends `Procedure<MasterProcedureEnv>`. It uses the `ServerCrashState` enum from `MasterProcedure.proto` to track its progress.
+
+The implementation's 13 enum values are collapsed to 6 model states. The collapse is safe because the omitted states perform operations **orthogonal** to region assignment:
+
+| Omitted state              | Implementation action                            | Omission rationale                                                               |
+|---------------------------|--------------------------------------------------|-----------------------------------------------------------------------------------|
+| `PROCESS_META` (=2)        | *Deprecated* (no-op in current code)             | Dead code                                                                         |
+| `NO_SPLIT_LOGS` (=4)      | *Deprecated*                                      | Dead code                                                                         |
+| `HANDLE_RIT2` (=20)       | *Deprecated*                                      | Dead code                                                                         |
+| `CLAIM_REPLICATION_QUEUES` (=14) | Claims peer-replication queues from dead server | Replication is orthogonal to region assignment                                   |
+| `DELETE_SPLIT_WALS_DIR` (=13) | Cleans up WAL split output directory            | Filesystem cleanup; no state transition visible to assignment                     |
+| `SPLIT_META_LOGS` (=10)   | Splits meta WALs before meta reassignment         | Collapsed into `ASSIGN_META` — the model captures the *outcome* (meta reassigned) |
+| `DELETE_SPLIT_META_WALS_DIR` (=12) | Cleans up meta WAL split directory        | Filesystem cleanup                                                                |
+
+The specification focuses on the region-state-affecting steps: which regions are marked crashed, when WALs are fenced (preventing zombie writes), and when reassignment procedures are created. WAL splitting itself (the I/O operation of reading WAL files and writing per-region recovered-edits) is abstracted into the `walFenced` flag — the model cares about fencing semantics (zombie prevention), not the I/O details of WAL replay.
+
 ```tla
 EXTENDS Types
 ```
@@ -162,7 +180,9 @@ Meta is now online; clear the `carryingMeta` flag.
 
 **SCP step 1:** Snapshot the set of regions assigned to the crashed server. This snapshot can go stale: between `GET_REGIONS` and `ASSIGN`, concurrent TRSPs may move regions, causing `isMatchingRegionLocation()` to skip them (Iteration 15).
 
-> **Implementation note (branch-2.6):** at this step, the implementation also calls `AM.markRegionsAsCrashed()`, which updates internal bookkeeping (RIT tracking, crash timestamps) to mark the regions as unavailable. This does *not* change the `RegionState.State` enum — the actual transition to `ABNORMALLY_CLOSED` happens later in `assignRegions()` (`SERVER_CRASH_ASSIGN`). The model's abstraction (no region state change at `GET_REGIONS`, state change only at `SCPAssignRegion`) remains valid.
+**`isMatchingRegionLocation()` race condition:** The SCP snapshots region assignments at `GET_REGIONS`, then iterates through them at `ASSIGN`. Between these two steps, a concurrent TRSP (e.g., a `MOVE` initiated before the crash was detected) may relocate a region from server `s` to server `t`. When SCP reaches this region in `SCPAssignRegion`, `regionState[r].location ≠ s` and SCP skips it. If the concurrent TRSP subsequently fails (e.g., the target server also crashes), the region is left in a limbo state — not processed by SCP, not successfully moved by TRSP. The model faithfully captures this race via the skip branch in `SCPAssignRegion`.
+
+**Implementation note (branch-2.6):** at this step, the implementation also calls `AM.markRegionsAsCrashed()`, which updates internal bookkeeping (RIT tracking, crash timestamps) to mark the regions as unavailable. This does *not* change the `RegionState.State` enum — the actual transition to `ABNORMALLY_CLOSED` happens later in `assignRegions()` (`SERVER_CRASH_ASSIGN`). The model's abstraction (no region state change at `GET_REGIONS`, state change only at `SCPAssignRegion`) remains valid.
 
 **Pre:** `scpState[s] = "GET_REGIONS"`.
 **Post:** `scpRegions[s]` = snapshot of regions with location = `s`, `scpState` advances to `"FENCE_WALS"`.
@@ -232,7 +252,13 @@ Region state, meta, RPCs, RS-side state, and WAL fencing unchanged.
 
 ### `SCPFenceWALs(s)`
 
-**SCP step 2:** Revoke WAL leases for the crashed server. After this step, the zombie RS cannot write to its WALs. Any write attempt will fail with an HDFS lease exception, triggering RS self-abort. This is the **fencing mechanism** that prevents write-side split-brain.
+**SCP step 2:** Revoke WAL leases for the crashed server. After this step, the zombie RS cannot write to its WALs. Any write attempt will fail with an HDFS lease exception, triggering RS self-abort. This is the fencing mechanism that prevents write-side split-brain.
+
+In the implementation, this step calls [`SplitWALManager.splitWALs()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitWALManager.java) (or `WALSplitUtil.splitLogDistributed()` depending on configuration), which:
+1. **Revokes HDFS leases** on the crashed server's WAL files via `recoverLease()` / `recoverFileLease()`. This is the actual fencing operation — after this, the zombie RS gets `AlreadyBeingCreatedException` or `RecoveryInProgressException` on any write attempt.
+2. **Splits WAL entries** per-region into recovered-edits files. Each region's recovered edits will be replayed when the region is opened on its new server.
+
+The model abstracts both operations into `walFenced[s] = TRUE`. The splitting I/O is orthogonal to assignment correctness; the fencing semantics (preventing zombie writes) are the safety-critical property. The `walFenced` guard on `SCPAssignRegion` ensures regions are never reassigned before fencing completes — this prevents the scenario where a zombie RS writes to a region that has been reopened on a new server (split-brain data corruption).
 
 **Pre:** `scpState[s] = "FENCE_WALS"`.
 **Post:** `walFenced[s] = TRUE`, `scpState` advances to `"ASSIGN"`.
