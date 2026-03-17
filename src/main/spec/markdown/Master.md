@@ -87,6 +87,13 @@ Transition from `CLOSED` back to `OFFLINE`. Used by `RegionStateNode.offline()` 
 
 **Post:** `regionState` set to `OFFLINE` with cleared location (in-memory only — `metaTable` is *not* updated). Meta retains `CLOSED`; divergence is resolved on master restart.
 
+[`RegionStateNode.offline()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStateNode.java) sets state to `OFFLINE` and clears the region location without writing to `hbase:meta`. This creates a **deliberate divergence** between in-memory state (`OFFLINE`) and persisted state (`CLOSED` in meta). The divergence is safe because:
+1. Both `OFFLINE` and `CLOSED` are *unassigned* states — no server is serving the region in either state.
+2. On master restart, `MasterRecover` rebuilds in-memory state from `metaTable`, restoring the region to `CLOSED`. The `TRSPCreate` action's guard (`regionState[r].state \in {"OFFLINE", "CLOSED", ...}`) accepts both states, so recovery proceeds correctly.
+3. The `GoOffline` action serves `DisableTableProcedure`: after the UNASSIGN TRSP closes the region and leaves it `CLOSED`, the procedure calls `offline()` to move it to `OFFLINE` for the "table is disabled" quiescent state.
+
+The spec explicitly models this divergence (no meta write in `GoOffline`, meta retains `CLOSED`) to catch any invariant violations that might arise from the inconsistency.
+
 > *Source:* `RegionStateNode.offline()` sets state to `OFFLINE` and clears the region location without writing to meta.
 
 ```tla
@@ -131,7 +138,7 @@ Move region to `OFFLINE` with cleared location (in-memory only).
        [regionState EXCEPT ![r].state = "OFFLINE", ![r].location = NoServer]
 ```
 
-Meta is **not** updated: `RegionStateNode.offline()` does not write to meta. `metaTable` retains `CLOSED`; divergence is resolved on master restart. See Appendix D.5.
+Meta is not updated: `RegionStateNode.offline()` does not write to meta. `metaTable` retains `CLOSED`; divergence is resolved on master restart. See Appendix D.5.
 
 ```tla
   /\ UNCHANGED << scpVars,
@@ -158,7 +165,11 @@ Regions remain in their pre-crash state (`OPEN`, `OPENING`, `CLOSING`) with loca
 
 **Post:** `serverState` set to `CRASHED`, SCP started.
 
-> *Impl state:* `SERVER_CRASH_START` (=1), absorbed into this action. See `SCP.tla` header for the full enum traceability table.
+[`RegionServerTracker.processAsActiveMaster()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionServerTracker.java) detects ZK child-node removal (ephemeral node deleted) and calls:
+1. `ServerManager.expireServer(serverName)` → `moveFromOnlineToDeadServers(serverName)` — marks the server as dead in the master's server tracking.
+2. → `AssignmentManager.submitServerCrash(serverName, shouldSplitWAL)` — creates a `ServerCrashProcedure` and submits it to the `ProcedureExecutor`.
+
+The master's crash detection is event-driven, not polling-based: `RegionServerTracker` registers a ZK watcher on `/hbase/rs` children. When ZK notifies the watcher of a child removal, `processAsActiveMaster()` fires synchronously on the ZK event thread.
 
 > *Source:* `RegionServerTracker.processAsActiveMaster()` detects child removal and calls `ServerManager.expireServer()`, which calls `moveFromOnlineToDeadServers()` and then `AM.submitServerCrash()`.
 
@@ -221,18 +232,18 @@ Guard: only one server can be carrying meta at a time. `hbase:meta` is hosted on
 
 The active master JVM crashes. All in-memory state is lost. Durable state (`metaTable`, `procStore`) and RS-side state (`rsOnlineRegions`) survive. WAL fencing (`walFenced`) survives because fencing is an HDFS-level operation, not master-level.
 
-In-memory variables (`regionState`, `serverState`, `dispatchedOps`, `pendingReports`, `scpState`, `scpRegions`, `serverRegions`, `carryingMeta`) become stale but are left `UNCHANGED` because:
-1. All invariants referencing them are gated on `masterAlive=TRUE`.
-2. All actions using them require `masterAlive=TRUE` as a guard.
-3. `MasterRecover` rebuilds them from durable state.
-4. Mutating them here would create spurious action-constraint violations (`TransitionValid`, `SCPMonotonicity`).
+In-memory variables (`regionState`, `serverState`, `dispatchedOps`, `pendingReports`, `scpState`, `scpRegions`, `serverRegions`, `carryingMeta`) become stale but are left `UNCHANGED` in this action. This design choice avoids 4 problems:
+1. **Invariant gating.** All invariants referencing these variables are gated on `masterAlive=TRUE`, so stale values cannot cause false violations.
+2. **Action gating.** All actions using them require `masterAlive=TRUE` as a guard, so stale values cannot enable spurious actions.
+3. **Recovery rebuild.** `MasterRecover` rebuilds all in-memory state from durable storage (`metaTable`, `procStore`, `zkNode`), so stale values are overwritten before any master-side action fires.
+4. **Action constraint preservation.** Resetting variables to initial values here would create spurious `TransitionValid` and `SCPMonotonicity` action constraint violations, since transitions like `OPEN → OFFLINE` and `ASSIGN → NONE` would appear in the action trace even though they represent crash recovery, not state machine violations.
 
 The regions are still open on their RegionServers and `hbase:meta` is still valid — only the master's in-memory view vanishes.
 
 **Pre:** `masterAlive = TRUE`.
 **Post:** `masterAlive = FALSE`.
 
-> *Source:* Master JVM crash — all in-memory state is lost.
+> *Source:* Master JVM crash — all in-memory state is lost. In production, the standby master (if HA is enabled) takes over; the model abstracts this to a single master that crashes and recovers.
 
 ```tla
 MasterCrash ==
@@ -291,7 +302,16 @@ ZK ephemeral nodes survive (external to master).
 
 The master recovers after a crash. Rebuilds in-memory state from durable storage (`metaTable` and `procStore`).
 
-This is modeled as a **single atomic action** because no external interactions happen between the recovery sub-steps (meta scan, procedure reload, `restoreSucceedState`).
+This is modeled as a single atomic action because no external interactions happen between the recovery sub-steps (meta scan, procedure reload, `restoreSucceedState`).
+
+The recovery path in the implementation is:
+1. [`HMaster.finishActiveMasterInitialization()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java) — main entry point for master initialization.
+2. → `AssignmentManager.start()` — scans `hbase:meta` to rebuild `RegionStateNode` objects (in-memory region state), populates `RegionStates` (master-side tracking), reads `TableState` from meta for each table.
+3. → `ServerManager.findDeadServersAndProcess()` — reads ZK `/hbase/rs` children to discover live servers; any server with a `ServerStateNode` but no ZK ephemeral node is marked `CRASHED` and gets an SCP submitted.
+4. → `ProcedureExecutor.start()` — calls `WALProcedureStore.load()` to deserialize all persisted procedures. For each procedure in `REPORT_SUCCEED` state, invokes `restoreSucceedState()` callback.
+5. → `AssignmentManager.joinCluster()` — creates TRSPs for any regions that are not in a stable state (e.g., `OFFLINE` regions that should be `OPEN`).
+
+Steps 2–4 are serialized (no concurrent external interactions). The model's single atomic `MasterRecover` action captures steps 2–4; step 5 is modeled by the separate `TRSPCreate` action (which fires after `masterAlive = TRUE`).
 
 **Recovery steps:**
 1. Rebuild `regionState` from `metaTable` (state and location only; procedure fields initially `NONE`/`IDLE`).

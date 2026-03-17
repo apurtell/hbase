@@ -10,6 +10,25 @@ DeleteTable procedure actions — table deletion with identifier freeing.
 ------------------------------ MODULE Delete ----------------------------------
 ```
 
+Models `DeleteTableProcedure` actions: Delete a disabled table by removing its region from meta and clearing state.
+
+### Implementation State Simplification
+
+The implementation's [`DeleteTableProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/DeleteTableProcedure.java) uses the `DeleteTableState` enum with 7 values: `PRE_OPERATION`, `REMOVE_TABLE_FROM_CACHE`, `MARK_REGIONS_CLOSED`, `CLEAR_FS_LAYOUT`, `REMOVE_FROM_META`, `DELETE_TABLE_FROM_FS`, `POST_OPERATION`. The model collapses these into two actions:
+
+- **`DeleteTablePrepare`** — `PRE_OPERATION` + `MARK_REGIONS_CLOSED` + `REMOVE_FROM_META` (removes region from meta)
+- **`DeleteTableDone`** — `CLEAR_FS_LAYOUT` + `DELETE_TABLE_FROM_FS` + `REMOVE_TABLE_FROM_CACHE` + `POST_OPERATION`
+
+Omitted operations: `CLEAR_FS_LAYOUT` removes HFiles and HRegion directories from HDFS. `DELETE_TABLE_FROM_FS` removes the table-level directory. `REMOVE_TABLE_FROM_CACHE` clears `TableDescriptor` cache. All are filesystem/cache operations orthogonal to assignment.
+
+### Disabled-Table Precondition
+
+`DeleteTableProcedure.prepareDelete()` checks `tableState.isDisabled()` and throws `TableNotDisabledException` if the table is still enabled. This maps to the model's guard that regions must be in `CLOSED` or `OFFLINE` state (which they will be after `DisableTableProcedure` completes) and `tableEnabled[t] = "DISABLED"`. The spec enforces this via the `regionState[r].state \in {"CLOSED", "OFFLINE"}` guard on `DeleteTablePrepare`.
+
+### Identifier Recycling
+
+The model's immediate reset of `keyRange` to `NoRange` and `metaTable` entries models the implementation's eventual GC of meta entries. In production, the `REMOVE_FROM_META` step deletes the region's meta rows, and `DELETE_TABLE_FROM_FS` removes the HDFS directory. The model's atomic reset is a safe abstraction because the deleted region identifier becomes immediately reusable for `CreateTableProcedure`, which is the same end state.
+
 Models `DeleteTableProcedure`: deletes all regions of a table, freeing region identifiers back to the unused pool. Requires all regions of the target table to be in `{"CLOSED","OFFLINE"}` with `procType = "NONE"` (modeling the disabled-table precondition).
 
 **Forward-path actions:**

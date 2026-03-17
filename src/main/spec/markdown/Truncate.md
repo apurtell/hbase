@@ -10,6 +10,29 @@ TruncateTable procedure actions — atomically delete old regions and create new
 ----------------------------- MODULE Truncate ---------------------------------
 ```
 
+Models `TruncateTableProcedure` actions: Truncate table = delete old region + create new region with the same keyspace, clearing all data while preserving the table structure.
+
+### Implementation State Simplification
+
+The implementation's [`TruncateTableProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/TruncateTableProcedure.java) uses the `TruncateTableState` enum with 9 values: `PRE_OPERATION`, `REMOVE_FROM_META`, `CLEAR_FS_LAYOUT`, `CREATE_FS_LAYOUT`, `ADD_TO_META`, `ASSIGN_REGIONS`, `UPDATE_DESC_CACHE`, `SET_ENABLED_TABLE_STATE`, `POST_OPERATION`. The model collapses these into four actions:
+
+- **`TruncateDeleteMeta`** — `REMOVE_FROM_META` + `CLEAR_FS_LAYOUT` (delete old region from meta)
+- **`TruncateCreateMeta`** — `CREATE_FS_LAYOUT` + `ADD_TO_META` (create new region in meta)
+- **`TruncateAssign`** — `ASSIGN_REGIONS` (spawn child ASSIGN TRSP for new region)
+- **`TruncateDone`** — `SET_ENABLED_TABLE_STATE` + `UPDATE_DESC_CACHE` + `POST_OPERATION`
+
+### Delete-Then-Create Two-Phase Design
+
+The implementation actually *deletes* the old region from meta and HDFS, then *creates* a new region with the same table and keyspace. This is NOT an in-place data reset — it is a full delete-then-create cycle. The model faithfully captures this two-phase design: `TruncateDeleteMeta` clears the old meta entry, then `TruncateCreateMeta` writes a new meta entry.
+
+### Crash-Vulnerable Window
+
+Between `TruncateDeleteMeta` and `TruncateCreateMeta`, the table has **zero regions in meta**. If the master crashes in this window, `MasterRecover` will scan meta and find no regions for this table. However, the procedure store preserves the `TruncateTableProcedure` state — when the `ProcedureExecutor` restarts, it resumes the truncate from `TruncateCreateMeta` (the persisted procedure state includes the new region's `RegionInfo` in its serialized fields). The `parentProc[r]` variable in the model tracks this: it survives master crash (it is an `UNCHANGED` in `MasterCrash`), ensuring the model correctly resumes truncation after recovery.
+
+### Snapshot Omission
+
+`TruncateTableProcedure` optionally takes a snapshot of the table before deletion (`boolean preserveSplits` parameter). Snapshot operations are orthogonal to the region assignment protocol — they do not modify `RegionState`, `ServerStateNode`, or any assignment-related variable. The model omits snapshots entirely.
+
 Models `TruncateTableProcedure`: atomically deletes old regions and creates new regions for the same table, clearing all data while preserving the table identity. Requires all regions of the target table to be in `{"CLOSED","OFFLINE"}` with `procType = "NONE"` (disabled-table precondition).
 
 **Forward-path actions:**
@@ -18,8 +41,7 @@ Models `TruncateTableProcedure`: atomically deletes old regions and creates new 
 - **`TruncateCreateMeta`** — pick new identifier, write meta, spawn child ASSIGN
 - **`TruncateDone`** — new region OPEN, clear parentProc
 
-There is a crash-vulnerable window between `TruncateDeleteMeta` and `TruncateCreateMeta`.  The WAL procedure store holds the new `RegionInfo` objects. `MasterRecover` restores the procedure from durable `parentProc`
-state and resumes.
+There is a crash-vulnerable window between `TruncateDeleteMeta` and `TruncateCreateMeta`.  The WAL procedure store holds the new `RegionInfo` objects. `MasterRecover` restores the procedure from durable `parentProc` state and resumes.
 
 > *Source:* `TruncateTableProcedure.java` — `PRE_OPERATION → [SNAPSHOT →] CLEAR_FS_LAYOUT → REMOVE_FROM_META → CREATE_FS_LAYOUT → ADD_TO_META → ASSIGN_REGIONS → POST_OPERATION`. Filesystem, descriptor cache, snapshot, and coprocessor operations abstracted. `PRE_OPERATION` + `CLEAR_FS_LAYOUT` collapsed into `TruncatePrepare`; `REMOVE_FROM_META` into `TruncateDeleteMeta`; `CREATE_FS_LAYOUT` + `ADD_TO_META` + `ASSIGN_REGIONS` into `TruncateCreateMeta`; `POST_OPERATION` into `TruncateDone`.
 

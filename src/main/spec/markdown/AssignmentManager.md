@@ -39,11 +39,19 @@ The specification models the region assignment lifecycle: state transitions, per
 - **`regionState`:** volatile in-memory master state (lost on master crash)
 - **`metaTable`:** persistent state in `hbase:meta` (survives master crash)
 
+The implementation maintains these two views in separate classes:
+- **[`RegionStateNode`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStateNode.java)** — volatile, in-memory. Holds current `RegionState.State`, server location, attached procedure reference, retry counter, and lock. All state transitions are performed under the `RegionStateNode` lock (`synchronized` block). This maps to the model's `regionState[r]` record.
+- **[`RegionStateStore`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStateStore.java)** — persistent, backed by `hbase:meta`. `updateRegionLocation()` writes the (state, server, openSeqNum) tuple to the region's meta row. This maps to the model's `metaTable[r]` record.
+
+The lock discipline that ensures atomicity of in-memory updates is critical: [`RegionStateNode`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStateNode.java) uses its own monitor lock for all state changes. The TLA+ model achieves the same atomicity through single-action granularity — each TLA+ action that modifies `regionState` and/or `metaTable` does so atomically, which corresponds to the implementation holding the `RegionStateNode` lock across the full update sequence.
+
 State and location fields are updated atomically (`RegionStateNode` lock held across both writes; see plan Appendix A.8 item 2).
 
 ### Procedure State Model
 
 Procedure state is inlined into `regionState`, keyed by region rather than by a global procedure ID counter. `ProcedureConsistency` (from earlier iterations) proved at most one procedure per region, so region identity is sufficient to distinguish procedures. Procedure fields (`procType`, `procStep`, `targetServer`, `retries`) model the `RegionStateNode.setProcedure()` / `unsetProcedure()` discipline.
+
+The real `ProcedureExecutor` assigns a global monotonically-increasing `procId` to each procedure. The model uses the region identifier `r` as the key instead. This is valid because the `ProcedureConsistency` invariant — which TLC verifies exhaustively — proves that at most one assignment-type procedure is active per region at any time. Given this invariant, region identity provides the same discriminating power as a global procedure ID. The benefit: the model avoids an unbounded `procId` counter (which would require a `StateConstraint` to keep the state space finite) while still faithfully tracking procedure state.
 
 TRSP state machines:
 - **`ASSIGN`:** `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` → *(cleared)*
@@ -62,6 +70,10 @@ Two RPC channels model the asynchronous communication:
 Commands and reports are matched by region (not by procedure ID). Since at most one procedure can be active per region, region identity provides the same discrimination as a procedure ID.
 
 The implementation processes reports synchronously: `reportRegionStateTransition` is an RPC; each report is handled immediately when it arrives. There is no `pendingReports` queue. The spec's `pendingReports` set models the possibility of reports arriving and being processed in arbitrary order (e.g., `OPENED` and `FAILED_OPEN` both in flight). The implementation's equivalent of "dropping" a report is rejecting it in the handler (e.g., when `regionNode.getState() = ABNORMALLY_CLOSED`).
+
+The implementation's [`RSProcedureDispatcher`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RSProcedureDispatcher.java) batches open/close commands and sends them in bulk via `executeProcedures()` RPC. The model abstracts this to a per-server set (`dispatchedOps[s]`) where commands are added individually. This is a sound over-approximation: the model allows arbitrary command delivery orderings, which weakly subsumes the batched delivery pattern. The batching optimization is a performance concern, not a correctness concern.
+
+For reports, the model's `pendingReports` set is a non-deterministic buffer. Reports from all servers accumulate and are consumed by master-side actions in arbitrary order. This models the asynchronous nature of RPC delivery without constraining the order of report processing. In the implementation, reports arrive via `RSRpcServices.reportRegionStateTransition()` RPC, which calls `AM.reportRegionStateTransition()` synchronously on the RPC handler thread.
 
 The implementation's TRSP executes as a state machine: `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED`. At `CONFIRM_OPENED`, the procedure suspends until a report arrives (`OpenRegionProcedure`/`CloseRegionProcedure` wake it via `reportTransition`). The procedure does not advance to the next step until the report is processed. The spec allows arbitrary interleaving of actions across regions and between TRSP/SCP/RS, which can expose races that the implementation's procedure serialization may prevent. The spec's mitigations (clear `OPEN` in `TRSPReportSucceedOpen`, prefer `OPENED`) are conservative guards for these model-exposed races.
 
@@ -115,7 +127,7 @@ The procedure fields (`procType`, `procStep`, `targetServer`, `retries`) model t
 VARIABLE regionState
 ```
 
-`metaTable[r]` is a record `[state: State, location: Servers ∪ {NoServer}]` for each `r` in `Regions`. This is persistent state in `hbase:meta`. Survives master crash; `regionState` does not. Procedure fields are **not** persisted to meta — procedures are master in-memory state, recovered from `ProcedureStore` on restart.
+`metaTable[r]` is a record `[state: State, location: Servers ∪ {NoServer}]` for each `r` in `Regions`. This is persistent state in `hbase:meta`. Survives master crash; `regionState` does not. Procedure fields are not persisted to meta — procedures are master in-memory state, recovered from `ProcedureStore` on restart.
 
 ```tla
 VARIABLE metaTable
@@ -267,7 +279,7 @@ A region "exists" iff its keyspace range has been assigned. Unused region identi
 RegionExists(r) == metaTable[r].keyRange # NoRange
 ```
 
-Two regions are **adjacent** when the first's `endKey` equals the second's `startKey`. Both must exist (have assigned keyspaces). Used as a precondition for merge operations (iterations 23+).
+Two regions are adjacent when the first's `endKey` equals the second's `startKey`. Both must exist (have assigned keyspaces). Used as a precondition for merge operations (iterations 23+).
 
 ```tla
 Adjacent(r1, r2) ==
@@ -310,7 +322,7 @@ TableLockFree(t) ==
 
 ## Module Instantiation
 
-Instantiate action modules. Each sub-module declares its shared variables as `CONSTANTS` with the **same names** as the variables declared here. TLA+ `INSTANCE` without a `WITH` clause automatically substitutes identifiers by name. Actions are then referenced as `trsp!ActionName(args)`, etc.
+Instantiate action modules. Each sub-module declares its shared variables as `CONSTANTS` with the same names as the variables declared here. TLA+ `INSTANCE` without a `WITH` clause automatically substitutes identifiers by name. Actions are then referenced as `trsp!ActionName(args)`, etc.
 
 ```tla
 trsp == INSTANCE TRSP
@@ -517,9 +529,13 @@ Keyspace range and table identity are now part of `metaTable[r]` records. Parent
 
 ## Safety Invariants
 
+Each safety invariant below corresponds to an implicit contract in the implementation code. The implementation does NOT declare these invariants formally — they are maintained by the procedural discipline of `TransitRegionStateProcedure`, `ServerCrashProcedure`, and the `RegionStateNode` lock. The TLA+ specification makes them explicit. When TLC verifies an invariant holds across all reachable states, it proves that the implementation's procedural discipline is sufficient to maintain that contract, for all possible interleavings of concurrent operations, RS crashes, and master restarts.
+
 ### `OpenImpliesLocation`
 
 A region that is `OPEN` must have a location.
+
+Ensured by `TransitRegionStateProcedure.executeFromState(CONFIRM_OPENED)` → `RegionStateNode.setOpeningState()` which sets location before setting state to `OPEN`. The `RegionStateNode` lock ensures atomicity.
 
 ```tla
 OpenImpliesLocation ==
@@ -1009,7 +1025,7 @@ NoOrphanedProcedures ==
 
 When the master is alive and all PEWorkers are consumed while meta is unavailable, there must exist at least one active procedure that is neither suspended nor blocked on meta. If this invariant fails, all workers are tied up on meta writes and no progress can be made — a thread-pool exhaustion deadlock.
 
-With `UseBlockOnMetaWrite = FALSE` (default), this should always hold because async suspension releases the PEWorker immediately. With `UseBlockOnMetaWrite = TRUE` (branch-2.6), violations are **expected** and represent genuine deadlock scenarios.
+With `UseBlockOnMetaWrite = FALSE` (default), this should always hold because async suspension releases the PEWorker immediately. With `UseBlockOnMetaWrite = TRUE` (branch-2.6), violations are expected and represent genuine deadlock scenarios.
 
 ```tla
 NoPEWorkerDeadlock ==
@@ -1052,7 +1068,7 @@ Per-table keyspace integrity. For each table `t` that has at least one live regi
 
 With multiple tables (e.g., `T1` pre-existing, `T2` created by `CreateTableProcedure`), each table independently tiles `[0, MaxKey)`. Tables with no live regions (e.g., `T2` before `CreateTablePrepare`) are not checked.
 
-`SPLITTING_NEW` and `MERGING_NEW` regions **are** counted as covering their keyspaces — they have been materialized at PONR and will become `OPEN` when their child TRSP completes.
+`SPLITTING_NEW` and `MERGING_NEW` regions are counted as covering their keyspaces — they have been materialized at PONR and will become `OPEN` when their child TRSP completes.
 
 During a split: the parent transitions to `SPLIT` (excluded), and daughters are materialized in `SPLITTING_NEW` (included). Coverage is maintained across the PONR boundary. `SplitDone` clears the parent's keyspace to `NoRange` and table to `NoTable`.
 
@@ -1080,7 +1096,7 @@ Per-region mutual exclusion:
 1. A daughter region (`SPLITTING_NEW`) cannot be a parent procedure target (`parentProc` is for parents; daughters are protected by `SplitPrepare`'s `state=OPEN` guard).
 2. No region has concurrent split and merge (trivially true: no merge actions in this iteration).
 
-Multiple disjoint splits **can** occur in parallel (faithful to the implementation). The `SplitMergeConstraint` state constraint bounds total concurrent splits for TLC tractability.
+Multiple disjoint splits can occur in parallel (faithful to the implementation). The `SplitMergeConstraint` state constraint bounds total concurrent splits for TLC tractability.
 
 ```tla
 SplitMergeMutualExclusion ==
@@ -1673,7 +1689,11 @@ Next ==
 
 ## Fairness
 
-Weak fairness on deterministic actions ensures forward progress. Procedure-step actions, crash-recovery actions, SCP state machine steps, and RS-side processing are all deterministic once enabled and therefore receive WF. Non-deterministic environmental events (`DispatchFail`, `DispatchFailClose`, `MasterDetectCrash`, `RSFailOpen`, `GoOffline`) receive no fairness — they may occur but are not required to.
+WF (Weak Fairness) on deterministic actions means "if the action is continuously enabled, it must eventually fire." This models the real-world guarantee that the `ProcedureExecutor`'s worker threads will eventually process any enabled procedure step, RS handler threads will eventually process any pending command, and ZK watchers will eventually detect session expiry.
+
+No fairness on non-deterministic events means "they may or may not occur." This models the fact that network failures, RS crashes, master crashes, and failed opens are environmental events outside the system's control. TLC's exhaustive exploration checks all behaviors: ones where the event occurs AND ones where it doesn't.
+
+SF (Strong Fairness) is used for message delivery actions (`RSOpen`, `RSClose`, `RSFailOpen`, etc.) where the action may be repeatedly enabled and disabled (e.g., a command is dispatched, consumed, re-dispatched). SF guarantees that infinitely-often-enabled actions eventually fire — modeling reliable (eventually) message delivery.
 
 ```tla
 Fairness ==

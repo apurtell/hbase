@@ -17,6 +17,21 @@ This module provides:
 - **`ProcStoreBijection`** — `procType` ↔ `procStore` presence (masterAlive-gated)
 - **`RestoreSucceedState`** — recovery operator for `REPORT_SUCCEED` procedures
 
+### Implementation Architecture
+
+The implementation uses two procedure store variants:
+
+- **`WALProcedureStore`** ([WALProcedureStore.java](file:///Users/andrewpurtell/src/hbase/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/store/wal/WALProcedureStore.java)) — the default store. Writes procedure state as WAL entries (protobuf-serialized `Procedure` records) to HDFS. Uses a slot-based file layout with periodic compaction to garbage-collect completed procedures. Each slot holds a full serialized `Procedure` object, including subclass-specific state.
+
+- **`RegionProcedureStore`** ([RegionProcedureStore.java](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/procedure2/store/region/RegionProcedureStore.java)) — an alternative (branch-3+) that stores procedure state in a special region backed by a local HRegion. Provides faster recovery and better compaction semantics.
+
+**Design note:** The specification's `procStore` is `[Regions → ProcStoreRecord ∪ {NoProcedure}]` — a simple function from region identifiers to 4-field records. This deliberately abstracts away:
+- **Procedure IDs.** The implementation assigns a global monotonically increasing `procId` to each procedure. The model uses the region identifier as the key, relying on the invariant that at most one assignment-type procedure is active per region at a time. The `ProcStoreBijection` invariant validates this mapping.
+- **Parent-child linkage.** The implementation's `Procedure.parentProcId` links child procedures (e.g., `OpenRegionProcedure`) to parent TRSPs. The model collapses parent-child into a single `regionState[r].procType`/`procStep` pair, with `parentProc[r]` handling the split/merge parent level.
+- **Slot management / compaction.** WAL slot reuse, file rolling, and cleanup compaction are operational concerns that do not affect correctness of the assignment protocol.
+- **Serialization format.** The model operates on semantic records, not byte-level serialization.
+> This abstraction is valid because the model's safety invariants (`ProcStoreConsistency`, `ProcStoreBijection`) are exactly the properties that the real store must maintain for correct recovery. If the model satisfies them, any implementation that faithfully persists/restores these 4 fields will also be correct.
+
 ```tla
 EXTENDS Types
 ```
@@ -134,6 +149,16 @@ ProcStoreBijection ==
 ### `RestoreSucceedState(r)`
 
 Compute the recovered in-memory state for a procedure that was at `REPORT_SUCCEED` when the master crashed. This models the implementation's `restoreSucceedState()` callback invoked during `ProcedureExecutor` recovery.
+
+**Recovery walk-through:** When the master restarts, `ProcedureExecutor.start()` calls `WALProcedureStore.load()` to deserialize all persisted procedures. For each procedure in `REPORT_SUCCEED` state, the executor invokes the procedure's `restoreSucceedState()` method (a virtual callback) to let the procedure reconstruct the in-memory `RegionStateNode` state from the persisted `transitionCode`.
+
+The implementation path for open-type procedures is:
+1. `ProcedureExecutor.start()` → `restoreProcedures()` → for each loaded procedure in `REPORT_SUCCEED` state
+2. → `procedure.restoreSucceedState(env)` (virtual call)
+3. → [`OpenRegionProcedure.restoreSucceedState()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/OpenRegionProcedure.java) L128–136
+4. → `AM.regionOpenedWithoutPersistingToMeta(regionNode)` (sets `OPEN` state + location)
+
+For close-type procedures: `CloseRegionProcedure.restoreSucceedState()` → `AM.regionClosedWithoutPersistingToMeta(regionNode)` → sets `CLOSED` state, clears location.
 
 **Branches on `UseRestoreSucceedQuirk`:**
 - **`TRUE`** — faithfully reproduces `OpenRegionProcedure.restoreSucceedState()` L128–136 bug: procedures with `OPENED` or `FAILED_OPEN` transition codes unconditionally replay as `OPENED` (ignoring `FAILED_OPEN`).

@@ -10,6 +10,30 @@ DisableTable procedure actions — disables a table by closing all its regions.
 ------------------------------ MODULE Disable ----------------------------------
 ```
 
+Models `DisableTableProcedure` actions: Disable a table by transitioning it from `ENABLED` → `DISABLING` → `DISABLED`, closing all its regions via child UNASSIGN TRSPs.
+
+### Implementation State Simplification
+
+The implementation's [`DisableTableProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/DisableTableProcedure.java) uses the `DisableTableState` enum with 7 values: `PREPARE`, `PRE_OPERATION`, `SET_DISABLING_TABLE_STATE`, `MARK_REGIONS_OFFLINE`, `ADD_REPLICATION_BARRIER`, `SET_DISABLED_TABLE_STATE`, `POST_OPERATION`. The model collapses these into three actions:
+
+- **`DisablePrepare`** — `PREPARE` + `PRE_OPERATION` + `SET_DISABLING_TABLE_STATE` (set table `DISABLING`)
+- **`DisableUnassign`** — `MARK_REGIONS_OFFLINE` (spawn child UNASSIGN TRSPs)
+- **`DisableDone`** — `SET_DISABLED_TABLE_STATE` + `POST_OPERATION` (set table `DISABLED`)
+
+Omitted: `PRE_OPERATION` fires coprocessor `preDisableTable` hook. `ADD_REPLICATION_BARRIER` adds a replication barrier in meta for each region. `POST_OPERATION` fires coprocessor `postDisableTable` hook. All are orthogonal to the assignment protocol.
+
+### Table State Machine
+
+[`TableStateManager.setTableState()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java) stores the table state as a protobuf `HBaseProtos.TableState` record in an `hbase:meta` table row keyed by the table name. The transition path is `ENABLED → DISABLING → DISABLED`, with `DISABLING` persisted in meta before any regions are closed. The model's `tableEnabled[t]` variable mirrors this persistence: `DisablePrepare` sets it to `"DISABLING"`, and `DisableDone` sets it to `"DISABLED"`.
+
+### MARK_REGIONS_OFFLINE vs UNASSIGN
+
+In `MARK_REGIONS_OFFLINE`, the implementation calls `assignmentManager.unassign(regionInfos)`, which creates one `TransitRegionStateProcedure` (type `UNASSIGN`) per region and adds them as child procedures via `addChildProcedure()`. The model's `DisableUnassign` action captures this exactly: it spawns child UNASSIGN TRSPs using the normal `TRSPCreate` machinery. The "offline" naming in the implementation is historical — the actual operation is an unassignment.
+
+### Concurrent Request Rejection
+
+The `DISABLING` intermediate state serves as a gate for concurrent client requests. `Admin.disableTable()` in the client checks `!table.isEnabled()` before proceeding, and `MasterRpcServices.disableTable()` checks `tableState.isEnabled()`. If the table is already `DISABLING` or `DISABLED`, the request is rejected. The model captures this via the `tableEnabled[t] = "ENABLED"` guard on `DisablePrepare` — since TLC explores all interleavings, this guard prevents any concurrent disable from starting.
+
 Models `DisableTableProcedure`: disables a table by closing all its regions. All regions must be `OPEN` with `procType = "NONE"` (enabled-table precondition). Spawns `UNASSIGN` TRSPs to close each region.
 
 **Forward-path actions:**

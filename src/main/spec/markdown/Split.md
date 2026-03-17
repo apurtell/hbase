@@ -23,7 +23,29 @@ Models `SplitTableRegionProcedure`: forward path (split a region into two daught
 
 The `parentProc[r]` variable tracks the parent procedure's state. It persists across child TRSP lifecycles and survives master crash. Child TRSPs use the normal TRSP machinery (`procType`/`procStep`).
 
-`SplitFail` fires non-deterministically at the same precondition as `SplitResumeAfterClose` (parent `CLOSED`, child complete). TLC explores both the success path (`SplitResumeAfterClose`) and the failure path (`SplitFail`) for every reachable split state.
+### Parent-Child Framework
+
+The implementation's [parent-child procedure mechanism](file:///Users/andrewpurtell/src/hbase/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/Procedure.java) uses `addChildProcedure()` to spawn child procedures. The parent enters `ProcedureState.WAITING` and yields its PEWorker thread. When all children complete, the `ProcedureExecutor` wakes the parent (via `countDown()` on the child latch) and re-enqueues it for execution.
+
+In the model, this yield/resume pattern is captured by the `parentProc[r].step` state machine:
+- **`SPAWNED_CLOSE`** — parent yielded after spawning child UNASSIGN TRSPs
+- **`PONR`** — parent resumed, crossing point-of-no-return (child completes detected via `regionState[r].state = "CLOSED"` + `procType = "NONE"` guard)
+- **`SPAWNED_OPEN`** — parent yielded after spawning child ASSIGN TRSPs for daughters
+
+The non-deterministic choice between `SplitResumeAfterClose` and `SplitFail` at the `SPAWNED_CLOSE` → `PONR` boundary models the success/failure decision that occurs inside the implementation's `checkClosedRegions()`. TLC exhaustively explores both branches for every reachable split state.
+
+### Implementation State Collapse
+
+The implementation's [`SplitTableRegionProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java) uses the `SplitTableRegionState` enum with 11 values. The model collapses these to 5 steps (`SPAWNED_CLOSE`, `PONR`, `SPAWNED_OPEN`, `COMPLETING`, plus `PREPARE` absorbed into `SplitPrepare`). Omitted states:
+
+| Omitted state                      | Implementation action        | Omission rationale                |
+|-----------------------------------|------------------------------|------------------------------------|
+| `PRE_OPERATION`                    | acquire table lock, coprocessor pre-hook | Abstracted into `SplitPrepare`     |
+| `SET_SPLITTING`                    | set `SPLITTING` state        | Folded into `SplitPrepare`         |
+| `CREATE_DAUGHTER_REGIONS`          | create HFile references      | Filesystem I/O; orthogonal to assignment |
+| `WRITE_MAX_SEQUENCE_ID_FILE`       | persist WAL sequence barrier | Filesystem I/O; orthogonal         |
+| `PRE_OPERATION_BEFORE_META`        | coprocessor hook             | Coprocessor ops abstracted          |
+| `UPDATE_META`                      | meta write for daughters     | Folded into `SplitUpdateMeta` (PONR) |
 
 > *Source:* `SplitTableRegionProcedure.rollbackState()` L368–411; `openParentRegion()` L647–651.
 
