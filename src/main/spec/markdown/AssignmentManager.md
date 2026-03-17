@@ -27,7 +27,7 @@ Action logic is factored into sub-modules:
 | **ZK**           | ZooKeeper ephemeral-node lifecycle (session expiry)                            |
 | **Split**        | `SplitTableRegionProcedure` forward path and rollback                          |
 | **Merge**        | `MergeTableRegionsProcedure` forward path and rollback                         |
-| **Create**       | `CreateTableProcedure` (single-region table creation)                          |
+| **Create**       | `CreateTableProcedure` (multi-region table creation)                           |
 | **Delete**       | `DeleteTableProcedure` (table deletion, identifier freeing)                    |
 | **Truncate**     | `TruncateTableProcedure` (delete old + create new regions)                     |
 
@@ -1274,7 +1274,7 @@ TruncateAtomicity ==
 
 ### `TruncateNoOrphans`
 
-A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` (child TRSP was spawned by `TruncateCreateMeta`). Same pattern as `NoOrphanedDaughters`.
+A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must either have an active child `ASSIGN` TRSP (`procType = "ASSIGN"`) or have completed it (`state = "OPEN"`, `procType = "NONE"`) awaiting `TruncateDone`. The latter is a legitimate window between child TRSP completion and `TruncateDone` firing.
 
 > *Source:* `TruncateCreateMeta` spawns a child ASSIGN TRSP on the new region.
 
@@ -1283,7 +1283,23 @@ TruncateNoOrphans ==
   masterAlive = TRUE =>
     \A r \in Regions:
       ( parentProc[r].type = "TRUNCATE" /\ parentProc[r].step = "SPAWNED_OPEN" ) =>
-        regionState[r].procType = "ASSIGN"
+        \/ regionState[r].procType = "ASSIGN"
+        \/ ( regionState[r].state = "OPEN" /\ regionState[r].procType = "NONE" )
+```
+
+### `CreateNoOrphans`
+
+A region with `parentProc = [CREATE, SPAWNED_OPEN]` must either have an active child `ASSIGN` TRSP (`procType = "ASSIGN"`) or have completed it (`state = "OPEN"`, `procType = "NONE"`) awaiting `CreateTableDone`. The latter is a legitimate window between child TRSP completion and `CreateTableDone` firing.
+
+> *Source:* `CreateTablePrepare` spawns a child ASSIGN TRSP on each region in the set `S`.
+
+```tla
+CreateNoOrphans ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( parentProc[r].type = "CREATE" /\ parentProc[r].step = "SPAWNED_OPEN" ) =>
+        \/ regionState[r].procType = "ASSIGN"
+        \/ ( regionState[r].state = "OPEN" /\ regionState[r].procType = "NONE" )
 ```
 
 ### `TableEnabledStateConsistency`
@@ -1645,7 +1661,11 @@ Next ==
 
 ```tla
   \* -- CreateTable forward path (gated on UseCreate) --
-  \/ ( UseCreate /\ \E t \in Tables: \E r \in Regions: create!CreateTablePrepare(t, r) )
+  \/ ( UseCreate /\
+         \E t \in Tables:
+           \E S \in SUBSET Regions:
+             create!CreateTablePrepare(t, S)
+     )
   \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
 ```
 
@@ -2109,6 +2129,13 @@ Safety: TRUNCATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
 ```tla
 \* Safety: TRUNCATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
         THEOREM Spec => []TruncateNoOrphans
+```
+
+Safety: CREATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
+
+```tla
+\* Safety: CREATE/SPAWNED_OPEN regions have child ASSIGN TRSP.
+        THEOREM Spec => []CreateNoOrphans
 ```
 
 Safety: table enabled state consistent with region lifecycle states.

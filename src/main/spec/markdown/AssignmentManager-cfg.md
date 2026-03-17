@@ -67,7 +67,7 @@ SYMMETRY Symmetry
 
 ## Invariants
 
-All 34 safety invariants are checked:
+All 35 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -105,6 +105,7 @@ INVARIANT
     DeleteTableAtomicity
     TruncateAtomicity
     TruncateNoOrphans
+    CreateNoOrphans
 ```
 
 ## Action Constraints
