@@ -799,12 +799,18 @@ After any SCP completes, no region is stuck without a procedure and without an S
 1. **`ABNORMALLY_CLOSED` with no procedure:** SCP should have attached an `ASSIGN` procedure. If it skipped the region (e.g., due to the `isMatchingRegionLocation` check), the region is lost.
 2. **Non-terminal mid-transition** (`OPENING`, `CLOSING`) with `location=None`, no procedure, and not in any SCP's snapshot: this region is stranded mid-transition with no active owner. `OFFLINE` is excluded: it is a legitimate quiescent state (initial state or post-`GoOffline`).
 
+Regions of disabled tables are excluded.
+
 ```tla
 NoLostRegions ==
   masterAlive = TRUE =>
     ( ( \E s \in Servers: scpState[s] = "DONE" ) =>
         \A r \in Regions:
-          RegionExists(r) =>
+          ( /\ RegionExists(r)
+            /\ ~( metaTable[r].table # NoTable /\
+                   tableEnabled[metaTable[r].table] = "DISABLED"
+               )
+            ) =>
             /\ ( regionState[r].state = "ABNORMALLY_CLOSED" =>
                    regionState[r].procType # "NONE"
                )
@@ -1304,7 +1310,7 @@ CreateNoOrphans ==
 
 ### `TableEnabledStateConsistency`
 
-When no exclusive lock is held on a table with regions, disabled tables must have all their regions in `{CLOSED, OFFLINE}`. This is the safety counterpart to `DisableTableProcedure`: once a table is disabled and the procedure completes, no region should be `OPEN` or in any opening state.
+When no exclusive lock is held on a table with regions, disabled tables must have all their regions in `{CLOSED, OFFLINE, ABNORMALLY_CLOSED}`. This is the safety counterpart to `DisableTableProcedure`: once a table is disabled and the procedure completes, no region should be `OPEN` or in any opening state. `ABNORMALLY_CLOSED` is permitted because SCP's disabled-table skip path leaves regions in this state with no procedure.
 
 The enabled-table side (at least one region `OPEN`) is NOT checked here because regions start `OFFLINE` at Init and after master recovery, before `TRSPCreate` fires. Enabled-table liveness is covered by the `RegionEventuallyAssigned` temporal property.
 
@@ -1314,13 +1320,17 @@ The enabled-table side (at least one region `OPEN`) is NOT checked here because 
 TableEnabledStateConsistency ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      ( tableEnabled[t] = "DISABLED"
-        /\ \E r \in Regions: metaTable[r].table = t
-        /\ ~\E r2 \in Regions: metaTable[r2].table = t
-                               /\ parentProc[r2].type \in TableExclusiveType )
-      =>
-        \A r \in Regions: metaTable[r].table = t =>
-          regionState[r].state \in {"CLOSED", "OFFLINE"}
+      ( tableEnabled[t] = "DISABLED" /\
+            \E r \in Regions:
+              metaTable[r].table = t /\
+                ~\E r2 \in Regions:
+                  metaTable[r2].table = t /\
+                    parentProc[r2].type \in TableExclusiveType
+        ) =>
+        \A r \in Regions:
+          metaTable[r].table = t =>
+            regionState[r].state \in
+              { "CLOSED", "OFFLINE", "ABNORMALLY_CLOSED" }
 ```
 
 ```tla

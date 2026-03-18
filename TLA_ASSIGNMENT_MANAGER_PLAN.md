@@ -1036,20 +1036,33 @@ states; wired into `AssignmentManager-liveness.cfg`. TLC 9r/3s simulation
 
 #### Iteration 39 - Multi-region CreateTable ✅ COMPLETE
 
-Extended `CreateTablePrepare(t, r)` → `CreateTablePrepare(t, S)` where `S` is
-a non-deterministically chosen non-empty set of unused region identifiers with
-`MaxKey % |S| = 0`.  Atomically tiles `[0, MaxKey)` into `|S|` equal-width
+Extended `CreateTablePrepare(t, r)` → `CreateTablePrepare(t, S)` where `S`
+is a non-deterministically chosen non-empty set of unused region identifiers
+with `MaxKey % |S| = 0`.  Atomically tiles `[0, MaxKey)` into `|S|` equal-width
 sub-ranges via CHOOSE bijection, writes `metaTable`, `regionState`, `procStore`,
 and `parentProc` for all `r ∈ S`.  No new constants — region count bounded by
-available unused identifiers and `MaxKey` divisibility (`MaxKey = 12` yields
-valid sizes {1, 2, 3, 4, 6}).  `CreateTableDone` unchanged (already uses `∀`
-over all CREATE regions).  `AssignmentManager.tla`: Next disjunct updated
-(`\E S \in SUBSET Regions`); new `CreateNoOrphans` invariant (33rd);
-`TruncateNoOrphans` strengthened to also allow OPEN/NONE completion window.
-All 3 configs updated (+`CreateNoOrphans`).  TLC 9r/3s simulation 300s:
+available unused identifiers and `MaxKey` divisibility.  `CreateTableDone`
+unchanged (already uses `∀` over all CREATE regions).  `AssignmentManager.tla`:
+Next disjunct updated (`\E S \in SUBSET Regions`); new `CreateNoOrphans`
+invariant; `TruncateNoOrphans` strengthened to also allow OPEN/NONE completion
+window. All 3 configs updated (+`CreateNoOrphans`).  TLC 9r/3s simulation 300s:
 2,286,210 states, 14,111 traces, depth 67 (σ=33), clean.
 
-#### Iteration 40 - Concurrent Split/Merge
+#### Iteration 40 — SCP disabled-table guard ✅ COMPLETE
+
+Modeled `isTableState(DISABLED)` check in `ServerCrashProcedure.assignRegions()`
+(L546-553).  `SCP.tla`: new Path C in `SCPAssignRegion(s, r)` — disabled-table
+skip path, guarded on `UseDisable`, `metaTable[r].table # NoTable`,
+`tableEnabled[metaTable[r].table] = "DISABLED"`; transitions to
+ABNORMALLY_CLOSED, clears location, does NOT create ASSIGN TRSP (no `procType`,
+no `procStore` insert).  Path B gained exclusion guard for disabled tables.
+`AssignmentManager.tla`: `NoLostRegions` modified to exclude disabled-table
+regions; `TableEnabledStateConsistency` relaxed to allow `ABNORMALLY_CLOSED`.
+No new invariants, variables, or constants; uses existing `tableEnabled` and
+`UseDisable` gate.  TLC 9r/3s simulation 300s: 2,399,960 states, 14,777
+traces, depth 67 (σ=33), clean.
+
+#### Iteration 41 - Concurrent Split/Merge
 
 Remove `SplitMergeConstraint` from simulation configuration. Will verify that
 concurrent splits on different regions don't interfere. Only impacts
