@@ -429,10 +429,13 @@ TypeOK ==
   \* META table maps every region to a persistent record with state,
   \* location, keyspace range (from RegionInfo), and table identity.
   /\ metaTable \in
-       [Regions -> [state:State,
-                    location:Servers \cup { NoServer },
-                    keyRange:[startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange },
-                    table:Tables \cup { NoTable } ]]
+       [Regions
+       ->
+       [state:State,
+         location:Servers \cup { NoServer },
+         keyRange:[startKey:0 .. MaxKey, endKey:0 .. MaxKey ] \cup { NoRange },
+         table:Tables \cup { NoTable }
+       ]]
   \* Each server has a set of dispatched operation commands (open/close).
   /\ dispatchedOps \in [Servers -> SUBSET [type:CommandType, region:Regions ]]
   \* Pending reports are a set of region-transition outcome messages.
@@ -770,11 +773,17 @@ AtMostOneCarryingMeta ==
 \*       concurrent TRSP clearing the location leaves the region
 \*       untracked.  OFFLINE is excluded: it is a legitimate quiescent
 \*       state (initial state or post-GoOffline).
+\*
+\* Regions of disabled tables are excluded.
 NoLostRegions ==
   masterAlive = TRUE =>
     ( ( \E s \in Servers: scpState[s] = "DONE" ) =>
         \A r \in Regions:
-          RegionExists(r) =>
+          ( /\ RegionExists(r)
+            /\ ~( metaTable[r].table # NoTable /\
+                   tableEnabled[metaTable[r].table] = "DISABLED"
+               )
+            ) =>
             /\ ( regionState[r].state = "ABNORMALLY_CLOSED" =>
                    regionState[r].procType # "NONE"
                )
@@ -1092,8 +1101,10 @@ SplitAtomicity ==
         IN ~\E d \in Regions:
               /\ regionState[d].state = "SPLITTING_NEW"
               /\ RegionExists(d)
-              /\ \/ metaTable[d].keyRange = [ startKey |-> startK, endKey |-> mid ]
-                 \/ metaTable[d].keyRange = [ startKey |-> mid, endKey |-> endK ]
+              /\ \/ metaTable[d].keyRange =
+                      [ startKey |-> startK, endKey |-> mid ]
+                 \/ metaTable[d].keyRange =
+                      [ startKey |-> mid, endKey |-> endK ]
 
 \* NoOrphanedDaughters: a region in SPLITTING_NEW state always has
 \* an ASSIGN procedure (child TRSP from SplitUpdateMeta).
@@ -1206,7 +1217,8 @@ DeleteTableAtomicity ==
     \A t \in Tables:
       ( \E r \in Regions: /\ metaTable[r].table = t
                           /\ parentProc[r].type = "DELETE" ) =>
-        \A r2 \in Regions: metaTable[r2].table = t => parentProc[r2].type = "DELETE"
+        \A r2 \in Regions:
+          metaTable[r2].table = t => parentProc[r2].type = "DELETE"
 
 \* TruncateAtomicity: if any region of table t has
 \* parentProc.type = "TRUNCATE" and step = "COMPLETING", then ALL regions
@@ -1256,9 +1268,11 @@ CreateNoOrphans ==
 
 \* TableEnabledStateConsistency: when no exclusive lock is held on a
 \*  table with regions, disabled tables must have all their regions
-\*  in {CLOSED, OFFLINE}.  This is the safety counterpart to
-\*  DisableTableProcedure: once a table is disabled and the procedure
-\*  completes, no region should be OPEN or in any opening state.
+\*  in {CLOSED, OFFLINE, ABNORMALLY_CLOSED}.  This is the safety
+\*  counterpart to DisableTableProcedure: once a table is disabled
+\*  and the procedure completes, no region should be OPEN or in any
+\*  opening state.  ABNORMALLY_CLOSED is permitted because SCP's
+\*  disabled-table skip path leaves regions in this state with no procedure.
 \*
 \*  The enabled-table side (at least one region OPEN) is NOT checked
 \*  here because regions start OFFLINE at Init and after master
@@ -1270,13 +1284,17 @@ CreateNoOrphans ==
 TableEnabledStateConsistency ==
   masterAlive = TRUE =>
     \A t \in Tables:
-      ( tableEnabled[t] = "DISABLED"
-        /\ \E r \in Regions: metaTable[r].table = t
-        /\ ~\E r2 \in Regions: metaTable[r2].table = t
-                               /\ parentProc[r2].type \in TableExclusiveType )
-      =>
-        \A r \in Regions: metaTable[r].table = t =>
-          regionState[r].state \in {"CLOSED", "OFFLINE"}
+      ( tableEnabled[t] = "DISABLED" /\
+            \E r \in Regions:
+              metaTable[r].table = t /\
+                ~\E r2 \in Regions:
+                  metaTable[r2].table = t /\
+                    parentProc[r2].type \in TableExclusiveType
+        ) =>
+        \A r \in Regions:
+          metaTable[r].table = t =>
+            regionState[r].state \in
+              { "CLOSED", "OFFLINE", "ABNORMALLY_CLOSED" }
 
 
 ---------------------------------------------------------------------------
@@ -1341,14 +1359,18 @@ Init ==
            [r \in Regions |->
              IF r \in DeployedRegions
              THEN [ state |-> "OFFLINE",
-                    location |-> NoServer,
-                    keyRange |-> [ startKey |-> rank[r] * width,
-                                   endKey |-> ( rank[r] + 1 ) * width ],
-                    table |-> t1 ]
+                 location |-> NoServer,
+                 keyRange |->
+                   [ startKey |-> rank[r] * width,
+                     endKey |-> ( rank[r] + 1 ) * width
+                   ],
+                 table |-> t1
+               ]
              ELSE [ state |-> "OFFLINE",
-                    location |-> NoServer,
-                    keyRange |-> NoRange,
-                    table |-> NoTable ]
+                 location |-> NoServer,
+                 keyRange |-> NoRange,
+                 table |-> NoTable
+               ]
            ]
   \* No operation commands have been dispatched to any server.
   /\ dispatchedOps = [s \in Servers |-> {}]
@@ -1454,8 +1476,7 @@ Next ==
   \* -- CreateTable forward path (gated on UseCreate) --
   \/ ( UseCreate /\
          \E t \in Tables:
-           \E S \in SUBSET Regions:
-             create!CreateTablePrepare(t, S)
+           \E S \in SUBSET Regions: create!CreateTablePrepare(t, S)
      )
   \/ ( UseCreate /\ \E t \in Tables: create!CreateTableDone(t) )
   \* -- DeleteTable forward path (gated on UseDelete) --
@@ -1620,8 +1641,8 @@ RegionEventuallyAssigned ==
 \*         SCP crash recovery.
 NoStuckRegions ==
   \A r \in Regions:
-    ( RegionExists(r) /\ regionState[r].state \in {"OPENING", "CLOSING"} )
-      ~> regionState[r].state \notin {"OPENING", "CLOSING"}
+    ( RegionExists(r) /\ regionState[r].state \in { "OPENING", "CLOSING" } ) ~>
+      regionState[r].state \notin { "OPENING", "CLOSING" }
 
 ---------------------------------------------------------------------------
 
@@ -1739,12 +1760,13 @@ NoStuckRegions ==
         THEOREM Spec => RegionEventuallyAssigned
 
 \* Liveness: regions in transitional states (OPENING, CLOSING) eventually
-\* leave those states.  A region stuck in OPENING or CLOSING indefinitely
-\* indicates a lost procedure, missing fairness, or RS liveness failure.
-\*
-\* Source: TRSP dispatch/confirm pipeline; RS open/close handlers;
-\*         SCP crash recovery re-assigns stuck regions.
-        THEOREM Spec => NoStuckRegions
+        \* leave those states.  A region stuck in OPENING or CLOSING indefinitely
+        \* indicates a lost procedure, missing fairness, or RS liveness failure.
+        \*
+        \* Source: TRSP dispatch/confirm pipeline; RS open/close handlers;
+        \*         SCP crash recovery re-assigns stuck regions.
+        THEOREM
+        Spec => NoStuckRegions
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.

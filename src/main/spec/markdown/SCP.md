@@ -326,11 +326,12 @@ Region state, meta, RPCs, RS-side state, and region snapshot unchanged.
 
 ### `SCPAssignRegion(s, r)`
 
-**SCP step 3:** Process *one* region from the SCP's region snapshot. Each invocation handles a single region and removes it from `scpRegions[s]`. Three sub-paths:
+**SCP step 3:** Process *one* region from the SCP's region snapshot. Each invocation handles a single region and removes it from `scpRegions[s]`. Four sub-paths:
 
 - **Skip** (location check): if the region's master-side location no longer matches the crashed server, SCP skips the region entirely. This models the `isMatchingRegionLocation()` guard.
 - **Path A** (procedure attached): transition region to `ABNORMALLY_CLOSED`, clear location; existing procedure preserved for `TRSPServerCrashed`.
-- **Path B** (no procedure): transition to `ABNORMALLY_CLOSED`, clear location, create fresh `ASSIGN`/`GET_ASSIGN_CANDIDATE` procedure.
+- **Path B** (no procedure, enabled table): transition to `ABNORMALLY_CLOSED`, clear location, create fresh `ASSIGN`/`GET_ASSIGN_CANDIDATE` procedure.
+- **Path C** (disabled-table skip): if the region has no procedure and its table is `DISABLED`, transition to `ABNORMALLY_CLOSED` but do NOT create an `ASSIGN` procedure. Models the `isTableState(DISABLED)` check in `assignRegions()` L546-553.
 
 **Pre:** `scpState[s] = "ASSIGN"`, `r ∈ scpRegions[s]`, `walFenced[s] = TRUE`.
 **Post:** `r` removed from `scpRegions[s]`, region transitioned (or skipped).
@@ -552,7 +553,7 @@ Recover the PEWorker thread if `r` was blocking one.
              IF r \in blockedOnMeta
              THEN availableWorkers + 1
              ELSE availableWorkers
-     \/ \* --- Path B: No TRSP attached ---
+     \/ \* --- Path B: No TRSP attached (enabled table) ---
 ```
 
 Meta must be available for Path B (writes to meta).
@@ -578,6 +579,14 @@ Location matches; no procedure. Transition to `ABNORMALLY_CLOSED` and attach a f
 ```tla
         /\ regionState[r].location = s
         /\ regionState[r].procType = "NONE"
+```
+
+Disabled-table regions are handled by Path C.
+
+```tla
+        /\ ~( UseDisable /\ metaTable[r].table # NoTable /\
+               tableEnabled[metaTable[r].table] = "DISABLED"
+           )
 ```
 
 Clear `r` from `rsOnlineRegions` on all servers.
@@ -617,8 +626,10 @@ Persist `ABNORMALLY_CLOSED` state to `metaTable` with cleared location.
 ```tla
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r].state = "ABNORMALLY_CLOSED",
-             ![r].location = NoServer ]
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
 ```
 
 Remove `r` from the SCP snapshot (processed).
@@ -647,6 +658,101 @@ Dispatched ops, server state, WAL fencing, SCP state, and meta-carrying flag unc
 ```tla
         /\ UNCHANGED << masterVars,
               dispatchedOps,
+              serverState,
+              scpState,
+              walFenced,
+              carryingMeta,
+              zkNode,
+              parentProc,
+              tableEnabled
+           >>
+```
+
+Clear `r` from suspended/blocked sets if it was waiting on meta.
+
+```tla
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        /\ availableWorkers' =
+             IF r \in blockedOnMeta
+             THEN availableWorkers + 1
+             ELSE availableWorkers
+     \/ \* --- Path C: Disabled-table skip (no ASSIGN created) ---
+```
+
+When the region has no procedure and its table is `DISABLED`, SCP skips creating an `ASSIGN` TRSP. The region is left in `ABNORMALLY_CLOSED` with no procedure.
+
+> *Source:* `ServerCrashProcedure.assignRegions()` L546-553, `isTableState(TableState.State.DISABLED)` check.
+
+```tla
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ regionState[r].location = s
+        /\ regionState[r].procType = "NONE"
+```
+
+Guard: table must be `DISABLED` and `UseDisable` must be `TRUE`.
+
+```tla
+        /\ UseDisable
+        /\ metaTable[r].table # NoTable
+        /\ tableEnabled[metaTable[r].table] = "DISABLED"
+```
+
+Clear `r` from `rsOnlineRegions` on all servers.
+
+```tla
+        /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
+```
+
+Drop stale `OPENED` reports for `r`.
+
+```tla
+        /\ pendingReports' =
+             {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
+```
+
+Mark `ABNORMALLY_CLOSED`, clear location; NO procedure created.
+
+```tla
+        /\ regionState' =
+             [regionState EXCEPT
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
+```
+
+Persist `ABNORMALLY_CLOSED` state to `metaTable` with cleared location.
+
+```tla
+        /\ metaTable' =
+             [metaTable EXCEPT
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
+```
+
+Remove `r` from the SCP snapshot (processed).
+
+```tla
+        /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
+```
+
+`ServerStateNode` tracking: remove `r` from crashed server `s`.
+
+```tla
+        /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
+```
+
+No procedure created: `procStore`, `dispatchedOps` unchanged.
+
+```tla
+        /\ UNCHANGED << masterVars,
+              dispatchedOps,
+              procStore,
               serverState,
               scpState,
               walFenced,

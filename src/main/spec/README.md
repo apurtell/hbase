@@ -372,7 +372,7 @@ All configurations check the same 36 safety invariants:
 | `RSMasterAgreementConverse` | RS-online region is acknowledged by master |
 | `FencingOrder` | SCP does not reassign until WAL leases are revoked |
 | `MetaAvailableForRecovery` | Meta-carrying SCP reassigns meta before proceeding |
-| `NoLostRegions` | After SCP completes, no region is stuck without a procedure |
+| `NoLostRegions` | After SCP completes, no region of an enabled table is stuck without a procedure |
 | `ProcStoreConsistency` | Intra-record correlation for persisted procedure records |
 | `ProcStoreBijection` | In-memory procedures ↔ persisted records (master-alive–gated) |
 | `ProcStepConsistency` | Procedure step correlates with region lifecycle state |
@@ -397,7 +397,7 @@ All configurations check the same 36 safety invariants:
 | `TruncateAtomicity` | If any region of a table has `parentProc.type = "TRUNCATE"` and `step = "COMPLETING"`, then ALL regions of that table must also have `parentProc.type = "TRUNCATE"` |
 | `TruncateNoOrphans` | A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
 | `CreateNoOrphans` | A region with `parentProc = [CREATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
-| `TableEnabledStateConsistency` | Disabled tables with no exclusive lock held have all regions in `{CLOSED, OFFLINE}` |
+| `TableEnabledStateConsistency` | Disabled tables with no exclusive lock held have all regions in `{CLOSED, OFFLINE, ABNORMALLY_CLOSED}` |
 
 ## Liveness Properties
 
@@ -447,13 +447,13 @@ All configurations check the same 36 safety invariants:
 
 | Detail | Value |
 |--------|-------|
-| **Date** | 2026-03-16 |
+| **Date** | 2026-03-18 |
 | **TLC version** | 2026.03.12.221037 |
 | **Config** | `AssignmentManager-sim.cfg` (9r/3s: 3 deployed + 6 unused, split and merge) |
-| **Mode** | Random Simulation (seed -1702499423105596566, aril 0) |
+| **Mode** | Random Simulation (seed 2344693266012683307, aril 0) |
 | **Workers** | 128 on 128 cores |
 | **Result** | All 36 invariants, 2 action constraints, and state constraint passed |
-| **States generated** | 1,314,483,362 |
+| **States generated** | 854,852,481 |
 | **Duration** | 8 hours |
 
 ## Running the Spec

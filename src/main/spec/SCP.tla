@@ -224,7 +224,7 @@ SCPFenceWALs(s) ==
 
 \* SCP step 3: Process ONE region from the SCP's region snapshot.
 \* Each invocation handles a single region and removes it from
-\* scpRegions[s].  Three sub-paths:
+\* scpRegions[s].  Four sub-paths:
 \*
 \*   Skip (location check): if the region's master-side location no
 \*     longer matches the crashed server, SCP skips the region entirely.
@@ -232,8 +232,12 @@ SCPFenceWALs(s) ==
 \*     implementation always applies.
 \*   Path A (procedure attached): transition region to ABNORMALLY_CLOSED,
 \*     clear location; existing procedure preserved for TRSPServerCrashed.
-\*   Path B (no procedure): transition to ABNORMALLY_CLOSED, clear
-\*     location, create fresh ASSIGN/GET_ASSIGN_CANDIDATE procedure.
+\*   Path B (no procedure, enabled table): transition to ABNORMALLY_CLOSED,
+\*     clear location, create fresh ASSIGN/GET_ASSIGN_CANDIDATE procedure.
+\*   Path C (disabled-table skip): if the region has no procedure and
+\*     its table is DISABLED, transition to ABNORMALLY_CLOSED but do NOT
+\*     create an ASSIGN procedure.  Models the isTableState(DISABLED)
+\*     check in assignRegions() L546-553.
 \*
 \* Pre: scpState[s] = "ASSIGN", r in scpRegions[s], walFenced[s] = TRUE.
 \* Post: r removed from scpRegions[s], region transitioned (or skipped).
@@ -361,8 +365,10 @@ SCPAssignRegion(s, r) ==
         \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r].state = "ABNORMALLY_CLOSED",
-             ![r].location = NoServer ]
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
         \* Remove r from the SCP snapshot (processed).
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Update persisted procedure: convert to ASSIGN.
@@ -392,7 +398,7 @@ SCPAssignRegion(s, r) ==
              IF r \in blockedOnMeta
              THEN availableWorkers + 1
              ELSE availableWorkers
-     \/ \* --- Path B: No TRSP attached ---
+     \/ \* --- Path B: No TRSP attached (enabled table) ---
         \* Meta must be available for Path B (writes to meta).
         /\ MetaIsAvailable
         \* Region is not suspended waiting for meta.
@@ -404,6 +410,10 @@ SCPAssignRegion(s, r) ==
         \* ASSIGN procedure at GET_ASSIGN_CANDIDATE.
         /\ regionState[r].location = s
         /\ regionState[r].procType = "NONE"
+        \* Disabled-table regions are handled by Path C.
+        /\ ~( UseDisable /\ metaTable[r].table # NoTable /\
+               tableEnabled[metaTable[r].table] = "DISABLED"
+           )
         \* Clear r from rsOnlineRegions on all servers.
         /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
         \* Drop stale OPENED reports for r.
@@ -427,8 +437,10 @@ SCPAssignRegion(s, r) ==
         \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
         /\ metaTable' =
              [metaTable EXCEPT
-             ![r].state = "ABNORMALLY_CLOSED",
-             ![r].location = NoServer ]
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
         \* Remove r from the SCP snapshot (processed).
         /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
         \* Insert a fresh ASSIGN procedure into the store.
@@ -442,6 +454,64 @@ SCPAssignRegion(s, r) ==
         \* meta-carrying flag unchanged.
         /\ UNCHANGED << masterVars,
               dispatchedOps,
+              serverState,
+              scpState,
+              walFenced,
+              carryingMeta,
+              zkNode,
+              parentProc,
+              tableEnabled
+           >>
+        \* Clear r from suspended/blocked sets if it was waiting on meta.
+        /\ suspendedOnMeta' = suspendedOnMeta \ { r }
+        /\ blockedOnMeta' = blockedOnMeta \ { r }
+        /\ availableWorkers' =
+             IF r \in blockedOnMeta
+             THEN availableWorkers + 1
+             ELSE availableWorkers
+     \/ \* --- Path C: Disabled-table skip (no ASSIGN created) ---
+        \* When the region has no procedure and its table is DISABLED,
+        \* SCP skips creating an ASSIGN TRSP.  The region is left in
+        \* ABNORMALLY_CLOSED with no procedure.
+        \*
+        \* Source: ServerCrashProcedure.assignRegions() L546-553
+        \*         isTableState(TableState.State.DISABLED) check.
+        /\ MetaIsAvailable
+        /\ r \notin suspendedOnMeta
+        /\ r \notin blockedOnMeta
+        /\ regionState[r].location = s
+        /\ regionState[r].procType = "NONE"
+        \* Guard: table must be DISABLED and UseDisable must be TRUE.
+        /\ UseDisable
+        /\ metaTable[r].table # NoTable
+        /\ tableEnabled[metaTable[r].table] = "DISABLED"
+        \* Clear r from rsOnlineRegions on all servers.
+        /\ rsOnlineRegions' = [t \in Servers |-> rsOnlineRegions[t] \ { r }]
+        \* Drop stale OPENED reports for r.
+        /\ pendingReports' =
+             {pr \in pendingReports: pr.code # "OPENED" \/ pr.region # r}
+        \* Mark ABNORMALLY_CLOSED, clear location; NO procedure created.
+        /\ regionState' =
+             [regionState EXCEPT
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
+        \* Persist ABNORMALLY_CLOSED state to metaTable with cleared location.
+        /\ metaTable' =
+             [metaTable EXCEPT
+             ![r].state =
+             "ABNORMALLY_CLOSED",
+             ![r].location =
+             NoServer]
+        \* Remove r from the SCP snapshot (processed).
+        /\ scpRegions' = [scpRegions EXCEPT ![s] = @ \ { r }]
+        \* ServerStateNode tracking: remove r from crashed server s.
+        /\ serverRegions' = [serverRegions EXCEPT ![s] = @ \ { r }]
+        \* No procedure created: procStore, dispatchedOps unchanged.
+        /\ UNCHANGED << masterVars,
+              dispatchedOps,
+              procStore,
               serverState,
               scpState,
               walFenced,
