@@ -177,7 +177,8 @@ Five liveness properties verify temporal guarantees:
 `NoStuckRegions` (regions in OPENING/CLOSING eventually leave those states).  Two action
 constraints enforce transition validity and SCP monotonicity.  One state
 constraint (`SplitMergeConstraint`) bounds concurrent split/merge procedures
-for TLC tractability.
+for TLC tractability in the exhaustive and liveness configs; the simulation
+config omits this constraint to verify concurrent splits on disjoint regions.
 
 The model checker runs in two tiers: fast exhaustive verification at 3
 regions / 2 servers (1 deployed + 2 unused for split daughters), and deep
@@ -336,6 +337,9 @@ allowing up to 3 independent splits.  Probabilistic coverage of the full
 state space including cascading crashes, master crash/recovery, concurrent
 split operations, and multi-cycle assign/unassign/move sequences.
 Simulation is the only tier that verifies deeper retry behavior and REOPEN.
+No `SplitMergeConstraint` is applied — concurrent splits on disjoint
+regions are permitted, verifying that parallel split/merge procedures
+do not interfere.
 
 | Parameter | Value |
 |-----------|-------|
@@ -422,9 +426,9 @@ All configurations check the same 36 safety invariants:
 
 ## State Constraints
 
-| Constraint | Description |
-|------------|-------------|
-| `SplitMergeConstraint` | Bounds concurrent split/merge procedures to at most 1 for TLC tractability |
+| Constraint | Configs | Description |
+|------------|---------|-------------|
+| `SplitMergeConstraint` | Exhaustive, Liveness | Bounds concurrent split/merge procedures to at most 1 for TLC tractability. Simulation omits this to verify concurrent splits. |
 
 ## Latest Verification Results
 

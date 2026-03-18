@@ -1102,7 +1102,7 @@ Per-region mutual exclusion:
 1. A daughter region (`SPLITTING_NEW`) cannot be a parent procedure target (`parentProc` is for parents; daughters are protected by `SplitPrepare`'s `state=OPEN` guard).
 2. No region has concurrent split and merge (trivially true: no merge actions in this iteration).
 
-Multiple disjoint splits can occur in parallel (faithful to the implementation). The `SplitMergeConstraint` state constraint bounds total concurrent splits for TLC tractability.
+Multiple disjoint splits can occur in parallel (faithful to the implementation). The `SplitMergeConstraint` state constraint bounds total concurrent splits in exhaustive and liveness configs for TLC tractability; the simulation config omits this constraint to verify concurrent splits on disjoint regions.
 
 ```tla
 SplitMergeMutualExclusion ==
@@ -1211,7 +1211,7 @@ Symmetry reduction: only unused region identifiers are interchangeable (deployed
 Symmetry == Permutations(Regions \ DeployedRegions) \union Permutations(Servers)
 ```
 
-State constraint: bound concurrent split/merge procedures. Limits to at most 1 concurrent split to keep the state space tractable for TLC. Multiple disjoint splits are permitted by the specification (faithful to implementation); this constraint is purely a model-checking optimization.
+State constraint: bound concurrent split/merge procedures. Limits to at most 1 concurrent split to keep the state space tractable for TLC. Multiple disjoint splits are permitted by the specification (faithful to implementation); this constraint is purely a model-checking optimization used by the exhaustive and liveness configs. The simulation config omits this constraint to verify concurrent split/merge on disjoint regions.
 
 ```tla
 SplitMergeConstraint ==
