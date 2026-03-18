@@ -1062,11 +1062,15 @@ No new invariants, variables, or constants; uses existing `tableEnabled` and
 `UseDisable` gate.  TLC 9r/3s simulation 300s: 2,399,960 states, 14,777
 traces, depth 67 (σ=33), clean.
 
-#### Iteration 41 - Concurrent Split/Merge
+#### Iteration 41 - Concurrent Split/Merge ✅ COMPLETE
 
-Remove `SplitMergeConstraint` from simulation configuration. Will verify that
-concurrent splits on different regions don't interfere. Only impacts
-simulation.
+Removed `SplitMergeConstraint` from simulation configuration
+(`AssignmentManager-sim.cfg`), allowing concurrent split/merge procedures on
+disjoint regions during simulation.  Constraint retained in exhaustive
+(`AssignmentManager.cfg`) and liveness (`AssignmentManager-liveness.cfg`)
+configs for tractability at 3r/2s.  `SplitMergeConstraint` definition in
+`AssignmentManager.tla` unchanged. TLC 9r/3s simulation 300s:
+3,503,967 states, 13,593 traces, depth 67, (σ=33), clean.
 
 ---
 

@@ -165,16 +165,6 @@ ACTION_CONSTRAINT
     TransitionValid
     SCPMonotonicity
 ```
-
-## State Constraints
-
-Bound concurrent split/merge procedures for TLC tractability:
-
-```tla
-CONSTRAINT
-    SplitMergeConstraint
-```
-
 ## Liveness
 
 Liveness properties require symmetry to be disabled. Use
