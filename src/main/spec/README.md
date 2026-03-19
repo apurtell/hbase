@@ -147,8 +147,12 @@ This TLA+ specification models the AssignmentManager as a state machine with
   lifecycle (`ENABLED`, `DISABLING`, `DISABLED`, `ENABLING`), matching Java's
   `TableState.State` enum. Persisted in meta via `TableStateManager`.  Intermediate
   states (`DISABLING`/`ENABLING`) serve as concurrent client request rejection gates.
+- **ModifyTable procedure** -- `ModifyTableProcedure` models two administrative
+  workflows: non-structural modifications on enabled tables (rolling restart
+  via TRSP REOPEN), and structural modifications on disabled tables
+  (`DisableTable → ModifyTable → EnableTable`), gated by `UseModify`.
 
-The specification defines 36 safety invariants verified at every reachable
+The specification defines 37 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
@@ -167,14 +171,17 @@ all regions of that table must also be marked), `TruncateNoOrphans` (new
 region at SPAWNED_OPEN step has a child ASSIGN TRSP or has completed it),
 `CreateNoOrphans` (CREATE/SPAWNED_OPEN region has a child ASSIGN TRSP or
 has completed it), and `TableEnabledStateConsistency` (disabled tables have
-all regions in {CLOSED, OFFLINE} when no exclusive lock is held).
+all regions in {CLOSED, OFFLINE} when no exclusive lock is held), and
+`ModifyTableSafety` (regions tagged for modify are in a valid REOPEN or
+skipped state).
 
-Five liveness properties verify temporal guarantees:
+Six liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
 `OfflineEventuallyOpen` (ASSIGN-bearing OFFLINE region eventually opens),
 `SCPEventuallyDone` (started SCP eventually completes),
 `RegionEventuallyAssigned` (ASSIGN on enabled table eventually opens), and
-`NoStuckRegions` (regions in OPENING/CLOSING eventually leave those states).  Two action
+`NoStuckRegions` (regions in OPENING/CLOSING eventually leave those states), and
+`ModifyEventuallyDone` (modify eventually completes).  Two action
 constraints enforce transition validity and SCP monotonicity.  One state
 constraint (`SplitMergeConstraint`) bounds concurrent split/merge procedures
 for TLC tractability in the exhaustive and liveness configs; the simulation
@@ -266,6 +273,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | [ZK.tla](markdown/ZK.md) | Minimal ZooKeeper model -- ephemeral node lifecycle (`ZKSessionExpire`) |
 | [Disable.tla](markdown/Disable.md) | DisableTableProcedure: mark table disabled, close all regions (DisableTablePrepare, DisableTableDone) |
 | [Enable.tla](markdown/Enable.md) | EnableTableProcedure: mark table enabled, assign all regions (EnableTablePrepare, EnableTableDone) |
+| [Modify.tla](markdown/Modify.md) | ModifyTableProcedure: non-structural reopen or structural disabled-table modify (ModifyTablePrepare, ModifyTableDone) |
 
 ## State Variables (19 total)
 
@@ -303,6 +311,7 @@ MERGING, MERGED, and MERGING_NEW states.
 | `UseDelete` | `TRUE` enables DeleteTable actions in `Next`/`Fairness`. `FALSE` (default) disables DeleteTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `UseTruncate` | `TRUE` enables TruncateTable actions in `Next`/`Fairness`. `FALSE` (default) disables TruncateTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `UseDisable` | `TRUE` enables DisableTable and EnableTable actions in `Next`/`Fairness`. A single toggle controls both. `FALSE` (default) disables both in exhaustive mode |
+| `UseModify` | `TRUE` enables ModifyTable actions in `Next`/`Fairness`. `FALSE` (default) disables ModifyTable in exhaustive mode. `TRUE` enables it in simulation mode |
 | `MaxRetries` | Maximum open-retry count per procedure |
 | `MaxWorkers` | PEWorker thread pool size; all procedure-step actions require `availableWorkers > 0` |
 | `MaxKey` | Upper bound of the keyspace `[0, MaxKey)` |
@@ -363,7 +372,7 @@ do not interfere.
 
 ## Invariants
 
-All configurations check the same 36 safety invariants:
+All configurations check the same 37 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -403,6 +412,7 @@ All configurations check the same 36 safety invariants:
 | `TruncateNoOrphans` | A region with `parentProc = [TRUNCATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
 | `CreateNoOrphans` | A region with `parentProc = [CREATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
 | `TableEnabledStateConsistency` | Disabled tables with no exclusive lock held have all regions in `{CLOSED, OFFLINE, ABNORMALLY_CLOSED}` |
+| `ModifyTableSafety` | While MODIFY is in progress, every tagged region is in a valid REOPEN, skipped, or SCP-handled state |
 
 ## Liveness Properties
 
@@ -413,6 +423,7 @@ All configurations check the same 36 safety invariants:
 | `SCPEventuallyDone` | Once an SCP starts for a crashed server (`scpState ∉ {NONE, DONE}`), it eventually completes (`scpState = DONE`) |
 | `RegionEventuallyAssigned` | Once an ASSIGN procedure is attached to a region of an enabled table, the region eventually reaches OPEN |
 | `NoStuckRegions` | Regions in transitional states (OPENING, CLOSING) eventually leave those states |
+| `ModifyEventuallyDone` | If ModifyTablePrepare fires, eventually all modify-tagged regions are cleared |
 
 > Liveness properties are incompatible with TLC's `SYMMETRY` reduction.
 > Use [`AssignmentManager-liveness.cfg`](markdown/AssignmentManager-liveness-cfg.md)

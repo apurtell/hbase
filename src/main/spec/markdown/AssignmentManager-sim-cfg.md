@@ -113,10 +113,12 @@ SPECIFICATION Spec
 | `UseUnknownServerQuirk` | `FALSE` | Master creates TRSP(ASSIGN) for Unknown Server orphans; `TRUE` models silent close gap |
 | `UseMasterAbortOnMetaWriteQuirk` | `FALSE` | No master abort on meta write failure; `TRUE` models `master.abort()` on `IOException` |
 | `UseStaleStateQuirk` | `FALSE` | No stale server state on recovery; `TRUE` models `AM.start()` stale `ServerStateNode` creation |
+| `UseDisable` | `TRUE` | Disable/Enable procedures enabled in simulation mode |
+| `UseModify` | `TRUE` | ModifyTable procedure enabled in simulation mode |
 
 ## Invariants
 
-All 36 safety invariants are checked:
+All 37 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -156,6 +158,7 @@ INVARIANT
     TruncateNoOrphans
     CreateNoOrphans
     TableEnabledStateConsistency
+    ModifyTableSafety
 ```
 
 ## Action Constraints
