@@ -188,7 +188,7 @@ rollback behavior.
 | `KeyspaceCoverage` | **Critical**: all keys in `[0, MaxKey)` must be covered by exactly one live region — no gaps, no overlaps |
 | `SplitAtomicity` / `MergeAtomicity` | Pre-PONR, daughters/merged region must not be materialized |
 | `NoOrphanedDaughters` / `NoOrphanedMergedRegion` | Newly materialized regions must always have an ASSIGN procedure |
-| `SplitCompleteness` / `MergeCompleteness` | After procedure completes, parent procedure state must be cleared |
+| `FencedServerNoOpen` | After SCP completes for a fenced server, no stably OPEN regions remain |
 | `SplitMergeMutualExclusion` | Daughter/merged regions cannot have active parent procedures |
 
 > **Tip:** Split changes are tested in **exhaustive** mode (`UseMerge = FALSE`).
@@ -280,12 +280,11 @@ that area.
 | Invariant | Check When Changing |
 |-----------|---------------------|
 | `SplitAtomicity` | Split PONR logic, split preparation, daughter creation timing |
-| `SplitCompleteness` | Split completion, parent procedure cleanup |
 | `NoOrphanedDaughters` | Daughter TRSP spawning, split meta-update |
 | `SplitMergeMutualExclusion` | Concurrent split/merge guards, parent procedure assignment |
 | `MergeAtomicity` | Merge PONR logic, merged-region materialization timing |
-| `MergeCompleteness` | Merge completion, target procedure cleanup |
 | `NoOrphanedMergedRegion` | Merged-region TRSP spawning, merge meta-update |
+| `FencedServerNoOpen` | SCP completion, WAL fencing, region reassignment |
 
 ### Table-Level Procedure Invariants
 

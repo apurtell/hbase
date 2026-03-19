@@ -70,7 +70,7 @@ Same model values and universe sizing as the primary exhaustive config:
 
 ## Safety Invariants
 
-All 37 safety invariants are checked alongside liveness:
+All 36 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -99,10 +99,8 @@ INVARIANT
     SplitMergeMutualExclusion
     SplitAtomicity
     NoOrphanedDaughters
-    SplitCompleteness
     AtMostOneCarryingMeta
     NoOrphanedMergedRegion
-    MergeCompleteness
     MergeAtomicity
     TableLockExclusivity
     DeleteTableAtomicity
@@ -111,6 +109,7 @@ INVARIANT
     CreateNoOrphans
     TableEnabledStateConsistency
     ModifyTableSafety
+    FencedServerNoOpen
 ```
 
 ## Action Constraints
@@ -140,7 +139,7 @@ be disabled:
 - **`SCPEventuallyDone`**: Started SCP eventually completes.
 - **`RegionEventuallyAssigned`**: ASSIGN on enabled table eventually opens.
 - **`NoStuckRegions`**: Regions in OPENING/CLOSING eventually leave those states.
-- **`ModifyEventuallyDone`**: ModifyTable eventually completes.
+- **`ProcedureEventuallyDone`**: Every active procedure eventually completes (success or failure).
 
 ```tla
 \* Liveness properties (the reason this config exists)
@@ -150,5 +149,5 @@ PROPERTY
     SCPEventuallyDone
     RegionEventuallyAssigned
     NoStuckRegions
-    ModifyEventuallyDone
+    ProcedureEventuallyDone
 ```

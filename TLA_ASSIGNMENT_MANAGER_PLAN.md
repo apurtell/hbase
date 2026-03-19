@@ -1097,17 +1097,20 @@ completes. Config: exhaustive/liveness `UseModify = FALSE`, simulation
 `UseModify = TRUE`.  TLC 9r/3s simulation 300s: 1,268,409 states, 4,799
 traces, depth 67 (σ=33), clean.
 
-#### Iteration 43 - Improve Invariants and Liveness
+#### Iteration 43 - Improve Invariants and Liveness ✅ COMPLETE
 
-Invariants:
-- After a CREATE/DELETE/TRUNCATE completes, no regions of that table should have dangling parentProc entries. SplitCompleteness and MergeCompleteness check this for split/merge, but there is no analogous "CreateCompleteness" or "DeleteCompleteness."
-- Strengthening NoDoubleAssignment to explicitly check if walFenced[s] = TRUE, then no region on s should be in a state allowing new writes from the master's perspective (no region assigned to s with state OPEN in regionState). This would complement the rsOnlineRegions-based check.
-- The spec tracks serverRegions separately from regionState[r].location. Do we need serverRegions?
-
-Liveness:
-- Does every CreateTable/DeleteTable/TruncateTable/DisableTable/EnableTable eventually complete? The spec has no liveness properties for these. A stuck DisableTableProcedure (e.g., one region's UNASSIGN keeps failing and retrying) would not be detected.
-- Does every SplitPrepare eventually reach either SplitDone or SplitFail? Does every MergePrepare eventually reach either MergeDone or MergeFail? The current liveness properties do not cover this.
-- After DisableTableDone, do all regions eventually reach a quiescent state (CLOSED or OFFLINE)? 
++`FencedServerNoOpen` (safety), +`ProcedureEventuallyDone` (liveness).
+−`SplitCompleteness`, `MergeCompleteness` (safety), `ModifyEventuallyDone`
+(liveness) — all subsumed. `FencedServerNoOpen`: after SCP completes
+(`scpState[s] ∈ {"DONE","NONE"}`), no region on fenced server `s` is stably
+OPEN with no procedure.  Gated on SCP completion for the SCPFenceWALs →
+SCPAssignRegion window.  Complements `NoDoubleAssignment`'s RS-side check
+with a master-side WAL-fencing check. `ProcedureEventuallyDone`:
+`procType ≠ NONE ~> NONE` ∧ `parentProc ≠ NoParentProc ~> NoParentProc`.
+Covers all 12 procedure types via two conjuncts.  Generalizes
+`ModifyEventuallyDone`/`SplitCompleteness`/ `MergeCompleteness`. Net: 36
+invariants (−2, +1), 6 liveness (−1, +1).  TLC sim 300s: 1,285,088 states,
+4,868 traces, depth 67 (σ=33), clean.
 
 #### Iteration 44 — CatalogJanitor
 

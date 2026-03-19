@@ -48,7 +48,7 @@ The implementation's [`SplitTableRegionProcedure`](file:///Users/andrewpurtell/s
 
 ### Safety-Critical Properties
 
-The split's safety-critical properties are: (1) no daughters materialized pre-PONR (`SplitAtomicity`), (2) daughters always have `ASSIGN` procedures (`NoOrphanedDaughters`), (3) keyspace coverage maintained (`KeyspaceCoverage`), and (4) parent keyspace cleared after daughters are open (`SplitCompleteness`). All four are verifiable at the 5-state abstraction level. The abstracted filesystem operations are either idempotent or roll back cleanly on failure.
+The split's safety-critical properties are: (1) no daughters materialized pre-PONR (`SplitAtomicity`), (2) daughters always have `ASSIGN` procedures (`NoOrphanedDaughters`), and (3) keyspace coverage maintained (`KeyspaceCoverage`). Split/merge completion is verified by the `ProcedureEventuallyDone` liveness property. All three safety properties are verifiable at the 5-state abstraction level. The abstracted filesystem operations are either idempotent or roll back cleanly on failure.
 
 > *Source:* `SplitTableRegionProcedure.rollbackState()` L368–411; `openParentRegion()` L647–651.
 

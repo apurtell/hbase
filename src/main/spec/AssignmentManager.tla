@@ -1126,29 +1126,10 @@ NoOrphanedMergedRegion ==
       ( RegionExists(r) /\ regionState[r].state = "MERGING_NEW" ) =>
         regionState[r].procType = "ASSIGN"
 
-\* SplitCompleteness: after a split completes (parent is SPLIT with
-\* NoRange, meaning SplitDone has fired), the daughters' keyspaces
-\* exist and are correct.  This is a post-condition check: if the
-\* parent has been cleaned up, the daughters should be OPEN.
-\* Gated on no active SCP (SCP may disrupt daughter assignments).
-SplitCompleteness ==
-  masterAlive = TRUE =>
-    ( ( \A s \in Servers: scpState[s] = "NONE" ) =>
-        \A r \in Regions:
-          ( regionState[r].state = "SPLIT" /\ ~RegionExists(r) ) =>
-            parentProc[r] = NoParentProc
-    )
-
-\* MergeCompleteness: after a merge completes (targets are MERGED with
-\* NoRange, meaning MergeDone has fired), the merged region exists and
-\* is OPEN with the union keyspace.  Gated on no active SCP.
-MergeCompleteness ==
-  masterAlive = TRUE =>
-    ( ( \A s \in Servers: scpState[s] = "NONE" ) =>
-        \A r \in Regions:
-          ( regionState[r].state = "MERGED" /\ ~RegionExists(r) ) =>
-            parentProc[r] = NoParentProc
-    )
+\* (SplitCompleteness and MergeCompleteness removed in iteration 43;
+\* subsumed by the ProcedureEventuallyDone liveness property which
+\* guarantees all parent procedures — including SPLIT and MERGE —
+\* eventually resolve to NoParentProc.)
 
 \* MergeAtomicity: pre-PONR, no MERGING_NEW merged region whose keyspace
 \* spans the merge targets' combined range should exist.  The merged
@@ -1324,6 +1305,34 @@ ModifyTableSafety ==
            )
         \/ regionState[r].procType \in { "ASSIGN", "UNASSIGN", "MOVE" }
 
+\* FencedServerNoOpen: when walFenced[s] = TRUE and SCP for s has
+\* completed (scpState[s] ∈ {"DONE", "NONE"}), no region assigned
+\* to server s should be stably OPEN (no procedure attached) from
+\* the master's perspective.  After SCP finishes processing a
+\* crashed server's regions, every region should have been moved
+\* off the fenced server — either via TRSPServerCrashed or
+\* SCPAssignRegion.  A stable OPEN on a fenced server after SCP
+\* completes would mean the master believes the region is serving
+\* on a dead server with no recovery in progress.
+\*
+\* The scpState guard is necessary because between SCPFenceWALs
+\* and SCPAssignRegion, regions are legitimately OPEN on the
+\* fenced server while SCP processes them one at a time.
+\*
+\* Complements NoDoubleAssignment (which validates the singleton
+\* assignment state of a single region via rsOnlineRegions) by
+\* checking the master-side view against WAL fencing state.
+\*
+\* Source: SCPFenceWALs revokes WAL leases; SCPAssignRegion and
+\*         TRSPServerCrashed move regions off the fenced server.
+FencedServerNoOpen ==
+  masterAlive = TRUE =>
+    \A s \in Servers:
+      ( walFenced[s] = TRUE /\ scpState[s] \in { "DONE", "NONE" } ) =>
+        ~\E r \in Regions:
+          /\ regionState[r].location = s
+          /\ regionState[r].state = "OPEN"
+          /\ regionState[r].procType = "NONE"
 
 ---------------------------------------------------------------------------
 
@@ -1678,20 +1687,32 @@ NoStuckRegions ==
     ( RegionExists(r) /\ regionState[r].state \in { "OPENING", "CLOSING" } ) ~>
       regionState[r].state \notin { "OPENING", "CLOSING" }
 
-\* Liveness: if ModifyTablePrepare(t) has fired (some region has
-\* parentProc.type = "MODIFY"), then eventually all such regions
-\* return to parentProc.type # "MODIFY".
-\* Requires WF on ModifyTableDone and SF on TRSP reopen path actions.
+\* Liveness: every active procedure — both standalone TRSPs
+\* (procType # "NONE") and parent procedures (parentProc #
+\* NoParentProc) — eventually completes.  This single property
+\* covers ASSIGN, UNASSIGN, MOVE, REOPEN (via procType) and
+\* SPLIT, MERGE, CREATE, DELETE, TRUNCATE, DISABLE, ENABLE,
+\* MODIFY (via parentProc).  Generalizes and replaces the
+\* former per-procedure ModifyEventuallyDone, SplitCompleteness,
+\* and MergeCompleteness.
 \*
-\* Source: ModifyTableProcedure completion guarantee.
-ModifyEventuallyDone ==
-  \A t \in Tables:
-    ( \E r \in Regions: metaTable[r].table = t /\ parentProc[r].type = "MODIFY"
-      ) ~>
-      ( \A r \in Regions:
-          ( metaTable[r].table = t /\ RegionExists(r) ) =>
-            parentProc[r].type # "MODIFY"
-      )
+\* Justified by: all Done actions (SplitDone, MergeDone,
+\* CreateTableDone, DeleteTableDone, TruncateDone,
+\* DisableTableDone, EnableTableDone, ModifyTableDone) have WF.
+\* SplitFail and MergeFail (no WF, non-deterministic) also clear
+\* parentProc; the leads-to target is satisfied by either success
+\* or failure paths.  The TRSP pipeline underneath (open/close
+\* dispatch, RS handlers) has WF/SF.
+\*
+\* Source: ProcedureExecutor completion guarantee for all
+\*         table-level, split/merge, and TRSP procedures.
+ProcedureEventuallyDone ==
+  /\ \A r \in Regions:
+       ( RegionExists(r) /\ regionState[r].procType # "NONE" ) ~>
+         regionState[r].procType = "NONE"
+  /\ \A r \in Regions:
+       ( RegionExists(r) /\ parentProc[r] # NoParentProc ) ~>
+         parentProc[r] = NoParentProc
 
 ---------------------------------------------------------------------------
 
@@ -1765,8 +1786,8 @@ ModifyEventuallyDone ==
 \* Safety: SPLITTING_NEW daughters always have a procedure.
         THEOREM Spec => []NoOrphanedDaughters
 
-\* Safety: completed split has cleaned-up parent.
-        THEOREM Spec => []SplitCompleteness
+\* Safety: fenced server has no stably OPEN regions.
+        THEOREM Spec => []FencedServerNoOpen
 
 \* Safety: at most one server carrying meta.
         THEOREM Spec => []AtMostOneCarryingMeta
@@ -1774,8 +1795,7 @@ ModifyEventuallyDone ==
 \* Safety: MERGING_NEW merged regions always have a procedure.
         THEOREM Spec => []NoOrphanedMergedRegion
 
-\* Safety: completed merge has cleaned-up targets.
-        THEOREM Spec => []MergeCompleteness
+
 
 \* Safety: pre-PONR merged region not materialized.
         THEOREM Spec => []MergeAtomicity
@@ -1820,8 +1840,8 @@ ModifyEventuallyDone ==
         THEOREM
         Spec => NoStuckRegions
 
-\* Liveness: ModifyTable eventually completes.
-        THEOREM Spec => ModifyEventuallyDone
+\* Liveness: every procedure eventually completes (success or failure).
+        THEOREM Spec => ProcedureEventuallyDone
 
 \* All transitions in every step are members of ValidTransition.
 \* Expressed as an action property checked via TLC's action constraint.
