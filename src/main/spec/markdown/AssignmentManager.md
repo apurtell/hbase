@@ -30,6 +30,9 @@ Action logic is factored into sub-modules:
 | **Create**       | `CreateTableProcedure` (multi-region table creation)                           |
 | **Delete**       | `DeleteTableProcedure` (table deletion, identifier freeing)                    |
 | **Truncate**     | `TruncateTableProcedure` (delete old + create new regions)                     |
+| **Disable**      | `DisableTableProcedure` (mark table disabled, close all regions)               |
+| **Enable**       | `EnableTableProcedure` (mark table enabled, assign all regions)                |
+| **Modify**       | `ModifyTableProcedure` (non-structural reopen or structural disabled-table modify) |
 
 ### Region Assignment Lifecycle
 
@@ -358,6 +361,7 @@ delete == INSTANCE Delete
 truncate == INSTANCE Truncate
 disable == INSTANCE Disable
 enable == INSTANCE Enable
+modify == INSTANCE Modify
 ```
 
 ```tla
@@ -1353,6 +1357,26 @@ TableEnabledStateConsistency ==
               { "CLOSED", "OFFLINE", "ABNORMALLY_CLOSED" }
 ```
 
+### `ModifyTableSafety`
+
+While a `MODIFY` is in progress on table `t`, every region with `parentProc.type = "MODIFY"` is either: (a) `OPEN` with no procedure (completed reopen or awaiting `ModifyTableDone`), (b) in a valid TRSP REOPEN state (`procType = "REOPEN"`), (c) handled by SCP (`ABNORMALLY_CLOSED` with `ASSIGN`), (d) skipped (`parentProc.step = "COMPLETING"`), or (e) in a valid TRSP state from another procedure (mid-split/merge/SCP). Ensures the rolling restart does not lose regions.
+
+> *Source:* `ReopenTableRegionsProcedure` skips busy regions; TRSP REOPEN drives the close/open cycle; SCP handles server crashes during reopen.
+
+```tla
+ModifyTableSafety ==
+  masterAlive = TRUE =>
+    \A r \in Regions:
+      ( RegionExists(r) /\ parentProc[r].type = "MODIFY" ) =>
+        \/ ( parentProc[r].step = "COMPLETING" )
+        \/ ( regionState[r].state = "OPEN" /\ regionState[r].procType = "NONE" )
+        \/ regionState[r].procType = "REOPEN"
+        \/ ( regionState[r].state = "ABNORMALLY_CLOSED" /\
+               regionState[r].procType = "ASSIGN"
+           )
+        \/ regionState[r].procType \in { "ASSIGN", "UNASSIGN", "MOVE" }
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1386,6 +1410,7 @@ PrintConfig ==
   /\ PrintT(<< "UseUnknownServerQuirk", UseUnknownServerQuirk >>)
   /\ PrintT(<< "UseMasterAbortOnMetaWriteQuirk", UseMasterAbortOnMetaWriteQuirk >>)
   /\ PrintT(<< "UseStaleStateQuirk", UseStaleStateQuirk >>)
+  /\ PrintT(<< "UseModify", UseModify >>)
   /\ PrintT("========================================")
 ```
 
@@ -1733,6 +1758,14 @@ Next ==
   \/ ( UseDisable /\ \E t \in Tables: enable!EnableTableDone(t) )
 ```
 
+**ModifyTable forward path** (gated on `UseModify`)
+
+```tla
+  \* -- ModifyTable forward path (gated on UseModify) --
+  \/ ( UseModify /\ \E t \in Tables: modify!ModifyTablePrepare(t) )
+  \/ ( UseModify /\ \E t \in Tables: modify!ModifyTableDone(t) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1881,6 +1914,13 @@ No fairness on `MasterCrash` (non-deterministic environmental event). No fairnes
   /\ ( UseDisable => \A t \in Tables: WF_vars(enable!EnableTableDone(t)) )
 ```
 
+**ModifyTable completion** (deterministic; gated on `UseModify`; no WF on `ModifyTablePrepare`)
+
+```tla
+  \* ModifyTable completion (deterministic; gated on UseModify; no WF on ModifyTablePrepare)
+  /\ ( UseModify => \A t \in Tables: WF_vars(modify!ModifyTableDone(t)) )
+```
+
 ```tla
 ---------------------------------------------------------------------------
 ```
@@ -1957,6 +1997,23 @@ NoStuckRegions ==
   \A r \in Regions:
     ( RegionExists(r) /\ regionState[r].state \in {"OPENING", "CLOSING"} )
       ~> regionState[r].state \notin {"OPENING", "CLOSING"}
+```
+
+### Liveness: `ModifyEventuallyDone`
+
+If a `ModifyTablePrepare` fires for table `t` (any region has `parentProc.type = "MODIFY"`), then eventually `ModifyTableDone` completes (all regions of `t` have `parentProc.type ≠ "MODIFY"`). Requires WF on `ModifyTableDone` and SF on TRSP reopen path actions.
+
+> *Source:* `ModifyTableProcedure` completion guarantee.
+
+```tla
+ModifyEventuallyDone ==
+  \A t \in Tables:
+    ( \E r \in Regions: metaTable[r].table = t /\ parentProc[r].type = "MODIFY"
+      ) ~>
+      ( \A r \in Regions:
+          ( metaTable[r].table = t /\ RegionExists(r) ) =>
+            parentProc[r].type # "MODIFY"
+      )
 ```
 
 ```tla
@@ -2200,6 +2257,20 @@ Liveness: regions in transitional states eventually leave those states.
 
 ```tla
         THEOREM Spec => NoStuckRegions
+```
+
+Safety: modify does not lose regions during rolling restart.
+
+```tla
+\* Safety: modify does not lose regions during rolling restart.
+        THEOREM Spec => []ModifyTableSafety
+```
+
+Liveness: modify eventually completes.
+
+```tla
+\* Liveness: modify eventually completes.
+        THEOREM Spec => ModifyEventuallyDone
 ```
 
 ### `TransitionValid` *(action property)*

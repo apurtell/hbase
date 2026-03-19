@@ -7,6 +7,12 @@
  * table identity.  Requires all regions of the target table to be in
  * {"CLOSED","OFFLINE"} with procType = "NONE" (disabled-table precondition).
  *
+ * Expected administrative sequence:
+ *   DisableTable -> TruncateTable -> EnableTable
+ * The administrator must disable the table before truncation.  After
+ * TruncateTable completes, the administrator re-enables the table to
+ * bring the new (empty) regions online.
+ *
  * Forward-path actions:
  *   TruncatePrepare     -- acquire table lock, mark all regions for truncation
  *   TruncateDeleteMeta  -- delete old regions from meta, free identifiers (PONR)
