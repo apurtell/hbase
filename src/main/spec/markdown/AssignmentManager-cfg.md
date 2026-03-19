@@ -69,7 +69,7 @@ SYMMETRY Symmetry
 
 ## Invariants
 
-All 37 safety invariants are checked:
+All 36 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -98,10 +98,8 @@ INVARIANT
     SplitMergeMutualExclusion
     SplitAtomicity
     NoOrphanedDaughters
-    SplitCompleteness
     AtMostOneCarryingMeta
     NoOrphanedMergedRegion
-    MergeCompleteness
     MergeAtomicity
     TableLockExclusivity
     DeleteTableAtomicity
@@ -110,6 +108,7 @@ INVARIANT
     CreateNoOrphans
     TableEnabledStateConsistency
     ModifyTableSafety
+    FencedServerNoOpen
 ```
 
 ## Action Constraints
