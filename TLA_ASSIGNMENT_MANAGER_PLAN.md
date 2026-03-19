@@ -1072,6 +1072,243 @@ configs for tractability at 3r/2s.  `SplitMergeConstraint` definition in
 `AssignmentManager.tla` unchanged. TLC 9r/3s simulation 300s:
 3,503,967 states, 13,593 traces, depth 67, (σ=33), clean.
 
+#### Iteration 42 — ModifyTableProcedure
+
+Model the `ModifyTableProcedure` (`ALTER TABLE`) — the most common
+table-level DDL operation that interacts with ongoing splits, merges,
+SCPs, and assignments.  Source: `ModifyTableProcedure.java`
+(`executeFromState()` L199-311, `prepareModify()` L432-472,
+`getTableOperationType()` L424-426 → `EDIT`),
+`ReopenTableRegionsProcedure.java` (child procedure, `executeFromState()`
+L191-254 → creates TRSP reopens per region),
+`TableQueue.java` (`requireTableExclusiveLock()` L50-80 — `EDIT`
+acquires exclusive table lock for all non-namespace tables),
+`MasterProcedure.proto` (`ModifyTableState` enum).
+**Key behavioral observations from code analysis:**
+1. `ModifyTableProcedure.getTableOperationType()` returns `EDIT`.
+   `TableQueue.requireTableExclusiveLock()` maps `EDIT` → `true`
+   (exclusive) for all tables except `NAMESPACE_TABLE_NAME`.
+   Therefore ModifyTable holds an **exclusive table lock**, blocking
+   concurrent CREATE/DELETE/TRUNCATE/DISABLE/ENABLE/MODIFY on the
+   same table.  However, REGION-level operations (SPLIT, MERGE,
+   ASSIGN, UNASSIGN) use **shared** table locks and can proceed
+   concurrently — this is the primary concurrency concern.
+2. The core assignment-manager interaction is
+   `MODIFY_TABLE_REOPEN_ALL_REGIONS` (L263-268): when the table is
+   enabled, spawns `ReopenTableRegionsProcedure` as a child procedure.
+   `ReopenTableRegionsProcedure` iterates over all table regions and
+   creates `TransitRegionStateProcedure.reopen()` (TRSP REOPEN) for
+   each, batched with progressive backoff.  This is a rolling restart
+   — individual regions cycle OPEN → CLOSING → CLOSED → OPENING → OPEN
+   while splits/merges may be in progress on other regions.
+3. Replica count changes (`closeExcessReplicasIfNeeded`,
+   `assignNewReplicasIfNeeded`) are secondary interactions.  The TLA+
+   model abstracts replica count as 1 (no region replicas modeled),
+   so these are out of scope.
+4. Descriptor update (`MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR`), FS
+   layout changes, erasure coding sync, snapshot, and coprocessor hooks
+   do not affect region state or assignments — abstracted away.
+5. `isRollbackSupported()` returns `true` only for PREPARE,
+   PRE_OPERATION, SNAPSHOT, CLOSE_EXCESS_REPLICAS — all before region
+   reopening begins.  Post-PONR (after UPDATE_TABLE_DESCRIPTOR), the
+   procedure cannot roll back and must eventually succeed.
+6. `ReopenTableRegionsProcedure` skips regions that already have an
+   active TRSP (`regionNode.getProcedure() != null`), and re-checks
+   completion in CONFIRM_REOPENED.  Regions split or merged during the
+   reopen window are naturally skipped (`regionNode == null` check at
+   L215-216) — no error, just skip.  This tolerance for concurrent
+   structural changes is a key correctness property to verify.
+**Modeling approach — collapsed two-action pattern (Prepare + Done):**
+Following the Disable/Enable pattern (Iteration 36), the procedure is
+collapsed to two actions.  The intermediate states (PRE_OPERATION,
+UPDATE_TABLE_DESCRIPTOR, POST_OPERATION) are descriptor-level operations
+that don't affect assignment state and are abstracted away.  The
+REOPEN_ALL_REGIONS step — spawning TRSP reopens for all table regions —
+is the critical assignment-manager interaction and is modeled atomically
+in the Prepare action.
+**New module:** `Modify.tla` — ModifyTableProcedure actions.
+**New constant:** `UseModify ∈ BOOLEAN` (Types.tla).  When `FALSE`
+(default for exhaustive/liveness), ModifyTable actions disabled.  When
+`TRUE` (simulation), ModifyTable enabled.
+**New actions:**
+1. `ModifyTablePrepare(t)` — Guards: `masterAlive`, `availableWorkers > 0`,
+   `UseModify`, `TableLockFree(t)`, `tableEnabled[t] = "ENABLED"`,
+   table has at least one region (`∃ r ∈ Regions: metaTable[r].table = t`).
+   Atomically: sets `parentProc = [MODIFY, SPAWNED_OPEN, NoRegion,
+   NoRegion]` on all regions of table `t` that are OPEN with no active
+   procedure, and creates TRSP REOPEN (procType = "REOPEN") for each.
+   Regions with an active procedure (e.g., mid-split, mid-merge, mid-SCP)
+   are skipped — matching `ReopenTableRegionsProcedure`'s
+   `regionNode.getProcedure() != null` skip (L221-223).
+   Skipped regions get `parentProc = [MODIFY, COMPLETING, NoRegion,
+   NoRegion]` to track that they are part of the modify scope but don't
+   need reopening.  The reopen spawns TRSP REOPEN child procedures that
+   cycle the region through CLOSING → CLOSED → OPENING → OPEN.
+   Source: `ModifyTableProcedure.executeFromState()` L263-268,
+   `ReopenTableRegionsProcedure.executeFromState()` L204-233.
+2. `ModifyTableDone(t)` — Guards: all regions of table `t` with
+   `parentProc.type = "MODIFY"` have completed their REOPEN TRSP
+   (region is OPEN with `procType = "NONE"`) or were skipped
+   (parentProc step = `COMPLETING`).  Clears `parentProc` to
+   `NoParentProc` for all MODIFY-tagged regions of table `t`.
+   Source: `ReopenTableRegionsProcedure.executeFromState()` L245-246
+   (empty regions → `NO_MORE_STATE`).
+**Concurrency with split/merge (key modeling concern):**
+- A region mid-split or mid-merge when `ModifyTablePrepare` fires is
+  skipped by the reopen (matching Java behavior).  The split/merge
+  proceeds independently.  After split completes, daughter regions
+  inherit the table but are NOT reopened by the in-flight modify —
+  matching `ReopenTableRegionsProcedure`'s snapshot-at-start behavior
+  (L199-201: `getRegionsOfTableForReopen()` fetches the region list
+  once at `GET_REGIONS` state).
+- A TRSP REOPEN on region `r` can interleave with SCP if the target
+  server crashes during the reopen cycle.  `TRSPServerCrashed` handles
+  this (existing mechanism).  The modify procedure's completion check
+  must tolerate the TRSP being restarted by SCP.
+**TRSP REOPEN modeling:**
+TRSP REOPEN is already modeled by `TRSPCreateReopen(r)` (Iteration 15).
+`ModifyTablePrepare` will use `TRSPCreateReopen` semantics: set
+`procType = "REOPEN"`, advance to CLOSING.  The guard
+`parentProc[r].type ∈ {"MODIFY"}` on `TRSPCreateReopen` is not needed
+— the existing `TRSPCreateReopen` does not check parentProc.  Instead,
+`ModifyTablePrepare` directly initializes the TRSP state for each
+applicable region, analogous to how `DisableTablePrepare` initializes
+UNASSIGN TRSPs and `EnableTablePrepare` initializes ASSIGN TRSPs.
+**Changes to `Types.tla`:**
+- Add `"MODIFY"` to `ParentProcType`.
+- Add `"MODIFY"` to `TableExclusiveType` (exclusive table lock for
+  mutual exclusion with other DDL, matching `EDIT` in `TableQueue`).
+- Add `UseModify ∈ BOOLEAN` constant.
+**Changes to `AssignmentManager.tla`:**
+- `INSTANCE Modify` — new module instance.
+- `TypeOK`: extend parentProc type check for MODIFY.
+- `Next`: add `ModifyTablePrepare(t)` and `ModifyTableDone(t)` disjuncts,
+  gated on `UseModify`.
+- `Fairness`: WF on `ModifyTableDone(t)` (deterministic completion).
+  No WF on `ModifyTablePrepare` (non-deterministic event — administrator
+  issues ALTER TABLE).
+- Extend existing invariants for MODIFY-related parentProc states:
+  `NoOrphanedProcedures` (MODIFY regions must have consistent procStore),
+  `LockExclusivity` (REOPEN regions can be in any TRSP state).
+- `PrintConfig`: include `UseModify`.
+- THEOREM: `ModifyTableDone` refines modify specification.
+**New invariant:**
+- `ModifyTableSafety`: While a MODIFY is in progress on table `t`
+  (any region has `parentProc.type = "MODIFY"`), no region of `t` is
+  permanently lost — every region with `parentProc.type = "MODIFY"` is
+  either (a) OPEN with no procedure (completed/skipped), (b) in a valid
+  TRSP REOPEN state, or (c) handled by SCP (ABNORMALLY_CLOSED with
+  ASSIGN).  This ensures the rolling restart does not lose regions.
+**New liveness property (liveness config only):**
+- `ModifyEventuallyDone`: If `ModifyTablePrepare(t)` has fired (some
+  region has `parentProc.type = "MODIFY"`), then eventually all such
+  regions return to OPEN with `parentProc = NoParentProc`.
+  Requires SF on TRSP reopen path actions.
+**Config updates:** All 3 configs: `+UseModify`.  Exhaustive and
+liveness: `UseModify = FALSE`.  Simulation: `UseModify = TRUE`.
+
+#### Iteration 43 — CatalogJanitor
+
+Model the `CatalogJanitor` periodic meta-consistency scanner and its
+associated `MetaFixer` repair actions.  The CatalogJanitor is the
+implementation's runtime consistency checker — analogous to some of the
+spec's invariants (`KeyspaceCoverage`, `NoLostRegions`) — but its actual
+behavior (async scanning, repair procedure creation) introduces its own
+concurrency concerns not currently modeled.
+Source: `CatalogJanitor.java` (`ScheduledChore`, default 300s period),
+`ReportMakingVisitor.java` (meta scan + consistency checks),
+`CatalogJanitorReport.java` (report: holes, overlaps, unknown servers,
+split parents, merged regions, empty region info),
+`MetaFixer.java` (automated repair: hole fill + ASSIGN, overlap merge),
+`GCRegionProcedure.java` (split parent GC),
+`GCMultipleMergedRegionsProcedure.java` (merged region GC).
+**New module:** `CatalogJanitor.tla` — periodic meta scan action with
+concurrency guards.
+**New constant:** `UseCatalogJanitor ∈ BOOLEAN` (Types.tla).  When
+`FALSE` (default for exhaustive), CatalogJanitor actions disabled.
+When `TRUE` (simulation), CatalogJanitor scan and repair enabled.
+**New actions:**
+1. `CJScanDetectHole(t)` — Scans `metaTable` for keyspace holes
+   within table `t` (gap between consecutive regions' `endKey` and
+   `startKey`).  When a hole is found: creates a new region covering
+   the gap, writes `metaTable`, spawns ASSIGN TRSP.  Models
+   `MetaFixer.fixHoles()` which creates `RegionInfo` for holes,
+   adds meta entries, creates region directories, and submits
+   `TransitRegionStateProcedure` for assignment.
+   Guard: `masterAlive`, `availableWorkers > 0`, `UseCatalogJanitor`,
+   no active table-exclusive lock on `t`, `tableEnabled[t] ∈
+   {"ENABLED"}`.  Source: `MetaFixer.fixHoles()` L100-118,
+   `ReportMakingVisitor.metaTableConsistencyCheck()` L117-188.
+2. `CJScanDetectOverlap(t)` — Scans `metaTable` for overlapping
+   regions within table `t`.  When overlap is found between adjacent
+   regions: initiates a merge procedure on the overlapping set.
+   Models `MetaFixer.fixOverlaps()` which calls
+   `masterServices.mergeRegions()`.  Guard: same as `CJScanDetectHole`
+   plus `UseMerge = TRUE`.
+   Source: `MetaFixer.fixOverlaps()` L258-270,
+   `ReportMakingVisitor.metaTableConsistencyCheck()` overlap branch
+   L163-181.
+3. `CJGCSplitParent(r)` — Garbage-collects a completed split parent.
+   Guard: region in state `SPLIT`, `metaTable[r].keyRange = NoRange`,
+   daughters exist and are `OPEN` with no references to parent.
+   Atomically removes the parent's meta entry and frees the region
+   identifier.  Models `CatalogJanitor.cleanParent()` L325-373 →
+   `GCRegionProcedure`.  Source: `CatalogJanitor.scan()` L198-224,
+   `GCRegionProcedure`.
+4. `CJGCMergedRegion(r)` — Garbage-collects completed merge targets.
+   Guard: region in state `MERGED`, `metaTable[r].keyRange = NoRange`,
+   merged region exists and is `OPEN` with no references to targets.
+   Atomically removes target meta entries and frees identifiers.
+   Models `CatalogJanitor.cleanMergeRegion()` L254-290 →
+   `GCMultipleMergedRegionsProcedure`.
+   Source: `CatalogJanitor.scan()` L185-197,
+   `GCMultipleMergedRegionsProcedure`.
+5. `CJDetectUnknownServer(r)` — Refactored from the existing
+   `DetectUnknownServer(r)` action (Iteration 29).  The unknown-server
+   detection is moved into the CatalogJanitor scan cycle.  The action
+   retains the same semantics and the `UseUnknownServerQuirk` toggle
+   but fires as part of the janitor's periodic scan rather than as an
+   independent non-deterministic event.
+   Guard: same as current `DetectUnknownServer` plus `UseCatalogJanitor`.
+   Source: `ReportMakingVisitor.checkServer()` L221-273,
+   `CatalogJanitorReport.unknownServers` L54.
+**Concurrency guards (from implementation):**
+- `CatalogJanitor.chore()` only runs when `!isInMaintenanceMode()`,
+  `!isClusterShutdown()`, `isMetaLoaded(am)`, and `getEnabled()`.
+  Modeled as: `masterAlive = TRUE` (subsumes maintenance/shutdown).
+- `scan()` uses `alreadyRunning` CAS — at most one concurrent scan.
+  Modeled as a new boolean variable `cjRunning` or simply by making
+  the scan actions mutually exclusive via unchanged guards.
+- `ReportMakingVisitor.isTableDisabled()` — skips disabled tables'
+  integrity checks. Modeled as: hole/overlap actions guard on
+  `tableEnabled[t] ∈ {"ENABLED"}`.
+- No RIT check for unknown-server detection (only GC operations
+  check `!hasRegionsInTransition()` in older versions; current code
+  does not gate the scan itself on RIT absence).
+**Modifications to existing actions:**
+- `DetectUnknownServer(r)` in `Master.tla`: When `UseCatalogJanitor =
+  TRUE`, this action is superseded by `CJDetectUnknownServer(r)` in
+  `CatalogJanitor.tla`.  The original `DetectUnknownServer` remains
+  available when `UseCatalogJanitor = FALSE` (backward compatibility
+  for existing exhaustive configs that don't enable CatalogJanitor).
+  The `Next` disjunct is updated: `DetectUnknownServer` gains an
+  additional guard `UseCatalogJanitor = FALSE`; `CJDetectUnknownServer`
+  is added with guard `UseCatalogJanitor = TRUE`.
+**New invariants:**
+- `CJHoleRepairSafety`: A region created by CatalogJanitor hole repair
+  always has a matching ASSIGN TRSP — no orphaned hole-fill regions.
+- `CJGCSafety`: A split parent or merge target is only GC'd when all
+  daughter/merged regions are OPEN and no references remain.
+**New liveness property (liveness config only):**
+- `FailedOpenEventuallyRecovered`: FAILED_OPEN regions on enabled
+  tables are eventually re-assigned.  With CatalogJanitor modeled,
+  the janitor's hole-detection scan would detect the missing coverage
+  and create a repair ASSIGN, providing the fairness mechanism for
+  this property.  Source: SPEC_CRITIQUE §4 item 4.
+**Config updates:** All 3 configs: `+UseCatalogJanitor`.  Exhaustive
+and liveness: `UseCatalogJanitor = FALSE`.  Simulation:
+`UseCatalogJanitor = TRUE`.
+
 ---
 
 ## 8. Mapping from Code to TLA+ Actions
@@ -1153,6 +1390,16 @@ is shown.
 | `EnableTableProcedure.executeFromState()` PREPARE→SET_ENABLED | `EnableTablePrepare(t)` | 36 | ✅ |
 | `EnableTableProcedure` POST_OP | `EnableTableDone(t)` | 36 | ✅ |
 | `tableEnabled` guard on `TRSPCreate` | `TRSPCreate` disabled-table guard | 36 | ✅ |
+| `SCP.assignRegions()` disabled-table skip (L546-553) | `SCPAssignRegion` Path C (disabled-table skip) | 40 | ✅ |
+| `ModifyTableProcedure.executeFromState()` PREPARE→REOPEN | `ModifyTablePrepare(t)` | 42 | ⏳ |
+| `ReopenTableRegionsProcedure` → TRSP REOPEN per region | `ModifyTablePrepare(t)` (atomic reopen spawn) | 42 | ⏳ |
+| `ModifyTableProcedure` POST_OPERATION / completion | `ModifyTableDone(t)` | 42 | ⏳ |
+| `CatalogJanitor.scan()` periodic meta consistency scan | `CJScanDetectHole(t)`, `CJScanDetectOverlap(t)`, `CJDetectUnknownServer(r)` | 43 | ⏳ |
+| `MetaFixer.fixHoles()` — create region for keyspace hole + ASSIGN | `CJScanDetectHole(t)` | 43 | ⏳ |
+| `MetaFixer.fixOverlaps()` — merge overlapping regions | `CJScanDetectOverlap(t)` | 43 | ⏳ |
+| `CatalogJanitor.cleanParent()` → `GCRegionProcedure` (split parent GC) | `CJGCSplitParent(r)` | 43 | ⏳ |
+| `CatalogJanitor.cleanMergeRegion()` → `GCMultipleMergedRegionsProcedure` | `CJGCMergedRegion(r)` | 43 | ⏳ |
+| `ReportMakingVisitor.checkServer()` unknown-server detection | `CJDetectUnknownServer(r)` (refactored from `DetectUnknownServer`) | 43 | ⏳ |
 
 ---
 
@@ -1177,6 +1424,15 @@ For each module, the primary source files and their key line ranges:
 | `master/ServerCrashProcedure.java` | State machine L142-305, `assignRegions()` L562-645 |
 | `master/ServerManager.java` | `expireServer()` L662-720, `regionServerReport()` L325-356 |
 | `master/HMaster.java` | Initialization L929-1228, `balance()` L2098-2190 |
+| `master/janitor/CatalogJanitor.java` | `scan()` L164-229, `cleanParent()` L325-383, `cleanMergeRegion()` L254-290 |
+| `master/janitor/CatalogJanitorReport.java` | `holes` L46, `overlaps` L47, `unknownServers` L54, `splitParents` L42, `mergedRegions` L43 |
+| `master/janitor/ReportMakingVisitor.java` | `metaTableConsistencyCheck()` L117-188, `checkServer()` L221-273 |
+| `master/janitor/MetaFixer.java` | `fix()` L82-94, `fixHoles()` L100-118, `fixOverlaps()` L258-270 |
+| `master/assignment/GCRegionProcedure.java` | Split parent GC procedure |
+| `master/assignment/GCMultipleMergedRegionsProcedure.java` | Merged region GC procedure |
+| `master/procedure/ModifyTableProcedure.java` | `executeFromState()` L199-311, `prepareModify()` L432-472, `getTableOperationType()` L424-426 |
+| `master/procedure/ReopenTableRegionsProcedure.java` | `executeFromState()` L191-254, `canSchedule()` L178-188, `filterReopened()` L256-260 |
+| `master/procedure/TableQueue.java` | `requireTableExclusiveLock()` L50-80 (EDIT → exclusive table lock) |
 
 ### RegionServer Side
 

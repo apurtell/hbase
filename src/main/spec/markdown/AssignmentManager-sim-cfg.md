@@ -17,7 +17,7 @@ concurrent or sequential splits, exercising the parent-child procedure
 framework across multiple regions and servers. The spec currently models the
 split forward path (`SplitPrepare` → `SplitResumeAfterClose` →
 `SplitUpdateMeta` → `SplitDone`) and pre-PONR rollback (`SplitFail`),
-covering 8 modules, 19 state variables, and 27 safety invariants.
+covering 8 modules, 19 state variables, and 36 safety invariants.
 
 ## Verification Strategy
 
@@ -63,6 +63,7 @@ Three-tier simulation durations:
 | Per-iteration (routine) | 900s (15 min) | Feedback each iteration |
 | Post-iteration (validation) | 3600s (1 hr) | After completing an iteration |
 | Post-phase (milestone) | 14400s (4 hr) | After completing a phase |
+| Nightly CI (continuous) | 86400s (24 hr) | Continuous overnight run for rare interleavings |
 
 ## Running
 
@@ -115,7 +116,7 @@ SPECIFICATION Spec
 
 ## Invariants
 
-All 33 safety invariants are checked:
+All 36 safety invariants are checked:
 
 ```tla
 INVARIANT
@@ -154,6 +155,7 @@ INVARIANT
     TruncateAtomicity
     TruncateNoOrphans
     CreateNoOrphans
+    TableEnabledStateConsistency
 ```
 
 ## Action Constraints

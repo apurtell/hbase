@@ -313,6 +313,14 @@ The recovery path in the implementation is:
 
 Steps 2–4 are serialized (no concurrent external interactions). The model's single atomic `MasterRecover` action captures steps 2–4; step 5 is modeled by the separate `TRSPCreate` action (which fires after `masterAlive = TRUE`).
 
+### Atomicity Limitation
+
+`MasterRecover` is the most complex single action in the spec. It atomically rebuilds `regionState` from `metaTable`, reattaches procedures from `procStore`, applies `restoreSucceedState` for procedures at `REPORT_SUCCEED`, rebuilds `serverState` from `zkNode`, starts fresh SCPs for crashed servers, and rebuilds `serverRegions`. This models `HMaster.finishActiveMasterInitialization()` faithfully in terms of the data flow.
+
+However, `MasterRecover` is atomic, but the implementation's recovery has multiple sub-phases (meta scan → procedure reload → `restoreSucceedState` → start assignment manager → start balancer). Between these phases, partial state exists. For example, after the meta scan but before procedure reload, the master has region state but no procedures. If an RS reports during this window, the report handler may behave differently than after full recovery. The spec's atomic recovery cannot detect such sub-phase window bugs.
+
+The `UseStaleStateQuirk` in `MasterRecover` faithfully models the `visitMeta()`/`createServer()` bug where dead servers with stale `hbase:meta` references appear `ONLINE`, preventing SCP from starting and leaving regions on those servers unrecovered.
+
 **Recovery steps:**
 1. Rebuild `regionState` from `metaTable` (state and location only; procedure fields initially `NONE`/`IDLE`).
 2. Reload procedures from `procStore` — for each region with a persisted procedure, set `procType`/`procStep`/`targetServer` from the record.

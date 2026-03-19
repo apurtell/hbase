@@ -29,6 +29,10 @@ Omitted operations: `CLEAR_FS_LAYOUT` removes HFiles and HRegion directories fro
 
 The model's immediate reset of `keyRange` to `NoRange` and `metaTable` entries models the implementation's eventual GC of meta entries. In production, the `REMOVE_FROM_META` step deletes the region's meta rows, and `DELETE_TABLE_FROM_FS` removes the HDFS directory. The model's atomic reset is a safe abstraction because the deleted region identifier becomes immediately reusable for `CreateTableProcedure`, which is the same end state.
 
+### Staged Deletion and Crash Vulnerability
+
+The implementation's `DeleteTableProcedure` has 6 states and performs a multi-step staged deletion: first FS layout (`CLEAR_FS_LAYOUT`), then meta removal (`REMOVE_FROM_META`), then assignment state cleanup. The spec atomically clears meta and resets region state in a single `DeleteTableDone` action, which is a significant simplification. The implementation's staged deletion creates crash-vulnerability windows not captured by the spec. If a crash occurs after FS deletion but before meta cleanup, the implementation must handle this inconsistency on recovery, a path the spec does not exercise. The implementation optionally takes a snapshot of the table data before deletion. Snapshot operations are orthogonal to the assignment protocol and are not modeled.
+
 Models `DeleteTableProcedure`: deletes all regions of a table, freeing region identifiers back to the unused pool. Requires all regions of the target table to be in `{"CLOSED","OFFLINE"}` with `procType = "NONE"` (modeling the disabled-table precondition).
 
 **Forward-path actions:**
