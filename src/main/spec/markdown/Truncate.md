@@ -4,6 +4,10 @@
 
 TruncateTable procedure actions — atomically delete old regions and create new regions for the same table.
 
+### Expected Administrative Sequence
+
+`DisableTable → TruncateTable → EnableTable`. The administrator must disable the table before truncation. After `TruncateTable` completes, the administrator re-enables the table to bring the new (empty) regions online.
+
 ---
 
 ```tla

@@ -1065,149 +1065,51 @@ traces, depth 67 (σ=33), clean.
 #### Iteration 41 - Concurrent Split/Merge ✅ COMPLETE
 
 Removed `SplitMergeConstraint` from simulation configuration
-(`AssignmentManager-sim.cfg`), allowing concurrent split/merge procedures on
-disjoint regions during simulation.  Constraint retained in exhaustive
+(`AssignmentManager-sim.cfg`), allowing concurrent split/merge procedures
+on disjoint regions during simulation.  Constraint retained in exhaustive
 (`AssignmentManager.cfg`) and liveness (`AssignmentManager-liveness.cfg`)
 configs for tractability at 3r/2s.  `SplitMergeConstraint` definition in
 `AssignmentManager.tla` unchanged. TLC 9r/3s simulation 300s:
 3,503,967 states, 13,593 traces, depth 67, (σ=33), clean.
 
-#### Iteration 42 — ModifyTableProcedure
+#### Iteration 42 — ModifyTableProcedure ✅ COMPLETE
 
-Model the `ModifyTableProcedure` (`ALTER TABLE`) — the most common
-table-level DDL operation that interacts with ongoing splits, merges,
-SCPs, and assignments.  Source: `ModifyTableProcedure.java`
-(`executeFromState()` L199-311, `prepareModify()` L432-472,
-`getTableOperationType()` L424-426 → `EDIT`),
-`ReopenTableRegionsProcedure.java` (child procedure, `executeFromState()`
-L191-254 → creates TRSP reopens per region),
-`TableQueue.java` (`requireTableExclusiveLock()` L50-80 — `EDIT`
-acquires exclusive table lock for all non-namespace tables),
-`MasterProcedure.proto` (`ModifyTableState` enum).
-**Key behavioral observations from code analysis:**
-1. `ModifyTableProcedure.getTableOperationType()` returns `EDIT`.
-   `TableQueue.requireTableExclusiveLock()` maps `EDIT` → `true`
-   (exclusive) for all tables except `NAMESPACE_TABLE_NAME`.
-   Therefore ModifyTable holds an **exclusive table lock**, blocking
-   concurrent CREATE/DELETE/TRUNCATE/DISABLE/ENABLE/MODIFY on the
-   same table.  However, REGION-level operations (SPLIT, MERGE,
-   ASSIGN, UNASSIGN) use **shared** table locks and can proceed
-   concurrently — this is the primary concurrency concern.
-2. The core assignment-manager interaction is
-   `MODIFY_TABLE_REOPEN_ALL_REGIONS` (L263-268): when the table is
-   enabled, spawns `ReopenTableRegionsProcedure` as a child procedure.
-   `ReopenTableRegionsProcedure` iterates over all table regions and
-   creates `TransitRegionStateProcedure.reopen()` (TRSP REOPEN) for
-   each, batched with progressive backoff.  This is a rolling restart
-   — individual regions cycle OPEN → CLOSING → CLOSED → OPENING → OPEN
-   while splits/merges may be in progress on other regions.
-3. Replica count changes (`closeExcessReplicasIfNeeded`,
-   `assignNewReplicasIfNeeded`) are secondary interactions.  The TLA+
-   model abstracts replica count as 1 (no region replicas modeled),
-   so these are out of scope.
-4. Descriptor update (`MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR`), FS
-   layout changes, erasure coding sync, snapshot, and coprocessor hooks
-   do not affect region state or assignments — abstracted away.
-5. `isRollbackSupported()` returns `true` only for PREPARE,
-   PRE_OPERATION, SNAPSHOT, CLOSE_EXCESS_REPLICAS — all before region
-   reopening begins.  Post-PONR (after UPDATE_TABLE_DESCRIPTOR), the
-   procedure cannot roll back and must eventually succeed.
-6. `ReopenTableRegionsProcedure` skips regions that already have an
-   active TRSP (`regionNode.getProcedure() != null`), and re-checks
-   completion in CONFIRM_REOPENED.  Regions split or merged during the
-   reopen window are naturally skipped (`regionNode == null` check at
-   L215-216) — no error, just skip.  This tolerance for concurrent
-   structural changes is a key correctness property to verify.
-**Modeling approach — collapsed two-action pattern (Prepare + Done):**
-Following the Disable/Enable pattern (Iteration 36), the procedure is
-collapsed to two actions.  The intermediate states (PRE_OPERATION,
-UPDATE_TABLE_DESCRIPTOR, POST_OPERATION) are descriptor-level operations
-that don't affect assignment state and are abstracted away.  The
-REOPEN_ALL_REGIONS step — spawning TRSP reopens for all table regions —
-is the critical assignment-manager interaction and is modeled atomically
-in the Prepare action.
-**New module:** `Modify.tla` — ModifyTableProcedure actions.
-**New constant:** `UseModify ∈ BOOLEAN` (Types.tla).  When `FALSE`
-(default for exhaustive/liveness), ModifyTable actions disabled.  When
-`TRUE` (simulation), ModifyTable enabled.
-**New actions:**
-1. `ModifyTablePrepare(t)` — Guards: `masterAlive`, `availableWorkers > 0`,
-   `UseModify`, `TableLockFree(t)`, `tableEnabled[t] = "ENABLED"`,
-   table has at least one region (`∃ r ∈ Regions: metaTable[r].table = t`).
-   Atomically: sets `parentProc = [MODIFY, SPAWNED_OPEN, NoRegion,
-   NoRegion]` on all regions of table `t` that are OPEN with no active
-   procedure, and creates TRSP REOPEN (procType = "REOPEN") for each.
-   Regions with an active procedure (e.g., mid-split, mid-merge, mid-SCP)
-   are skipped — matching `ReopenTableRegionsProcedure`'s
-   `regionNode.getProcedure() != null` skip (L221-223).
-   Skipped regions get `parentProc = [MODIFY, COMPLETING, NoRegion,
-   NoRegion]` to track that they are part of the modify scope but don't
-   need reopening.  The reopen spawns TRSP REOPEN child procedures that
-   cycle the region through CLOSING → CLOSED → OPENING → OPEN.
-   Source: `ModifyTableProcedure.executeFromState()` L263-268,
-   `ReopenTableRegionsProcedure.executeFromState()` L204-233.
-2. `ModifyTableDone(t)` — Guards: all regions of table `t` with
-   `parentProc.type = "MODIFY"` have completed their REOPEN TRSP
-   (region is OPEN with `procType = "NONE"`) or were skipped
-   (parentProc step = `COMPLETING`).  Clears `parentProc` to
-   `NoParentProc` for all MODIFY-tagged regions of table `t`.
-   Source: `ReopenTableRegionsProcedure.executeFromState()` L245-246
-   (empty regions → `NO_MORE_STATE`).
-**Concurrency with split/merge (key modeling concern):**
-- A region mid-split or mid-merge when `ModifyTablePrepare` fires is
-  skipped by the reopen (matching Java behavior).  The split/merge
-  proceeds independently.  After split completes, daughter regions
-  inherit the table but are NOT reopened by the in-flight modify —
-  matching `ReopenTableRegionsProcedure`'s snapshot-at-start behavior
-  (L199-201: `getRegionsOfTableForReopen()` fetches the region list
-  once at `GET_REGIONS` state).
-- A TRSP REOPEN on region `r` can interleave with SCP if the target
-  server crashes during the reopen cycle.  `TRSPServerCrashed` handles
-  this (existing mechanism).  The modify procedure's completion check
-  must tolerate the TRSP being restarted by SCP.
-**TRSP REOPEN modeling:**
-TRSP REOPEN is already modeled by `TRSPCreateReopen(r)` (Iteration 15).
-`ModifyTablePrepare` will use `TRSPCreateReopen` semantics: set
-`procType = "REOPEN"`, advance to CLOSING.  The guard
-`parentProc[r].type ∈ {"MODIFY"}` on `TRSPCreateReopen` is not needed
-— the existing `TRSPCreateReopen` does not check parentProc.  Instead,
-`ModifyTablePrepare` directly initializes the TRSP state for each
-applicable region, analogous to how `DisableTablePrepare` initializes
-UNASSIGN TRSPs and `EnableTablePrepare` initializes ASSIGN TRSPs.
-**Changes to `Types.tla`:**
-- Add `"MODIFY"` to `ParentProcType`.
-- Add `"MODIFY"` to `TableExclusiveType` (exclusive table lock for
-  mutual exclusion with other DDL, matching `EDIT` in `TableQueue`).
-- Add `UseModify ∈ BOOLEAN` constant.
-**Changes to `AssignmentManager.tla`:**
-- `INSTANCE Modify` — new module instance.
-- `TypeOK`: extend parentProc type check for MODIFY.
-- `Next`: add `ModifyTablePrepare(t)` and `ModifyTableDone(t)` disjuncts,
-  gated on `UseModify`.
-- `Fairness`: WF on `ModifyTableDone(t)` (deterministic completion).
-  No WF on `ModifyTablePrepare` (non-deterministic event — administrator
-  issues ALTER TABLE).
-- Extend existing invariants for MODIFY-related parentProc states:
-  `NoOrphanedProcedures` (MODIFY regions must have consistent procStore),
-  `LockExclusivity` (REOPEN regions can be in any TRSP state).
-- `PrintConfig`: include `UseModify`.
-- THEOREM: `ModifyTableDone` refines modify specification.
-**New invariant:**
-- `ModifyTableSafety`: While a MODIFY is in progress on table `t`
-  (any region has `parentProc.type = "MODIFY"`), no region of `t` is
-  permanently lost — every region with `parentProc.type = "MODIFY"` is
-  either (a) OPEN with no procedure (completed/skipped), (b) in a valid
-  TRSP REOPEN state, or (c) handled by SCP (ABNORMALLY_CLOSED with
-  ASSIGN).  This ensures the rolling restart does not lose regions.
-**New liveness property (liveness config only):**
-- `ModifyEventuallyDone`: If `ModifyTablePrepare(t)` has fired (some
-  region has `parentProc.type = "MODIFY"`), then eventually all such
-  regions return to OPEN with `parentProc = NoParentProc`.
-  Requires SF on TRSP reopen path actions.
-**Config updates:** All 3 configs: `+UseModify`.  Exhaustive and
-liveness: `UseModify = FALSE`.  Simulation: `UseModify = TRUE`.
+Sixth table-level procedure.  Sources: `ModifyTableProcedure.java`
+(`executeFromState()` L199-311), `ReopenTableRegionsProcedure.java`
+(L191-254 TRSP REOPEN per region), `TableQueue.java` L50-80 (`EDIT` →
+exclusive table lock).  Two administrative workflows modeled via two
+disjunct `ModifyTablePrepare`: (1) non-structural modification on ENABLED
+table — spawns TRSP REOPEN for idle OPEN regions, skips busy regions
+(`parentProc = [MODIFY, COMPLETING]`), matching
+`ReopenTableRegionsProcedure` L221-223 `getProcedure() != null` skip; (2)
+structural modification on DISABLED table (admin sequence
+`DisableTable → ModifyTable → EnableTable`) — no reopens, all regions
+marked COMPLETING, matching `preflightChecks()` rejection of structural
+changes on enabled tables.  `ModifyTableDone(t)` clears `parentProc` when
+all SPAWNED_OPEN regions are OPEN/idle.  New module `Modify.tla` (collapsed
+Prepare + Done).  `Types.tla`: +`UseModify ∈ BOOLEAN`, +`"MODIFY"` to
+`ParentProcType` and `TableExclusiveType`.  `AssignmentManager.tla`:
++`INSTANCE Modify`, +2 Next disjuncts gated on `UseModify`, +WF
+`ModifyTableDone`, +`UseModify` in PrintConfig. Invariant
+`ModifyTableSafety`: MODIFY-tagged regions are in valid REOPEN, skipped,
+or SCP-handled state.  Liveness `ModifyEventuallyDone`: modify eventually
+completes. Config: exhaustive/liveness `UseModify = FALSE`, simulation
+`UseModify = TRUE`.  TLC 9r/3s simulation 300s: 1,268,409 states, 4,799
+traces, depth 67 (σ=33), clean.
 
-#### Iteration 43 — CatalogJanitor
+#### Iteration 43 - Improve Invariants and Liveness
+
+Invariants:
+- After a CREATE/DELETE/TRUNCATE completes, no regions of that table should have dangling parentProc entries. SplitCompleteness and MergeCompleteness check this for split/merge, but there is no analogous "CreateCompleteness" or "DeleteCompleteness."
+- Strengthening NoDoubleAssignment to explicitly check if walFenced[s] = TRUE, then no region on s should be in a state allowing new writes from the master's perspective (no region assigned to s with state OPEN in regionState). This would complement the rsOnlineRegions-based check.
+- The spec tracks serverRegions separately from regionState[r].location. Do we need serverRegions?
+
+Liveness:
+- Does every CreateTable/DeleteTable/TruncateTable/DisableTable/EnableTable eventually complete? The spec has no liveness properties for these. A stuck DisableTableProcedure (e.g., one region's UNASSIGN keeps failing and retrying) would not be detected.
+- Does every SplitPrepare eventually reach either SplitDone or SplitFail? Does every MergePrepare eventually reach either MergeDone or MergeFail? The current liveness properties do not cover this.
+- After DisableTableDone, do all regions eventually reach a quiescent state (CLOSED or OFFLINE)? 
+
+#### Iteration 44 — CatalogJanitor
 
 Model the `CatalogJanitor` periodic meta-consistency scanner and its
 associated `MetaFixer` repair actions.  The CatalogJanitor is the
@@ -1391,9 +1293,9 @@ is shown.
 | `EnableTableProcedure` POST_OP | `EnableTableDone(t)` | 36 | ✅ |
 | `tableEnabled` guard on `TRSPCreate` | `TRSPCreate` disabled-table guard | 36 | ✅ |
 | `SCP.assignRegions()` disabled-table skip (L546-553) | `SCPAssignRegion` Path C (disabled-table skip) | 40 | ✅ |
-| `ModifyTableProcedure.executeFromState()` PREPARE→REOPEN | `ModifyTablePrepare(t)` | 42 | ⏳ |
-| `ReopenTableRegionsProcedure` → TRSP REOPEN per region | `ModifyTablePrepare(t)` (atomic reopen spawn) | 42 | ⏳ |
-| `ModifyTableProcedure` POST_OPERATION / completion | `ModifyTableDone(t)` | 42 | ⏳ |
+| `ModifyTableProcedure.executeFromState()` PREPARE→REOPEN | `ModifyTablePrepare(t)` | 42 | ✅ |
+| `ReopenTableRegionsProcedure` → TRSP REOPEN per region | `ModifyTablePrepare(t)` (atomic reopen spawn) | 42 | ✅ |
+| `ModifyTableProcedure` POST_OPERATION / completion | `ModifyTableDone(t)` | 42 | ✅ |
 | `CatalogJanitor.scan()` periodic meta consistency scan | `CJScanDetectHole(t)`, `CJScanDetectOverlap(t)`, `CJDetectUnknownServer(r)` | 43 | ⏳ |
 | `MetaFixer.fixHoles()` — create region for keyspace hole + ASSIGN | `CJScanDetectHole(t)` | 43 | ⏳ |
 | `MetaFixer.fixOverlaps()` — merge overlapping regions | `CJScanDetectOverlap(t)` | 43 | ⏳ |

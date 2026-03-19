@@ -156,6 +156,13 @@ CONSTANTS UseDisable
 ASSUME UseDisable \in BOOLEAN
 ```
 
+`UseModify` — when `TRUE`, `ModifyTable` actions are enabled in `Next` and `Fairness`. Setting `FALSE` disables ModifyTable in exhaustive mode. Setting `TRUE` enables it in simulation mode (with `UseDisable = TRUE` to exercise the disable → modify → enable structural change path).
+
+```tla
+CONSTANTS UseModify
+ASSUME UseModify \in BOOLEAN
+```
+
 `UseRSOpenDuplicateQuirk` — when `TRUE`, the `RSOpenDuplicate` action is enabled, modeling [`AssignRegionHandler.process()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/AssignRegionHandler.java) L107–115 where the RS silently drops `OPEN` requests for already-online regions without reporting back. This can cause TRSP deadlock (stuck at `CONFIRM_OPENED`). Default `FALSE` to avoid deadlock in model checking; set `TRUE` to surface the implementation quirk and generate traces.
 
 The RS checks `getRegion(encodedName) != null` and returns early without calling `reportRegionStateTransition()`. The master-side `OpenRegionProcedure` suspends indefinitely at `REPORT_SUCCEED` waiting for a report that will never arrive. This is a genuine implementation bug that can cause region unavailability; the `UseRSOpenDuplicateQuirk` toggle lets TLC generate counterexample traces demonstrating the deadlock.
@@ -391,18 +398,18 @@ ParentProcStep ==
 
 ### Parent Procedure Types
 
-Parent procedure types. `"NONE"` means no parent procedure is attached. `SPLIT`/`MERGE` are region-level parent procedures. `CREATE`/`DELETE`/`TRUNCATE` are table-level parent procedures.
+Parent procedure types. `"NONE"` means no parent procedure is attached. `SPLIT`/`MERGE` are region-level parent procedures. `CREATE`/`DELETE`/`TRUNCATE`/`MODIFY` are table-level parent procedures.
 
 ```tla
-ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
+ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE", "MODIFY" }
 ```
 
 `TableExclusiveType` — the subset of parent procedure types that require exclusive access to all regions of a table. No `SPLIT` or `MERGE` can coexist with these on the same table.
 
-> *Source:* `CreateTableProcedure`, `DeleteTableProcedure`, `TruncateTableProcedure`, `DisableTableProcedure`, `EnableTableProcedure` each acquire a table-level exclusive lock via `TableLockManager`.
+> *Source:* `CreateTableProcedure`, `DeleteTableProcedure`, `TruncateTableProcedure`, `DisableTableProcedure`, `EnableTableProcedure`, `ModifyTableProcedure` each acquire a table-level exclusive lock via `TableLockManager`.
 
 ```tla
-TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
+TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE", "MODIFY" }
 ```
 
 ### Table State Set

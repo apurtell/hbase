@@ -105,6 +105,12 @@ ASSUME UseTruncate \in BOOLEAN
 CONSTANTS UseDisable
 ASSUME UseDisable \in BOOLEAN
 
+\* UseModify: when TRUE, ModifyTable actions are enabled in Next and Fairness.
+\* Setting FALSE disables ModifyTable in exhaustive mode.
+\* Setting TRUE enables ModifyTable in simulation mode.
+CONSTANTS UseModify
+ASSUME UseModify \in BOOLEAN
+
 \* UseRSOpenDuplicateQuirk: when TRUE, the RSOpenDuplicate action is
 \* enabled, modeling AssignRegionHandler.process() L107-115 where the
 \* RS silently drops OPEN requests for already-online regions without
@@ -308,7 +314,7 @@ ParentProcStep ==
 \* Parent procedure types.  "NONE" means no parent procedure is
 \* attached.  SPLIT/MERGE are region-level parent procedures.
 \* CREATE/DELETE/TRUNCATE are table-level parent procedures.
-ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
+ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE", "MODIFY" }
 
 \* TableExclusiveType: the subset of parent procedure types that
 \* require exclusive access to all regions of a table.
@@ -318,7 +324,7 @@ ParentProcType == { "SPLIT", "MERGE", "CREATE", "DELETE", "TRUNCATE", "DISABLE",
 \*         TruncateTableProcedure, DisableTableProcedure,
 \*         EnableTableProcedure each acquire a table-level
 \*         exclusive lock via TableLockManager.
-TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE" }
+TableExclusiveType == { "CREATE", "DELETE", "TRUNCATE", "DISABLE", "ENABLE", "MODIFY" }
 
 \* The set of valid table-level states, matching the Java
 \* TableState.State enum (ENABLED, DISABLED, DISABLING, ENABLING).

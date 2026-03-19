@@ -62,6 +62,7 @@ Same model values and universe sizing as the primary exhaustive config:
 | `UseMasterAbortOnMetaWriteQuirk` | `FALSE` | No master abort on meta write failure; `TRUE` models `master.abort()` on `IOException` |
 | `UseStaleStateQuirk` | `FALSE` | No stale server state on recovery; `TRUE` models `AM.start()` stale `ServerStateNode` creation |
 | `UseDisable` | `FALSE` | Disable/EnableTable procedures disabled in liveness mode |
+| `UseModify` | `FALSE` | ModifyTable procedure disabled in liveness mode |
 
 ## Symmetry
 
@@ -69,7 +70,7 @@ Same model values and universe sizing as the primary exhaustive config:
 
 ## Safety Invariants
 
-All 36 safety invariants are checked alongside liveness:
+All 37 safety invariants are checked alongside liveness:
 
 ```tla
 INVARIANT
@@ -109,6 +110,7 @@ INVARIANT
     TruncateNoOrphans
     CreateNoOrphans
     TableEnabledStateConsistency
+    ModifyTableSafety
 ```
 
 ## Action Constraints
@@ -138,6 +140,7 @@ be disabled:
 - **`SCPEventuallyDone`**: Started SCP eventually completes.
 - **`RegionEventuallyAssigned`**: ASSIGN on enabled table eventually opens.
 - **`NoStuckRegions`**: Regions in OPENING/CLOSING eventually leave those states.
+- **`ModifyEventuallyDone`**: ModifyTable eventually completes.
 
 ```tla
 \* Liveness properties (the reason this config exists)
@@ -147,4 +150,5 @@ PROPERTY
     SCPEventuallyDone
     RegionEventuallyAssigned
     NoStuckRegions
+    ModifyEventuallyDone
 ```
