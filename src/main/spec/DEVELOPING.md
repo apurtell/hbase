@@ -70,6 +70,7 @@ java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
 | Per-iteration | 300s (5 min) | Feedback during development |
 | Post-iteration | 900s (15 min) | Validation after completing an iteration |
 | Post-phase | 14400s (4 hr) | Milestone verification |
+| Nightly CI | 86400s (24 hr) | Continuous overnight run for rare interleavings |
 
 ---
 

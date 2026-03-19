@@ -111,6 +111,18 @@ The implementation's `ServerCrashState` enum (`MasterProcedure.proto`) has 13 va
 | `"DONE"`           | `SERVER_CRASH_CLAIM_REPLICATION_QUEUES` (=14), `SERVER_CRASH_DELETE_SPLIT_WALS_DIR` (=13), `SERVER_CRASH_FINISH` (=100) — replication queue claiming and WAL dir cleanup are orthogonal to assignment; collapsed with `FINISH` into terminal `"DONE"` |
 | *(not modeled)*    | `SERVER_CRASH_PROCESS_META` (=2, deprecated), `SERVER_CRASH_NO_SPLIT_LOGS` (=4, deprecated), `SERVER_CRASH_HANDLE_RIT2` (=20, deprecated) |
 
+### State Collapsing Rationale
+
+The spec collapses the implementation's 13-state enum (with 3 deprecated) into 6 states: `ASSIGN_META`, `GET_REGIONS`, `FENCE_WALS`, `ASSIGN`, `DONE`, and the implicit start (`MasterDetectCrash`). The collapsed groups are:
+
+- **`SERVER_CRASH_SPLIT_META_LOGS` + `ASSIGN_META` + `DELETE_SPLIT_META_WALS_DIR` → `"ASSIGN_META"`**: These three states represent the meta WAL split → meta reassign → cleanup sub-path. Collapsing them is justified because the intermediate states do not interact with region assignment. They are WAL infrastructure operations. However, the spec's atomic `SCPAssignMeta` abstracts away the actual meta TRSP that the implementation spawns and waits for. If the meta TRSP itself has bugs, the spec would miss them in this context.
+
+- **`SERVER_CRASH_ASSIGN` + `WAIT_ON_ASSIGN` → `"ASSIGN"` + per-region `SCPAssignRegion`**: The implementation's `WAIT_ON_ASSIGN` waits for child TRSPs spawned during `ASSIGN` to complete. The spec models this by having `SCPAssignRegion` process one region at a time, immediately creating `ASSIGN` procedures. `SCPDone` then fires when all regions are processed. The actual `WAIT_ON_ASSIGN` semantics, where the `ProcedureExecutor` suspends the parent SCP until all child `ASSIGN`s complete, is abstracted. This is safe because the spec's `SCPDone` merely marks completion and the actual reassignment liveness comes from the TRSP actions.
+
+- **`CLAIM_REPLICATION_QUEUES` + `DELETE_SPLIT_WALS_DIR` + `FINISH` → `"DONE"`**: These are post-assignment cleanup steps that do not affect region safety.
+
+The `isMatchingRegionLocation()` guard in `SCPAssignRegion` is faithfully modeled (skip path when `regionState[r].location ≠ s`). See the `SCPAssignRegion` [skip branch](#scpassignregionsr) below for details: between `SCPGetRegions` and `SCPAssignRegion`, a concurrent TRSP may have moved the region, and the implementation (and model) skip it.
+
 ---
 
 ### `SCPAssignMeta(s)`

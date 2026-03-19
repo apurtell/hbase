@@ -36,16 +36,19 @@ The non-deterministic choice between `SplitResumeAfterClose` and `SplitFail` at 
 
 ### Implementation State Collapse
 
-The implementation's [`SplitTableRegionProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java) uses the `SplitTableRegionState` enum with 11 values. The model collapses these to 5 steps (`SPAWNED_CLOSE`, `PONR`, `SPAWNED_OPEN`, `COMPLETING`, plus `PREPARE` absorbed into `SplitPrepare`). Omitted states:
+The implementation's [`SplitTableRegionProcedure`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java) uses the `SplitTableRegionState` enum with 11 values. The spec collapses these into 5 steps (`SPAWNED_CLOSE`, `PONR`, `SPAWNED_OPEN`, `COMPLETING`, plus rollback). The collapsed states are:
 
-| Omitted state                      | Implementation action        | Omission rationale                |
-|-----------------------------------|------------------------------|------------------------------------|
-| `PRE_OPERATION`                    | acquire table lock, coprocessor pre-hook | Abstracted into `SplitPrepare`     |
-| `SET_SPLITTING`                    | set `SPLITTING` state        | Folded into `SplitPrepare`         |
-| `CREATE_DAUGHTER_REGIONS`          | create HFile references      | Filesystem I/O; orthogonal to assignment |
-| `WRITE_MAX_SEQUENCE_ID_FILE`       | persist WAL sequence barrier | Filesystem I/O; orthogonal         |
-| `PRE_OPERATION_BEFORE_META`        | coprocessor hook             | Coprocessor ops abstracted          |
-| `UPDATE_META`                      | meta write for daughters     | Folded into `SplitUpdateMeta` (PONR) |
+- **`PREPARE` + `PRE_OPERATION`** → `SplitPrepare`: Coprocessor pre-split hooks are abstracted away entirely. This is safe for assignment correctness but means the spec cannot detect bugs in coprocessor interaction (e.g., a coprocessor vetoing a split after partial state has been set).
+
+- **`CHECK_CLOSED_REGIONS` + `CREATE_DAUGHTER_REGIONS` + `WRITE_MAX_SEQUENCE_ID_FILE` + `PRE_OPERATION_BEFORE_META` + `UPDATE_META`** → PONR (`SplitUpdateMeta`): Five implementation states collapsed into one atomic action. The critical question is whether the intermediate filesystem states (`createDaughterRegions()`, `writeMaxSequenceIdFile()`) can fail in ways that leave orphaned state. In the implementation, these states are all pre-PONR; failure triggers rollback. The spec captures the PONR boundary correctly — `SplitFail` can fire at `SPAWNED_CLOSE` but not after `SplitUpdateMeta`. The filesystem operations themselves (`HRegionFileSystem.createRegionOnFileSystem()`) are not modeled, which is appropriate since HDFS-level failures would manifest as HBase-level exceptions triggering rollback.
+
+- **`PRE_OPERATION_AFTER_META` + `OPEN_CHILD_REGIONS`** → `SPAWNED_OPEN`
+
+- **`POST_OPERATION`** → `SplitDone` (`COMPLETING`)
+
+### Safety-Critical Properties
+
+The split's safety-critical properties are: (1) no daughters materialized pre-PONR (`SplitAtomicity`), (2) daughters always have `ASSIGN` procedures (`NoOrphanedDaughters`), (3) keyspace coverage maintained (`KeyspaceCoverage`), and (4) parent keyspace cleared after daughters are open (`SplitCompleteness`). All four are verifiable at the 5-state abstraction level. The abstracted filesystem operations are either idempotent or roll back cleanly on failure.
 
 > *Source:* `SplitTableRegionProcedure.rollbackState()` L368–411; `openParentRegion()` L647–651.
 

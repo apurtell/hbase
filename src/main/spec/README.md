@@ -359,6 +359,7 @@ do not interfere.
 | Per-iteration | 900s (15 min) | Feedback during development |
 | Post-iteration | 3600s (1 hr) | Validation after completing an iteration |
 | Post-phase | 14400s (4 hr) | Milestone verification |
+| Nightly CI | 86400s (24 hr) | Continuous overnight run for rare interleavings |
 
 ## Invariants
 
@@ -478,4 +479,4 @@ java -XX:+UseParallelGC -cp "tla2tools.jar:CommunityModules-deps.jar" \
   -workers auto -cleanup
 ```
 
-Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 14400).
+Adjust `-Dtlc2.TLC.stopAfter=<seconds>` for the desired duration (900, 3600, 14400, 86400).

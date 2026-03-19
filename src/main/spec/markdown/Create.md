@@ -21,6 +21,8 @@ The implementation's [`CreateTableProcedure`](file:///Users/andrewpurtell/src/hb
 
 Omitted operations: `WRITE_FS_LAYOUT` creates HRegion directories and column-family subdirectories on HDFS. `UPDATE_DESC_CACHE` refreshes the `TableDescriptor` cache. `POST_OPERATION` fires coprocessor `postCreateTable` hooks. All are orthogonal to the assignment/state-tracking protocol.
 
+Region replica handling ([`RegionReplicaUtil.addReplicas()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/util/RegionReplicaUtil.java)) is not modeled. The spec creates only primary regions.
+
 **Forward-path actions:**
 - **`CreateTablePrepare`** — pick unused identifiers, assign keyspace, write meta, spawn child `ASSIGN` TRSPs
 - **`CreateTableDone`** — all regions `OPEN`, clear `parentProc`

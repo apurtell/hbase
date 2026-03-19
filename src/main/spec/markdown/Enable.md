@@ -22,6 +22,10 @@ The implementation's [`EnableTableProcedure`](file:///Users/andrewpurtell/src/hb
 
 Omitted: `PRE_OPERATION` fires coprocessor `preEnableTable` hook. `POST_OPERATION` fires coprocessor `postEnableTable` hook. Both are orthogonal to the assignment protocol.
 
+### Unmodeled Behaviors
+
+The implementation's `EnableTableProcedure` dynamically adjusts region replicas during enable, creating or removing replica regions based on the table descriptor's `REGION_REPLICATION` setting. This replica adjustment is not modeled. The spec only handles primary regions. The table state transitions (`DISABLED` → `ENABLING` → `ENABLED`) are faithfully modeled through `tableEnabled[t]`: `EnableTablePrepare` sets `"ENABLING"` and `EnableTableDone` sets `"ENABLED"`, matching the implementation's `TableStateManager.setTableState()` persistence.
+
 ### Table State Machine
 
 The transition path is `DISABLED → ENABLING → ENABLED`, with `ENABLING` persisted in `hbase:meta` via `TableStateManager.setTableState()` before any regions are opened. This matches the model's `tableEnabled[t]` variable: `EnablePrepare` sets it to `"ENABLING"`, and `EnableDone` sets it to `"ENABLED"`.

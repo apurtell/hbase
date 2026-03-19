@@ -24,14 +24,27 @@ The `TRSPState` set maps 1:1 to the `RegionStateTransitionState` protobuf enum (
 | `"CLOSE"`                | `REGION_STATE_TRANSITION_CLOSE` (=4)                     |
 | `"CONFIRM_CLOSED"`       | `REGION_STATE_TRANSITION_CONFIRM_CLOSED` (=5)            |
 
+The ASSIGN, UNASSIGN, MOVE, and REOPEN state machines in this module match the implementation's [`TRSP.executeFromState()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/TransitRegionStateProcedure.java) control flow:
+
+- **ASSIGN:** `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` — modeled by `TRSPCreate` → `TRSPGetCandidate` → `TRSPDispatchOpen` → `TRSPReportSucceedOpen` → `TRSPPersistToMetaOpen`.
+- **UNASSIGN:** `CLOSE` → `CONFIRM_CLOSED` — modeled by `TRSPCreateUnassign` → `TRSPDispatchClose` → `TRSPReportSucceedClose` → `TRSPPersistToMetaClose`.
+- **MOVE:** `CLOSE` → `CONFIRM_CLOSED` → `GET_ASSIGN_CANDIDATE` → `OPEN` → `CONFIRM_OPENED` — the close phase followed by the assign phase, both within a single procedure.
+- **REOPEN:** Same flow as MOVE but with `assignCandidate` pre-set to the current server.
+
+The `REPORT_SUCCEED` intermediate step (not in the protobuf enum) is introduced by this module to model the crash window between RS report consumption and meta persistence — see [Two-Phase Report/Persist Split](#two-phase-reportpersist-split) below.
+
+Retry logic uses `MaxRetries`: when a `FAILED_OPEN` report is received and `retries < MaxRetries`, the procedure resets to `GET_ASSIGN_CANDIDATE` with an incremented retry counter. When retries are exhausted (`retries >= MaxRetries`), the region moves to `FAILED_OPEN` terminal state. On dispatch failure, the `forceNewPlan` path (modeled by `DispatchFail` disjunct 1) clears `targetServer` and resets to `GET_ASSIGN_CANDIDATE`, forcing the load balancer to pick a new server.
+
+Server crashes during an active TRSP are handled by the `serverCrashed()` callback (modeled in `TRSPServerCrashed`), which converts the procedure to `GET_ASSIGN_CANDIDATE` with its type preserved — UNASSIGN procedures remain UNASSIGN for two-phase recovery (reopen then re-close), while ASSIGN/MOVE/REOPEN procedures continue with the same type since the remaining steps are identical.
+
 ### RegionRemoteProcedureBase Child Procedure Absorption
 
-The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionProcedure`) that extend [`RegionRemoteProcedureBase`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionRemoteProcedureBase.java) and have their own 4-state machine (`RegionRemoteProcedureBaseState` in `MasterProcedure.proto`). The model merges these into TRSP actions:
+The implementation uses child procedures (`OpenRegionProcedure`, `CloseRegionProcedure`) that extend [`RegionRemoteProcedureBase`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionRemoteProcedureBase.java) and have their own 4-state machine (`RegionRemoteProcedureBaseState` in `MasterProcedure.proto`). The RRPB 4-state machine (DISPATCH, REPORT_SUCCEED, DISPATCH_FAIL, SERVER_CRASH) is folded into TRSP actions rather than modeled as a separate entity. This is a sound abstraction — the RRPB states represent implementation layering, not independent safety-relevant states:
 
 | RRPB state            | Absorbed by TLA+ action(s)                                                          |
 |-----------------------|-------------------------------------------------------------------------------------|
 | `DISPATCH` (=1)       | `TRSPDispatchOpen`, `TRSPDispatchClose` — RPC dispatch is atomic within TRSP step   |
-| `REPORT_SUCCEED` (=2) | `TRSPConfirmOpened`, `TRSPConfirmClosed` — decomposed to model crash window         |
+| `REPORT_SUCCEED` (=2) | `TRSPReportSucceedOpen`, `TRSPReportSucceedClose` — decomposed to model crash window |
 | `DISPATCH_FAIL` (=3)  | `DispatchFail`, `DispatchFailClose` — RPC failure resets TRSP to retry (disjunct 1) or expires server and starts SCP (disjunct 2) |
 | `SERVER_CRASH` (=4)   | `TRSPServerCrashed` — server crash recovery (type-preserving)                       |
 
@@ -39,6 +52,10 @@ The RRPB child procedure pattern introduces a 2-level procedure hierarchy: TRSP 
 1. **No independent lifecycle.** RRPB children are always spawned by TRSP and complete within TRSP's context.
 2. **Same crash semantics.** RRPB's `restoreSucceedState()` is modeled in `ProcStore.md`; the parent TRSP's `CONFIRM_OPENED`/`CONFIRM_CLOSED` step corresponds to the child's `REPORT_SUCCEED` state.
 3. **State space reduction.** A 2-level hierarchy would double the state variables per region without adding reachable behaviors.
+
+### RSProcedureDispatcher Batching Abstraction
+
+The `RSProcedureDispatcher` batching semantics are also abstracted: the spec dispatches one command per action (e.g., `TRSPDispatchOpen` enqueues a single `OPEN` to `dispatchedOps[s]`), while the implementation batches multiple commands per `executeProcedures()` RPC. Since batching is a performance optimization and each command within a batch is processed independently by the RS, this abstraction is safe — no safety-relevant behavior depends on whether commands are sent individually or in batches.
 
 ### Two-Phase Report/Persist Split
 
@@ -60,6 +77,14 @@ The model's `TRSPConfirmFailedOpen` action captures steps 2–3; the `removeRegi
 `UseBlockOnMetaWrite` comparison:
 - **`TRUE` (branch-2.6)**: `RegionStateStore.updateRegionLocation()` uses `Table.put()` — a synchronous HBase client call. The procedure thread blocks until the meta write completes. The model represents this as direct meta variable update within `TRSPPersistToMetaOpen` / `TRSPPersistToMetaClose`.
 - **`FALSE` (master branch)**: `RegionStateStore.updateRegionLocation()` uses `AsyncTable.put()` — the procedure thread does not block. Instead, the TRSP suspends via `ProcedureFutureUtil.suspendIfNecessary()`, yielding the PEWorker thread. When the async meta write completes, the TRSP is woken and re-enqueued. The model represents this as a two-phase pattern: `TRSPPersistToMetaOpen` updates meta BUT the TRSP enters `suspendedOnMeta` and must be woken by `TRSPCompleteMetaSuspend`.
+
+Meta-unavailability suspend/block behavior is modeled across both branch-2.6 and branch-3+ in every meta-writing action (`TRSPDispatchOpen`, `TRSPDispatchClose`, `TRSPPersistToMetaOpen`, `TRSPPersistToMetaClose`). When `MetaIsAvailable` is `FALSE`, the procedure either suspends (async, `suspendedOnMeta`), blocks a PEWorker (sync, `blockedOnMeta`), or aborts the master (`UseMasterAbortOnMetaWriteQuirk`). `ResumeFromMeta` wakes suspended/blocked procedures when meta becomes available.
+
+### RPC Timeout Over-Approximation
+
+The spec does not model the RPC timeout that separates "dispatch succeeded but RS hasn't reported yet" from "dispatch failed." In the implementation, [`RSProcedureDispatcher.scheduleForRetry()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/procedure2/RSProcedureDispatcher.java) counts failures (10 retries before `expireServer()`); the spec non-deterministically chooses between retry and crash via `DispatchFail`'s / `DispatchFailClose`'s two disjuncts. This is an **over-approximation** (sound but imprecise) — the spec explores both branches regardless of retry count, which is correct for safety verification but means the spec cannot detect bugs that depend on the exact retry threshold.
+
+The over-approximation is sound because: (1) any safety violation found via non-deterministic choice is reachable via the real retry-counted path (the spec never constrains behavior that the implementation permits); (2) the set of behaviors explored by the spec is a strict superset of the implementation's behaviors. The trade-off is that liveness properties cannot distinguish between "retry eventually succeeds" and "retries exhausted, server expired" — both paths are always explored.
 
 ```tla
 EXTENDS Types

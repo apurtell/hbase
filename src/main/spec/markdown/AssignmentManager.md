@@ -109,6 +109,26 @@ Region lifecycle states cover the full `RegionState.State` enum: `OFFLINE`, `OPE
 
 `FAILED_CLOSE` is omitted because no code path transitions into it. The RS abort triggers crash detection, so close failures are resolved through `ABNORMALLY_CLOSED` instead.
 
+### What Is Modeled
+
+The spec's `AssignmentManager.tla` orchestrates all sub-modules and defines invariants. Key aspects of the Java [`AssignmentManager.java`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java) that are faithfully modeled: region state tracking (`RegionStateNode` → `regionState[r]`), procedure attachment (`setProcedure`/`unsetProcedure` → `procType`/`procStep`), server state tracking (`ServerStateNode` → `serverState[s]`, `serverRegions[s]`), and the meta-unavailability blocking/suspension mechanism (`suspendedOnMeta`, `blockedOnMeta`).
+
+### What Is Not Modeled
+
+The following implementation components are not captured by the spec:
+
+- **`RegionStateStore` table operations**: The actual HBase `Put`/`Get` operations on `hbase:meta` are abstracted to direct reads/writes of the `metaTable` variable. Bugs in the serialization, column family layout, or row-key construction of meta entries would not be detected.
+
+- **`RSProcedureDispatcher` batching and buffering**: The implementation batches open/close commands and sends them in bulk via `executeProcedures()` RPC. The spec abstracts this to a per-server set (`dispatchedOps[s]`) without batching semantics. Bugs related to batch assembly, retry buffering, or dispatch ordering would not be detected.
+
+- **`LoadBalancer` server selection logic**: The spec uses non-deterministic choice (any `ONLINE` server) rather than modeling the balancer's actual algorithm (`StochasticLoadBalancer`, `SimpleLoadBalancer`, etc.). This is a sound over-approximation for safety properties.
+
+- **Region normalizer**: The `RegionNormalizer` periodic merging/splitting based on region size is not modeled.
+
+- **HBCK2 repair operations**: The `HBCKServerCrashProcedure` and other HBCK2 repair tools that manually fix assignment state are not modeled.
+
+- **`CatalogJanitor` periodic scanning**: The `CatalogJanitor`'s async scanning, consistency checking, and repair procedure creation are not modeled. This gap is significant — the `CatalogJanitor` is the implementation's runtime consistency checker, analogous to some of the spec's invariants (e.g., `KeyspaceCoverage`, `NoLostRegions`), but its actual behavior (asynchronous scanning, repair procedure creation) introduces its own concurrency concerns not captured by the spec.
+
 ```tla
 EXTENDS Types
 ```

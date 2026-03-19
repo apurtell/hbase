@@ -31,7 +31,9 @@ The `ref2` field on both targets stores the merged region identifier `m`, which 
 
 ### Implementation State Simplification
 
-The implementation's `MergeTableRegionsState` enum has 10 values, collapsed to 5 model steps. Omitted states are filesystem (move HFile store files) and coprocessor operations, identical to the Split collapse rationale.
+The implementation's `MergeTableRegionsState` enum has 10 values, collapsed to 5 model steps (`MergePrepare`, `MergeCheckClosed`, `MergeUpdateMeta`, `MergeDone`, and `MergeFail`), following the same pattern as split. Omitted states are filesystem (move HFile store files) and coprocessor operations, identical to the Split collapse rationale.
+
+The cross-referencing of both targets via `parentProc[r1].ref1 = r2`, `parentProc[r2].ref1 = r1` is faithful to the implementation's `regionsToMerge[]` array. The spec only models 2-region merge, while the implementation's `MergeTableRegionsProcedure` accepts an array of regions. The 2-region case covers the dominant usage. N-way merge bugs would require extending the spec.
 
 ### GC Procedure Omission 
 

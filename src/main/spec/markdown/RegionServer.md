@@ -35,6 +35,20 @@ In the implementation, open and close operations are multi-step: the RS receives
 
 > **Design note — RS epochs are *not* modeled explicitly.** Real HBase uses `ServerName` (host + port + startcode) to distinguish incarnations. Each RS restart gets a new `startcode` (system timestamp). Stale reports carry the old `ServerName` and are rejected by `AM.reportRegionStateTransition()` (`serverNode.getServerName().equals(serverName)` check). The model achieves the same effect through atomic crash (`RSAbort` purges zombie state) + atomic restart (`RSRestart` purges stale reports and dispatched ops). An explicit epoch variable would only add value if crash or restart were decomposed into non-atomic multi-step sequences — which would increase state space without covering additional safety properties.
 
+### RS-Side Behaviors Not Modeled
+
+The RS-side actions merge receive + complete into atomic actions (`RSOpen`, `RSClose`, `RSFailOpen`). The justification is sound: the intermediate RS state (command consumed, region being opened/closed) is not observable by the master, and a crash in this window produces the same recovery outcome as a pre-receive crash (the dispatched command is lost along with the RS). The following RS-side behaviors are not captured:
+
+1. **Region open/close timing**: The actual time to open a region (loading HFiles, replaying WAL edits) or close a region (flushing MemStore, closing HFiles) is abstracted to instantaneous. This means the spec cannot detect bugs that depend on the duration of region opening (e.g., a timeout-triggered expiry during a long region open).
+
+2. **RS-side region transitions in progress (`regionsInTransitionInRS`)**: The implementation maintains a per-RS map ([`HRegionServer.regionsInTransitionInRS`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java)) tracking regions being opened or closed. The spec merges receive+complete, eliminating this state. A bug in the `regionsInTransitionInRS` bookkeeping would not be caught.
+
+3. **RS compaction, flush, memstore operations**: Entirely absent. These do not affect assignment safety but do affect data integrity and availability.
+
+4. **RS heartbeat mechanism**: The RS periodically reports to the master via `regionServerReport()`. Missed heartbeats trigger crash detection. The spec models crash detection via ZK ephemeral node expiry (`ZKSessionExpire` → `MasterDetectCrash`), which is the actual mechanism used, but does not model the heartbeat-based region report reconciliation ([`AssignmentManager.checkOnlineRegionsReport()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java)).
+
+5. **RS-side region state verification**: In the implementation, the RS validates that it should still host a region (e.g., checking for `CloseRegionHandler` overlap). The spec's `RSClose` removes from `rsOnlineRegions` without checking whether the region is actually online, relying on the `CLOSE` command existence as sufficient guard.
+
 ```tla
 EXTENDS Types
 ```
