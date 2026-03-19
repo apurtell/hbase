@@ -22,6 +22,10 @@ The implementation's [`DisableTableProcedure`](file:///Users/andrewpurtell/src/h
 
 Omitted: `PRE_OPERATION` fires coprocessor `preDisableTable` hook. `ADD_REPLICATION_BARRIER` adds a replication barrier in meta for each region. `POST_OPERATION` fires coprocessor `postDisableTable` hook. All are orthogonal to the assignment protocol.
 
+### Unmodeled Behaviors
+
+The implementation's `DISABLE_TABLE_ADD_REPLICATION_BARRIER` state inserts replication barriers into `hbase:meta` for each region — this is not modeled because replication barriers do not affect the assignment protocol. The table state transitions (`ENABLED` → `DISABLING` → `DISABLED`) are faithfully modeled through `tableEnabled[t]`: `DisableTablePrepare` sets `"DISABLING"` and `DisableTableDone` sets `"DISABLED"`, matching the implementation's `TableStateManager.setTableState()` persistence.
+
 ### Table State Machine
 
 [`TableStateManager.setTableState()`](file:///Users/andrewpurtell/src/hbase/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java) stores the table state as a protobuf `HBaseProtos.TableState` record in an `hbase:meta` table row keyed by the table name. The transition path is `ENABLED → DISABLING → DISABLED`, with `DISABLING` persisted in meta before any regions are closed. The model's `tableEnabled[t]` variable mirrors this persistence: `DisablePrepare` sets it to `"DISABLING"`, and `DisableDone` sets it to `"DISABLED"`.

@@ -33,6 +33,10 @@ Between `TruncateDeleteMeta` and `TruncateCreateMeta`, the table has **zero regi
 
 `TruncateTableProcedure` optionally takes a snapshot of the table before deletion (`boolean preserveSplits` parameter). Snapshot operations are orthogonal to the region assignment protocol — they do not modify `RegionState`, `ServerStateNode`, or any assignment-related variable. The model omits snapshots entirely.
 
+### PreserveSplits Omission
+
+The `preserveSplits` option in `TruncateTableProcedure` controls whether the new regions after truncation preserve the split boundaries of the old regions or use a single region spanning `[0, MaxKey)`. The spec does not model `preserveSplits`. It always creates a single new region covering the full keyspace with equal-width sub-ranges. This means the spec cannot verify behaviors specific to the split-preserving path (e.g., correctly reconstructing the old keyspace tiling for the new regions).
+
 Models `TruncateTableProcedure`: atomically deletes old regions and creates new regions for the same table, clearing all data while preserving the table identity. Requires all regions of the target table to be in `{"CLOSED","OFFLINE"}` with `procType = "NONE"` (disabled-table precondition).
 
 **Forward-path actions:**
