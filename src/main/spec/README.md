@@ -152,7 +152,7 @@ This TLA+ specification models the AssignmentManager as a state machine with
   via TRSP REOPEN), and structural modifications on disabled tables
   (`DisableTable → ModifyTable → EnableTable`), gated by `UseModify`.
 
-The specification defines 37 safety invariants verified at every reachable
+The specification defines 36 safety invariants verified at every reachable
 state, including the critical `NoDoubleAssignment` (no region writable on two
 servers), `MetaConsistency` (persistent and in-memory state agree),
 `FencingOrder` (WALs fenced before reassignment), `NoLostRegions` (no region
@@ -161,27 +161,27 @@ stuck without a procedure after crash recovery), `NoPEWorkerDeadlock`
 exactly one live region), `SplitMergeMutualExclusion` (split daughters and
 merged regions cannot have active parent procedures), `SplitAtomicity`
 (pre-PONR, no daughters materialized), `AtMostOneCarryingMeta` (at most one
-server carrying meta), `MergeCompleteness` (completed merge has cleaned-up
-targets), `MergeAtomicity` (pre-PONR, merged region not materialized), and
+server carrying meta), `MergeAtomicity` (pre-PONR, merged region not materialized),
 `TableLockExclusivity` (exclusive table locks prevent concurrent region ops
-on the same table), and `DeleteTableAtomicity` (if any region of a table is
+on the same table), `DeleteTableAtomicity` (if any region of a table is
 marked for deletion, all regions of that table must also be marked),
 `TruncateAtomicity` (if any region is marked for truncation at COMPLETING step,
 all regions of that table must also be marked), `TruncateNoOrphans` (new
 region at SPAWNED_OPEN step has a child ASSIGN TRSP or has completed it),
 `CreateNoOrphans` (CREATE/SPAWNED_OPEN region has a child ASSIGN TRSP or
-has completed it), and `TableEnabledStateConsistency` (disabled tables have
-all regions in {CLOSED, OFFLINE} when no exclusive lock is held), and
+has completed it), `TableEnabledStateConsistency` (disabled tables have
+all regions in {CLOSED, OFFLINE} when no exclusive lock is held),
 `ModifyTableSafety` (regions tagged for modify are in a valid REOPEN or
-skipped state).
+skipped state), and `FencedServerNoOpen` (after SCP completes, no stably OPEN
+regions remain on a WAL-fenced server).
 
 Six liveness properties verify temporal guarantees:
 `MetaEventuallyAssigned` (meta eventually reassigned after crash),
 `OfflineEventuallyOpen` (ASSIGN-bearing OFFLINE region eventually opens),
 `SCPEventuallyDone` (started SCP eventually completes),
-`RegionEventuallyAssigned` (ASSIGN on enabled table eventually opens), and
+`RegionEventuallyAssigned` (ASSIGN on enabled table eventually opens),
 `NoStuckRegions` (regions in OPENING/CLOSING eventually leave those states), and
-`ModifyEventuallyDone` (modify eventually completes).  Two action
+`ProcedureEventuallyDone` (every active procedure eventually completes).  Two action
 constraints enforce transition validity and SCP monotonicity.  One state
 constraint (`SplitMergeConstraint`) bounds concurrent split/merge procedures
 for TLC tractability in the exhaustive and liveness configs; the simulation
@@ -372,7 +372,7 @@ do not interfere.
 
 ## Invariants
 
-All configurations check the same 37 safety invariants:
+All configurations check the same 36 safety invariants:
 
 | Invariant | Description |
 |-----------|-------------|
@@ -401,10 +401,8 @@ All configurations check the same 37 safety invariants:
 | `SplitMergeMutualExclusion` | Daughter/merged regions (SPLITTING_NEW, MERGING_NEW) cannot have active parent procedures |
 | `SplitAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), no SPLITTING_NEW daughters of this parent exist |
 | `NoOrphanedDaughters` | SPLITTING_NEW regions always have an ASSIGN procedure |
-| `SplitCompleteness` | After split completes (parent SPLIT + NoRange), parentProc is cleared |
 | `AtMostOneCarryingMeta` | At most one server can be carrying `hbase:meta` at any time |
 | `NoOrphanedMergedRegion` | MERGING_NEW regions always have an ASSIGN procedure |
-| `MergeCompleteness` | After merge completes (targets MERGED + NoRange), parentProc is cleared |
 | `MergeAtomicity` | Pre-PONR (SPAWNED_CLOSE phase), merged region not materialized |
 | `TableLockExclusivity` | No two regions of the same table can simultaneously hold exclusive-type parent procedures (CREATE, DELETE, TRUNCATE) |
 | `DeleteTableAtomicity` | If any region of a table has `parentProc.type = "DELETE"`, then ALL regions of that table must also have `parentProc.type = "DELETE"` |
@@ -413,6 +411,7 @@ All configurations check the same 37 safety invariants:
 | `CreateNoOrphans` | A region with `parentProc = [CREATE, SPAWNED_OPEN]` must have `procType = "ASSIGN"` or have completed (`state = "OPEN"`, `procType = "NONE"`) |
 | `TableEnabledStateConsistency` | Disabled tables with no exclusive lock held have all regions in `{CLOSED, OFFLINE, ABNORMALLY_CLOSED}` |
 | `ModifyTableSafety` | While MODIFY is in progress, every tagged region is in a valid REOPEN, skipped, or SCP-handled state |
+| `FencedServerNoOpen` | After SCP completes for a fenced server, no stably OPEN regions remain on it |
 
 ## Liveness Properties
 
@@ -423,7 +422,7 @@ All configurations check the same 37 safety invariants:
 | `SCPEventuallyDone` | Once an SCP starts for a crashed server (`scpState ∉ {NONE, DONE}`), it eventually completes (`scpState = DONE`) |
 | `RegionEventuallyAssigned` | Once an ASSIGN procedure is attached to a region of an enabled table, the region eventually reaches OPEN |
 | `NoStuckRegions` | Regions in transitional states (OPENING, CLOSING) eventually leave those states |
-| `ModifyEventuallyDone` | If ModifyTablePrepare fires, eventually all modify-tagged regions are cleared |
+| `ProcedureEventuallyDone` | Every active procedure (TRSP and parent) eventually completes (success or failure) |
 
 > Liveness properties are incompatible with TLC's `SYMMETRY` reduction.
 > Use [`AssignmentManager-liveness.cfg`](markdown/AssignmentManager-liveness-cfg.md)
