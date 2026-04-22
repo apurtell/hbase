@@ -8,7 +8,7 @@
  * This module targets exhaustive verification of election safety, lease
  * exclusivity under worst-case clock drift, term fencing, and timer/
  * heartbeat protocols.  It uses the ORIGINAL UNMODIFIED Next relation
- * with all 34 actions — no action merges, no action removals.  The only
+ * with all 35 actions — no action merges, no action removals.  The only
  * change from the full exhaustive config (MCRaftRegionReplica) is
  * reducing MaxSeqId from 3 to 1.
  *

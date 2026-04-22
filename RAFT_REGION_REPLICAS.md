@@ -102,9 +102,9 @@ If AZ-1 is lost, the master detects the dead regionserver(s) and launches Server
 
 ## Design Overview
 
-We replace the current async replication model with RAFT consensus groups at the region level, using a purpose-built lightweight consensus layer tailored to the specific requirement of keeping read-only replica memstores warm for fast promotion to read-write primary. The consensus layer implements the subset of RAFT needed for region replication (leader election, ordered log replication to 2 followers, and term/epoch fencing) with an architecture designed from the outset for O(10000) groups per RegionServer.
+We replace the current async replication model with RAFT consensus groups at the region level, using a purpose-built lightweight consensus layer tailored to the specific requirement of keeping read-only replica memstores warm for fast promotion to read-write primary. The consensus layer implements the subset of RAFT needed for region replication with an architecture designed from the outset for O(10000) groups per RegionServer.
 
-Each set of replicas for a region forms a RAFT group. The read-write primary (RAFT leader) accepts client writes, writes to the HBase WAL on HDFS for durability, and simultaneously replicates edits through RAFT to keep read-only replica memstores warm. WAL and RAFT operate in parallel on the leader, joined by a barrier. The read-write primary alone writes HFiles to HDFS; read-only replicas (RAFT followers) share those HFiles for reads and maintain their own memstores via RAFT log replay. RAFT is an internal implementation detail invisible to clients. Clients continue to interact with the read-write primary through the standard HBase client protocol (master -> META -> RegionServer), unchanged from non-replicated tables.
+Each set of replicas for a region forms a RAFT group. The read-write leader accepts client writes, writes to the HBase WAL on HDFS for durability, and simultaneously replicates edits through RAFT to keep read-only replica memstores warm. WAL and RAFT operate in parallel on the leader, joined by a barrier. The read-write primary alone writes HFiles to HDFS. Read-only followers share those HFiles for reads and maintain their own memstores via RAFT log replay. RAFT is an internal implementation detail invisible to clients. Clients continue to interact with the read-write primary through the standard HBase client protocol, unchanged from non-replicated tables.
 
 ```
           ┌───────────────── RAFT Group for Region R ────────────┐
@@ -133,17 +133,45 @@ Each set of replicas for a region forms a RAFT group. The read-write primary (RA
           └──────────────────────────────────────────────────────┘
 ```
 
-There is only one set of HFiles per region, always written by the read-write primary to HDFS. Read-only replicas read those same HFiles. The read-write primary writes to the HBase WAL on HDFS for durability (exactly as today) and simultaneously replicates edits through RAFT to keep read-only replica memstores warm; both operations run in parallel, joined by a barrier. Each member maintains its own memstore (populated by applying RAFT log entries). When the read-write primary flushes, it writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT; all read-only replicas pick up the new HFiles and drop their memstores. The storage overhead of read-only replicas is limited to lightweight local RAFT log segments (GC'd after each flush) and memstore memory. There is no additional HDFS write amplification from RAFT. The only HDFS writes are the WAL (by the leader, as today) and HFiles (on flush/compaction, as today).
+There is only one set of HFiles per region, always written by the read-write primary to HDFS. Read-only replicas read those same HFiles. The read-write primary writes to the HBase WAL on HDFS for durability and simultaneously replicates edits through RAFT to keep read-only replica memstores warm; both operations run in parallel, joined by a barrier. Each member maintains its own memstore, populated by applying RAFT log entries. When the read-write primary flushes, it writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT. All read-only replicas pick up the new HFiles and drop their memstores. The storage overhead of read-only replicas is limited to lightweight local RAFT log segments and memstore memory. There is no additional HDFS write amplification from RAFT. The only HDFS writes are the WAL and HFiles.
 
 ## Consensus Layer Architecture
 
-The consensus layer is a purpose-built, lightweight RAFT implementation in a new `hbase-consensus` module, built on MicroRaft's consensus core (Apache 2.0). Its initial scope is the narrow requirement of keeping read-only replica memstores warm for fast promotion to read-write primary. It implements the core RAFT protocol, specifically leader election, ordered log replication to a small group of followers, and term/epoch fencing. For the region replication use case, several RAFT features are unnecessary and omitted from the initial implementation: linearizable reads via RAFT (HBase serves reads directly), membership change protocol (the HBase Master controls membership via region open/close), and snapshot transfer over the consensus transport (shared HDFS handles catch-up).
+The consensus layer is a purpose-built, lightweight RAFT implementation in a new `hbase-consensus` module, built on MicroRaft's consensus core (Apache 2.0). Its initial scope is the narrow requirement of keeping read-only replica memstores warm for fast promotion to read-write primary. It implements the core RAFT protocol, specifically leader election, ordered log replication to a small group of followers, and term/epoch fencing. For the region replication use case, several RAFT features are unnecessary and omitted from the initial implementation: linearizable reads via RAFT, membership change protocol, and snapshot transfer over the consensus transport.
 
 MicroRaft provides a single-threaded actor model Raft implementation with only one runtime dependency on SLF4J. The pluggable interfaces `Transport`, `StateMachine`, `RaftStore`, `RaftNodeExecutor`, `RaftModelFactory`, and `Clock` allow adaptation without modifying the core protocol state machine. The core protocol features that transfer directly to hbase-consensus: leader election with pre-vote, leader stickiness, vote durability before response via the store's persist-and-flush-term method, immediate heartbeat on election win, new-term entry on election, term fencing and step-down, deterministic commit-index advancement, parallel leader flush, single-server membership changes with committed-entry-in-current-term guard, and leadership transfer with stickiness bypass. Three areas require modification: leader lease timing, snapshot transfer, and multi-group scaling. The subsequent subsections describe these modifications alongside the features they extend.
 
 Architecturally, the `ConsensusServer` is a general-purpose RAFT engine. It manages groups, replicates opaque log entries, runs leader elections, and invokes pluggable callbacks on commit. The region-specific logic lives entirely in the callback implementation and in `RegionGroupManager`, not in the consensus engine itself. This separation is deliberate. It keeps the door open for the consensus layer to serve other coordination needs in HBase's architecture over time (see Appendix A).
 
 The architecture is designed from the start for O(10000) groups per RegionServer, incorporating proven patterns from TiKV (shared event loop, hibernate regions), CockroachDB (store-level heartbeat coalescing), and Redpanda (lightweight heartbeats).
+
+```mermaid
+flowchart TD
+    subgraph HRegionServer ["HRegionServer"]
+        RGM["RegionGroupManager<br/>(region-specific adapter:<br/>maps regions to groups)"]
+
+        subgraph CS ["ConsensusServer (general-purpose RAFT engine)"]
+            MGE["MultiGroupExecutor<br/>(shared thread pool,<br/>O(cores) workers)"]
+            CT["CoalescingTransport<br/>(Netty, one TCP conn per peer)"]
+            URS["UnifiedRaftStore<br/>(shared append-only log<br/>on local NVMe)"]
+
+            subgraph groups ["Per-Group Instances (x10000)"]
+                RN["RaftNode<br/>(FSM: term, role,<br/>log, leader/candidate/<br/>follower state)"]
+                SM["StateMachine Adapter<br/>(HBase callbacks:<br/>on-commit, on-flush,<br/>on-leader-elected)"]
+            end
+        end
+    end
+
+    RegionOpen["Region open / close"] --> RGM
+    RGM -->|"addGroup / removeGroup"| CS
+
+    RN -->|"execute / drain loop"| MGE
+    RN -->|"send to peers"| CT
+    RN -->|"persist entries, term, vote"| URS
+    RN -->|"on commit"| SM
+    SM -->|"apply to HRegion<br/>(memstore, flush, MVCC)"| HRegion["HRegion"]
+    CT -->|"single TCP per peer"| RemoteRS["Remote RegionServers"]
+```
 
 ### Vote State Durability
 
@@ -159,20 +187,58 @@ A RegionServer hosts many regions. The consensus layer runs all RAFT groups with
 
 MicroRaft provides the per-group FSM: each `RaftNode` instance encapsulates a complete Raft state machine (term, role, log, leader/candidate/follower state) and processes events serially via a `RaftNodeExecutor`. The `RaftNodeExecutor` interface has three methods: an execute method, which must guarantee serial execution per group; a submit method, which wraps execute and returns a future; and a schedule method, which defers a task for later serial execution. MicroRaft's default `DefaultRaftNodeExecutor` implements this interface by creating a dedicated scheduled executor with a single thread per `RaftNode` instance. At ten thousand groups, this means ten thousand threads (plus their stack memory, context-switch overhead, and scheduler pressure), which is untenable.
 
-The `MultiGroupExecutor` replaces the per-group executor with a single scheduled thread pool whose thread count is O(CPU cores) (`hbase.consensus.worker.threads`, default 2 * cores). Each group receives a bounded MPSC (multi-producer, single-consumer) mailbox backed by a lock-free queue. When execute is called on a group's executor, the task is enqueued into the group's mailbox and an atomic scheduled flag is tested-and-set. If the flag transitions from unset to set, the group is submitted to the shared pool as a runnable. If the flag was already set, the group is already scheduled and the enqueue alone suffices. A pool thread that picks up the group runs a drain loop: it dequeues and executes each task serially from the mailbox until the mailbox is empty, then clears the scheduled flag. If the mailbox is non-empty after clearing, the group re-submits itself to the pool. This protocol guarantees serial execution per group while multiplexing all groups onto the fixed pool without per-group thread allocation.
+The `MultiGroupExecutor` replaces the per-group executor with a single scheduled thread pool whose thread count is O(CPU cores) (`hbase.consensus.worker.threads`, default 2 * cores). Each group receives a bounded multi-producer, single-consumer (or MPSC) mailbox backed by a lock-free queue. When execute is called on a group's executor, the task is enqueued into the group's mailbox and an atomic scheduled flag is tested-and-set. If the flag transitions from unset to set, the group is submitted to the shared pool as a runnable. If the flag was already set, the group is already scheduled and the enqueue alone suffices. A pool thread that picks up the group runs a drain loop: it dequeues and executes each task serially from the mailbox until the mailbox is empty, then clears the scheduled flag. If the mailbox is non-empty after clearing, the group re-submits itself to the pool. This protocol guarantees serial execution per group while multiplexing all groups onto the fixed pool without per-group thread allocation.
 
 For the schedule method, MicroRaft uses it primarily for the heartbeat task and the state summary publish task. Under the store-level heartbeat sweep model described below, per-group schedule calls for heartbeats are eliminated entirely. The executor's schedule method is retained only for infrequent per-group timers such as election timeout. These use the shared pool's scheduled executor with the scheduled task wrapping the group's execute method to preserve serial execution: the timer fires, enqueues the election task on the group, and the task runs within the drain loop alongside other group work.
 
 The drain-on-schedule semantics are the foundation for leader proposal micro-batching. When a pool thread runs a group, it drains all pending items from the mailbox rather than processing one at a time. Multiple proposals that accumulate in the mailbox while the previous drain is in-flight are collected and batched by the next pool invocation. The `RaftNodeExecutor` interface is pluggable via `RaftNodeBuilder.setExecutor()`, so the `MultiGroupExecutor` does not require modifying `RaftNodeImpl`.
 
+```mermaid
+flowchart TD
+    subgraph callers ["Callers (any thread)"]
+        W1["Write thread<br/>(propose)"]
+        W2["Write thread<br/>(propose)"]
+        HB["Heartbeat sweep<br/>(election check)"]
+    end
+
+    subgraph groups ["Per-Group State"]
+        subgraph G1 ["Group A"]
+            MB1["MPSC Mailbox<br/>(lock-free queue)"]
+            SF1["Scheduled Flag<br/>(atomic boolean)"]
+        end
+        subgraph G2 ["Group B"]
+            MB2["MPSC Mailbox"]
+            SF2["Scheduled Flag"]
+        end
+        subgraph G3 ["Group C"]
+            MB3["MPSC Mailbox"]
+            SF3["Scheduled Flag"]
+        end
+    end
+
+    subgraph pool ["Shared Thread Pool (O(cores) workers)"]
+        T1["Worker 1"]
+        T2["Worker 2"]
+        T3["Worker N"]
+    end
+
+    W1 -->|"1. enqueue task"| MB1
+    W2 -->|"1. enqueue task"| MB2
+    HB -->|"1. enqueue task"| MB3
+
+    SF1 -->|"2. test-and-set:<br/>unset to set =<br/>submit group to pool"| pool
+    SF2 -->|"2. test-and-set"| pool
+    SF3 -->|"2. test-and-set"| pool
+
+    T1 -->|"3. drain loop:<br/>dequeue all tasks,<br/>execute serially"| G1
+    T2 -->|"3. drain loop"| G2
+
+    G1 -->|"4. clear flag;<br/>if mailbox non-empty,<br/>re-submit to pool"| pool
+```
+
 MicroRaft's `Transport` interface is similarly wrapped by a coalescing transport that buffers outbound messages per-peer per-tick and flushes them as batched frames. MicroRaft's `RaftStore` interface is replaced by the unified multiplexed log, which implements the store interface by tagging entries with their group ID and writing to the shared append-only file.
 
-As regions are opened and closed, RAFT groups are dynamically added and removed via the `RegionGroupManager`:
-
-```java
-regionGroupManager.addGroup(regionInfo, peerList);   // on region open
-regionGroupManager.removeGroup(regionInfo);           // on region close
-```
+As regions are opened and closed, RAFT groups are dynamically added and removed via the `RegionGroupManager`.
 
 ### Leader Proposal Micro-Batching
 
@@ -188,11 +254,52 @@ This is the single highest-impact CPU optimization for the consensus layer. TiKV
 
 MicroRaft's `Transport` interface is instantiated per `RaftNode`. Each `RaftNodeImpl` holds its own transport reference and calls send for individual messages. Messages carry a group ID via the message header, so routing is possible even with a shared transport instance. The `CoalescingTransport` exploits this by providing a single transport instance shared across all `RaftNode` instances on the RegionServer.
 
-The `CoalescingTransport` implements MicroRaft's `Transport` interface and maintains one Netty TCP connection per peer, lazily connected with automatic reconnection on failure. The consensus module registers a protocol handler on a dedicated Netty port (`hbase.consensus.port`), reusing HBase's existing Netty infrastructure. The wire format is Protobuf. No TLS configuration is needed because the encrypted overlay network already provides confidentiality and integrity for inter-AZ traffic. Netty is already a core HBase dependency (used by AsyncFSWAL and the async RPC client), so no new dependencies are introduced.
+The consensus module registers a protocol handler on a dedicated Netty port (`hbase.consensus.port`), reusing HBase's existing Netty infrastructure. The wire format is Protobuf. No TLS configuration is needed because the encrypted overlay network already provides confidentiality and integrity for inter-AZ traffic. The `CoalescingTransport` implements MicroRaft's `Transport` interface and maintains one Netty TCP connection per peer, lazily connected with automatic reconnection on failure. All network-dependent consensus operations require retry-with-backoff semantics because partition oscillation can repeatedly disable them. The transport layer's automatic reconnection handles the TCP-level recovery, and the consensus protocol must also retry the logical operation. MicroRaft's single-threaded actor model naturally provides this with the periodic heartbeat sweep and the group executor's drain loop. Netty is already a core HBase dependency (used by AsyncFSWAL and the async RPC client), so no new dependencies are introduced.
 
 Each peer has an outbound buffer backed by a lock-free MPSC queue. When send is called by any `RaftNode`, the message is appended to the target peer's outbound buffer. A flush hook, invoked by the heartbeat sweep timer or a dedicated flush timer at the consensus log sync batch interval (`hbase.consensus.log.sync.batch.ms`), drains each peer's buffer and builds coalesced frames. Data-carrying messages are coalesced into batch-append-entries frames; heartbeats are coalesced into heartbeat-batch frames. The Protobuf entries field carries the WALEdit's pre-serialized byte buffer directly (the same bytes destined for the WAL write path), avoiding re-serialization through the Protobuf envelope.
 
 All messages for all groups between two RegionServers multiplex over a single TCP connection per peer.
+
+```mermaid
+flowchart LR
+    subgraph outbound ["Outbound Path (this RegionServer)"]
+        RN1["RaftNode<br/>Group A"]
+        RN2["RaftNode<br/>Group B"]
+        RN3["RaftNode<br/>Group C"]
+
+        subgraph buffers ["Per-Peer Outbound Buffers"]
+            BufP1["Peer 1 Buffer<br/>(MPSC queue)"]
+            BufP2["Peer 2 Buffer<br/>(MPSC queue)"]
+        end
+
+        Flush["Flush Hook<br/>(heartbeat sweep timer<br/>or sync batch timer)"]
+    end
+
+    subgraph wire ["Network"]
+        TCP1["Single TCP<br/>to Peer 1"]
+        TCP2["Single TCP<br/>to Peer 2"]
+    end
+
+    subgraph inbound ["Inbound Path (remote RegionServer)"]
+        NettyH["Netty Handler:<br/>deserialize batch frame"]
+        Dispatch["Dispatch per-group<br/>entries via<br/>MultiGroupExecutor"]
+    end
+
+    RN1 -->|"send()"| BufP1
+    RN2 -->|"send()"| BufP1
+    RN2 -->|"send()"| BufP2
+    RN3 -->|"send()"| BufP2
+
+    Flush -->|"drain + coalesce:<br/>BatchAppendEntries<br/>or HeartbeatBatch"| BufP1
+    Flush -->|"drain + coalesce"| BufP2
+
+    BufP1 --> TCP1
+    BufP2 --> TCP2
+
+    TCP1 --> NettyH
+    TCP2 --> NettyH
+    NettyH --> Dispatch
+```
 
 When the flush hook fires and multiple groups have pending AppendEntries to the same peer, they are coalesced into a single message rather than sent as individual messages:
 
@@ -240,9 +347,11 @@ When a heartbeat batch response arrives from a peer, it carries per-group ack or
 
 ### Hibernate Idle Groups
 
-After a flush-complete marker is committed and no subsequent writes arrive for a configurable timeout (`hbase.consensus.hibernate.timeout.ms`, default 10000), the leader proposes a hibernate request through the group. When all members acknowledge, the group enters hibernate state. The leader stops including the group in heartbeat batch messages, followers stop expecting heartbeats for it, preventing false election timeouts, and the group's FSM remains in memory but consumes no CPU and network. On the next write to the region the write path wakes the group by having the leader send a wake-up message to followers, wait for acknowledgment, then resume normal operation and propose the write. The cost of waking a hibernated group is one additional round-trip (roughly 1-2ms inter-AZ) on the first write after hibernation, amortized over the write burst that follows. The wake-complete step requires the leader to hold a valid lease. This prevents a stale leader from a previous term from refreshing its own expired lease, which would violate lease exclusivity (formally verified).
+After a flush-complete marker is committed and no subsequent writes arrive for a configurable timeout (`hbase.consensus.hibernate.timeout.ms`, default 30000), the leader proposes a hibernate request through the group. When all members acknowledge, the group enters hibernate state. The leader stops including the group in heartbeat batch messages, followers stop expecting heartbeats for it, preventing false election timeouts, and the group's FSM remains in memory but consumes no CPU and network. On the next write to the region the write path wakes the group by having the leader send a wake-up message to followers, wait for acknowledgment, then resume normal operation and propose the write. The cost of waking a hibernated group is one additional round-trip (roughly 1-2ms inter-AZ) on the first write after hibernation, amortized over the write burst that follows. The wake-complete step requires the leader to hold a valid lease. This prevents a stale leader from a previous term from refreshing its own expired lease, which would violate lease exclusivity (formally verified).
 
 A follower's hibernate/wake lifecycle has three states: Hibernated, Waking, and Active. In the Hibernated state the follower's election timer is suppressed. When a follower receives a wake-up message from the leader it transitions to Waking, sends a wake-up response, and starts its election timer. The transition to Active occurs when the follower receives the first AppendEntries or heartbeat batch entry for this group from the leader, confirming the leader is alive and operating normally. If the leader crashes during the wake protocol, having sent the wake-up but not yet any AppendEntries, the follower is in the Waking state with its election timer already running. When the timer fires the follower transitions to Active and initiates a normal election, ensuring liveness is maintained. The key invariant is that a follower's election timer must be started no later than receipt of the wake-up, so a leader crash mid-wake cannot leave followers permanently hibernated without election capability.
+
+The Waking-to-Active transition is local. It requires only that the follower's own election timer fires or a message arrives. No RAFT majority or network quorum is needed. This ensures hibernate convergence is immune to network instability. Once a follower is in the Waking state, it will reach Active regardless of partition conditions.
 
 ```mermaid
 flowchart LR
@@ -265,6 +374,36 @@ MicroRaft's `RaftStore` interface is instantiated per `RaftNode`. Each `RaftNode
 Instead of per-group log files, the consensus layer writes a single append-only log file per RS to local NVMe, multiplexing entries from all groups, exactly as `AbstractFSWAL` already multiplexes entries from all regions into one WAL file. The `UnifiedRaftStore` is a single instance wrapping the shared append-only log file. Each `RaftNode` receives a `GroupRaftStore` adapter that implements MicroRaft's `RaftStore` interface by delegating to the shared store with its group ID prefix. When log entries are persisted, each entry is tagged with the group ID and appended to the shared log. When the term and vote state are persisted, a term-update record tagged with the group ID is written to the shared log. When flush is called, a sync request is enqueued; the `UnifiedRaftStore` batches fdatasync across all groups with pending writes per coalescing window (`hbase.consensus.log.sync.batch.ms`, default 10ms), amortizing the syscall cost across all concurrent writers. When log truncation is requested, a truncation tombstone record is appended to the shared log rather than physically deleting entries; physical deletion is deferred to log file GC.
 
 A per-group in-memory index maps each (group ID, log index) pair to a file offset for fast replay during catch-up. This index is rebuilt lazily on first access after restart by scanning the relevant log segments. Log rolling occurs at a segment size threshold (`hbase.consensus.log.segment.size.mb`, default 256MB). Old segments are deleted when all groups referenced in them have advanced past their entries. GC accounting uses a map from group ID to last-applied flush sequence ID; a segment is eligible for deletion when the minimum last-applied flush sequence ID across all groups referenced in the segment exceeds the segment's maximum sequence ID. On flush-complete for a group, that group's accounting is updated and the GC check is triggered. Since the consensus log is not the durability mechanism, crash safety requirements are relaxed: a crash loses at most one coalescing window of RAFT entries, which are recovered from the HDFS WAL or from the leader's RAFT log via AppendEntries.
+
+```mermaid
+flowchart TD
+    subgraph adapters ["Per-Group Store Adapters"]
+        GS_A["GroupRaftStore A<br/>(implements RaftStore)"]
+        GS_B["GroupRaftStore B<br/>(implements RaftStore)"]
+        GS_C["GroupRaftStore C<br/>(implements RaftStore)"]
+    end
+
+    subgraph unified ["UnifiedRaftStore (single instance per RS)"]
+        AppendQ["Append Queue:<br/>entries tagged with group ID"]
+        SyncBatch["Batched fdatasync<br/>(coalescing window:<br/>hbase.consensus.log<br/>.sync.batch.ms)"]
+        Index["Per-Group In-Memory Index<br/>(groupId, logIndex) to file offset"]
+        GC["Segment GC Accounting<br/>groupId to lastAppliedFlushSeqId"]
+    end
+
+    subgraph storage ["Local NVMe Storage"]
+        Seg1["Segment 1 (256 MB)<br/>[A:entry][B:entry][A:term]<br/>[C:entry][B:entry]..."]
+        Seg2["Segment 2 (active)<br/>[B:entry][A:entry]<br/>[C:entry]..."]
+    end
+
+    GS_A -->|"delegate with<br/>group ID prefix"| AppendQ
+    GS_B -->|"delegate"| AppendQ
+    GS_C -->|"delegate"| AppendQ
+
+    AppendQ --> SyncBatch
+    SyncBatch -->|"single sequential<br/>write stream"| Seg2
+    Seg1 -->|"roll at size threshold"| Seg2
+    GC -->|"delete when all<br/>referenced groups<br/>have advanced past"| Seg1
+```
 
 ### AsyncFSWAL as RAFT Consensus Log
 
@@ -316,9 +455,9 @@ void onHeartbeatResponse(GroupId g, PeerId p) {
 
 The lease safety analysis depends on the leader heartbeating *all* followers every tick, not a subset. The implementation satisfies this because the heartbeat batch is sent to all peers every tick and the lease is refreshed only when a majority of acks from that round have arrived. Atomic heartbeat rounds are required.
 
-The leader lease duration is set to the election timeout minus twice the max clock drift, ensuring the leader's lease expires before any follower's election timer fires even under worst-case clock drift (formally verified by TLA+ model under all partition configurations and worst-case clock drift). With the default configuration (`hbase.consensus.leader.heartbeat.timeout.ms` = 3000, `hbase.consensus.heartbeat.interval.ms` = 500), a conservative max clock drift of 200ms yields a leader lease duration of 2600ms. The leader considers itself authoritative for reads as long as the current time is less than the lease expiry.
+The leader lease duration must be strictly less than the election timeout minus twice the max clock drift, ensuring the leader's lease expires before any follower's election timer fires even under worst-case clock drift (formally verified by TLA+ model under all partition configurations and worst-case clock drift). With the default configuration (`hbase.consensus.leader.heartbeat.timeout.ms` = 3000, `hbase.consensus.heartbeat.interval.ms` = 500), a conservative max clock drift of 200ms gives an upper bound of 2600ms; the implementation uses a leader lease duration of 2500ms to maintain strict inequality (2500 < 3000 - 400 = 2600). The leader considers itself authoritative for reads as long as the current time is less than the lease expiry.
 
-The max clock drift parameter must bound the maximum relative drift between any two nodes, not the maximum absolute drift of a single node. With NTP-synchronized hosts, the maximum relative drift is bounded by twice the maximum absolute drift to NTP, since both can drift in opposite directions. The default of 200ms assumes each node's clock is within 100ms of NTP truth, yielding a 200ms worst-case relative drift. The factor of 2 in the formula (lease duration = election timeout - 2 * max clock drift) accounts for two independent sources of timing error: (1) the leader's clock may run slow by up to the max drift, causing the lease to expire later in real time; (2) a follower's clock may run fast by up to the max drift, causing the election timer to fire earlier in real time. These combine to a worst-case timing error of twice the max clock drift.
+The max clock drift parameter must bound the maximum relative drift between any two nodes, not the maximum absolute drift of a single node. With NTP-synchronized hosts, the maximum relative drift is bounded by twice the maximum absolute drift to NTP, since both can drift in opposite directions. The default of 200ms assumes each node's clock is within 100ms of NTP truth, yielding a 200ms worst-case relative drift. The factor of 2 in the formula (lease duration < election timeout - 2 * max clock drift) accounts for two independent sources of timing error: (1) the leader's clock may run slow by up to the max drift, causing the lease to expire later in real time; (2) a follower's clock may run fast by up to the max drift, causing the election timer to fire earlier in real time. These combine to a worst-case timing error of twice the max clock drift.
 
 The leader status check used by the read path and write path is defined as:
 
@@ -337,21 +476,23 @@ flowchart TD
         HB["Last heartbeat ack<br/>at real time T0"]
         HB --> LP["Old Leader<br/>(clock slow by D)"]
         HB --> FP["Follower<br/>(clock fast by D)"]
-        LP --> LE["Lease expires at real time<br/>T0 + LD + D<br/>= T0 + (ET - 2D) + D<br/>= T0 + ET - D"]
-        FP --> FE["Election timer fires at real time<br/>T0 + (ET - D)"]
-        LE --> Safe["Lease expired at or before election fires"]
+        LP --> LE["Lease expires at real time<br/>T0 + LD + D<br/>= T0 + 2500 + 200<br/>= T0 + 2700ms"]
+        FP --> FE["Election timer fires at real time<br/>T0 + ET - D<br/>= T0 + 3000 - 200<br/>= T0 + 2800ms"]
+        LE --> Safe["Lease expires 100ms before election fires"]
         FE --> Safe
     end
 
     subgraph formula ["Key Parameters (defaults)"]
         P1["ET = electionTimeout = 3000ms"]
         P2["D = maxClockDrift = 200ms"]
-        P3["LD = ET - 2D = 2600ms"]
+        P3["LD = 2500ms, strictly less than ET - 2D = 2600ms"]
         P1 --- P2 --- P3
     end
 ```
 
-MicroRaft's existing `QueryPolicy.LEADER_LEASE` implements a weaker variant: it checks whether the leader has received heartbeat responses from a quorum within the leader heartbeat timeout, using the same timeout for both leader self-demotion and follower leader-death detection, with no clock drift margin. MicroRaft's own documentation warns this "cannot guarantee linearizability." Implementing the clock-drift-compensated lease described above requires several modifications to MicroRaft. A max clock drift field (default 200ms) is added to `RaftConfig`, and a lease expiry field is added to `LeaderState`. In `AppendEntriesSuccessResponseHandler`, after counting a quorum of acks (where MicroRaft currently updates the follower's response timestamp), the lease expiry is set to the current clock time plus the leader lease duration, where the lease duration equals the leader heartbeat timeout minus twice the max clock drift. The leader status check is exposed as a combined role and lease-expiry test, replacing the current `demoteToFollowerIfQuorumHeartbeatTimeoutElapsed()` check. In the heartbeat task, if the lease has expired, the leader steps down to follower before sending heartbeats. The election timer in followers is unchanged (it fires at the leader heartbeat timeout). The timing relationship — lease duration less than election timeout minus twice the max clock drift — ensures the leader's lease expires before any follower's election timer fires (verified by the TLA+ model).
+MicroRaft's existing `QueryPolicy.LEADER_LEASE` implements a weaker variant: it checks whether the leader has received heartbeat responses from a quorum within the leader heartbeat timeout, using the same timeout for both leader self-demotion and follower leader-death detection, with no clock drift margin. MicroRaft's own documentation warns this "cannot guarantee linearizability." Implementing the clock-drift-compensated lease described above requires several modifications to MicroRaft. A max clock drift field (default 200ms) is added to `RaftConfig`, and a lease expiry field is added to `LeaderState`. In `AppendEntriesSuccessResponseHandler`, after counting a quorum of acks (where MicroRaft currently updates the follower's response timestamp), the lease expiry is set to the current clock time plus the leader lease duration, where the lease duration is strictly less than the leader heartbeat timeout minus twice the max clock drift (default: 2500ms < 3000 - 400 = 2600ms). The leader status check is exposed as a combined role and lease-expiry test, replacing the current `demoteToFollowerIfQuorumHeartbeatTimeoutElapsed()` check. In the heartbeat task, if the lease has expired, the leader steps down to follower before sending heartbeats. The election timer in followers is unchanged. The timing relationship where the lease duration strictly less than election timeout minus twice the max clock drift ensures the leader's lease expires before any follower's election timer fires (verified by the TLA+ model).
+
+A third MicroRaft improvement addresses stale liveness. If a `VoteResponse` carries a term higher than the candidate's current term, the candidate must step down immediately rather than continuing to collect votes it cannot use. A candidate that collected majority votes in a lower term but cannot become leader, because a higher-term member exists but is temporarily unreachable, blocks progress for all members. MicroRaft's candidate state machine should eagerly abandon candidacy when it discovers any reachable member with a higher term during the vote-counting path. Without this, the candidate sits with enough votes to block elections but cannot transition to leader. The fix is to add a term check in `VoteResponseHandler.handleResponse()` that triggers `toFollower()` on a higher-term response, the same step-down logic already present in `AppendEntriesRequestHandler`.
 
 Two additional MicroRaft fixes are required. First, `AppendEntriesSuccessResponseHandler` and `InstallSnapshotResponseHandler` must step down on higher-term responses. MicroRaft's current implementation ignores higher-term responses in both handlers when the node is leader. Without this fix a stale leader could continue refreshing its lease after a new leader has been elected in a higher term. This fix is safety-critical. The formal model confirms that without it, a stale leader could refresh its lease indefinitely, violating the single-lease invariant. The `InstallSnapshotResponseHandler` fix is lower priority but the handler code remains in the codebase and must be correct. Second, `VoteRequestHandler` must reset the heartbeat timer on vote grant. MicroRaft's current implementation grants the vote and sends the response without resetting the voter's heartbeat timestamp. Standard RAFT specifies three events that reset the election timer, receiving an AppendEntries from the current leader, starting an election, and granting a vote, and MicroRaft only implements the first. The fix is to reset the heartbeat timer in `VoteRequestHandler.handle()` after granting the vote and before sending the response. This fix improves liveness but is not required for safety: the formal model verifies all safety properties hold without the timer reset, since the atomic initial heartbeat on election immediately resets all reachable followers' timers. Without it, a voter whose election timer has already expired could immediately start its own pre-vote after voting for another candidate, causing unnecessary election disruption.
 
@@ -380,6 +521,29 @@ The existing WAL subsystem (AsyncFSWAL / FSHLog) is retained for the leader. The
 On the read-write primary and RAFT leader the write path proceeds through the existing WAL-append code path, which atomically assigns a sequence ID via MVCC begin, claims a WAL ring buffer slot, stamps cells, and publishes the entry to the ring buffer, all under the MVCC write-queue lock inside `AbstractFSWAL.stampSequenceIdAndPublishToRingBuffer()`. This atomic coupling is preserved unchanged for RAFT-enabled regions because it guarantees that WAL entries appear in the same order as MVCC sequence IDs. Decoupling them would allow concurrent writes to the same region to interleave, producing non-monotonic sequence IDs in the WAL. HBase's WAL replay treats this as a serious defect. After the ring buffer entry is published, but before the WAL is synced to HDFS, the write path forks two parallel slow I/O operations: (a) WAL sync to HDFS for durability, and (b) consensus replication to followers. A barrier waits for both to complete. Only then does the primary apply the edit to its local memstore and complete the MVCC write entry.
 
 The refactoring target is `HRegion.doMiniBatchMutate()` step 4 (the WAL append): the existing call to append-data followed by sync is split so that append-data which publishes to the ring buffer runs first, then the sync and RAFT proposal run in parallel. The `AbstractFSWAL` internals are unchanged. A new append-without-sync method (or equivalent) returns the transaction ID without blocking on HDFS, and the caller explicitly calls sync in the parallel fork.
+
+```mermaid
+flowchart TD
+    Entry["doWALAppend (atomic):<br/>mvcc.begin() + ringBuffer.publish()"]
+
+    Entry --> Fork{"Fork parallel I/O"}
+
+    Fork --> WAL["WAL sync to HDFS<br/>(~3-5ms cross-AZ)"]
+    Fork --> RAFT["RAFT propose to followers<br/>(~1-2ms cross-AZ)"]
+
+    WAL --> WALResult{"WAL sync<br/>result?"}
+    RAFT --> RAFTResult{"RAFT propose<br/>result?"}
+
+    WALResult -->|"Success"| Barrier["Barrier:<br/>both paths complete"]
+    WALResult -->|"Failure"| Abort["Abort RegionServer<br/>(WALFailureAbort)"]
+
+    RAFTResult -->|"Majority ack"| Barrier
+    RAFTResult -->|"Failure or<br/>step-down"| SkipErr["mvcc.complete(we)<br/>Return error to client"]
+
+    Barrier --> RoleCheck{"Verify<br/>role == LEADER?"}
+    RoleCheck -->|"Yes"| Apply["memstore.add()<br/>mvcc.completeAndWait()<br/>Return success"]
+    RoleCheck -->|"No (stepped down)"| Cleanup["mvcc.complete(we)<br/>Return error to client"]
+```
 
 On read-only replicas (RAFT followers), the consensus apply callback deserializes the WALEdit and applies it to the local memstore using the leader-assigned sequence ID. Read-only replicas do not write to WAL or HFiles. They rely on the read-write primary's WAL and HFiles on HDFS for recovery.
 
@@ -726,7 +890,7 @@ Promotion sequence on the promoted replica's RegionServer:
   9. Notify the master: promotion complete              [master updates META]
 ```
 
-Steps 2 through 8 all happen locally on the RegionServer. The region becomes structurally ready to accept client writes after step 2, because the RAFT leader lease is already held at that point, but WAL durability requires step 3 to complete before any write can be safely acknowledged to a client.
+Steps 2 through 8 all happen locally on the RegionServer. The region becomes ready to accept client writes after step 2, because the RAFT leader lease is already held at that point, but WAL durability requires step 3 to complete before any write can be safely acknowledged to a client. None of these steps require network communication with other RAFT members. Once a follower has committed entries in its local state (step 1), the remainder of the promotion protocol, catch-up apply, and hibernate convergence proceed using purely local operations. None of the post-election promotion steps should block on RAFT round-trips or peer communication.
 
 This creates a brief gap between the moment a replica becomes RAFT leader and the moment it finishes the full promotion protocol. During this gap, the leader status check returns true because the member holds the leader role and lease, yet the region cannot safely acknowledge client writes because it has not yet acquired a WAL reference. The write path must therefore gate on promotion completion, not merely on leader status. In practice, `HRegion.doMiniBatchMutate()` must check both the leader status and a per-region promotion-complete flag that is set only after step 3 finishes. Any write that arrives before promotion completes is rejected with `NotServingRegionException`, which triggers the client's standard retry loop. This guarantees that no write is ever acknowledged without WAL durability, even though the RAFT leader lease is already valid (verified by the TLA+ model). Safety holds across all states, including crash during promotion, lease expiry during promotion, and double election during promotion.
 
@@ -890,6 +1054,8 @@ The shared-storage catch-up path serves three scenarios: (1) new member bootstra
 
 **RAFT log on local disk.** The RAFT log is stored on local disk. It is not a durability mechanism. The HBase WAL on HDFS handles durability. The RAFT log exists solely to keep follower memstores warm for fast promotion. If a member loses its local RAFT log (e.g., instance replacement), the current leader triggers a flush to materialize the memstore into HFiles on HDFS, then the recovering member loads the fresh HFiles and starts with an empty memstore, the same path as new member bootstrap. The local disk may be an instance-store NVMe device or the EBS root volume; both appear as NVMe block devices to the OS. Instance-store NVMe offers the lowest latency but its contents do not survive instance stop/terminate. The EBS root volume survives instance stop and may allow faster restart without a full bootstrap, but adds I/O latency. For Kubernetes deployments where pods are ephemeral and have no persistent local storage, every pod restart is equivalent to instance replacement. The RAFT log is rebuilt from the leader's log via AppendEntries or from HFiles via CatchUpReference on each restart. EBS root volume IOPS and throughput provisioning should account for the consensus log's sequential write and fdatasync workload.
 
+**Election liveness under adversarial schedules.** Election liveness depends on unbounded RAFT terms and unbounded real time. Any implementation that caps election retry attempts, limits the maximum term number, or imposes a hard timeout on the election process risks violating liveness. If election terms are capped at some maximum value, a series of failed elections can exhaust the cap. Operators who introduce circuit breakers or rate limiters around election retries must ensure they bound the *rate* of attempts, not the total *number* of attempts.
+
 **Scalability at thousands of groups per RegionServer.** A typical RegionServer hosts hundreds to thousands of regions. The consensus layer's architecture (shared event loop, store-level heartbeat coalescing, hibernate idle groups, and unified multiplexed log, all described in the "Consensus Layer Architecture" section) is designed to handle O(10000) groups per RS with overhead proportional to the active write rate, not the total group count.
 
 *Expected resource profile at N=10000 groups per RS:*
@@ -907,14 +1073,14 @@ The shared-storage catch-up path serves three scenarios: (1) new member bootstra
 - `hbase.consensus.port`: Dedicated Netty port for consensus traffic.
 - `hbase.consensus.worker.threads`: Shared thread pool size (default: 2 * cores).
 - `hbase.consensus.heartbeat.interval.ms`: Heartbeat tick interval (default: 500).
-- `hbase.consensus.leader.heartbeat.timeout.ms`: Leader heartbeat timeout, i.e., how long a follower waits before declaring the leader dead and initiating an election (default: 3000). Maps to MicroRaft's leader heartbeat timeout. This is the timing-critical parameter for lease safety: the leader lease duration equals the heartbeat timeout minus twice the max clock drift.
+- `hbase.consensus.leader.heartbeat.timeout.ms`: Leader heartbeat timeout, i.e., how long a follower waits before declaring the leader dead and initiating an election (default: 3000). Maps to MicroRaft's leader heartbeat timeout. This is the timing-critical parameter for lease safety: the leader lease duration must be strictly less than the heartbeat timeout minus twice the max clock drift (default: 2500ms < 3000 - 400 = 2600ms).
 - `hbase.consensus.hibernate.timeout.ms`: Inactivity timeout before hibernation (default: 30000).
 - `hbase.consensus.log.segment.size.mb`: Unified log segment size (default: 256).
 - `hbase.consensus.log.sync.batch.ms`: Batched fdatasync interval (default: 10).
 - `hbase.consensus.propose.batch.max.entries`: Maximum proposals combined into a single AppendEntries per group (default: 16).
 - `hbase.consensus.maxgroups`: Maximum RAFT groups per RS (default: the value of `hbase.regionserver.maxregions`).
 
-*Monitoring:* Expose per-RS metrics for RAFT group count (active, hibernated), aggregate heartbeat rate, consensus log disk usage, apply latency, propose latency, `consensus_proposals_batched` (histogram of entries per AppendEntries), `consensus_apply_batch_size` (histogram of entries per follower apply), and `consensus_appends_coalesced` (histogram of groups per BatchAppendEntries frame). Alert on group count approaching the configured limit.
+*Monitoring:* Expose per-RS metrics for RAFT group count (active, hibernated), aggregate heartbeat rate, consensus log disk usage, apply latency, propose latency, `consensus_proposals_batched` (histogram of entries per AppendEntries), `consensus_apply_batch_size` (histogram of entries per follower apply), and `consensus_appends_coalesced` (histogram of groups per BatchAppendEntries frame). Alert on group count approaching the configured limit. Network health must be tracked per member-to-member link, not just per RegionServer. A `consensus_peer_link_up` gauge per peer reports whether the Netty connection to that peer is currently established. A `consensus_peer_last_response_ms` gauge per peer tracks time since the last successful message exchange. Partial partitions can leave some members fully connected while others are isolated.
 
 Since only the primary writes HFiles to HDFS, the primary's ability to flush depends on HDFS availability. If HDFS is degraded (e.g., the NameNode in the primary's AZ is unreachable), the primary cannot flush but can continue to accept writes in memstore (bounded by memstore size limits). RAFT replication continues independently of HDFS. Replicas receive and apply RAFT log entries to their memstores regardless of the primary's flush status. If the primary cannot flush for an extended period, it will hit memstore back-pressure and slow down writes, which is the same behavior as a non-replicated region under HDFS pressure.
 
@@ -948,6 +1114,21 @@ Phoenix adds its own ZooKeeper dependencies on top of HBase's. The legacy `jdbc:
 The `hbase-consensus` module, designed as a general-purpose RAFT engine with pluggable callbacks and opaque group and entry types, can eventually subsume all of these roles across both HBase and Phoenix, eliminating ZooKeeper as an external dependency entirely.
 
 This appendix outlines a high-level, multi-phase roadmap. Each phase is independently valuable and deployable. No phase is a prerequisite for the region replica work described in the main design. This is a future direction that the `hbase-consensus` architecture deliberately does not foreclose.
+
+```mermaid
+flowchart LR
+    P1["Region Replica<br/>Consensus<br/>(foundation)"]
+
+    P1 --> P2["Master<br/>Election"]
+    P2 --> P3["RS Liveness<br/>via Consensus<br/>Lease"]
+    P3 --> P4["Cluster<br/>Metadata<br/>via Master<br/>RAFT Group"]
+    P4 --> P5["Replication<br/>State"]
+
+    P1 --> P6["Phoenix JDBC<br/>+ HA State<br/>Migration"]
+
+    P5 --> P7["Full ZooKeeper<br/>Removal"]
+    P6 --> P7
+```
 
 ### Current ZooKeeper Roles (What Must Be Replaced)
 
@@ -1050,22 +1231,24 @@ A TLA+ specification models the protocols described in the design document that 
 | 16 | `CatchUpDataIntegrity` | Every committed entry is recoverable via RAFT log replay (in a majority of logs) or via HFiles on HDFS (covered by a committed flush marker with durable HFiles). Formalized as: `∀ s ∈ committedEntries : Cardinality({m ∈ Members : s ∈ raftLog[m]}) ≥ Majority ∨ ∃ f ∈ flushMarkerEntries ∩ hdfsHFiles : f ≥ s`. | Verified |
 | 17 | `CatchUpCompleteness` | Once a follower (or promoting member) has applied all committed entries (`ApplicableEntries(m) = {}` and `fApplyBatch[m] = {}`), its memstore is consistent with the committed state: every committed entry is in memstore or covered by an applied flush marker (data is in HFiles on HDFS). Verifies no entries are lost or applied twice during catch-up with concurrent flush. | Verified |
 
+
+
 #### Liveness Properties
 
-| # | Property | Description |
-|---|----------|-------------|
-| 1 | `ElectionProgress` | If the leader is lost, a new leader is eventually elected (under fair scheduling) |
-| 2 | `WriteCompletion` | A proposed write to a healthy group (majority alive) eventually commits |
-| 3 | `FlushCompletion` | A flush initiated by the leader eventually completes (flush-complete marker committed) if the leader remains alive and a majority is reachable |
-| 4 | `PromotionCompletion` | SCP's PRIMARY_PROMOTED transition eventually completes if the elected replica's RegionServer is alive |
-| 5 | `CatchUpCompletion` | A new or recovering member eventually catches up to the current committed index if the leader is alive and HDFS is accessible |
-| 6 | `HibernateConvergence` | An idle group eventually enters hibernate state after the configured timeout |
-| 7 | `OrphanHFileCleanup` | Orphan HFiles from an incomplete flush are eventually cleaned up if the new primary is alive and HDFS is accessible |
-| 8 | `WakeElectionProgress` | If the leader dies mid-wake, the partially-awake followers eventually start their election timers and elect a new leader |
+| # | Property | Fairness | Description | Status |
+|---|----------|----------|-------------|--------|
+| 1 | `ElectionProgress` | BaseFairness + ElectionSF | If no member holds a valid leader lease, eventually some member acquires one. Requires SF on RequestVote, BecomeLeader, StepDown, and HealAllPartitions. | Verified (simulation) |
+| 2 | `WriteCompletion` | BaseFairness + WriteSF | A write in the Pending phase eventually returns to Idle — either the normal path completes or the WAL fails and the leader aborts. Requires SF on RAFTCommitWrite and HealAllPartitions. | Verified (simulation) |
+| 3 | `FlushCompletion` | BaseFairness + FlushSF | A flush in any non-Idle phase eventually returns to Idle — either the phase chain completes or a crash resets the flush state. Requires SF on FlushRAFTPropose, FlushRAFTCommit, and HealAllPartitions. | Verified (simulation) |
+| 4 | `PromotionCompletion` | BaseFairness | A member in the Promoting phase eventually leaves it — either PromotionComplete fires or the member steps down / crashes. WF-only (no network dependency). | Verified (simulation) |
+| 5 | `CatchUpCompletion` | BaseFairness | A follower with unapplied committed entries eventually catches up or leaves the Follower role. WF-only (no network dependency). | Verified (simulation) |
+| 6 | `HibernateConvergence` | BaseFairness | A member in the Waking hibernate state eventually transitions out — either WakeComplete fires, or lease expiry triggers a new election cycle, or a crash resets to Active. WF-only. | Verified (simulation) |
+| 7 | `OrphanHFileCleanup` | — | Orphan HFiles from an incomplete flush are eventually cleaned up if the new primary is alive and HDFS is accessible | Pending |
+| 8 | `WakeElectionProgress` | — | If the leader dies mid-wake, the partially-awake followers eventually start their election timers and elect a new leader | Pending |
 
 ### Iterative Development Plan
 
-**Standing instruction:** Each iteration ends with a mirror-back review step. After simulation model checking completes with no violations (a clean 15–30 minute run), review counterexamples and learnings from model development. If the formal model exposes under-specification, ambiguity, or incorrect informal reasoning in the design document, amend the design document. If the formal model is insufficient for modeling the critical aspects of the design or implementation, amend the formal model. When a design element is formally verified, add a short parenthetical in the relevant section. The formal spec is not just a verification artifact, it is a mandatory tool for design refinement. The exhaustive check runs as a daily background job on buildbox.aws (see "Running TLC" below) and is not part of the inner development loop; do not block iteration completion on the exhaustive run.
+**Standing instruction:** Each iteration ends with a mirror-back review step. After simulation model checking completes with no violations (a clean 15–30 minute run), review counterexamples and learnings from model development. If the formal model exposes under-specification, ambiguity, or incorrect informal reasoning in the design document, amend the design document. If the formal model is insufficient for modeling the critical aspects of the design or implementation, amend the formal model. When a design element is formally verified, add a short parenthetical in the relevant section. The formal spec is not just a verification artifact, it is a mandatory tool for design refinement.
 
 ~~**Iteration 1. Member roles and term fencing.**~~
 ~~**Iteration 2. Leader lease acquisition, expiry, and vote durability.**~~
@@ -1083,12 +1266,14 @@ A TLA+ specification models the protocols described in the design document that 
 ~~**Iteration 14. Promotion + in-flight writes.**~~
 ~~**Iteration 15. Catch-up + concurrent flush.**~~
 ~~**Iteration 16. Hibernate/wake lifecycle and wake race.**~~
-
-**Iteration 17. Multi-group interactions.** Verify that operations on one group (election, flush, promotion) do not interfere with another group sharing the same ConsensusServer. Focus on shared thread pool scheduling and unified log correctness.
-
-**Iteration 18. Fairness and liveness properties.** Add fairness constraints (WF on deterministic protocol steps, SF on environmental recovery) and verify `ElectionProgress`, `WriteCompletion`, `FlushCompletion`, `PromotionCompletion`, `CatchUpCompletion`, and `HibernateConvergence`.
+~~**Iteration 17. Multi-group interactions.**~~
+~~**Iteration 18. Fairness and liveness properties.**~~
 
 **Iteration 19 — Region split/merge with RAFT groups.** Model parent group close → daughter group creation for split; symmetric for merge. Verify that no period exists where both parent and daughter groups are active for the same key range.
+
+**Iteration 20 — Combined simulation-mode liveness checking.** Define `LiveSpecAll` (combined fairness with all SF terms: ElectionSF + WriteSF + FlushSF) in `RaftRegionReplica.tla` and create `MCRaftRegionReplica_liveness_all.cfg` listing all 6 liveness properties. This is only useful for TLC `-simulate` mode (exhaustive checking would hit DNF blowup with the combined SF terms). Enables a single simulation run to check all liveness properties simultaneously rather than requiring 6 separate runs.
+
+**Iteration 21 — Datapath module refactor.** Refactor `MCRaftRegionReplica_datapath.tla` to use `GroupDataPathNext` from the base spec instead of defining its own `FollowerBatchApply` and `CompleteWriteAndAck` actions, which are functionally identical to the base spec's `AtomicFollowerBatchApply` and `AtomicCompleteWriteAndAck`. Express `DataPathNext` as `GroupDataPathNext` plus shared-impact actions (ClockTick, CrashRestart, CreatePartition, HealPartition, RaftLogGC), eliminating the duplicate definitions and reducing maintenance surface.
 
 ### Specification
 
@@ -1096,11 +1281,13 @@ The full TLA+ specification is included in its entirety at the end of this appen
 
 #### Model Checking Results
 
-Three model-checking configurations are maintained:
+Five categories of model-checking configurations are maintained:
 
-- **Exhaustive** (`MCRaftRegionReplica.tla` + `.cfg`): MaxSeqId = 3, symmetry-reduced, breadth-first. Run on buildbox.aws Proves absence of invariant violations across the complete state space. Expected runtime ~24 hours; run as a daily job after spec changes.
+- **Exhaustive** (`MCRaftRegionReplica.tla` + `.cfg`): MaxSeqId = 3, symmetry-reduced, breadth-first. Proves absence of invariant violations across the complete state space. Expected runtime ~24 hours; run as a daily job after spec changes.
 - **Simulation (dev inner loop)** (`MCRaftRegionReplica_sim.tla` + `_sim.cfg`): MaxSeqId = 5, no symmetry, TLC `-simulate` mode with `-depth 120`. Used as the fast validation loop during spec development. Counterexamples from invariant violations are typically found within minutes if they exist. Depth 120 is tuned so that every trace is deep enough to complete the most complex 5-seqId scenario.
 - **Simulation (daily deep run)**: Same configuration as above but with `-Dtlc2.TLC.stopAfter=28800` (8 hours). Supplements the exhaustive run by exercising longer traces and higher seqId values.
+- **Multi-group** (`MCRaftRegionReplica_multigroup.tla` + `_multigroup.cfg`): Two RAFT groups sharing clock, network, and unified log. MaxSeqId = 2, zero clock drift, data-path action merges. Verifies that operations on one group do not violate another group's safety invariants.
+- **Liveness simulation** (six per-property configs, `MCRaftRegionReplica_liveness_*.cfg`): Each config pairs a per-property `SPECIFICATION` (`LiveSpecElection`, `LiveSpecWrite`, etc.) with the matching `PROPERTY`. The shared liveness MC module (`MCRaftRegionReplica_liveness.tla`) uses MaxTerm = 2, MaxClock = 4, MaxSeqId = 2; the election-specific MC module (`MCRaftRegionReplica_liveness_election.tla`) uses MaxTerm = 4, MaxClock = 12, MaxSeqId = 1 (more term/clock headroom, fewer seqIds). All use MaxClockDrift = 1.
 
 #### Running TLC
 
@@ -1111,12 +1298,9 @@ The simulation mode is the primary validation tool during spec development. It e
 Depth 120 is chosen so that every trace reaches the deepest interesting scenario (~80 steps for the 5-seqId orphan-flush + re-flush path with two full election cycles) while avoiding the diminishing-returns tail beyond step ~100.
 
 ```bash
-java -XX:+UseParallelGC \
+java -XX:+UseParallelGC -cp tla2tools.jar \
   -Dtlc2.TLC.stopAfter=1800 \
-  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
-  -cp tla2tools.jar \
-  tlc2.TLC MCRaftRegionReplica_sim \
-  -simulate -depth 120 -workers auto
+  tlc2.TLC MCRaftRegionReplica_sim  -simulate -depth 120 -workers auto
 ```
 
 Adjust `-Dtlc2.TLC.stopAfter` (seconds) to control the run duration: e.g. 900, 1800, or 28800.
@@ -1126,11 +1310,50 @@ Adjust `-Dtlc2.TLC.stopAfter` (seconds) to control the run duration: e.g. 900, 1
 The exhaustive mode proves absence of invariant violations across the complete state space at MaxSeqId = 3.
 
 ```bash
-java -XX:+UseParallelGC \
-  -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
-  -cp tla2tools.jar \
-  tlc2.TLC MCRaftRegionReplica \
-  -workers auto 
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  tlc2.TLC MCRaftRegionReplica -workers auto 
+```
+
+##### Domain-Decomposed Exhaustive Configurations
+
+In addition to the full exhaustive and simulation configurations above, two domain-focused exhaustive configurations split the state space into orthogonal domains that can run concurrently, completing in minutes instead of days:
+
+- **`MCRaftRegionReplica_datapath`** — Full data-path coverage (MaxSeqId=3) with simplified timing (MaxClockDrift=0). Merged and removed actions reduce the branching factor. Provides BFS proof of data-path protocol correctness (flush, write pipeline, log GC, catch-up, bootstrap).
+
+- **`MCRaftRegionReplica_election`** — Full timing/drift coverage (MaxClockDrift=1, ElectionTimeoutMin=4) with minimal data path (MaxSeqId=1). Uses the original unmodified `Next` with all 35 actions. Provides BFS proof of election safety, lease exclusivity, and term fencing.
+
+Together with simulation (which exercises both domains simultaneously at MaxSeqId=5), these configurations cover all 14 invariants non-trivially.
+
+##### Multi-Group Simulation
+
+The multi-group configuration verifies that two RAFT groups sharing the same `ConsensusServer` resources (clock, network, unified log) do not interfere with each other's safety properties. It uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared clock, network partitions, and a `UnifiedLogGC` action modeling cross-group log segment deletion accounting.
+
+```bash
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  -Dtlc2.TLC.stopAfter=1800 \
+  tlc2.TLC MCRaftRegionReplica_multigroup -simulate -depth 150 -workers auto
+```
+
+##### Liveness Simulation
+
+Liveness properties are verified through simulation because the state space under the liveness constants (e.g., MaxTerm=4, MaxClock=12 for election; MaxTerm=2, MaxClock=4 for others) without symmetry reduction is too large for exhaustive checking. Each of the six properties has its own `.cfg` file that selects the appropriate `SPECIFICATION` (with the matching fairness constraints) and `PROPERTY`. The properties are split across separate configs to ensure the verification is tractable. The election property uses its own MC module (`MCRaftRegionReplica_liveness_election`); the other five use the shared module (`MCRaftRegionReplica_liveness`) with per-property `.cfg` files:
+
+```bash
+echo "=== Liveness: election ==="
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  -Dtlc2.TLC.stopAfter=1800 \
+  tlc2.TLC MCRaftRegionReplica_liveness_election \
+  -config MCRaftRegionReplica_liveness_election.cfg \
+  -simulate -depth 150 -workers auto
+
+for prop in write flush promotion catchup hibernate; do
+  echo "=== Liveness: $prop ==="
+  java -XX:+UseParallelGC -cp tla2tools.jar \
+    -Dtlc2.TLC.stopAfter=1800 \
+    tlc2.TLC MCRaftRegionReplica_liveness \
+    -config MCRaftRegionReplica_liveness_${prop}.cfg \
+    -simulate -depth 150 -workers auto
+done
 ```
 
 ### TLA+ Specification: `RaftRegionReplica.tla`
@@ -1774,7 +1997,7 @@ CreatePartition ==
                        writeVars, flushVars, promotionPhase, hibernateState>>
 
 \* Nondeterministically heal a partition between two members.
-\* Models network recovery.
+\* Models individual network link recovery.
 HealPartition ==
     \E m1, m2 \in Members :
         /\ <<m1, m2>> \in partition
@@ -1784,6 +2007,19 @@ HealPartition ==
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                        writeVars, flushVars, promotionPhase, hibernateState>>
+
+\* Heal ALL partitions at once — full network recovery.
+\* This action is deterministic (no internal nondeterminism) so
+\* SF_vars(HealAllPartitions) guarantees that if the network is ever
+\* partitioned, it eventually fully recovers.
+HealAllPartitions ==
+    /\ partition # {}
+    /\ partition' = {}
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   writeVars, flushVars, promotionPhase, hibernateState>>
 
 \* ---- Leader write path actions ----
 
@@ -1887,11 +2123,11 @@ RAFTCommitWrite(m) ==
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
-\* HRegion.doMiniBatchMutate steps 5-7: barrier join -> memstore.add()
-\* (cells already stamped with seqId) -> mvcc.completeAndWait() (makes
-\* cells visible to readers).  The write is now durable (WAL on HDFS +
-\* replicated via RAFT) and visible.  The write's seqId is added to
-\* the leader's memstore.
+\* HRegion.doMiniBatchMutate steps 5-8: barrier join -> verify role ->
+\* memstore.add() (cells already stamped with seqId) ->
+\* mvcc.completeAndWait() (makes cells visible to readers).  The write
+\* is now durable (WAL on HDFS + replicated via RAFT) and visible.
+\* The write's seqId is added to the leader's memstore.
 \*
 \* Guard: walSync must be "Done" and raftCommitted must be TRUE.  This
 \* is the write barrier — the central safety mechanism ensuring no write
@@ -1912,7 +2148,7 @@ CompleteWrite(m) ==
                    promotionPhase, hibernateState>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
-\* doMiniBatchMutate (step 8) and resets the write pipeline for the
+\* doMiniBatchMutate (step 9) and resets the write pipeline for the
 \* next write.
 AckWrite(m) ==
     /\ writePhase[m] = "Applied"
@@ -2628,7 +2864,10 @@ WakeComplete(m) ==
 ----
 (* ---- Next-state relation and specification ---- *)
 
-Next ==
+\* Actions common to both GroupNext and GroupDataPathNext.  The write
+\* path and follower-apply actions that differ between the two (merged
+\* vs unmerged) are added by each variant separately.
+GroupCoreNext ==
     \* Election
     \/ \E m \in Members     : Timeout(m)
     \/ \E c, v \in Members  : RequestVote(c, v)
@@ -2637,39 +2876,23 @@ Next ==
     \/ \E m \in Members     : Heartbeat(m)
     \/ \E m \in Members     : StepDown(m)
     \/ \E m \in Members     : LeaderLeaseExpiry(m)
-    \* Timing
-    \/ \E m \in Members     : ClockTick(m)
-    \* Crash recovery
-    \/ \E m \in Members     : CrashRestart(m)
-    \* Network
-    \/ CreatePartition
-    \/ HealPartition
-    \* Write path
+    \* Write path (common subset)
     \/ \E m \in Members     : BeginWrite(m)
     \/ \E m \in Members     : WALSyncComplete(m)
-    \/ \E m \in Members     : WALSyncFail(m)
     \/ \E m \in Members     : RAFTCommitWrite(m)
-    \/ \E m \in Members     : CompleteWrite(m)
-    \/ \E m \in Members     : AckWrite(m)
-    \/ \E m \in Members     : WALFailureAbort(m)
-    \* Markers
-    \/ \E m \in Members     : ProposeMarker(m)
     \* Flush protocol
     \/ \E m \in Members     : FlushStart(m)
     \/ \E m \in Members     : FlushCommitHFiles(m)
     \/ \E m \in Members     : FlushRAFTPropose(m)
     \/ \E m \in Members     : FlushRAFTCommit(m)
     \/ \E m \in Members     : FlushComplete(m)
-    \* Follower apply
-    \/ \E m \in Members     : FollowerBeginBatchApply(m)
-    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+    \* Follower apply (common subset)
     \/ \E m \in Members     : FollowerApplyMarker(m)
     \* Promotion
     \/ \E m \in Members     : PromotionComplete(m)
     \* Orphan commitment
     \/ NewLeaderCommitOrphanEntry
-    \* RAFT log GC and catch-up
-    \/ \E m \in Members     : RaftLogGC(m)
+    \* Catch-up (not GC — GC is in the shared-impact set)
     \/ \E l, f \in Members  : InstallSnapshot(l, f)
     \* New member bootstrap
     \/ \E m \in Members     : NewMemberBootstrap(m)
@@ -2677,6 +2900,103 @@ Next ==
     \/ \E m \in Members     : HibernateRequest(m)
     \/ \E m \in Members     : WakeGroup(m)
     \/ \E m \in Members     : WakeComplete(m)
+
+\* Per-group subset of Next for multi-group composition.  Excludes the
+\* five "shared-impact" actions whose effects span all groups on a
+\* server: ClockTick (shared physical clock), CrashRestart (server
+\* crash kills all groups), CreatePartition / HealPartition (network
+\* link affects all groups), and RaftLogGC (unified log segment
+\* deletion affects all groups).  The multi-group module
+\* (MultiGroupRaftRegionReplica) provides custom versions of these
+\* five actions that correctly apply to all co-located groups, and
+\* uses G1!GroupNext / G2!GroupNext for per-group steps.
+GroupNext ==
+    \/ GroupCoreNext
+    \* Write path (unmerged actions not in GroupCoreNext)
+    \/ \E m \in Members     : WALSyncFail(m)
+    \/ \E m \in Members     : CompleteWrite(m)
+    \/ \E m \in Members     : AckWrite(m)
+    \/ \E m \in Members     : WALFailureAbort(m)
+    \* Markers
+    \/ \E m \in Members     : ProposeMarker(m)
+    \* Follower apply (unmerged actions not in GroupCoreNext)
+    \/ \E m \in Members     : FollowerBeginBatchApply(m)
+    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+
+\* Merged actions for data-path domain decomposition.  These are used
+\* by GroupDataPathNext (below) and the multi-group MC configuration.
+\* The rationale for each merge is documented in
+\* MCRaftRegionReplica_datapath.tla.
+
+\* Atomic follower batch apply: computes the mutation batch and applies
+\* it to memstore in a single step.  Merges FollowerBeginBatchApply +
+\* FollowerCompleteBatchApply.  fApplyBatch is never modified.
+AtomicFollowerBatchApply(m) ==
+    /\ \/ role[m] = "Follower"
+       \/ promotionPhase[m] = "Promoting"
+    /\ fApplyBatch[m] = {}
+    /\ LET applicable == ApplicableEntries(m)
+       IN /\ applicable # {}
+          /\ LET nextEntry == SetMin(applicable)
+             IN /\ nextEntry \notin markerEntries
+                /\ LET applicableMarkers == applicable \cap markerEntries
+                       boundary == IF applicableMarkers # {}
+                                   THEN SetMin(applicableMarkers)
+                                   ELSE MaxSeqId + 1
+                       batch == {s \in applicable \ markerEntries : s < boundary}
+                   IN memstore' = [memstore EXCEPT ![m] = @ \union batch]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining, partition,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   writePhase, walSync, raftCommitted, writeSeqId,
+                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
+
+\* Atomic write completion and ack: applies the write to memstore and
+\* resets the write pipeline in a single step.  Merges CompleteWrite +
+\* AckWrite, skipping the transient "Applied" phase.
+AtomicCompleteWriteAndAck(m) ==
+    /\ writePhase[m] = "Pending"
+    /\ walSync[m] = "Done"
+    /\ raftCommitted[m]
+    /\ role[m] = "Leader"
+    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
+    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
+    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
+    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
+    /\ memstore'      = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining, partition,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
+
+\* Per-group data-path next-state relation for multi-group composition.
+\* Like GroupNext but with the same action merges and removals as
+\* MCRaftRegionReplica_datapath.tla:
+\*   - FollowerBeginBatchApply + FollowerCompleteBatchApply merged
+\*   - CompleteWrite + AckWrite merged
+\*   - ProposeMarker, WALSyncFail, WALFailureAbort removed
+GroupDataPathNext ==
+    \/ GroupCoreNext
+    \* Write path (merged)
+    \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
+    \* Follower apply (merged)
+    \/ \E m \in Members     : AtomicFollowerBatchApply(m)
+
+\* Full next-state relation: per-group actions plus shared-impact actions.
+Next ==
+    \/ GroupNext
+    \* Timing
+    \/ \E m \in Members     : ClockTick(m)
+    \* Crash recovery
+    \/ \E m \in Members     : CrashRestart(m)
+    \* Network
+    \/ CreatePartition
+    \/ HealPartition
+    \/ HealAllPartitions
+    \* RAFT log GC
+    \/ \E m \in Members     : RaftLogGC(m)
 
 Spec == Init /\ [][Next]_vars
 
@@ -2951,6 +3271,165 @@ THEOREM SafetyTHM ==
                /\ PromotionReadWriteGuard
                /\ PromotionMVCCContinuity
                /\ CatchUpCompleteness)
+
+----
+(* ---- Fairness and liveness properties ---- *)
+
+\* Fairness constraints.
+\*
+\* Factored into BaseFairness (WF on all non-network-dependent actions)
+\* plus per-property SF additions.  This factoring is necessary because
+\* TLC converts the fairness formula to DNF, where each SF_vars(A) term
+\* contributes 2 disjuncts, giving 2^N branches for N SF terms.  A
+\* monolithic fairness with all network-dependent actions as SF would
+\* exceed TLC's DNF capacity.  Per-property specs include only the
+\* minimum SF terms that the property's progress chain requires.
+\*
+\* WF (weak fairness) on actions whose enabling conditions do not
+\* depend on network connectivity — once enabled, they remain enabled
+\* until they fire (no external event disables them).
+\*
+\* SF (strong fairness) on actions whose enabling conditions check
+\* CanCommunicate or require a majority of reachable members.  Because
+\* CreatePartition is a perturbation (no fairness), it can fire at any
+\* time and repeatedly disable these actions.  SF requires that if the
+\* action is enabled infinitely often, it eventually fires — capturing
+\* the real-world expectation that network connectivity windows are
+\* long enough for atomic protocol steps to complete.
+\*
+\* No fairness on perturbation actions (CrashRestart, CreatePartition,
+\* WALSyncFail) — failures are nondeterministic and must not be forced.
+BaseFairness ==
+    \* Election (Timeout only needs timerRemaining=0, no network)
+    /\ \A m \in Members     : WF_vars(Timeout(m))
+    \* Leadership
+    /\ \A m \in Members     : WF_vars(LeaderLeaseExpiry(m))
+    /\ \A m \in Members     : WF_vars(StepDown(m))
+    \* Timing
+    /\ \A m \in Members     : WF_vars(ClockTick(m))
+    \* Write path (local I/O and pipeline steps)
+    /\ \A m \in Members     : WF_vars(BeginWrite(m))
+    /\ \A m \in Members     : WF_vars(WALSyncComplete(m))
+    /\ \A m \in Members     : WF_vars(CompleteWrite(m))
+    /\ \A m \in Members     : WF_vars(AckWrite(m))
+    /\ \A m \in Members     : WF_vars(WALFailureAbort(m))
+    \* Flush protocol (local steps)
+    /\ \A m \in Members     : WF_vars(FlushStart(m))
+    /\ \A m \in Members     : WF_vars(FlushCommitHFiles(m))
+    /\ \A m \in Members     : WF_vars(FlushComplete(m))
+    \* Follower apply (local processing of committed entries)
+    /\ \A m \in Members     : WF_vars(FollowerBeginBatchApply(m))
+    /\ \A m \in Members     : WF_vars(FollowerCompleteBatchApply(m))
+    /\ \A m \in Members     : WF_vars(FollowerApplyMarker(m))
+    \* Promotion (local: requires ApplicableEntries={}, no network)
+    /\ \A m \in Members     : WF_vars(PromotionComplete(m))
+    \* Orphan commitment (requires IsLeader but not CanCommunicate)
+    /\ WF_vars(NewLeaderCommitOrphanEntry)
+    \* Log GC (local)
+    /\ \A m \in Members     : WF_vars(RaftLogGC(m))
+    \* Hibernate (WakeGroup sends to reachable; no majority gate)
+    /\ \A m \in Members     : WF_vars(WakeGroup(m))
+
+\* SF additions for ElectionProgress.
+\* RequestVote + BecomeLeader + StepDown all require CanCommunicate;
+\* partition oscillation can repeatedly disable them.  StepDown is
+\* needed because a stale Candidate whose votesGranted >= Majority
+\* blocks ClockTick (the "no pending BecomeLeader" guard) even when
+\* BecomeLeader itself is disabled (higher-term members exist).
+\* SF on HealAllPartitions (not HealPartition) because
+\* HealPartition's \E nondeterminism allows TLC to always heal the
+\* same unhelpful link.  HealAllPartitions is deterministic: it
+\* forces full network recovery, preventing isolated-member cycles.
+\* 16 SF terms.
+ElectionSF ==
+    /\ SF_vars(HealAllPartitions)
+    /\ \A c, v \in Members  : SF_vars(RequestVote(c, v))
+    /\ \A m \in Members     : SF_vars(BecomeLeader(m))
+    /\ \A m \in Members     : SF_vars(StepDown(m))
+
+\* SF additions for WriteCompletion.
+\* RAFTCommitWrite requires majority reachable.
+\* 4 SF terms.
+WriteSF ==
+    /\ SF_vars(HealAllPartitions)
+    /\ \A m \in Members     : SF_vars(RAFTCommitWrite(m))
+
+\* SF additions for FlushCompletion.
+\* FlushRAFTPropose + FlushRAFTCommit require majority reachable.
+\* 7 SF terms.
+FlushSF ==
+    /\ SF_vars(HealAllPartitions)
+    /\ \A m \in Members     : SF_vars(FlushRAFTPropose(m))
+    /\ \A m \in Members     : SF_vars(FlushRAFTCommit(m))
+
+\* Per-property specification formulas.  Each includes only the SF
+\* terms needed for its progress chain to avoid DNF blowup.
+LiveSpecElection == Init /\ [][Next]_vars /\ BaseFairness /\ ElectionSF
+LiveSpecWrite    == Init /\ [][Next]_vars /\ BaseFairness /\ WriteSF
+LiveSpecFlush    == Init /\ [][Next]_vars /\ BaseFairness /\ FlushSF
+
+\* PromotionCompletion, CatchUpCompletion, HibernateConvergence need
+\* only local actions (all WF in BaseFairness, no network dependency):
+\* follower apply drains committed entries for Promotion/CatchUp;
+\* ClockTick + Timeout exits the Waking state for Hibernate.
+LiveSpecLocal    == Init /\ [][Next]_vars /\ BaseFairness
+
+\* ---- Liveness properties ----
+
+\* If no member holds a valid leader lease, eventually some member
+\* acquires one.  Depends on WF of ClockTick (timers count down)
+\* and Timeout (election starts), and SF of RequestVote (votes
+\* delivered despite partition oscillation), BecomeLeader (majority
+\* wins despite partition oscillation), and HealAllPartitions
+\* (network eventually fully recovers).
+ElectionProgress ==
+    (\A m \in Members : ~IsLeader(m)) ~> (\E m \in Members : IsLeader(m))
+
+\* A write in the Pending phase eventually returns to Idle — either
+\* the normal path completes (WAL sync + RAFT commit + barrier +
+\* ack) or the WAL fails and the leader aborts (WALFailureAbort,
+\* which resets the pipeline via crash).
+WriteCompletion ==
+    \A m \in Members :
+        writePhase[m] = "Pending" ~> writePhase[m] = "Idle"
+
+\* A flush in any non-Idle phase eventually returns to Idle — either
+\* the phase chain completes (HFiles + propose + commit + drop) or
+\* a crash resets the flush state.
+FlushCompletion ==
+    \A m \in Members :
+        flushPhase[m] # "Idle" ~> flushPhase[m] = "Idle"
+
+\* A member in the Promoting phase eventually leaves it — either
+\* PromotionComplete fires (after follower apply drains all
+\* committed entries), or the member steps down / crashes.
+PromotionCompletion ==
+    \A m \in Members :
+        promotionPhase[m] = "Promoting" ~> promotionPhase[m] # "Promoting"
+
+\* A follower with unapplied committed entries eventually catches
+\* up (ApplicableEntries drains to empty with no batch in flight)
+\* or leaves the Follower role (election / crash).
+CatchUpCompletion ==
+    \A m \in Members :
+        (role[m] = "Follower" /\ ApplicableEntries(m) # {})
+            ~> (role[m] # "Follower"
+                \/ (ApplicableEntries(m) = {} /\ fApplyBatch[m] = {}))
+
+\* A member in the Waking hibernate state eventually transitions
+\* out — either WakeComplete fires, or lease expiry triggers a
+\* new election cycle that resets hibernate state, or a crash
+\* resets to Active.
+HibernateConvergence ==
+    \A m \in Members :
+        hibernateState[m] = "Waking" ~> hibernateState[m] # "Waking"
+
+THEOREM ElectionProgressTHM  == LiveSpecElection => ElectionProgress
+THEOREM WriteCompletionTHM   == LiveSpecWrite    => WriteCompletion
+THEOREM FlushCompletionTHM   == LiveSpecFlush    => FlushCompletion
+THEOREM PromotionCompletionTHM == LiveSpecLocal  => PromotionCompletion
+THEOREM CatchUpCompletionTHM == LiveSpecLocal    => CatchUpCompletion
+THEOREM HibernateConvergenceTHM == LiveSpecLocal => HibernateConvergence
 
 ====
 ```
@@ -3422,7 +3901,7 @@ CHECK_DEADLOCK FALSE
  * This module targets exhaustive verification of election safety, lease
  * exclusivity under worst-case clock drift, term fencing, and timer/
  * heartbeat protocols.  It uses the ORIGINAL UNMODIFIED Next relation
- * with all 34 actions — no action merges, no action removals.  The only
+ * with all 35 actions — no action merges, no action removals.  The only
  * change from the full exhaustive config (MCRaftRegionReplica) is
  * reducing MaxSeqId from 3 to 1.
  *
@@ -3549,12 +4028,815 @@ CHECK_DEADLOCK FALSE
 ```
 <!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_election.cfg -->
 
-### Domain-Decomposed Exhaustive Configurations
+### TLA+ Specification: `MultiGroupRaftRegionReplica.tla`
 
-In addition to the full exhaustive and simulation configurations above, two domain-focused exhaustive configurations split the state space into orthogonal domains that can run concurrently, completing in minutes instead of days:
+<!-- CUT:src/main/tla/RaftRegionReplica/MultiGroupRaftRegionReplica.tla -->
+```tla
+---- MODULE MultiGroupRaftRegionReplica ----
+(*
+ * Multi-group composition of RaftRegionReplica.
+ *
+ * Models two independent RAFT groups (G1, G2) sharing the same
+ * ConsensusServer resources on a set of RegionServers:
+ *
+ *   - Shared physical clock (clock): ClockTick decrements both
+ *     groups' timers simultaneously.
+ *   - Shared network (partition): partitions affect both groups.
+ *   - Unified multiplexed consensus log: log segment GC requires
+ *     ALL groups to have flushed past their entries before deletion.
+ *   - Shared thread pool (MultiGroupExecutor): modeled implicitly
+ *     by TLA+'s nondeterministic interleaving — any enabled action
+ *     from either group may fire at each step.
+ *
+ * Per-group actions are dispatched via G1!GroupNext / G2!GroupNext
+ * (the per-group subset of Next defined in RaftRegionReplica.tla).
+ * Five "shared-impact" actions are replaced with multi-group
+ * versions: ClockTick, CrashRestart, CreatePartition, HealPartition,
+ * and RaftLogGC (replaced by UnifiedLogGC).
+ *
+ * Server crash (MultiGroupCrashRestart) resets volatile state for
+ * BOTH groups on the crashed member, modeling the physical reality
+ * that a process crash kills all RAFT groups on that server.
+ *
+ * All 14 single-group safety invariants are checked per-group via
+ * INSTANCE (G1!LeaderUniqueness, G2!LeaderUniqueness, etc.).
+ * CatchUpDataIntegrity is the key cross-group invariant: it verifies
+ * that unified log GC does not delete entries still needed by
+ * either group for catch-up.
+ *)
+EXTENDS Naturals, FiniteSets
 
-- **`MCRaftRegionReplica_datapath`** — Full data-path coverage (MaxSeqId=3) with simplified timing (MaxClockDrift=0). Merged and removed actions reduce the branching factor. Provides BFS proof of data-path protocol correctness (flush, write pipeline, log GC, catch-up, bootstrap). Completes in minutes.
+CONSTANTS
+    Members,
+    None,
+    MaxTerm,
+    LeaderLeaseDuration,
+    ElectionTimeoutMin,
+    MaxClockDrift,
+    MaxClock,
+    MaxSeqId
 
-- **`MCRaftRegionReplica_election`** — Full timing/drift coverage (MaxClockDrift=1, ElectionTimeoutMin=4) with minimal data path (MaxSeqId=1). Uses the original unmodified `Next` with all 34 actions. Provides BFS proof of election safety, lease exclusivity, and term fencing. Completes in minutes.
+\* ---- Shared state ----
+VARIABLES clock, partition
 
-Together with simulation (which exercises both domains simultaneously at MaxSeqId=5), these configurations cover all 14 invariants non-trivially.
+\* ---- Group 1 per-group state (22 variables) ----
+VARIABLES
+    role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
+    leaseRemaining_1, timerRemaining_1,
+    nextSeqId_1, committedEntries_1, markerEntries_1,
+    flushMarkerEntries_1, hdfsHFiles_1,
+    memstore_1, fApplyBatch_1,
+    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+    flushPhase_1, flushSeqId_1,
+    promotionPhase_1,
+    hibernateState_1
+
+\* ---- Group 2 per-group state (22 variables) ----
+VARIABLES
+    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
+    leaseRemaining_2, timerRemaining_2,
+    nextSeqId_2, committedEntries_2, markerEntries_2,
+    flushMarkerEntries_2, hdfsHFiles_2,
+    memstore_2, fApplyBatch_2,
+    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+    flushPhase_2, flushSeqId_2,
+    promotionPhase_2,
+    hibernateState_2
+
+\* ---- Variable tuples ----
+
+g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
+             leaseRemaining_1, timerRemaining_1,
+             nextSeqId_1, committedEntries_1, markerEntries_1,
+             flushMarkerEntries_1, hdfsHFiles_1,
+             memstore_1, fApplyBatch_1,
+             writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+             flushPhase_1, flushSeqId_1,
+             promotionPhase_1, hibernateState_1>>
+
+g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
+             leaseRemaining_2, timerRemaining_2,
+             nextSeqId_2, committedEntries_2, markerEntries_2,
+             flushMarkerEntries_2, hdfsHFiles_2,
+             memstore_2, fApplyBatch_2,
+             writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+             flushPhase_2, flushSeqId_2,
+             promotionPhase_2, hibernateState_2>>
+
+vars == <<clock, partition, g1_vars, g2_vars>>
+
+----
+(* ---- INSTANCE declarations ---- *)
+
+G1 == INSTANCE RaftRegionReplica WITH
+    role            <- role_1,
+    currentTerm     <- currentTerm_1,
+    votedFor        <- votedFor_1,
+    votesGranted    <- votesGranted_1,
+    raftLog         <- raftLog_1,
+    clock           <- clock,
+    leaseRemaining  <- leaseRemaining_1,
+    timerRemaining  <- timerRemaining_1,
+    partition       <- partition,
+    nextSeqId       <- nextSeqId_1,
+    committedEntries <- committedEntries_1,
+    markerEntries   <- markerEntries_1,
+    flushMarkerEntries <- flushMarkerEntries_1,
+    hdfsHFiles      <- hdfsHFiles_1,
+    memstore        <- memstore_1,
+    fApplyBatch     <- fApplyBatch_1,
+    writePhase      <- writePhase_1,
+    walSync         <- walSync_1,
+    raftCommitted   <- raftCommitted_1,
+    writeSeqId      <- writeSeqId_1,
+    flushPhase      <- flushPhase_1,
+    flushSeqId      <- flushSeqId_1,
+    promotionPhase  <- promotionPhase_1,
+    hibernateState  <- hibernateState_1
+
+G2 == INSTANCE RaftRegionReplica WITH
+    role            <- role_2,
+    currentTerm     <- currentTerm_2,
+    votedFor        <- votedFor_2,
+    votesGranted    <- votesGranted_2,
+    raftLog         <- raftLog_2,
+    clock           <- clock,
+    leaseRemaining  <- leaseRemaining_2,
+    timerRemaining  <- timerRemaining_2,
+    partition       <- partition,
+    nextSeqId       <- nextSeqId_2,
+    committedEntries <- committedEntries_2,
+    markerEntries   <- markerEntries_2,
+    flushMarkerEntries <- flushMarkerEntries_2,
+    hdfsHFiles      <- hdfsHFiles_2,
+    memstore        <- memstore_2,
+    fApplyBatch     <- fApplyBatch_2,
+    writePhase      <- writePhase_2,
+    walSync         <- walSync_2,
+    raftCommitted   <- raftCommitted_2,
+    writeSeqId      <- writeSeqId_2,
+    flushPhase      <- flushPhase_2,
+    flushSeqId      <- flushSeqId_2,
+    promotionPhase  <- promotionPhase_2,
+    hibernateState  <- hibernateState_2
+
+Majority == (Cardinality(Members) \div 2) + 1
+
+----
+(* ---- Initial state ---- *)
+
+Init == G1!Init /\ G2!Init
+
+----
+(* ---- Shared-impact actions ---- *)
+
+\* Clock tick decrements both groups' timers on the ticking member.
+\* Guards check both groups' candidate and timer state.
+MultiGroupClockTick(m) ==
+    /\ clock[m] < MaxClock
+    /\ \A other \in Members :
+        clock[m] + 1 - clock[other] <= MaxClockDrift
+    /\ ~\E c \in Members :
+          \/ (role_1[c] = "Candidate"
+              /\ Cardinality(votesGranted_1[c]) >= Majority)
+          \/ (role_2[c] = "Candidate"
+              /\ Cardinality(votesGranted_2[c]) >= Majority)
+    /\ \E m2 \in Members :
+          \/ timerRemaining_1[m2] > 0 \/ leaseRemaining_1[m2] > 0
+          \/ timerRemaining_2[m2] > 0 \/ leaseRemaining_2[m2] > 0
+    /\ clock' = [clock EXCEPT ![m] = @ + 1]
+    /\ timerRemaining_1' = [timerRemaining_1 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ leaseRemaining_1' = [leaseRemaining_1 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ timerRemaining_2' = [timerRemaining_2 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ leaseRemaining_2' = [leaseRemaining_2 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ UNCHANGED <<partition,
+                   role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   memstore_1, fApplyBatch_1,
+                   writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   memstore_2, fApplyBatch_2,
+                   writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2>>
+
+\* Server crash resets volatile state for BOTH groups on the crashed
+\* member.  Durable state (currentTerm, votedFor, raftLog) survives.
+\* Guard: at least one group has volatile state worth resetting.
+MultiGroupCrashRestart(m) ==
+    /\ \/ role_1[m] # "Follower"
+       \/ memstore_1[m] # {}
+       \/ fApplyBatch_1[m] # {}
+       \/ votesGranted_1[m] # {}
+       \/ leaseRemaining_1[m] > 0
+       \/ timerRemaining_1[m] # ElectionTimeoutMin
+       \/ writePhase_1[m] # "Idle"
+       \/ flushPhase_1[m] # "Idle"
+       \/ promotionPhase_1[m] # "None"
+       \/ hibernateState_1[m] # "Active"
+       \/ role_2[m] # "Follower"
+       \/ memstore_2[m] # {}
+       \/ fApplyBatch_2[m] # {}
+       \/ votesGranted_2[m] # {}
+       \/ leaseRemaining_2[m] > 0
+       \/ timerRemaining_2[m] # ElectionTimeoutMin
+       \/ writePhase_2[m] # "Idle"
+       \/ flushPhase_2[m] # "Idle"
+       \/ promotionPhase_2[m] # "None"
+       \/ hibernateState_2[m] # "Active"
+    \* Reset group 1 volatile state
+    /\ role_1'           = [role_1           EXCEPT ![m] = "Follower"]
+    /\ votesGranted_1'   = [votesGranted_1   EXCEPT ![m] = {}]
+    /\ leaseRemaining_1' = [leaseRemaining_1 EXCEPT ![m] = 0]
+    /\ timerRemaining_1' = [timerRemaining_1 EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore_1'       = [memstore_1       EXCEPT ![m] = {}]
+    /\ fApplyBatch_1'    = [fApplyBatch_1    EXCEPT ![m] = {}]
+    /\ writePhase_1'     = [writePhase_1     EXCEPT ![m] = "Idle"]
+    /\ walSync_1'        = [walSync_1        EXCEPT ![m] = "Pending"]
+    /\ raftCommitted_1'  = [raftCommitted_1  EXCEPT ![m] = FALSE]
+    /\ writeSeqId_1'     = [writeSeqId_1     EXCEPT ![m] = 0]
+    /\ flushPhase_1'     = [flushPhase_1     EXCEPT ![m] = "Idle"]
+    /\ flushSeqId_1'     = [flushSeqId_1     EXCEPT ![m] = 0]
+    /\ promotionPhase_1' = [promotionPhase_1 EXCEPT ![m] = "None"]
+    /\ hibernateState_1' = [hibernateState_1 EXCEPT ![m] = "Active"]
+    \* Reset group 2 volatile state
+    /\ role_2'           = [role_2           EXCEPT ![m] = "Follower"]
+    /\ votesGranted_2'   = [votesGranted_2   EXCEPT ![m] = {}]
+    /\ leaseRemaining_2' = [leaseRemaining_2 EXCEPT ![m] = 0]
+    /\ timerRemaining_2' = [timerRemaining_2 EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore_2'       = [memstore_2       EXCEPT ![m] = {}]
+    /\ fApplyBatch_2'    = [fApplyBatch_2    EXCEPT ![m] = {}]
+    /\ writePhase_2'     = [writePhase_2     EXCEPT ![m] = "Idle"]
+    /\ walSync_2'        = [walSync_2        EXCEPT ![m] = "Pending"]
+    /\ raftCommitted_2'  = [raftCommitted_2  EXCEPT ![m] = FALSE]
+    /\ writeSeqId_2'     = [writeSeqId_2     EXCEPT ![m] = 0]
+    /\ flushPhase_2'     = [flushPhase_2     EXCEPT ![m] = "Idle"]
+    /\ flushSeqId_2'     = [flushSeqId_2     EXCEPT ![m] = 0]
+    /\ promotionPhase_2' = [promotionPhase_2 EXCEPT ![m] = "None"]
+    /\ hibernateState_2' = [hibernateState_2 EXCEPT ![m] = "Active"]
+    \* Preserve durable state for both groups
+    /\ UNCHANGED <<clock, partition,
+                   currentTerm_1, votedFor_1, raftLog_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   currentTerm_2, votedFor_2, raftLog_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2>>
+
+\* Network partition — shared across both groups.
+MultiGroupCreatePartition ==
+    \E m1, m2 \in Members :
+        /\ m1 # m2
+        /\ <<m1, m2>> \notin partition
+        /\ partition' = partition \union {<<m1, m2>>, <<m2, m1>>}
+        /\ UNCHANGED <<clock, g1_vars, g2_vars>>
+
+MultiGroupHealPartition ==
+    \E m1, m2 \in Members :
+        /\ <<m1, m2>> \in partition
+        /\ partition' = partition \ {<<m1, m2>>, <<m2, m1>>}
+        /\ UNCHANGED <<clock, g1_vars, g2_vars>>
+
+\* Unified log GC: models physical segment deletion in the shared
+\* append-only consensus log.  A segment is eligible for deletion
+\* only when ALL groups referenced in it have flushed past their
+\* entries.  Both groups must have an applied flush marker on member
+\* m, and entries below each group's chosen flush watermark are
+\* removed from both groups' raftLogs simultaneously.
+UnifiedLogGC(m) ==
+    /\ \E s1 \in flushMarkerEntries_1 \cap memstore_1[m] :
+       \E s2 \in flushMarkerEntries_2 \cap memstore_2[m] :
+            /\ (\E e \in raftLog_1[m] : e < s1)
+               \/ (\E e \in raftLog_2[m] : e < s2)
+            /\ raftLog_1' = [raftLog_1 EXCEPT
+                             ![m] = {e \in @ : e >= s1}]
+            /\ raftLog_2' = [raftLog_2 EXCEPT
+                             ![m] = {e \in @ : e >= s2}]
+    /\ UNCHANGED <<clock, partition,
+                   role_1, currentTerm_1, votedFor_1, votesGranted_1,
+                   leaseRemaining_1, timerRemaining_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   memstore_1, fApplyBatch_1,
+                   writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   role_2, currentTerm_2, votedFor_2, votesGranted_2,
+                   leaseRemaining_2, timerRemaining_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   memstore_2, fApplyBatch_2,
+                   writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2>>
+
+----
+(* ---- Next-state relation and specification ---- *)
+
+Next ==
+    \* Per-group steps via INSTANCE
+    \/ (G1!GroupNext /\ UNCHANGED g2_vars)
+    \/ (G2!GroupNext /\ UNCHANGED g1_vars)
+    \* Shared-impact actions
+    \/ \E m \in Members : MultiGroupClockTick(m)
+    \/ \E m \in Members : MultiGroupCrashRestart(m)
+    \/ MultiGroupCreatePartition
+    \/ MultiGroupHealPartition
+    \* Unified log GC (replaces per-group RaftLogGC)
+    \/ \E m \in Members : UnifiedLogGC(m)
+
+Spec == Init /\ [][Next]_vars
+
+----
+(* ---- Safety properties ---- *)
+
+MultiGroupTypeOK == G1!TypeOK /\ G2!TypeOK
+
+PerGroupSafety ==
+    /\ G1!LeaderUniqueness          /\ G2!LeaderUniqueness
+    /\ G1!LeaseImpliesLeadership    /\ G2!LeaseImpliesLeadership
+    /\ G1!LeaseExpiresBeforeElection /\ G2!LeaseExpiresBeforeElection
+    /\ G1!CatchUpDataIntegrity      /\ G2!CatchUpDataIntegrity
+    /\ G1!WriteBarrierSafety        /\ G2!WriteBarrierSafety
+    /\ G1!FollowerSeqIdConsistency  /\ G2!FollowerSeqIdConsistency
+    /\ G1!NoOrphanMemstoreDrop      /\ G2!NoOrphanMemstoreDrop
+    /\ G1!FlushWriteExclusion       /\ G2!FlushWriteExclusion
+    /\ G1!FollowerFlushMemstoreDrop /\ G2!FollowerFlushMemstoreDrop
+    /\ G1!HFilesBeforeFlushMarker   /\ G2!HFilesBeforeFlushMarker
+    /\ G1!PromotionReadWriteGuard   /\ G2!PromotionReadWriteGuard
+    /\ G1!PromotionMVCCContinuity   /\ G2!PromotionMVCCContinuity
+    /\ G1!CatchUpCompleteness       /\ G2!CatchUpCompleteness
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MultiGroupRaftRegionReplica.tla -->
+
+### TLA+ Specification: `MCRaftRegionReplica_multigroup.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_multigroup.tla -->
+```tla
+---- MODULE MCRaftRegionReplica_multigroup ----
+(*
+ * Multi-group domain model-checking configuration.
+ *
+ * PURPOSE
+ * -------
+ * Verify that two RAFT groups sharing the same ConsensusServer
+ * resources (clock, network, unified log) do not interfere with
+ * each other's safety properties.  All 14 single-group invariants
+ * are checked per-group via INSTANCE.  CatchUpDataIntegrity is the
+ * key cross-group invariant: it verifies that unified log GC
+ * (which requires all groups to have flushed) does not delete
+ * entries needed by either group for catch-up.
+ *
+ * TIMING SIMPLIFICATION
+ * ---------------------
+ * Identical to MCRaftRegionReplica_datapath: MaxClockDrift = 0,
+ * ElectionTimeoutMin = 2, MaxClock = 2.  Clock drift is orthogonal
+ * to cross-group interaction correctness.
+ *
+ * DATA-PATH ACTION MERGES
+ * -----------------------
+ * Per-group steps use GroupDataPathNext (defined in the base spec),
+ * which applies the same action merges as the datapath domain:
+ *   - FollowerBeginBatchApply + FollowerCompleteBatchApply merged
+ *   - CompleteWrite + AckWrite merged
+ *   - ProposeMarker, WALSyncFail, WALFailureAbort removed
+ *
+ * STATE SPACE
+ * -----------
+ * MaxSeqId = 2 (reduced from 3) compensates for the two-group
+ * product.  write(1) + flush(2) per group exercises the flush-GC
+ * path that is critical for UnifiedLogGC verification.
+ *
+ * Partitions limited to at most 1 link (same as datapath domain).
+ *)
+EXTENDS MultiGroupRaftRegionReplica, TLC
+
+CONSTANTS m1, m2, m3, NoVote
+
+MC_Members == {m1, m2, m3}
+MC_None == NoVote
+MC_MaxTerm == 2
+MC_LeaderLeaseDuration == 1
+MC_ElectionTimeoutMin == 2
+MC_MaxClockDrift == 0
+MC_MaxClock == 2
+MC_MaxSeqId == 2
+
+Symmetry == Permutations(MC_Members)
+
+PartitionConstraint == Cardinality(partition) <= 2
+
+----
+(* ---- Multi-group data-path next-state relation ---- *)
+
+\* Per-group steps use the data-path-merged GroupDataPathNext.
+\* Shared-impact actions are the multi-group versions from
+\* MultiGroupRaftRegionReplica.
+MultiGroupDataPathNext ==
+    \/ (G1!GroupDataPathNext /\ UNCHANGED g2_vars)
+    \/ (G2!GroupDataPathNext /\ UNCHANGED g1_vars)
+    \/ \E m \in Members : MultiGroupClockTick(m)
+    \/ \E m \in Members : MultiGroupCrashRestart(m)
+    \/ MultiGroupCreatePartition
+    \/ MultiGroupHealPartition
+    \/ \E m \in Members : UnifiedLogGC(m)
+
+MultiGroupDataPathSpec == Init /\ [][MultiGroupDataPathNext]_vars
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_multigroup.tla -->
+
+### TLC Config: `MCRaftRegionReplica_multigroup.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_multigroup.cfg -->
+```
+SPECIFICATION MultiGroupDataPathSpec
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+SYMMETRY Symmetry
+
+CONSTRAINT PartitionConstraint
+
+INVARIANTS
+    MultiGroupTypeOK
+    PerGroupSafety
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_multigroup.cfg -->
+
+### TLC Module: `MCRaftRegionReplica_liveness.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness.tla -->
+```tla
+---- MODULE MCRaftRegionReplica_liveness ----
+(*
+ * Model-checking configuration for RaftRegionReplica liveness properties.
+ * Defines concrete constant values for TLC liveness verification.
+ *
+ * Key differences from the safety exhaustive configuration
+ * (MCRaftRegionReplica):
+ *
+ *   - MaxSeqId = 2 (reduced from 3).  Without SYMMETRY the state
+ *     space is ~6x larger per state variable, so a smaller seqId
+ *     bound is needed to keep exhaustive checking tractable.  Two
+ *     seqIds are sufficient for write + flush + follower-apply.
+ *
+ *   - No Symmetry definition.  TLC's liveness checking is
+ *     incompatible with symmetry reduction (the behavior graph
+ *     cross-product with the tableau requires distinguishing
+ *     states that symmetry would collapse).
+ *
+ * All other parameters match the safety exhaustive configuration.
+ * See MCRaftRegionReplica.tla for parameter rationale.
+ *
+ * Invocation (exhaustive, single property):
+ *   java -XX:+UseParallelGC -Xmx32g \
+ *     -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+ *     -cp tla2tools.jar tlc2.TLC \
+ *     MCRaftRegionReplica_liveness -workers auto \
+ *     -config MCRaftRegionReplica_liveness_election.cfg
+ *
+ * Invocation (simulation, all properties):
+ *   java -XX:+UseParallelGC -Xmx16g -cp tla2tools.jar \
+ *     -Dtlc2.TLC.stopAfter=900 \
+ *     tlc2.TLC MCRaftRegionReplica_liveness \
+ *     -simulate -depth 200 -workers auto \
+ *     -config MCRaftRegionReplica_liveness_all.cfg
+ *)
+EXTENDS RaftRegionReplica, TLC
+
+CONSTANTS m1, m2, m3, NoVote
+
+MC_Members == {m1, m2, m3}
+MC_None == NoVote
+MC_MaxTerm == 2
+MC_LeaderLeaseDuration == 1
+MC_ElectionTimeoutMin == 4
+MC_MaxClockDrift == 1
+MC_MaxClock == 4
+MC_MaxSeqId == 2
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness.tla -->
+
+### TLC Module: `MCRaftRegionReplica_liveness_election.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_election.tla -->
+```tla
+---- MODULE MCRaftRegionReplica_liveness_election ----
+(*
+ * Model-checking configuration tuned for ElectionProgress liveness.
+ *
+ * Tuned for ElectionProgress: the property needs enough term and
+ * clock budget for elections to succeed despite nondeterministic
+ * crashes and partitions (which have no fairness and can waste
+ * terms and clock ticks via timer resets).
+ *
+ * MaxTerm = 4: enough headroom for multiple failed elections.
+ * ElectionTimeoutMin = 2: each election countdown costs 2 clock
+ *   ticks instead of 4, conserving clock budget (safety constraint
+ *   LeaderLeaseDuration=1 < ElectionTimeoutMin=2 still holds).
+ * MaxClock = 12: allows 12/2 = 6 timer countdowns per member.
+ * MaxSeqId = 1: ElectionProgress doesn't exercise writes/flushes.
+ *
+ * No Symmetry (incompatible with liveness checking in TLC).
+ *)
+EXTENDS RaftRegionReplica, TLC
+
+CONSTANTS m1, m2, m3, NoVote
+
+MC_Members == {m1, m2, m3}
+MC_None == NoVote
+MC_MaxTerm == 4
+MC_LeaderLeaseDuration == 1
+MC_ElectionTimeoutMin == 2
+MC_MaxClockDrift == 1
+MC_MaxClock == 12
+MC_MaxSeqId == 1
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_election.tla -->
+
+### TLC Config: `MCRaftRegionReplica_liveness_election.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_election.cfg -->
+```
+SPECIFICATION LiveSpecElection
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+\* NOTE: Use with MCRaftRegionReplica_liveness_election.tla (MaxTerm=4, MaxSeqId=1)
+
+INVARIANTS
+    TypeOK
+    LeaderUniqueness
+    LeaseImpliesLeadership
+    LeaseExpiresBeforeElection
+    CatchUpDataIntegrity
+    WriteBarrierSafety
+    FollowerSeqIdConsistency
+    NoOrphanMemstoreDrop
+    FlushWriteExclusion
+    FollowerFlushMemstoreDrop
+    HFilesBeforeFlushMarker
+    PromotionReadWriteGuard
+    PromotionMVCCContinuity
+    CatchUpCompleteness
+
+PROPERTY
+    ElectionProgress
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_election.cfg -->
+
+### TLC Config: `MCRaftRegionReplica_liveness_write.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_write.cfg -->
+```
+SPECIFICATION LiveSpecWrite
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+INVARIANTS
+    TypeOK
+    LeaderUniqueness
+    LeaseImpliesLeadership
+    LeaseExpiresBeforeElection
+    CatchUpDataIntegrity
+    WriteBarrierSafety
+    FollowerSeqIdConsistency
+    NoOrphanMemstoreDrop
+    FlushWriteExclusion
+    FollowerFlushMemstoreDrop
+    HFilesBeforeFlushMarker
+    PromotionReadWriteGuard
+    PromotionMVCCContinuity
+    CatchUpCompleteness
+
+PROPERTY
+    WriteCompletion
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_write.cfg -->
+
+### TLC Config: `MCRaftRegionReplica_liveness_flush.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_flush.cfg -->
+```
+SPECIFICATION LiveSpecFlush
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+INVARIANTS
+    TypeOK
+    LeaderUniqueness
+    LeaseImpliesLeadership
+    LeaseExpiresBeforeElection
+    CatchUpDataIntegrity
+    WriteBarrierSafety
+    FollowerSeqIdConsistency
+    NoOrphanMemstoreDrop
+    FlushWriteExclusion
+    FollowerFlushMemstoreDrop
+    HFilesBeforeFlushMarker
+    PromotionReadWriteGuard
+    PromotionMVCCContinuity
+    CatchUpCompleteness
+
+PROPERTY
+    FlushCompletion
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_flush.cfg -->
+
+### TLC Config: `MCRaftRegionReplica_liveness_promotion.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_promotion.cfg -->
+```
+SPECIFICATION LiveSpecLocal
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+INVARIANTS
+    TypeOK
+    LeaderUniqueness
+    LeaseImpliesLeadership
+    LeaseExpiresBeforeElection
+    CatchUpDataIntegrity
+    WriteBarrierSafety
+    FollowerSeqIdConsistency
+    NoOrphanMemstoreDrop
+    FlushWriteExclusion
+    FollowerFlushMemstoreDrop
+    HFilesBeforeFlushMarker
+    PromotionReadWriteGuard
+    PromotionMVCCContinuity
+    CatchUpCompleteness
+
+PROPERTY
+    PromotionCompletion
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_promotion.cfg -->
+
+### TLC Config: `MCRaftRegionReplica_liveness_catchup.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_catchup.cfg -->
+```
+SPECIFICATION LiveSpecLocal
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+INVARIANTS
+    TypeOK
+    LeaderUniqueness
+    LeaseImpliesLeadership
+    LeaseExpiresBeforeElection
+    CatchUpDataIntegrity
+    WriteBarrierSafety
+    FollowerSeqIdConsistency
+    NoOrphanMemstoreDrop
+    FlushWriteExclusion
+    FollowerFlushMemstoreDrop
+    HFilesBeforeFlushMarker
+    PromotionReadWriteGuard
+    PromotionMVCCContinuity
+    CatchUpCompleteness
+
+PROPERTY
+    CatchUpCompletion
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_catchup.cfg -->
+
+### TLC Config: `MCRaftRegionReplica_liveness_hibernate.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_hibernate.cfg -->
+```
+SPECIFICATION LiveSpecLocal
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+INVARIANTS
+    TypeOK
+    LeaderUniqueness
+    LeaseImpliesLeadership
+    LeaseExpiresBeforeElection
+    CatchUpDataIntegrity
+    WriteBarrierSafety
+    FollowerSeqIdConsistency
+    NoOrphanMemstoreDrop
+    FlushWriteExclusion
+    FollowerFlushMemstoreDrop
+    HFilesBeforeFlushMarker
+    PromotionReadWriteGuard
+    PromotionMVCCContinuity
+    CatchUpCompleteness
+
+PROPERTY
+    HibernateConvergence
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_hibernate.cfg -->

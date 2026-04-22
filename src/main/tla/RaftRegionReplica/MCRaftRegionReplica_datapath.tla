@@ -97,7 +97,7 @@
  * COMPLEMENTARY DOMAIN
  * --------------------
  * The election domain (MCRaftRegionReplica_election) uses the original
- * unmodified Next with all 34 actions, full timing (MaxClockDrift = 1,
+ * unmodified Next with all 35 actions, full timing (MaxClockDrift = 1,
  * ElectionTimeoutMin = 4), and MaxSeqId = 1.  It provides primary
  * verification for WriteBarrierSafety (which is vacuous here).
  * Simulation mode (MCRaftRegionReplica_sim) exercises both domains

@@ -232,7 +232,7 @@
  * pipeline for RAFT-enabled regions: BeginWrite (doWALAppend, step 3),
  * WALSyncComplete/WALSyncFail (wal.sync, step 4a), RAFTCommitWrite
  * (consensus.propose, step 4b), CompleteWrite (barrier + memstore.add +
- * mvcc.completeAndWait, steps 5-7), AckWrite (return to client, step 8),
+ * mvcc.completeAndWait, steps 5-8), AckWrite (return to client, step 9),
  * WALFailureAbort (RS abort on WAL sync failure).
  *
  * Follower batch apply actions model the consensus apply callback on
@@ -944,7 +944,7 @@ CreatePartition ==
                        writeVars, flushVars, promotionPhase, hibernateState>>
 
 \* Nondeterministically heal a partition between two members.
-\* Models network recovery.
+\* Models individual network link recovery.
 HealPartition ==
     \E m1, m2 \in Members :
         /\ <<m1, m2>> \in partition
@@ -954,6 +954,22 @@ HealPartition ==
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                        writeVars, flushVars, promotionPhase, hibernateState>>
+
+\* Heal ALL partitions at once — full network recovery.
+\* This action is deterministic (no internal nondeterminism) so
+\* SF_vars(HealAllPartitions) guarantees that if the network is ever
+\* partitioned, it eventually fully recovers.  SF on HealPartition
+\* alone does NOT provide this because its \E nondeterminism allows
+\* TLC to always heal the same unhelpful link while leaving other
+\* links permanently down.
+HealAllPartitions ==
+    /\ partition # {}
+    /\ partition' = {}
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   writeVars, flushVars, promotionPhase, hibernateState>>
 
 \* ---- Leader write path actions ----
 
@@ -1057,11 +1073,11 @@ RAFTCommitWrite(m) ==
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
-\* HRegion.doMiniBatchMutate steps 5-7: barrier join -> memstore.add()
-\* (cells already stamped with seqId) -> mvcc.completeAndWait() (makes
-\* cells visible to readers).  The write is now durable (WAL on HDFS +
-\* replicated via RAFT) and visible.  The write's seqId is added to
-\* the leader's memstore.
+\* HRegion.doMiniBatchMutate steps 5-8: barrier join -> verify role ->
+\* memstore.add() (cells already stamped with seqId) ->
+\* mvcc.completeAndWait() (makes cells visible to readers).  The write
+\* is now durable (WAL on HDFS + replicated via RAFT) and visible.
+\* The write's seqId is added to the leader's memstore.
 \*
 \* Guard: walSync must be "Done" and raftCommitted must be TRUE.  This
 \* is the write barrier — the central safety mechanism ensuring no write
@@ -1082,7 +1098,7 @@ CompleteWrite(m) ==
                    promotionPhase, hibernateState>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
-\* doMiniBatchMutate (step 8) and resets the write pipeline for the
+\* doMiniBatchMutate (step 9) and resets the write pipeline for the
 \* next write.
 AckWrite(m) ==
     /\ writePhase[m] = "Applied"
@@ -1798,7 +1814,10 @@ WakeComplete(m) ==
 ----
 (* ---- Next-state relation and specification ---- *)
 
-Next ==
+\* Actions common to both GroupNext and GroupDataPathNext.  The write
+\* path and follower-apply actions that differ between the two (merged
+\* vs unmerged) are added by each variant separately.
+GroupCoreNext ==
     \* Election
     \/ \E m \in Members     : Timeout(m)
     \/ \E c, v \in Members  : RequestVote(c, v)
@@ -1807,39 +1826,23 @@ Next ==
     \/ \E m \in Members     : Heartbeat(m)
     \/ \E m \in Members     : StepDown(m)
     \/ \E m \in Members     : LeaderLeaseExpiry(m)
-    \* Timing
-    \/ \E m \in Members     : ClockTick(m)
-    \* Crash recovery
-    \/ \E m \in Members     : CrashRestart(m)
-    \* Network
-    \/ CreatePartition
-    \/ HealPartition
-    \* Write path
+    \* Write path (common subset)
     \/ \E m \in Members     : BeginWrite(m)
     \/ \E m \in Members     : WALSyncComplete(m)
-    \/ \E m \in Members     : WALSyncFail(m)
     \/ \E m \in Members     : RAFTCommitWrite(m)
-    \/ \E m \in Members     : CompleteWrite(m)
-    \/ \E m \in Members     : AckWrite(m)
-    \/ \E m \in Members     : WALFailureAbort(m)
-    \* Markers
-    \/ \E m \in Members     : ProposeMarker(m)
     \* Flush protocol
     \/ \E m \in Members     : FlushStart(m)
     \/ \E m \in Members     : FlushCommitHFiles(m)
     \/ \E m \in Members     : FlushRAFTPropose(m)
     \/ \E m \in Members     : FlushRAFTCommit(m)
     \/ \E m \in Members     : FlushComplete(m)
-    \* Follower apply
-    \/ \E m \in Members     : FollowerBeginBatchApply(m)
-    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+    \* Follower apply (common subset)
     \/ \E m \in Members     : FollowerApplyMarker(m)
     \* Promotion
     \/ \E m \in Members     : PromotionComplete(m)
     \* Orphan commitment
     \/ NewLeaderCommitOrphanEntry
-    \* RAFT log GC and catch-up
-    \/ \E m \in Members     : RaftLogGC(m)
+    \* Catch-up (not GC — GC is in the shared-impact set)
     \/ \E l, f \in Members  : InstallSnapshot(l, f)
     \* New member bootstrap
     \/ \E m \in Members     : NewMemberBootstrap(m)
@@ -1847,6 +1850,103 @@ Next ==
     \/ \E m \in Members     : HibernateRequest(m)
     \/ \E m \in Members     : WakeGroup(m)
     \/ \E m \in Members     : WakeComplete(m)
+
+\* Per-group subset of Next for multi-group composition.  Excludes the
+\* five "shared-impact" actions whose effects span all groups on a
+\* server: ClockTick (shared physical clock), CrashRestart (server
+\* crash kills all groups), CreatePartition / HealPartition (network
+\* link affects all groups), and RaftLogGC (unified log segment
+\* deletion affects all groups).  The multi-group module
+\* (MultiGroupRaftRegionReplica) provides custom versions of these
+\* five actions that correctly apply to all co-located groups, and
+\* uses G1!GroupNext / G2!GroupNext for per-group steps.
+GroupNext ==
+    \/ GroupCoreNext
+    \* Write path (unmerged actions not in GroupCoreNext)
+    \/ \E m \in Members     : WALSyncFail(m)
+    \/ \E m \in Members     : CompleteWrite(m)
+    \/ \E m \in Members     : AckWrite(m)
+    \/ \E m \in Members     : WALFailureAbort(m)
+    \* Markers
+    \/ \E m \in Members     : ProposeMarker(m)
+    \* Follower apply (unmerged actions not in GroupCoreNext)
+    \/ \E m \in Members     : FollowerBeginBatchApply(m)
+    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+
+\* Merged actions for data-path domain decomposition.  These are used
+\* by GroupDataPathNext (below) and the multi-group MC configuration.
+\* The rationale for each merge is documented in
+\* MCRaftRegionReplica_datapath.tla.
+
+\* Atomic follower batch apply: computes the mutation batch and applies
+\* it to memstore in a single step.  Merges FollowerBeginBatchApply +
+\* FollowerCompleteBatchApply.  fApplyBatch is never modified.
+AtomicFollowerBatchApply(m) ==
+    /\ \/ role[m] = "Follower"
+       \/ promotionPhase[m] = "Promoting"
+    /\ fApplyBatch[m] = {}
+    /\ LET applicable == ApplicableEntries(m)
+       IN /\ applicable # {}
+          /\ LET nextEntry == SetMin(applicable)
+             IN /\ nextEntry \notin markerEntries
+                /\ LET applicableMarkers == applicable \cap markerEntries
+                       boundary == IF applicableMarkers # {}
+                                   THEN SetMin(applicableMarkers)
+                                   ELSE MaxSeqId + 1
+                       batch == {s \in applicable \ markerEntries : s < boundary}
+                   IN memstore' = [memstore EXCEPT ![m] = @ \union batch]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining, partition,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   writePhase, walSync, raftCommitted, writeSeqId,
+                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
+
+\* Atomic write completion and ack: applies the write to memstore and
+\* resets the write pipeline in a single step.  Merges CompleteWrite +
+\* AckWrite, skipping the transient "Applied" phase.
+AtomicCompleteWriteAndAck(m) ==
+    /\ writePhase[m] = "Pending"
+    /\ walSync[m] = "Done"
+    /\ raftCommitted[m]
+    /\ role[m] = "Leader"
+    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
+    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
+    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
+    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
+    /\ memstore'      = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining, partition,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
+
+\* Per-group data-path next-state relation for multi-group composition.
+\* Like GroupNext but with the same action merges and removals as
+\* MCRaftRegionReplica_datapath.tla:
+\*   - FollowerBeginBatchApply + FollowerCompleteBatchApply merged
+\*   - CompleteWrite + AckWrite merged
+\*   - ProposeMarker, WALSyncFail, WALFailureAbort removed
+GroupDataPathNext ==
+    \/ GroupCoreNext
+    \* Write path (merged)
+    \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
+    \* Follower apply (merged)
+    \/ \E m \in Members     : AtomicFollowerBatchApply(m)
+
+\* Full next-state relation: per-group actions plus shared-impact actions.
+Next ==
+    \/ GroupNext
+    \* Timing
+    \/ \E m \in Members     : ClockTick(m)
+    \* Crash recovery
+    \/ \E m \in Members     : CrashRestart(m)
+    \* Network
+    \/ CreatePartition
+    \/ HealPartition
+    \/ HealAllPartitions
+    \* RAFT log GC
+    \/ \E m \in Members     : RaftLogGC(m)
 
 Spec == Init /\ [][Next]_vars
 
@@ -2121,5 +2221,164 @@ THEOREM SafetyTHM ==
                /\ PromotionReadWriteGuard
                /\ PromotionMVCCContinuity
                /\ CatchUpCompleteness)
+
+----
+(* ---- Fairness and liveness properties ---- *)
+
+\* Fairness constraints.
+\*
+\* Factored into BaseFairness (WF on all non-network-dependent actions)
+\* plus per-property SF additions.  This factoring is necessary because
+\* TLC converts the fairness formula to DNF, where each SF_vars(A) term
+\* contributes 2 disjuncts, giving 2^N branches for N SF terms.  A
+\* monolithic fairness with all network-dependent actions as SF would
+\* exceed TLC's DNF capacity.  Per-property specs include only the
+\* minimum SF terms that the property's progress chain requires.
+\*
+\* WF (weak fairness) on actions whose enabling conditions do not
+\* depend on network connectivity — once enabled, they remain enabled
+\* until they fire (no external event disables them).
+\*
+\* SF (strong fairness) on actions whose enabling conditions check
+\* CanCommunicate or require a majority of reachable members.  Because
+\* CreatePartition is a perturbation (no fairness), it can fire at any
+\* time and repeatedly disable these actions.  SF requires that if the
+\* action is enabled infinitely often, it eventually fires — capturing
+\* the real-world expectation that network connectivity windows are
+\* long enough for atomic protocol steps to complete.
+\*
+\* No fairness on perturbation actions (CrashRestart, CreatePartition,
+\* WALSyncFail) — failures are nondeterministic and must not be forced.
+BaseFairness ==
+    \* Election (Timeout only needs timerRemaining=0, no network)
+    /\ \A m \in Members     : WF_vars(Timeout(m))
+    \* Leadership
+    /\ \A m \in Members     : WF_vars(LeaderLeaseExpiry(m))
+    /\ \A m \in Members     : WF_vars(StepDown(m))
+    \* Timing
+    /\ \A m \in Members     : WF_vars(ClockTick(m))
+    \* Write path (local I/O and pipeline steps)
+    /\ \A m \in Members     : WF_vars(BeginWrite(m))
+    /\ \A m \in Members     : WF_vars(WALSyncComplete(m))
+    /\ \A m \in Members     : WF_vars(CompleteWrite(m))
+    /\ \A m \in Members     : WF_vars(AckWrite(m))
+    /\ \A m \in Members     : WF_vars(WALFailureAbort(m))
+    \* Flush protocol (local steps)
+    /\ \A m \in Members     : WF_vars(FlushStart(m))
+    /\ \A m \in Members     : WF_vars(FlushCommitHFiles(m))
+    /\ \A m \in Members     : WF_vars(FlushComplete(m))
+    \* Follower apply (local processing of committed entries)
+    /\ \A m \in Members     : WF_vars(FollowerBeginBatchApply(m))
+    /\ \A m \in Members     : WF_vars(FollowerCompleteBatchApply(m))
+    /\ \A m \in Members     : WF_vars(FollowerApplyMarker(m))
+    \* Promotion (local: requires ApplicableEntries={}, no network)
+    /\ \A m \in Members     : WF_vars(PromotionComplete(m))
+    \* Orphan commitment (requires IsLeader but not CanCommunicate)
+    /\ WF_vars(NewLeaderCommitOrphanEntry)
+    \* Log GC (local)
+    /\ \A m \in Members     : WF_vars(RaftLogGC(m))
+    \* Hibernate (WakeGroup sends to reachable; no majority gate)
+    /\ \A m \in Members     : WF_vars(WakeGroup(m))
+
+\* SF additions for ElectionProgress.
+\* RequestVote + BecomeLeader + StepDown all require CanCommunicate;
+\* partition oscillation can repeatedly disable them.  StepDown is
+\* needed because a stale Candidate whose votesGranted >= Majority
+\* blocks ClockTick (the "no pending BecomeLeader" guard) even when
+\* BecomeLeader itself is disabled (higher-term members exist).
+\* SF on HealAllPartitions (not HealPartition) because
+\* HealPartition's \E nondeterminism allows TLC to always heal the
+\* same unhelpful link.  HealAllPartitions is deterministic: it
+\* forces full network recovery, preventing isolated-member cycles.
+\* 16 SF terms.
+ElectionSF ==
+    /\ SF_vars(HealAllPartitions)
+    /\ \A c, v \in Members  : SF_vars(RequestVote(c, v))
+    /\ \A m \in Members     : SF_vars(BecomeLeader(m))
+    /\ \A m \in Members     : SF_vars(StepDown(m))
+
+\* SF additions for WriteCompletion.
+\* RAFTCommitWrite requires majority reachable.
+\* 4 SF terms.
+WriteSF ==
+    /\ SF_vars(HealAllPartitions)
+    /\ \A m \in Members     : SF_vars(RAFTCommitWrite(m))
+
+\* SF additions for FlushCompletion.
+\* FlushRAFTPropose + FlushRAFTCommit require majority reachable.
+\* 7 SF terms.
+FlushSF ==
+    /\ SF_vars(HealAllPartitions)
+    /\ \A m \in Members     : SF_vars(FlushRAFTPropose(m))
+    /\ \A m \in Members     : SF_vars(FlushRAFTCommit(m))
+
+\* Per-property specification formulas.  Each includes only the SF
+\* terms needed for its progress chain to avoid DNF blowup.
+LiveSpecElection == Init /\ [][Next]_vars /\ BaseFairness /\ ElectionSF
+LiveSpecWrite    == Init /\ [][Next]_vars /\ BaseFairness /\ WriteSF
+LiveSpecFlush    == Init /\ [][Next]_vars /\ BaseFairness /\ FlushSF
+
+\* PromotionCompletion, CatchUpCompletion, HibernateConvergence need
+\* only local actions (all WF in BaseFairness, no network dependency):
+\* follower apply drains committed entries for Promotion/CatchUp;
+\* ClockTick + Timeout exits the Waking state for Hibernate.
+LiveSpecLocal    == Init /\ [][Next]_vars /\ BaseFairness
+
+\* ---- Liveness properties ----
+
+\* If no member holds a valid leader lease, eventually some member
+\* acquires one.  Depends on WF of ClockTick (timers count down)
+\* and Timeout (election starts), and SF of RequestVote (votes
+\* delivered despite partition oscillation), BecomeLeader (majority
+\* wins despite partition oscillation), and HealAllPartitions
+\* (network eventually fully recovers).
+ElectionProgress ==
+    (\A m \in Members : ~IsLeader(m)) ~> (\E m \in Members : IsLeader(m))
+
+\* A write in the Pending phase eventually returns to Idle — either
+\* the normal path completes (WAL sync + RAFT commit + barrier +
+\* ack) or the WAL fails and the leader aborts (WALFailureAbort,
+\* which resets the pipeline via crash).
+WriteCompletion ==
+    \A m \in Members :
+        writePhase[m] = "Pending" ~> writePhase[m] = "Idle"
+
+\* A flush in any non-Idle phase eventually returns to Idle — either
+\* the phase chain completes (HFiles + propose + commit + drop) or
+\* a crash resets the flush state.
+FlushCompletion ==
+    \A m \in Members :
+        flushPhase[m] # "Idle" ~> flushPhase[m] = "Idle"
+
+\* A member in the Promoting phase eventually leaves it — either
+\* PromotionComplete fires (after follower apply drains all
+\* committed entries), or the member steps down / crashes.
+PromotionCompletion ==
+    \A m \in Members :
+        promotionPhase[m] = "Promoting" ~> promotionPhase[m] # "Promoting"
+
+\* A follower with unapplied committed entries eventually catches
+\* up (ApplicableEntries drains to empty with no batch in flight)
+\* or leaves the Follower role (election / crash).
+CatchUpCompletion ==
+    \A m \in Members :
+        (role[m] = "Follower" /\ ApplicableEntries(m) # {})
+            ~> (role[m] # "Follower"
+                \/ (ApplicableEntries(m) = {} /\ fApplyBatch[m] = {}))
+
+\* A member in the Waking hibernate state eventually transitions
+\* out — either WakeComplete fires, or lease expiry triggers a
+\* new election cycle that resets hibernate state, or a crash
+\* resets to Active.
+HibernateConvergence ==
+    \A m \in Members :
+        hibernateState[m] = "Waking" ~> hibernateState[m] # "Waking"
+
+THEOREM ElectionProgressTHM  == LiveSpecElection => ElectionProgress
+THEOREM WriteCompletionTHM   == LiveSpecWrite    => WriteCompletion
+THEOREM FlushCompletionTHM   == LiveSpecFlush    => FlushCompletion
+THEOREM PromotionCompletionTHM == LiveSpecLocal  => PromotionCompletion
+THEOREM CatchUpCompletionTHM == LiveSpecLocal    => CatchUpCompletion
+THEOREM HibernateConvergenceTHM == LiveSpecLocal => HibernateConvergence
 
 ====
