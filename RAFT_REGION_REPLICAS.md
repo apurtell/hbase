@@ -688,11 +688,11 @@ Region splits and merges are fundamental HBase operations that must work correct
 
 ### Split
 
-The split is coordinated through the existing `SplitTableRegionProcedure` on the master. The primary proposes a "region-close / split" marker through RAFT, and the master's procedure waits for this marker to be RAFT-committed before proceeding. When each member applies the committed split marker via the consensus apply callback, the callback triggers group removal locally, ensuring that group shutdown is driven by RAFT log ordering rather than by asynchronous master RPCs so that all members close the group at the same logical point. The master then creates two new RAFT groups for the daughter regions via the normal region-open path; daughter regions inherit HFiles from the parent's HDFS directory via reference files, as they do today. No RAFT log state carries over. Daughters start with empty RAFT logs and empty memstores, building state from new writes. If the primary crashes mid-split after the split marker has been committed, the master's procedure framework resumes the split from the last persisted step, opening daughter RAFT groups on surviving members.
+The split is coordinated through the existing `SplitTableRegionProcedure` on the master. The primary proposes a "region-close / split" marker through RAFT, and the master's procedure waits for this marker to be RAFT-committed before proceeding. When each member applies the committed split marker via the consensus apply callback, the callback triggers group removal locally, ensuring that group shutdown is driven by RAFT log ordering rather than by asynchronous master RPCs so that all members close the group at the same logical point (verified by the TLA+ model). The master then creates two new RAFT groups for the daughter regions via the normal region-open path. The daughter regions inherit HFiles from the parent's HDFS directory via reference files, as they do today. No RAFT log state carries over. Daughters start with empty RAFT logs and empty memstores, building state from new writes. If the primary crashes mid-split after the split marker has been committed, the master's procedure framework resumes the split from the last persisted step, opening daughter RAFT groups on surviving members.
 
 ### Merge
 
-Merge is symmetric to split. Both parent RAFT groups receive a "region-close / merge" marker through RAFT, and the master waits for both markers to be RAFT-committed. When each member applies the committed merge markers via the consensus apply callback, the callback triggers group removal for each parent group locally. The master then creates a new merged RAFT group via the normal region-open path; the merged region opens with the combined reference files and an empty RAFT log.
+Merge is symmetric to split. Both parent RAFT groups receive a "region-close / merge" marker through RAFT, and the master waits for both markers to be RAFT-committed. When each member applies the committed merge markers via the consensus apply callback, the callback triggers group removal for each parent group locally (verified by the TLA+ model). The master then creates a new merged RAFT group via the normal region-open path. The merged region opens with the combined reference files and an empty RAFT log.
 
 In both split and merge, the parent RAFT group is closed on a majority of members before daughter or merged RAFT groups are opened. This ordering is enforced by the RAFT commit of the close marker preceding the master's region-open step, which avoids any period where both parent and child groups are active for the same key range. If one member is unreachable, the split or merge proceeds with the majority. The unreachable member's stale group is cleaned up when it recovers: it will discover via the RAFT term that it has been superseded, or the master will instruct it to close the stale group upon reconnection. The master's procedure framework handles this cleanup as a deferred step with retries.
 
@@ -718,6 +718,24 @@ sequenceDiagram
 
     Note over L,F: Daughters start with empty RAFT logs,<br/>inherit HFiles via reference files
 ```
+
+### Safety: No Key-Range Overlap
+
+The core safety property for both split and merge is that no member has both a parent group and the daughter or merged group active for the same key range simultaneously. The master opens daughter (or merged) groups on a member only after verifying that the split (or merge) marker has been RAFT-committed and locally applied on that member. This per-member guard is the `RegionGroupManager`'s serialization point. The callback triggers the closing of the parent, and only after this has occurred does the master open daughters on that member (verified by the TLA+ model).
+
+The safety guarantee rests on RAFT entry ordering: `ApplicableEntries` processes entries in monotonically increasing seqId order. A member cannot have applied a later entry without first having applied all earlier entries, including the split/merge marker. This ordering is the foundation for the per-member guard — the marker's presence in the member's applied state proves parent closure.
+
+### State-Loss Events and Lifecycle Recovery
+
+Three events can clear a member's volatile state, including any applied split/merge marker:
+
+1. **Server crash**: Kills all groups on that server. After restart, the member has no volatile state. The master must re-open all groups on that member after it recovers and re-applies the marker via the RAFT log.
+
+2. **New member bootstrap**: A completely new pod joining the group has no state at all. The member must catch up from the leader (via log replay or snapshot), apply the marker, and then the master can open daughters/merged group.
+
+3. **Snapshot installation**: A leader sends a snapshot to a lagging follower, replacing the follower's memstore with the snapshot contents. In the real system this is moot for the split/merge lifecycle. The parent group is removed on marker application, so no further RAFT operations occur on the parent.
+
+In all three cases, the implementation must treat the member's group lifecycle state as lost and require the master to re-verify that the marker applied on the member before re-opening daughter or merged groups. The `RegionGroupManager` must not assume daughters or merged groups survive any of these state-loss events.
 
 ## Shared Storage and Flush Coordination
 
@@ -1230,8 +1248,8 @@ A TLA+ specification models the protocols described in the design document that 
 | 15 | `HFilesBeforeFlushMarker` | A flush marker is committed through RAFT only after the corresponding HFiles are durable on HDFS. Formalized as: `∀ s ∈ flushMarkerEntries ∩ committedEntries : s ∈ hdfsHFiles`. | Verified |
 | 16 | `CatchUpDataIntegrity` | Every committed entry is recoverable via RAFT log replay (in a majority of logs) or via HFiles on HDFS (covered by a committed flush marker with durable HFiles). Formalized as: `∀ s ∈ committedEntries : Cardinality({m ∈ Members : s ∈ raftLog[m]}) ≥ Majority ∨ ∃ f ∈ flushMarkerEntries ∩ hdfsHFiles : f ≥ s`. | Verified |
 | 17 | `CatchUpCompleteness` | Once a follower (or promoting member) has applied all committed entries (`ApplicableEntries(m) = {}` and `fApplyBatch[m] = {}`), its memstore is consistent with the committed state: every committed entry is in memstore or covered by an applied flush marker (data is in HFiles on HDFS). Verifies no entries are lost or applied twice during catch-up with concurrent flush. | Verified |
-
-
+| 18 | `NoKeyRangeOverlap` | **(Split lifecycle)** No member has both parent and daughter groups active for the same key range. Formalized as: `∀ m ∈ Members : daughterGroupsActive[m] ⇒ splitMarkerSeqId > 0 ∧ (splitMarkerSeqId ∈ memstore[m] ∨ ∃ f ∈ flushMarkerEntries ∩ memstore[m] : f ≥ splitMarkerSeqId)`. The flush-marker disjunct handles the over-approximation artifact where the ungated parent's flush cleans the split marker from memstore; entry ordering guarantees the split marker was applied first. State-loss actions (crash, bootstrap, snapshot) reset `daughterGroupsActive[m]`, so the antecedent is false after state loss. | Verified |
+| 19 | `NoKeyRangeOverlapMerge` | **(Merge lifecycle)** No member has both a parent group and the merged group active for the same key range. Both parents' merge markers must be committed and locally applied before the merged group opens. Formalized as: `∀ m ∈ Members : mergedGroupActive[m] ⇒ (mergeMarkerSeqId_1 > 0 ∧ (mergeMarkerSeqId_1 ∈ memstore_1[m] ∨ ∃ f ∈ flushMarkerEntries_1 ∩ memstore_1[m] : f ≥ mergeMarkerSeqId_1)) ∧ (mergeMarkerSeqId_2 > 0 ∧ (mergeMarkerSeqId_2 ∈ memstore_2[m] ∨ ∃ f ∈ flushMarkerEntries_2 ∩ memstore_2[m] : f ≥ mergeMarkerSeqId_2))`. Same reasoning as `NoKeyRangeOverlap` applied to both parent groups independently. | Verified |
 
 #### Liveness Properties
 
@@ -1268,12 +1286,11 @@ A TLA+ specification models the protocols described in the design document that 
 ~~**Iteration 16. Hibernate/wake lifecycle and wake race.**~~
 ~~**Iteration 17. Multi-group interactions.**~~
 ~~**Iteration 18. Fairness and liveness properties.**~~
+~~**Iteration 19 — Region split/merge with RAFT groups.**~~
 
-**Iteration 19 — Region split/merge with RAFT groups.** Model parent group close → daughter group creation for split; symmetric for merge. Verify that no period exists where both parent and daughter groups are active for the same key range.
+**Iteration 20 — Datapath module refactor.** Refactor `MCRaftRegionReplica_datapath.tla` to use `GroupDataPathNext` from the base spec instead of defining its own `FollowerBatchApply` and `CompleteWriteAndAck` actions, which are functionally identical to the base spec's `AtomicFollowerBatchApply` and `AtomicCompleteWriteAndAck`. Express `DataPathNext` as `GroupDataPathNext` plus shared-impact actions (ClockTick, CrashRestart, CreatePartition, HealPartition, RaftLogGC), eliminating the duplicate definitions and reducing maintenance surface.
 
-**Iteration 20 — Combined simulation-mode liveness checking.** Define `LiveSpecAll` (combined fairness with all SF terms: ElectionSF + WriteSF + FlushSF) in `RaftRegionReplica.tla` and create `MCRaftRegionReplica_liveness_all.cfg` listing all 6 liveness properties. This is only useful for TLC `-simulate` mode (exhaustive checking would hit DNF blowup with the combined SF terms). Enables a single simulation run to check all liveness properties simultaneously rather than requiring 6 separate runs.
-
-**Iteration 21 — Datapath module refactor.** Refactor `MCRaftRegionReplica_datapath.tla` to use `GroupDataPathNext` from the base spec instead of defining its own `FollowerBatchApply` and `CompleteWriteAndAck` actions, which are functionally identical to the base spec's `AtomicFollowerBatchApply` and `AtomicCompleteWriteAndAck`. Express `DataPathNext` as `GroupDataPathNext` plus shared-impact actions (ClockTick, CrashRestart, CreatePartition, HealPartition, RaftLogGC), eliminating the duplicate definitions and reducing maintenance surface.
+**Iteration 21 — Combined simulation-mode liveness checking.** Define `LiveSpecAll` (combined fairness with all SF terms: ElectionSF + WriteSF + FlushSF) in `RaftRegionReplica.tla` and create `MCRaftRegionReplica_liveness_all.cfg` listing all 6 liveness properties. This is only useful for TLC `-simulate` mode (exhaustive checking would hit DNF blowup with the combined SF terms). Enables a single simulation run to check all liveness properties simultaneously rather than requiring 6 separate runs.
 
 ### Specification
 
@@ -1281,12 +1298,14 @@ The full TLA+ specification is included in its entirety at the end of this appen
 
 #### Model Checking Results
 
-Five categories of model-checking configurations are maintained:
+Seven categories of model-checking configurations are maintained:
 
 - **Exhaustive** (`MCRaftRegionReplica.tla` + `.cfg`): MaxSeqId = 3, symmetry-reduced, breadth-first. Proves absence of invariant violations across the complete state space. Expected runtime ~24 hours; run as a daily job after spec changes.
 - **Simulation (dev inner loop)** (`MCRaftRegionReplica_sim.tla` + `_sim.cfg`): MaxSeqId = 5, no symmetry, TLC `-simulate` mode with `-depth 120`. Used as the fast validation loop during spec development. Counterexamples from invariant violations are typically found within minutes if they exist. Depth 120 is tuned so that every trace is deep enough to complete the most complex 5-seqId scenario.
 - **Simulation (daily deep run)**: Same configuration as above but with `-Dtlc2.TLC.stopAfter=28800` (8 hours). Supplements the exhaustive run by exercising longer traces and higher seqId values.
 - **Multi-group** (`MCRaftRegionReplica_multigroup.tla` + `_multigroup.cfg`): Two RAFT groups sharing clock, network, and unified log. MaxSeqId = 2, zero clock drift, data-path action merges. Verifies that operations on one group do not violate another group's safety invariants.
+- **Split lifecycle** (`MCRaftRegionReplica_split.tla` + `.cfg`): One parent RAFT group with per-member daughter lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlap` (no overlap between parent and daughter key ranges) plus all 14 parent-group safety invariants.
+- **Merge lifecycle** (`MCRaftRegionReplica_merge.tla` + `.cfg`): Two parent RAFT groups with per-member merged-group lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlapMerge` (no overlap between parent and merged key ranges) plus all 14 per-group safety invariants for both parents.
 - **Liveness simulation** (six per-property configs, `MCRaftRegionReplica_liveness_*.cfg`): Each config pairs a per-property `SPECIFICATION` (`LiveSpecElection`, `LiveSpecWrite`, etc.) with the matching `PROPERTY`. The shared liveness MC module (`MCRaftRegionReplica_liveness.tla`) uses MaxTerm = 2, MaxClock = 4, MaxSeqId = 2; the election-specific MC module (`MCRaftRegionReplica_liveness_election.tla`) uses MaxTerm = 4, MaxClock = 12, MaxSeqId = 1 (more term/clock headroom, fewer seqIds). All use MaxClockDrift = 1.
 
 #### Running TLC
@@ -1323,6 +1342,24 @@ In addition to the full exhaustive and simulation configurations above, two doma
 - **`MCRaftRegionReplica_election`** — Full timing/drift coverage (MaxClockDrift=1, ElectionTimeoutMin=4) with minimal data path (MaxSeqId=1). Uses the original unmodified `Next` with all 35 actions. Provides BFS proof of election safety, lease exclusivity, and term fencing.
 
 Together with simulation (which exercises both domains simultaneously at MaxSeqId=5), these configurations cover all 14 invariants non-trivially.
+
+##### Split Lifecycle
+
+The split configuration (`MCRaftRegionReplica_split.tla` + `.cfg`) verifies the region split protocol using `SplitRaftRegionReplica.tla`, which composes one full INSTANCE of the parent group with a lightweight per-member daughter lifecycle. Uses the data-path-merged `SplitDataPathNext` for reduced state space. MaxSeqId=2 (write + split marker, or flush + split marker), MaxClockDrift=0, 3 members with symmetry, partitions limited to 1 link. Checks all 14 parent-group safety invariants plus `NoKeyRangeOverlap`.
+
+```bash
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  tlc2.TLC MCRaftRegionReplica_split -workers auto
+```
+
+##### Merge Lifecycle
+
+The merge configuration (`MCRaftRegionReplica_merge.tla` + `.cfg`) verifies the region merge protocol using `MergeRaftRegionReplica.tla`, which composes two full INSTANCE parent groups (G1, G2) sharing clock and network with a lightweight per-member merged-group lifecycle. Uses `MergeDataPathNext` for reduced state space. Same bounds as the multi-group configuration: MaxSeqId=2, MaxClockDrift=0, 3 members with symmetry, partitions limited to 1 link. Checks all 14 per-group safety invariants for both parent groups plus `NoKeyRangeOverlapMerge`.
+
+```bash
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  tlc2.TLC MCRaftRegionReplica_merge -workers auto
+```
 
 ##### Multi-Group Simulation
 
@@ -2864,10 +2901,16 @@ WakeComplete(m) ==
 ----
 (* ---- Next-state relation and specification ---- *)
 
-\* Actions common to both GroupNext and GroupDataPathNext.  The write
-\* path and follower-apply actions that differ between the two (merged
-\* vs unmerged) are added by each variant separately.
-GroupCoreNext ==
+\* Base per-group actions common to all composition variants.  Excludes
+\* "state-loss" actions (InstallSnapshot, NewMemberBootstrap) that clear
+\* or replace a member's memstore.  Composition modules that track
+\* per-member lifecycle state (e.g., split/merge group activation) must
+\* intercept state-loss actions to reset lifecycle variables, since the
+\* memstore clearing implies the member has lost all group state.
+\* GroupCoreNextBase provides the safe subset; state-loss actions are
+\* added back by GroupCoreNext (for single-group use) or by custom
+\* wrappers in composition modules.
+GroupCoreNextBase ==
     \* Election
     \/ \E m \in Members     : Timeout(m)
     \/ \E c, v \in Members  : RequestVote(c, v)
@@ -2892,14 +2935,19 @@ GroupCoreNext ==
     \/ \E m \in Members     : PromotionComplete(m)
     \* Orphan commitment
     \/ NewLeaderCommitOrphanEntry
-    \* Catch-up (not GC — GC is in the shared-impact set)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
-    \* New member bootstrap
-    \/ \E m \in Members     : NewMemberBootstrap(m)
     \* Hibernate lifecycle
     \/ \E m \in Members     : HibernateRequest(m)
     \/ \E m \in Members     : WakeGroup(m)
     \/ \E m \in Members     : WakeComplete(m)
+
+\* Full per-group core actions including state-loss actions.
+\* Used by single-group Next and by composition modules that do not
+\* need to intercept state-loss events.
+GroupCoreNext ==
+    \/ GroupCoreNextBase
+    \* State-loss actions (clear/replace member memstore)
+    \/ \E l, f \in Members  : InstallSnapshot(l, f)
+    \/ \E m \in Members     : NewMemberBootstrap(m)
 
 \* Per-group subset of Next for multi-group composition.  Excludes the
 \* five "shared-impact" actions whose effects span all groups on a
@@ -2979,6 +3027,30 @@ AtomicCompleteWriteAndAck(m) ==
 \*   - ProposeMarker, WALSyncFail, WALFailureAbort removed
 GroupDataPathNext ==
     \/ GroupCoreNext
+    \* Write path (merged)
+    \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
+    \* Follower apply (merged)
+    \/ \E m \in Members     : AtomicFollowerBatchApply(m)
+
+\* Base variants excluding state-loss actions for lifecycle-aware
+\* composition.  Split/merge modules use these and add custom wrappers
+\* for InstallSnapshot and NewMemberBootstrap that reset per-member
+\* lifecycle state (e.g., daughterGroupsActive, mergedGroupActive).
+GroupNextBase ==
+    \/ GroupCoreNextBase
+    \* Write path (unmerged actions not in GroupCoreNextBase)
+    \/ \E m \in Members     : WALSyncFail(m)
+    \/ \E m \in Members     : CompleteWrite(m)
+    \/ \E m \in Members     : AckWrite(m)
+    \/ \E m \in Members     : WALFailureAbort(m)
+    \* Markers
+    \/ \E m \in Members     : ProposeMarker(m)
+    \* Follower apply (unmerged actions not in GroupCoreNextBase)
+    \/ \E m \in Members     : FollowerBeginBatchApply(m)
+    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+
+GroupDataPathNextBase ==
+    \/ GroupCoreNextBase
     \* Write path (merged)
     \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
     \* Follower apply (merged)
@@ -4840,3 +4912,1009 @@ PROPERTY
 CHECK_DEADLOCK FALSE
 ```
 <!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_liveness_hibernate.cfg -->
+
+### TLA+ Specification: `SplitRaftRegionReplica.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/SplitRaftRegionReplica.tla -->
+```tla
+---- MODULE SplitRaftRegionReplica ----
+(*
+ * Region split lifecycle composition over RaftRegionReplica.
+ *
+ * Models one parent RAFT group (full INSTANCE of RaftRegionReplica)
+ * undergoing a region split: the leader proposes a "region-close /
+ * split" marker through RAFT, members apply the committed marker
+ * (closing the parent group locally), and the master opens daughter
+ * groups on members that have applied the marker.
+ *
+ * Daughter groups are lightweight (per-member boolean) since their
+ * internal RAFT safety is already verified by the base spec's 14
+ * invariants.  The focus here is the lifecycle handoff: verifying
+ * that no member has both parent and daughter groups active for the
+ * same key range simultaneously.
+ *
+ * The parent group is NOT gated after the split marker is applied —
+ * this is an intentional over-approximation.  If the invariant holds
+ * with the parent free to continue operating, it certainly holds in
+ * the real system where the group is removed on marker application.
+ *
+ * State-loss handling: three actions can clear or replace a member's
+ * memstore, erasing the split marker from memstore[m]:
+ *   - CrashRestart: server crash kills all groups on that server.
+ *   - NewMemberBootstrap: total state loss (new pod, no persistent state).
+ *   - InstallSnapshot: memstore truncated to snapshot point.
+ * All three are intercepted with lifecycle-aware wrappers that reset
+ * daughterGroupsActive[m] = FALSE, modeling the physical reality that
+ * the daughter groups on that member are also lost.  The member must
+ * re-apply the split marker via FollowerApplyMarker and re-open
+ * daughters via MasterOpenDaughter after recovery.
+ *
+ * The base spec's GroupDataPathNextBase / GroupNextBase exclude
+ * InstallSnapshot and NewMemberBootstrap (the "state-loss" actions),
+ * allowing this module to add them back with lifecycle wrappers.
+ * CrashRestart is already excluded from GroupNext (it is a
+ * shared-impact action).
+ *)
+EXTENDS Naturals, FiniteSets
+
+CONSTANTS
+    Members,
+    None,
+    MaxTerm,
+    LeaderLeaseDuration,
+    ElectionTimeoutMin,
+    MaxClockDrift,
+    MaxClock,
+    MaxSeqId
+
+(* ---- Parent group state (full INSTANCE) ---- *)
+VARIABLES
+    role, currentTerm, votedFor, votesGranted, raftLog,
+    clock, leaseRemaining, timerRemaining, partition,
+    nextSeqId, committedEntries, markerEntries,
+    flushMarkerEntries, hdfsHFiles,
+    memstore, fApplyBatch,
+    writePhase, walSync, raftCommitted, writeSeqId,
+    flushPhase, flushSeqId, promotionPhase, hibernateState
+
+(* ---- Split lifecycle state ---- *)
+VARIABLES
+    splitMarkerSeqId,    \* 0 = not proposed, >0 = the split marker's seqId
+    daughterGroupsActive \* [Members -> BOOLEAN]: per-member daughter lifecycle
+
+splitVars == <<splitMarkerSeqId, daughterGroupsActive>>
+
+parentVars == <<role, currentTerm, votedFor, votesGranted, raftLog,
+               clock, leaseRemaining, timerRemaining, partition,
+               nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
+               hdfsHFiles, memstore, fApplyBatch,
+               writePhase, walSync, raftCommitted, writeSeqId,
+               flushPhase, flushSeqId, promotionPhase, hibernateState>>
+
+vars == <<parentVars, splitVars>>
+
+----
+(* ---- INSTANCE declaration ---- *)
+
+Parent == INSTANCE RaftRegionReplica
+
+Majority == (Cardinality(Members) \div 2) + 1
+
+----
+(* ---- Initial state ---- *)
+
+Init ==
+    /\ Parent!Init
+    /\ splitMarkerSeqId = 0
+    /\ daughterGroupsActive = [m \in Members |-> FALSE]
+
+----
+(* ---- Split lifecycle actions ---- *)
+
+\* Leader proposes a "region-close / split" marker through RAFT.
+\* Same mechanics as ProposeMarker in the base spec, but additionally
+\* records the seqId as the split marker.  At most one split per trace.
+\*
+\* Guard: all ProposeMarker guards plus splitMarkerSeqId = 0 (not yet
+\* proposed).  The marker is atomically committed and placed in the
+\* leader's memstore, modeling the real system where the leader applies
+\* the marker in the same callback that commits it.
+ProposeSplitMarker(m) ==
+    /\ splitMarkerSeqId = 0
+    /\ Parent!IsLeader(m)
+    /\ promotionPhase[m] = "Complete"
+    /\ writePhase[m] = "Idle"
+    /\ flushPhase[m] = "Idle"
+    /\ nextSeqId <= MaxSeqId
+    /\ LET seqId == nextSeqId
+           followers  == Members \ {m}
+           responders == {f \in followers :
+                            /\ currentTerm[m] >= currentTerm[f]
+                            /\ Parent!CanCommunicate(m, f)}
+       IN
+        /\ ~\E f \in followers :
+              /\ Parent!CanCommunicate(m, f)
+              /\ currentTerm[f] > currentTerm[m]
+        /\ Cardinality(responders) + 1 >= Majority
+        /\ nextSeqId' = nextSeqId + 1
+        /\ committedEntries' = committedEntries \union {seqId}
+        /\ markerEntries' = markerEntries \union {seqId}
+        /\ memstore' = [memstore EXCEPT ![m] = @ \union {seqId}]
+        /\ raftLog' = [r \in Members |->
+              IF r = m \/ r \in responders
+              THEN raftLog[r] \union {seqId}
+              ELSE raftLog[r]]
+        /\ splitMarkerSeqId' = seqId
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
+                   clock, leaseRemaining, timerRemaining, partition,
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   writePhase, walSync, raftCommitted, writeSeqId,
+                   flushPhase, flushSeqId, promotionPhase, hibernateState,
+                   daughterGroupsActive>>
+
+\* Master opens daughter groups on member m after the split marker
+\* is RAFT-committed and applied on that member.  Models the
+\* SplitTableRegionProcedure's region-open step and the
+\* RegionGroupManager's serialization: daughters are opened only
+\* on members that have closed the parent group (split marker in
+\* memstore).
+\*
+\* Guard:
+\*   - splitMarkerSeqId > 0: a split has been proposed
+\*   - splitMarkerSeqId \in committedEntries: marker is RAFT-committed
+\*   - splitMarkerSeqId \in memstore[m]: member m has applied the marker
+\*     (parent group closed locally — models regionGroupManager.removeGroup()
+\*     triggered by the consensus apply callback)
+\*   - ~daughterGroupsActive[m]: daughters not already open on this member
+MasterOpenDaughter(m) ==
+    /\ splitMarkerSeqId > 0
+    /\ splitMarkerSeqId \in committedEntries
+    /\ splitMarkerSeqId \in memstore[m]
+    /\ ~daughterGroupsActive[m]
+    /\ daughterGroupsActive' = [daughterGroupsActive EXCEPT ![m] = TRUE]
+    /\ UNCHANGED <<parentVars, splitMarkerSeqId>>
+
+\* ---- State-loss wrappers ----
+\*
+\* Three parent-group actions clear or replace a member's memstore,
+\* erasing the split marker.  Each is wrapped to also reset
+\* daughterGroupsActive[m], modeling the physical reality that group
+\* lifecycle state on that member is also lost.
+
+\* Server crash resets daughter state on the crashed member.
+SplitCrashRestart(m) ==
+    /\ Parent!CrashRestart(m)
+    /\ daughterGroupsActive' = [daughterGroupsActive EXCEPT ![m] = FALSE]
+    /\ UNCHANGED splitMarkerSeqId
+
+\* New member bootstrap (total state loss) resets daughter state.
+SplitNewMemberBootstrap(m) ==
+    /\ Parent!NewMemberBootstrap(m)
+    /\ daughterGroupsActive' = [daughterGroupsActive EXCEPT ![m] = FALSE]
+    /\ UNCHANGED splitMarkerSeqId
+
+\* Snapshot installation truncates memstore to the snapshot point,
+\* potentially removing the split marker.  Reset daughter state.
+SplitInstallSnapshot(leader, follower) ==
+    /\ Parent!InstallSnapshot(leader, follower)
+    /\ daughterGroupsActive' = [daughterGroupsActive EXCEPT ![follower] = FALSE]
+    /\ UNCHANGED splitMarkerSeqId
+
+----
+(* ---- Next-state relation and specification ---- *)
+
+Next ==
+    \* Parent group per-group actions excluding state-loss (split vars unchanged)
+    \/ (Parent!GroupNextBase /\ UNCHANGED splitVars)
+    \* State-loss actions — wrapped to reset daughter lifecycle
+    \/ \E m \in Members     : SplitNewMemberBootstrap(m)
+    \/ \E l, f \in Members  : SplitInstallSnapshot(l, f)
+    \* Timing (shared clock — split vars unchanged)
+    \/ (\E m \in Members : Parent!ClockTick(m) /\ UNCHANGED splitVars)
+    \* Crash recovery — wrapped to reset daughter lifecycle
+    \/ \E m \in Members : SplitCrashRestart(m)
+    \* Network partitions (split vars unchanged)
+    \/ (Parent!CreatePartition /\ UNCHANGED splitVars)
+    \/ (Parent!HealPartition /\ UNCHANGED splitVars)
+    \/ (Parent!HealAllPartitions /\ UNCHANGED splitVars)
+    \* RAFT log GC (split vars unchanged)
+    \/ (\E m \in Members : Parent!RaftLogGC(m) /\ UNCHANGED splitVars)
+    \* Split lifecycle
+    \/ \E m \in Members : ProposeSplitMarker(m)
+    \/ \E m \in Members : MasterOpenDaughter(m)
+
+Spec == Init /\ [][Next]_vars
+
+----
+(* ---- Data-path next-state relation ---- *)
+
+\* Uses the data-path-merged GroupDataPathNextBase (fewer actions per
+\* step, no state-loss) for faster model checking.  State-loss actions
+\* are added back with lifecycle wrappers.
+SplitDataPathNext ==
+    \/ (Parent!GroupDataPathNextBase /\ UNCHANGED splitVars)
+    \* State-loss actions — wrapped to reset daughter lifecycle
+    \/ \E m \in Members     : SplitNewMemberBootstrap(m)
+    \/ \E l, f \in Members  : SplitInstallSnapshot(l, f)
+    \* Shared-impact actions
+    \/ (\E m \in Members : Parent!ClockTick(m) /\ UNCHANGED splitVars)
+    \/ \E m \in Members : SplitCrashRestart(m)
+    \/ (Parent!CreatePartition /\ UNCHANGED splitVars)
+    \/ (Parent!HealPartition /\ UNCHANGED splitVars)
+    \/ (Parent!HealAllPartitions /\ UNCHANGED splitVars)
+    \/ (\E m \in Members : Parent!RaftLogGC(m) /\ UNCHANGED splitVars)
+    \* Split lifecycle
+    \/ \E m \in Members : ProposeSplitMarker(m)
+    \/ \E m \in Members : MasterOpenDaughter(m)
+
+SplitDataPathSpec == Init /\ [][SplitDataPathNext]_vars
+
+----
+(* ---- Safety properties ---- *)
+
+\* Parent group type correctness.
+SplitTypeOK ==
+    /\ Parent!TypeOK
+    /\ splitMarkerSeqId \in 0..MaxSeqId
+    /\ daughterGroupsActive \in [Members -> BOOLEAN]
+
+\* All 14 per-group safety invariants for the parent group.
+ParentGroupSafety ==
+    /\ Parent!LeaderUniqueness
+    /\ Parent!LeaseImpliesLeadership
+    /\ Parent!LeaseExpiresBeforeElection
+    /\ Parent!CatchUpDataIntegrity
+    /\ Parent!WriteBarrierSafety
+    /\ Parent!FollowerSeqIdConsistency
+    /\ Parent!NoOrphanMemstoreDrop
+    /\ Parent!FlushWriteExclusion
+    /\ Parent!FollowerFlushMemstoreDrop
+    /\ Parent!HFilesBeforeFlushMarker
+    /\ Parent!PromotionReadWriteGuard
+    /\ Parent!PromotionMVCCContinuity
+    /\ Parent!CatchUpCompleteness
+
+\* Core split safety invariant: no member has both parent and daughter
+\* groups active for the same key range.  "Parent closed on m" means
+\* the split marker was applied on member m — either the marker is still
+\* in memstore[m], or a subsequent flush marker (seqId >= split marker)
+\* has been applied and cleaned the split marker from memstore.
+\*
+\* The second disjunct is needed because the parent group is not gated
+\* after the split marker is applied (intentional over-approximation):
+\* the parent's flush protocol can drop the split marker from memstore
+\* via the normal flush-watermark mechanism.  The ordering guarantee
+\* is sound because ApplicableEntries processes entries in seqId order,
+\* so a flush marker with seqId >= splitMarkerSeqId can only appear in
+\* memstore[m] if the split marker (lower seqId) was applied first.
+\*
+\* State-loss actions (crash, bootstrap, snapshot) reset
+\* daughterGroupsActive[m] = FALSE, so the antecedent is false and
+\* the invariant holds trivially after state loss.
+NoKeyRangeOverlap ==
+    \A m \in Members :
+        daughterGroupsActive[m] =>
+            /\ splitMarkerSeqId > 0
+            /\ \/ splitMarkerSeqId \in memstore[m]
+               \/ \E f \in flushMarkerEntries \cap memstore[m] :
+                    f >= splitMarkerSeqId
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/SplitRaftRegionReplica.tla -->
+
+### TLA+ Specification: `MCRaftRegionReplica_split.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_split.tla -->
+```tla
+---- MODULE MCRaftRegionReplica_split ----
+(*
+ * Split lifecycle domain model-checking configuration.
+ *
+ * PURPOSE
+ * -------
+ * Verify that the region split protocol — leader proposes a split
+ * marker through RAFT, members apply the committed marker (closing
+ * the parent group locally), master opens daughters on members that
+ * have applied the marker — correctly prevents any period where both
+ * parent and daughter groups are active for the same key range.
+ *
+ * Uses the data-path-merged SplitDataPathNext (GroupDataPathNext for
+ * parent group actions) for reduced state space.  All 14 parent-group
+ * safety invariants are checked alongside the split-specific
+ * NoKeyRangeOverlap invariant.
+ *
+ * TIMING SIMPLIFICATION
+ * ---------------------
+ * MaxClockDrift = 0, ElectionTimeoutMin = 2, MaxClock = 2.
+ * Clock drift is orthogonal to split lifecycle correctness.
+ *
+ * STATE SPACE
+ * -----------
+ * MaxSeqId = 2: write(1) + split marker(2), or flush(1) + split(2),
+ * exercises the critical paths.  3 members with symmetry.
+ * Partitions limited to at most 1 link.
+ *)
+EXTENDS SplitRaftRegionReplica, TLC
+
+CONSTANTS m1, m2, m3, NoVote
+
+MC_Members == {m1, m2, m3}
+MC_None == NoVote
+MC_MaxTerm == 2
+MC_LeaderLeaseDuration == 1
+MC_ElectionTimeoutMin == 2
+MC_MaxClockDrift == 0
+MC_MaxClock == 2
+MC_MaxSeqId == 2
+
+Symmetry == Permutations(MC_Members)
+
+PartitionConstraint == Cardinality(partition) <= 2
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_split.tla -->
+
+### TLA+ Configuration: `MCRaftRegionReplica_split.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_split.cfg -->
+```
+SPECIFICATION SplitDataPathSpec
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+SYMMETRY Symmetry
+
+CONSTRAINT PartitionConstraint
+
+INVARIANTS
+    SplitTypeOK
+    ParentGroupSafety
+    NoKeyRangeOverlap
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_split.cfg -->
+
+### TLA+ Specification: `MergeRaftRegionReplica.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MergeRaftRegionReplica.tla -->
+```tla
+---- MODULE MergeRaftRegionReplica ----
+(*
+ * Region merge lifecycle composition over two RaftRegionReplica groups.
+ *
+ * Models two parent RAFT groups (G1, G2) undergoing a region merge:
+ * each parent's leader proposes a "region-close / merge" marker through
+ * RAFT, members apply both committed markers (closing each parent group
+ * locally), and the master opens the merged group on members that have
+ * applied both markers.
+ *
+ * Follows the MultiGroupRaftRegionReplica pattern: two full INSTANCE
+ * groups sharing clock, partition, and unified log, with five
+ * shared-impact actions (ClockTick, CrashRestart, CreatePartition,
+ * HealPartition, UnifiedLogGC) replaced by multi-group versions.
+ *
+ * The merged group is lightweight (per-member boolean) since its
+ * internal RAFT safety is already verified by the base spec's 14
+ * invariants.  The focus here is the lifecycle handoff: verifying
+ * that no member has both a parent group and the merged group active
+ * for the same key range simultaneously.
+ *
+ * Parent groups are NOT gated after their merge markers are applied —
+ * intentional over-approximation (see SplitRaftRegionReplica.tla).
+ *
+ * State-loss handling: NewMemberBootstrap and InstallSnapshot can
+ * clear a member's memstore (erasing merge markers).  These are
+ * intercepted with lifecycle-aware wrappers that reset
+ * mergedGroupActive[m] = FALSE on the affected member, using
+ * GroupDataPathNextBase / GroupNextBase from the base spec.
+ * CrashRestart is already a shared-impact action handled by
+ * MergeCrashRestart.
+ *)
+EXTENDS Naturals, FiniteSets
+
+CONSTANTS
+    Members,
+    None,
+    MaxTerm,
+    LeaderLeaseDuration,
+    ElectionTimeoutMin,
+    MaxClockDrift,
+    MaxClock,
+    MaxSeqId
+
+\* ---- Shared state ----
+VARIABLES clock, partition
+
+\* ---- Group 1 per-group state (22 variables) ----
+VARIABLES
+    role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
+    leaseRemaining_1, timerRemaining_1,
+    nextSeqId_1, committedEntries_1, markerEntries_1,
+    flushMarkerEntries_1, hdfsHFiles_1,
+    memstore_1, fApplyBatch_1,
+    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+    flushPhase_1, flushSeqId_1,
+    promotionPhase_1,
+    hibernateState_1
+
+\* ---- Group 2 per-group state (22 variables) ----
+VARIABLES
+    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
+    leaseRemaining_2, timerRemaining_2,
+    nextSeqId_2, committedEntries_2, markerEntries_2,
+    flushMarkerEntries_2, hdfsHFiles_2,
+    memstore_2, fApplyBatch_2,
+    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+    flushPhase_2, flushSeqId_2,
+    promotionPhase_2,
+    hibernateState_2
+
+\* ---- Merge lifecycle state ----
+VARIABLES
+    mergeMarkerSeqId_1,  \* 0 = not proposed, >0 = G1's merge marker seqId
+    mergeMarkerSeqId_2,  \* 0 = not proposed, >0 = G2's merge marker seqId
+    mergedGroupActive    \* [Members -> BOOLEAN]: per-member merged group lifecycle
+
+\* ---- Variable tuples ----
+
+g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
+             leaseRemaining_1, timerRemaining_1,
+             nextSeqId_1, committedEntries_1, markerEntries_1,
+             flushMarkerEntries_1, hdfsHFiles_1,
+             memstore_1, fApplyBatch_1,
+             writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+             flushPhase_1, flushSeqId_1,
+             promotionPhase_1, hibernateState_1>>
+
+g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
+             leaseRemaining_2, timerRemaining_2,
+             nextSeqId_2, committedEntries_2, markerEntries_2,
+             flushMarkerEntries_2, hdfsHFiles_2,
+             memstore_2, fApplyBatch_2,
+             writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+             flushPhase_2, flushSeqId_2,
+             promotionPhase_2, hibernateState_2>>
+
+mergeVars == <<mergeMarkerSeqId_1, mergeMarkerSeqId_2, mergedGroupActive>>
+
+vars == <<clock, partition, g1_vars, g2_vars, mergeVars>>
+
+----
+(* ---- INSTANCE declarations ---- *)
+
+G1 == INSTANCE RaftRegionReplica WITH
+    role            <- role_1,
+    currentTerm     <- currentTerm_1,
+    votedFor        <- votedFor_1,
+    votesGranted    <- votesGranted_1,
+    raftLog         <- raftLog_1,
+    clock           <- clock,
+    leaseRemaining  <- leaseRemaining_1,
+    timerRemaining  <- timerRemaining_1,
+    partition       <- partition,
+    nextSeqId       <- nextSeqId_1,
+    committedEntries <- committedEntries_1,
+    markerEntries   <- markerEntries_1,
+    flushMarkerEntries <- flushMarkerEntries_1,
+    hdfsHFiles      <- hdfsHFiles_1,
+    memstore        <- memstore_1,
+    fApplyBatch     <- fApplyBatch_1,
+    writePhase      <- writePhase_1,
+    walSync         <- walSync_1,
+    raftCommitted   <- raftCommitted_1,
+    writeSeqId      <- writeSeqId_1,
+    flushPhase      <- flushPhase_1,
+    flushSeqId      <- flushSeqId_1,
+    promotionPhase  <- promotionPhase_1,
+    hibernateState  <- hibernateState_1
+
+G2 == INSTANCE RaftRegionReplica WITH
+    role            <- role_2,
+    currentTerm     <- currentTerm_2,
+    votedFor        <- votedFor_2,
+    votesGranted    <- votesGranted_2,
+    raftLog         <- raftLog_2,
+    clock           <- clock,
+    leaseRemaining  <- leaseRemaining_2,
+    timerRemaining  <- timerRemaining_2,
+    partition       <- partition,
+    nextSeqId       <- nextSeqId_2,
+    committedEntries <- committedEntries_2,
+    markerEntries   <- markerEntries_2,
+    flushMarkerEntries <- flushMarkerEntries_2,
+    hdfsHFiles      <- hdfsHFiles_2,
+    memstore        <- memstore_2,
+    fApplyBatch     <- fApplyBatch_2,
+    writePhase      <- writePhase_2,
+    walSync         <- walSync_2,
+    raftCommitted   <- raftCommitted_2,
+    writeSeqId      <- writeSeqId_2,
+    flushPhase      <- flushPhase_2,
+    flushSeqId      <- flushSeqId_2,
+    promotionPhase  <- promotionPhase_2,
+    hibernateState  <- hibernateState_2
+
+Majority == (Cardinality(Members) \div 2) + 1
+
+----
+(* ---- Initial state ---- *)
+
+Init ==
+    /\ G1!Init
+    /\ G2!Init
+    /\ mergeMarkerSeqId_1 = 0
+    /\ mergeMarkerSeqId_2 = 0
+    /\ mergedGroupActive = [m \in Members |-> FALSE]
+
+----
+(* ---- Shared-impact actions ---- *)
+
+\* Clock tick decrements both groups' timers on the ticking member.
+MergeClockTick(m) ==
+    /\ clock[m] < MaxClock
+    /\ \A other \in Members :
+        clock[m] + 1 - clock[other] <= MaxClockDrift
+    /\ ~\E c \in Members :
+          \/ (role_1[c] = "Candidate"
+              /\ Cardinality(votesGranted_1[c]) >= Majority)
+          \/ (role_2[c] = "Candidate"
+              /\ Cardinality(votesGranted_2[c]) >= Majority)
+    /\ \E m2 \in Members :
+          \/ timerRemaining_1[m2] > 0 \/ leaseRemaining_1[m2] > 0
+          \/ timerRemaining_2[m2] > 0 \/ leaseRemaining_2[m2] > 0
+    /\ clock' = [clock EXCEPT ![m] = @ + 1]
+    /\ timerRemaining_1' = [timerRemaining_1 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ leaseRemaining_1' = [leaseRemaining_1 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ timerRemaining_2' = [timerRemaining_2 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ leaseRemaining_2' = [leaseRemaining_2 EXCEPT
+                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ UNCHANGED <<partition,
+                   role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   memstore_1, fApplyBatch_1,
+                   writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   memstore_2, fApplyBatch_2,
+                   writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2,
+                   mergeVars>>
+
+\* Server crash resets volatile state for BOTH groups and the merged
+\* group on the crashed member.
+MergeCrashRestart(m) ==
+    /\ \/ role_1[m] # "Follower"
+       \/ memstore_1[m] # {}
+       \/ fApplyBatch_1[m] # {}
+       \/ votesGranted_1[m] # {}
+       \/ leaseRemaining_1[m] > 0
+       \/ timerRemaining_1[m] # ElectionTimeoutMin
+       \/ writePhase_1[m] # "Idle"
+       \/ flushPhase_1[m] # "Idle"
+       \/ promotionPhase_1[m] # "None"
+       \/ hibernateState_1[m] # "Active"
+       \/ role_2[m] # "Follower"
+       \/ memstore_2[m] # {}
+       \/ fApplyBatch_2[m] # {}
+       \/ votesGranted_2[m] # {}
+       \/ leaseRemaining_2[m] > 0
+       \/ timerRemaining_2[m] # ElectionTimeoutMin
+       \/ writePhase_2[m] # "Idle"
+       \/ flushPhase_2[m] # "Idle"
+       \/ promotionPhase_2[m] # "None"
+       \/ hibernateState_2[m] # "Active"
+       \/ mergedGroupActive[m]
+    \* Reset group 1 volatile state
+    /\ role_1'           = [role_1           EXCEPT ![m] = "Follower"]
+    /\ votesGranted_1'   = [votesGranted_1   EXCEPT ![m] = {}]
+    /\ leaseRemaining_1' = [leaseRemaining_1 EXCEPT ![m] = 0]
+    /\ timerRemaining_1' = [timerRemaining_1 EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore_1'       = [memstore_1       EXCEPT ![m] = {}]
+    /\ fApplyBatch_1'    = [fApplyBatch_1    EXCEPT ![m] = {}]
+    /\ writePhase_1'     = [writePhase_1     EXCEPT ![m] = "Idle"]
+    /\ walSync_1'        = [walSync_1        EXCEPT ![m] = "Pending"]
+    /\ raftCommitted_1'  = [raftCommitted_1  EXCEPT ![m] = FALSE]
+    /\ writeSeqId_1'     = [writeSeqId_1     EXCEPT ![m] = 0]
+    /\ flushPhase_1'     = [flushPhase_1     EXCEPT ![m] = "Idle"]
+    /\ flushSeqId_1'     = [flushSeqId_1     EXCEPT ![m] = 0]
+    /\ promotionPhase_1' = [promotionPhase_1 EXCEPT ![m] = "None"]
+    /\ hibernateState_1' = [hibernateState_1 EXCEPT ![m] = "Active"]
+    \* Reset group 2 volatile state
+    /\ role_2'           = [role_2           EXCEPT ![m] = "Follower"]
+    /\ votesGranted_2'   = [votesGranted_2   EXCEPT ![m] = {}]
+    /\ leaseRemaining_2' = [leaseRemaining_2 EXCEPT ![m] = 0]
+    /\ timerRemaining_2' = [timerRemaining_2 EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore_2'       = [memstore_2       EXCEPT ![m] = {}]
+    /\ fApplyBatch_2'    = [fApplyBatch_2    EXCEPT ![m] = {}]
+    /\ writePhase_2'     = [writePhase_2     EXCEPT ![m] = "Idle"]
+    /\ walSync_2'        = [walSync_2        EXCEPT ![m] = "Pending"]
+    /\ raftCommitted_2'  = [raftCommitted_2  EXCEPT ![m] = FALSE]
+    /\ writeSeqId_2'     = [writeSeqId_2     EXCEPT ![m] = 0]
+    /\ flushPhase_2'     = [flushPhase_2     EXCEPT ![m] = "Idle"]
+    /\ flushSeqId_2'     = [flushSeqId_2     EXCEPT ![m] = 0]
+    /\ promotionPhase_2' = [promotionPhase_2 EXCEPT ![m] = "None"]
+    /\ hibernateState_2' = [hibernateState_2 EXCEPT ![m] = "Active"]
+    \* Reset merged group state
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![m] = FALSE]
+    \* Preserve durable state for both groups and merge marker tracking
+    /\ UNCHANGED <<clock, partition,
+                   currentTerm_1, votedFor_1, raftLog_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   currentTerm_2, votedFor_2, raftLog_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
+\* Network partition — shared across both groups.
+MergeCreatePartition ==
+    \E m1, m2 \in Members :
+        /\ m1 # m2
+        /\ <<m1, m2>> \notin partition
+        /\ partition' = partition \union {<<m1, m2>>, <<m2, m1>>}
+        /\ UNCHANGED <<clock, g1_vars, g2_vars, mergeVars>>
+
+MergeHealPartition ==
+    \E m1, m2 \in Members :
+        /\ <<m1, m2>> \in partition
+        /\ partition' = partition \ {<<m1, m2>>, <<m2, m1>>}
+        /\ UNCHANGED <<clock, g1_vars, g2_vars, mergeVars>>
+
+\* Unified log GC: both groups must have an applied flush marker
+\* before entries below the watermark are removed.
+MergeUnifiedLogGC(m) ==
+    /\ \E s1 \in flushMarkerEntries_1 \cap memstore_1[m] :
+       \E s2 \in flushMarkerEntries_2 \cap memstore_2[m] :
+            /\ (\E e \in raftLog_1[m] : e < s1)
+               \/ (\E e \in raftLog_2[m] : e < s2)
+            /\ raftLog_1' = [raftLog_1 EXCEPT
+                             ![m] = {e \in @ : e >= s1}]
+            /\ raftLog_2' = [raftLog_2 EXCEPT
+                             ![m] = {e \in @ : e >= s2}]
+    /\ UNCHANGED <<clock, partition,
+                   role_1, currentTerm_1, votedFor_1, votesGranted_1,
+                   leaseRemaining_1, timerRemaining_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   memstore_1, fApplyBatch_1,
+                   writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   role_2, currentTerm_2, votedFor_2, votesGranted_2,
+                   leaseRemaining_2, timerRemaining_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   memstore_2, fApplyBatch_2,
+                   writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2,
+                   mergeVars>>
+
+----
+(* ---- Per-group state-loss wrappers ---- *)
+
+\* NewMemberBootstrap and InstallSnapshot can clear a member's memstore,
+\* erasing merge markers.  Each per-group instance is wrapped to also
+\* reset mergedGroupActive[m], modeling the physical reality that the
+\* merged group on that member is also lost.
+
+\* G1 state-loss: new member bootstrap
+MergeNewMemberBootstrap_1(m) ==
+    /\ G1!NewMemberBootstrap(m)
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![m] = FALSE]
+    /\ UNCHANGED <<g2_vars, mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
+\* G2 state-loss: new member bootstrap
+MergeNewMemberBootstrap_2(m) ==
+    /\ G2!NewMemberBootstrap(m)
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![m] = FALSE]
+    /\ UNCHANGED <<g1_vars, mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
+\* G1 state-loss: snapshot installation
+MergeInstallSnapshot_1(leader, follower) ==
+    /\ G1!InstallSnapshot(leader, follower)
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![follower] = FALSE]
+    /\ UNCHANGED <<g2_vars, mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
+\* G2 state-loss: snapshot installation
+MergeInstallSnapshot_2(leader, follower) ==
+    /\ G2!InstallSnapshot(leader, follower)
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![follower] = FALSE]
+    /\ UNCHANGED <<g1_vars, mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
+----
+(* ---- Merge lifecycle actions ---- *)
+
+\* G1's leader proposes a "region-close / merge" marker through RAFT.
+\* Same mechanics as ProposeMarker, but records the seqId as the merge
+\* marker for G1.  At most one merge marker per group per trace.
+ProposeMergeMarker_1(m) ==
+    /\ mergeMarkerSeqId_1 = 0
+    /\ G1!IsLeader(m)
+    /\ promotionPhase_1[m] = "Complete"
+    /\ writePhase_1[m] = "Idle"
+    /\ flushPhase_1[m] = "Idle"
+    /\ nextSeqId_1 <= MaxSeqId
+    /\ LET seqId == nextSeqId_1
+           followers  == Members \ {m}
+           responders == {f \in followers :
+                            /\ currentTerm_1[m] >= currentTerm_1[f]
+                            /\ G1!CanCommunicate(m, f)}
+       IN
+        /\ ~\E f \in followers :
+              /\ G1!CanCommunicate(m, f)
+              /\ currentTerm_1[f] > currentTerm_1[m]
+        /\ Cardinality(responders) + 1 >= Majority
+        /\ nextSeqId_1' = nextSeqId_1 + 1
+        /\ committedEntries_1' = committedEntries_1 \union {seqId}
+        /\ markerEntries_1' = markerEntries_1 \union {seqId}
+        /\ memstore_1' = [memstore_1 EXCEPT ![m] = @ \union {seqId}]
+        /\ raftLog_1' = [r \in Members |->
+              IF r = m \/ r \in responders
+              THEN raftLog_1[r] \union {seqId}
+              ELSE raftLog_1[r]]
+        /\ mergeMarkerSeqId_1' = seqId
+    /\ UNCHANGED <<role_1, currentTerm_1, votedFor_1, votesGranted_1,
+                   clock, leaseRemaining_1, timerRemaining_1, partition,
+                   flushMarkerEntries_1, hdfsHFiles_1, fApplyBatch_1,
+                   writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   g2_vars, mergeMarkerSeqId_2, mergedGroupActive>>
+
+\* G2's leader proposes a "region-close / merge" marker through RAFT.
+ProposeMergeMarker_2(m) ==
+    /\ mergeMarkerSeqId_2 = 0
+    /\ G2!IsLeader(m)
+    /\ promotionPhase_2[m] = "Complete"
+    /\ writePhase_2[m] = "Idle"
+    /\ flushPhase_2[m] = "Idle"
+    /\ nextSeqId_2 <= MaxSeqId
+    /\ LET seqId == nextSeqId_2
+           followers  == Members \ {m}
+           responders == {f \in followers :
+                            /\ currentTerm_2[m] >= currentTerm_2[f]
+                            /\ G2!CanCommunicate(m, f)}
+       IN
+        /\ ~\E f \in followers :
+              /\ G2!CanCommunicate(m, f)
+              /\ currentTerm_2[f] > currentTerm_2[m]
+        /\ Cardinality(responders) + 1 >= Majority
+        /\ nextSeqId_2' = nextSeqId_2 + 1
+        /\ committedEntries_2' = committedEntries_2 \union {seqId}
+        /\ markerEntries_2' = markerEntries_2 \union {seqId}
+        /\ memstore_2' = [memstore_2 EXCEPT ![m] = @ \union {seqId}]
+        /\ raftLog_2' = [r \in Members |->
+              IF r = m \/ r \in responders
+              THEN raftLog_2[r] \union {seqId}
+              ELSE raftLog_2[r]]
+        /\ mergeMarkerSeqId_2' = seqId
+    /\ UNCHANGED <<role_2, currentTerm_2, votedFor_2, votesGranted_2,
+                   clock, leaseRemaining_2, timerRemaining_2, partition,
+                   flushMarkerEntries_2, hdfsHFiles_2, fApplyBatch_2,
+                   writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2,
+                   g1_vars, mergeMarkerSeqId_1, mergedGroupActive>>
+
+\* Master opens the merged group on member m after BOTH parent groups'
+\* merge markers are RAFT-committed and applied on that member.
+\* Models the master's region-open step and the RegionGroupManager's
+\* serialization: the merged group opens only on members that have
+\* closed both parent groups.
+MasterOpenMerged(m) ==
+    /\ mergeMarkerSeqId_1 > 0
+    /\ mergeMarkerSeqId_1 \in committedEntries_1
+    /\ mergeMarkerSeqId_1 \in memstore_1[m]
+    /\ mergeMarkerSeqId_2 > 0
+    /\ mergeMarkerSeqId_2 \in committedEntries_2
+    /\ mergeMarkerSeqId_2 \in memstore_2[m]
+    /\ ~mergedGroupActive[m]
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![m] = TRUE]
+    /\ UNCHANGED <<clock, partition, g1_vars, g2_vars,
+                   mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
+----
+(* ---- Next-state relation and specification ---- *)
+
+Next ==
+    \* Per-group steps excluding state-loss via INSTANCE
+    \/ (G1!GroupNextBase /\ UNCHANGED <<g2_vars, mergeVars>>)
+    \/ (G2!GroupNextBase /\ UNCHANGED <<g1_vars, mergeVars>>)
+    \* Per-group state-loss actions — wrapped to reset merged lifecycle
+    \/ \E m \in Members     : MergeNewMemberBootstrap_1(m)
+    \/ \E m \in Members     : MergeNewMemberBootstrap_2(m)
+    \/ \E l, f \in Members  : MergeInstallSnapshot_1(l, f)
+    \/ \E l, f \in Members  : MergeInstallSnapshot_2(l, f)
+    \* Shared-impact actions
+    \/ \E m \in Members : MergeClockTick(m)
+    \/ \E m \in Members : MergeCrashRestart(m)
+    \/ MergeCreatePartition
+    \/ MergeHealPartition
+    \* Unified log GC
+    \/ \E m \in Members : MergeUnifiedLogGC(m)
+    \* Merge lifecycle
+    \/ \E m \in Members : ProposeMergeMarker_1(m)
+    \/ \E m \in Members : ProposeMergeMarker_2(m)
+    \/ \E m \in Members : MasterOpenMerged(m)
+
+Spec == Init /\ [][Next]_vars
+
+----
+(* ---- Data-path next-state relation ---- *)
+
+MergeDataPathNext ==
+    \/ (G1!GroupDataPathNextBase /\ UNCHANGED <<g2_vars, mergeVars>>)
+    \/ (G2!GroupDataPathNextBase /\ UNCHANGED <<g1_vars, mergeVars>>)
+    \* Per-group state-loss actions — wrapped to reset merged lifecycle
+    \/ \E m \in Members     : MergeNewMemberBootstrap_1(m)
+    \/ \E m \in Members     : MergeNewMemberBootstrap_2(m)
+    \/ \E l, f \in Members  : MergeInstallSnapshot_1(l, f)
+    \/ \E l, f \in Members  : MergeInstallSnapshot_2(l, f)
+    \* Shared-impact actions
+    \/ \E m \in Members : MergeClockTick(m)
+    \/ \E m \in Members : MergeCrashRestart(m)
+    \/ MergeCreatePartition
+    \/ MergeHealPartition
+    \/ \E m \in Members : MergeUnifiedLogGC(m)
+    \* Merge lifecycle
+    \/ \E m \in Members : ProposeMergeMarker_1(m)
+    \/ \E m \in Members : ProposeMergeMarker_2(m)
+    \/ \E m \in Members : MasterOpenMerged(m)
+
+MergeDataPathSpec == Init /\ [][MergeDataPathNext]_vars
+
+----
+(* ---- Safety properties ---- *)
+
+MergeTypeOK ==
+    /\ G1!TypeOK
+    /\ G2!TypeOK
+    /\ mergeMarkerSeqId_1 \in 0..MaxSeqId
+    /\ mergeMarkerSeqId_2 \in 0..MaxSeqId
+    /\ mergedGroupActive \in [Members -> BOOLEAN]
+
+\* All 14 per-group safety invariants for both parent groups.
+PerGroupSafety ==
+    /\ G1!LeaderUniqueness          /\ G2!LeaderUniqueness
+    /\ G1!LeaseImpliesLeadership    /\ G2!LeaseImpliesLeadership
+    /\ G1!LeaseExpiresBeforeElection /\ G2!LeaseExpiresBeforeElection
+    /\ G1!CatchUpDataIntegrity      /\ G2!CatchUpDataIntegrity
+    /\ G1!WriteBarrierSafety        /\ G2!WriteBarrierSafety
+    /\ G1!FollowerSeqIdConsistency  /\ G2!FollowerSeqIdConsistency
+    /\ G1!NoOrphanMemstoreDrop      /\ G2!NoOrphanMemstoreDrop
+    /\ G1!FlushWriteExclusion       /\ G2!FlushWriteExclusion
+    /\ G1!FollowerFlushMemstoreDrop /\ G2!FollowerFlushMemstoreDrop
+    /\ G1!HFilesBeforeFlushMarker   /\ G2!HFilesBeforeFlushMarker
+    /\ G1!PromotionReadWriteGuard   /\ G2!PromotionReadWriteGuard
+    /\ G1!PromotionMVCCContinuity   /\ G2!PromotionMVCCContinuity
+    /\ G1!CatchUpCompleteness       /\ G2!CatchUpCompleteness
+
+\* Core merge safety invariant: no member has both a parent group and
+\* the merged group active for the same key range.  The merged group
+\* opens on member m only after both parents' merge markers have been
+\* applied on that member.  Each parent's marker is either still in
+\* memstore or superseded by a flush marker with higher seqId (the
+\* parent group's flush protocol can clean the merge marker from
+\* memstore via the normal flush-watermark mechanism — see
+\* NoKeyRangeOverlap in SplitRaftRegionReplica.tla for the full
+\* ordering argument).
+NoKeyRangeOverlapMerge ==
+    \A m \in Members :
+        mergedGroupActive[m] =>
+            /\ mergeMarkerSeqId_1 > 0
+            /\ (\/ mergeMarkerSeqId_1 \in memstore_1[m]
+                \/ \E f \in flushMarkerEntries_1 \cap memstore_1[m] :
+                     f >= mergeMarkerSeqId_1)
+            /\ mergeMarkerSeqId_2 > 0
+            /\ (\/ mergeMarkerSeqId_2 \in memstore_2[m]
+                \/ \E f \in flushMarkerEntries_2 \cap memstore_2[m] :
+                     f >= mergeMarkerSeqId_2)
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MergeRaftRegionReplica.tla -->
+
+### TLA+ Specification: `MCRaftRegionReplica_merge.tla`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_merge.tla -->
+```tla
+---- MODULE MCRaftRegionReplica_merge ----
+(*
+ * Merge lifecycle domain model-checking configuration.
+ *
+ * PURPOSE
+ * -------
+ * Verify that the region merge protocol — each parent group's leader
+ * proposes a merge marker through RAFT, members apply both committed
+ * markers (closing both parents locally), master opens the merged
+ * group on members that have applied both markers — correctly prevents
+ * any period where both a parent group and the merged group are active
+ * for the same key range.
+ *
+ * Uses the data-path-merged MergeDataPathNext (GroupDataPathNext for
+ * per-group actions) for reduced state space.  All 14 per-group
+ * safety invariants are checked per parent group alongside the
+ * merge-specific NoKeyRangeOverlapMerge invariant.
+ *
+ * TIMING SIMPLIFICATION
+ * ---------------------
+ * Identical to MCRaftRegionReplica_multigroup: MaxClockDrift = 0,
+ * ElectionTimeoutMin = 2, MaxClock = 2.
+ *
+ * STATE SPACE
+ * -----------
+ * MaxSeqId = 2 (same as multi-group): merge marker(1) + one data
+ * entry(2) per group exercises the critical paths.  3 members with
+ * symmetry.  Partitions limited to at most 1 link.
+ *)
+EXTENDS MergeRaftRegionReplica, TLC
+
+CONSTANTS m1, m2, m3, NoVote
+
+MC_Members == {m1, m2, m3}
+MC_None == NoVote
+MC_MaxTerm == 2
+MC_LeaderLeaseDuration == 1
+MC_ElectionTimeoutMin == 2
+MC_MaxClockDrift == 0
+MC_MaxClock == 2
+MC_MaxSeqId == 2
+
+Symmetry == Permutations(MC_Members)
+
+PartitionConstraint == Cardinality(partition) <= 2
+
+====
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_merge.tla -->
+
+### TLA+ Configuration: `MCRaftRegionReplica_merge.cfg`
+
+<!-- CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_merge.cfg -->
+```
+SPECIFICATION MergeDataPathSpec
+
+CONSTANTS
+    m1 = m1
+    m2 = m2
+    m3 = m3
+    NoVote = NoVote
+    Members <- MC_Members
+    None <- MC_None
+    MaxTerm <- MC_MaxTerm
+    LeaderLeaseDuration <- MC_LeaderLeaseDuration
+    ElectionTimeoutMin <- MC_ElectionTimeoutMin
+    MaxClockDrift <- MC_MaxClockDrift
+    MaxClock <- MC_MaxClock
+    MaxSeqId <- MC_MaxSeqId
+
+SYMMETRY Symmetry
+
+CONSTRAINT PartitionConstraint
+
+INVARIANTS
+    MergeTypeOK
+    PerGroupSafety
+    NoKeyRangeOverlapMerge
+
+CHECK_DEADLOCK FALSE
+```
+<!-- /CUT:src/main/tla/RaftRegionReplica/MCRaftRegionReplica_merge.cfg -->

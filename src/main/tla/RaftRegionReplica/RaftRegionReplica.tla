@@ -1814,10 +1814,16 @@ WakeComplete(m) ==
 ----
 (* ---- Next-state relation and specification ---- *)
 
-\* Actions common to both GroupNext and GroupDataPathNext.  The write
-\* path and follower-apply actions that differ between the two (merged
-\* vs unmerged) are added by each variant separately.
-GroupCoreNext ==
+\* Base per-group actions common to all composition variants.  Excludes
+\* "state-loss" actions (InstallSnapshot, NewMemberBootstrap) that clear
+\* or replace a member's memstore.  Composition modules that track
+\* per-member lifecycle state (e.g., split/merge group activation) must
+\* intercept state-loss actions to reset lifecycle variables, since the
+\* memstore clearing implies the member has lost all group state.
+\* GroupCoreNextBase provides the safe subset; state-loss actions are
+\* added back by GroupCoreNext (for single-group use) or by custom
+\* wrappers in composition modules.
+GroupCoreNextBase ==
     \* Election
     \/ \E m \in Members     : Timeout(m)
     \/ \E c, v \in Members  : RequestVote(c, v)
@@ -1842,14 +1848,19 @@ GroupCoreNext ==
     \/ \E m \in Members     : PromotionComplete(m)
     \* Orphan commitment
     \/ NewLeaderCommitOrphanEntry
-    \* Catch-up (not GC — GC is in the shared-impact set)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
-    \* New member bootstrap
-    \/ \E m \in Members     : NewMemberBootstrap(m)
     \* Hibernate lifecycle
     \/ \E m \in Members     : HibernateRequest(m)
     \/ \E m \in Members     : WakeGroup(m)
     \/ \E m \in Members     : WakeComplete(m)
+
+\* Full per-group core actions including state-loss actions.
+\* Used by single-group Next and by composition modules that do not
+\* need to intercept state-loss events.
+GroupCoreNext ==
+    \/ GroupCoreNextBase
+    \* State-loss actions (clear/replace member memstore)
+    \/ \E l, f \in Members  : InstallSnapshot(l, f)
+    \/ \E m \in Members     : NewMemberBootstrap(m)
 
 \* Per-group subset of Next for multi-group composition.  Excludes the
 \* five "shared-impact" actions whose effects span all groups on a
@@ -1929,6 +1940,30 @@ AtomicCompleteWriteAndAck(m) ==
 \*   - ProposeMarker, WALSyncFail, WALFailureAbort removed
 GroupDataPathNext ==
     \/ GroupCoreNext
+    \* Write path (merged)
+    \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
+    \* Follower apply (merged)
+    \/ \E m \in Members     : AtomicFollowerBatchApply(m)
+
+\* Base variants excluding state-loss actions for lifecycle-aware
+\* composition.  Split/merge modules use these and add custom wrappers
+\* for InstallSnapshot and NewMemberBootstrap that reset per-member
+\* lifecycle state (e.g., daughterGroupsActive, mergedGroupActive).
+GroupNextBase ==
+    \/ GroupCoreNextBase
+    \* Write path (unmerged actions not in GroupCoreNextBase)
+    \/ \E m \in Members     : WALSyncFail(m)
+    \/ \E m \in Members     : CompleteWrite(m)
+    \/ \E m \in Members     : AckWrite(m)
+    \/ \E m \in Members     : WALFailureAbort(m)
+    \* Markers
+    \/ \E m \in Members     : ProposeMarker(m)
+    \* Follower apply (unmerged actions not in GroupCoreNextBase)
+    \/ \E m \in Members     : FollowerBeginBatchApply(m)
+    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+
+GroupDataPathNextBase ==
+    \/ GroupCoreNextBase
     \* Write path (merged)
     \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
     \* Follower apply (merged)
