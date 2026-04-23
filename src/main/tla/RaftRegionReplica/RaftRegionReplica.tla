@@ -5,11 +5,11 @@
  * follower batch apply, flush and compaction marker handling,
  * flush protocol, flush crash recovery, follower flush-complete
  * handling, per-member RAFT log, orphan entry commitment by new
- * leader, promotion protocol with leader-primary gap, RAFT log
- * GC, old primary rejoin via shared-storage catch-up, new
- * member bootstrap via leader-based network catch-up,
- * promotion MVCC continuity with in-flight writes,
- * catch-up completeness with concurrent flush, and
+ * leader, promotion protocol with master confirmation and
+ * leader-primary gap, RAFT log GC, old primary rejoin via
+ * shared-storage catch-up, new member bootstrap via leader-based
+ * network catch-up, promotion MVCC continuity with in-flight
+ * writes, catch-up completeness with concurrent flush, and
  * hibernate/wake lifecycle with wake-race safety.
  *
  * Models RAFT member roles (Leader, Follower, Candidate), term fencing,
@@ -121,20 +121,31 @@
  * "Promoting" phase.  During this phase, isLeader() returns true (the
  * member holds the Leader role and a valid lease), but the region has
  * not yet acquired a WAL reference.  Writes must be rejected during
- * this gap.  The 9-step promotion sequence from the design document
- * is collapsed into safety-critical phases: (1) finish consuming
- * remaining RAFT log entries (modeled by allowing follower apply
- * actions to fire during the Promoting phase, with the
- * ApplicableEntries(m) = {} guard on PromotionComplete), (2)
- * setReadOnly(false), and (3) acquire WAL reference (modeled by the
- * PromotionComplete action transitioning to "Complete").  Steps 4-9
- * (write open marker, .regioninfo, seqId file, enable
- * flush/compaction, notify master) are collapsed into the Complete
- * transition since the safety-critical boundary is step 3.
- * BeginWrite, FlushStart, and ProposeMarker all guard on
- * promotionPhase[m] = "Complete".  The PromotionReadWriteGuard
+ * this gap.  The promotion protocol proceeds in three phases modeled
+ * by three promotionPhase transitions:
+ *
+ *   Promoting -> AwaitingMaster:  MasterConfirmPromotion fires when
+ *     the leader has consumed all applicable RAFT log entries
+ *     (ApplicableEntries(m) = {}), holds a valid lease, and the
+ *     master has not already confirmed a higher term for this group
+ *     (currentTerm[m] > masterConfirmedTerm).  This models the
+ *     master's ReportLeaderElection validation and META update.
+ *
+ *   AwaitingMaster -> Complete:  PromotionComplete fires when master
+ *     confirmation has been received (promotionPhase = AwaitingMaster),
+ *     the leader still holds a valid lease, and no new committed entries
+ *     need applying (ApplicableEntries(m) = {}).  This models the
+ *     local promotion steps: setReadOnly(false) and WAL reference
+ *     acquisition.
+ *
+ * The master is modeled as a nondeterministic oracle with a term-fencing
+ * guard (masterConfirmedTerm), consistent with how the master is modeled
+ * in the split and merge lifecycle modules (MasterOpenDaughter,
+ * MasterOpenMerged).  BeginWrite, FlushStart, and ProposeMarker all
+ * guard on promotionPhase[m] = "Complete".  The PromotionReadWriteGuard
  * invariant verifies that no write pipeline is active without
- * promotion completion.
+ * promotion completion, now with master confirmation included in the
+ * definition of completion.
  *
  * RAFT log GC and old primary rejoin: after a flush completes, log
  * entries below the flush seqId are GC-eligible because the data they
@@ -284,7 +295,7 @@
  *     marker is committed through RAFT; subsumes NoFlushDuplication
  *   Promotion protocol:
  *   - PromotionReadWriteGuard: a write pipeline is active only when the
- *     member has completed promotion (WAL reference acquired)
+ *     member has completed promotion (master confirmation + WAL reference)
  *   - PromotionMVCCContinuity: for an active leader (valid lease) that
  *     has completed promotion, no committed entry is unapplied except
  *     the leader's own in-flight write
@@ -363,7 +374,8 @@ VARIABLES
     flushPhase,         \* flushPhase[m]: flush phase (Idle | FlushStarted | HFilesCommitted | RAFTProposed | RAFTCommitted)
     flushSeqId,         \* flushSeqId[m]: seqId consumed by m's current flush (0 = none)
     \* ---- Promotion pipeline ----
-    promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | Complete)
+    promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
+    masterConfirmedTerm,\* masterConfirmedTerm: highest RAFT term confirmed by master for this group (0 = none)
     \* ---- Hibernate lifecycle ----
     hibernateState      \* hibernateState[m]: hibernate lifecycle (Active | Hibernated | Waking)
 
@@ -372,7 +384,8 @@ vars == <<role, currentTerm, votedFor, votesGranted, raftLog,
           nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
           hdfsHFiles, memstore, fApplyBatch,
           writePhase, walSync, raftCommitted, writeSeqId,
-          flushPhase, flushSeqId, promotionPhase, hibernateState>>
+          flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm,
+          hibernateState>>
 
 writeVars == <<writePhase, walSync, raftCommitted, writeSeqId>>
 
@@ -404,7 +417,8 @@ TypeOK ==
     /\ writeSeqId \in [Members -> 0..MaxSeqId]
     /\ flushPhase \in [Members -> {"Idle", "FlushStarted", "HFilesCommitted", "RAFTProposed", "RAFTCommitted"}]
     /\ flushSeqId \in [Members -> 0..MaxSeqId]
-    /\ promotionPhase \in [Members -> {"None", "Promoting", "Complete"}]
+    /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
+    /\ masterConfirmedTerm \in 0..MaxTerm
     /\ hibernateState \in [Members -> {"Active", "Hibernated", "Waking"}]
 
 ----
@@ -491,6 +505,7 @@ Init ==
     /\ flushSeqId      = [m \in Members |-> 0]
     \* Promotion pipeline
     /\ promotionPhase  = [m \in Members |-> "None"]
+    /\ masterConfirmedTerm = 0
     \* Hibernate lifecycle
     /\ hibernateState  = [m \in Members |-> "Active"]
 
@@ -523,7 +538,7 @@ Timeout(m) ==
     /\ UNCHANGED <<raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore,
-                   writeVars, flushVars, promotionPhase>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* A candidate requests and receives a vote from another member (atomic).
 \* Requires that candidate and voter can communicate (not partitioned).
@@ -598,7 +613,8 @@ RequestVote(candidate, voter) ==
                                   IF steppingDown THEN "Active" ELSE @]
     /\ UNCHANGED <<raftLog, clock, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch>>
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   masterConfirmedTerm>>
 
 \* A candidate with a majority of votes becomes leader AND immediately
 \* sends its initial heartbeat round to all reachable followers (atomic).
@@ -680,7 +696,8 @@ BecomeLeader(m) ==
               ELSE hibernateState[r]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        nextSeqId, committedEntries, markerEntries,
-                       flushMarkerEntries, hdfsHFiles, fApplyBatch>>
+                       flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                       masterConfirmedTerm>>
 
 \* ---- RAFT leadership actions ----
 
@@ -756,7 +773,8 @@ Heartbeat(leader) ==
                 IF m \in responders THEN "Active" ELSE hibernateState[m]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        nextSeqId, committedEntries, markerEntries,
-                       flushMarkerEntries, hdfsHFiles, fApplyBatch>>
+                       flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                       masterConfirmedTerm>>
 
 \* A member discovers a higher term and steps down to Follower.
 \* Abstracts receiving any RPC carrying a higher term.
@@ -795,7 +813,8 @@ StepDown(m) ==
     /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
     /\ UNCHANGED <<raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch>>
+                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   masterConfirmedTerm>>
 
 \* A leader whose lease has expired (it could not heartbeat a quorum
 \* within the lease duration) voluntarily steps down to Follower.
@@ -840,7 +859,8 @@ LeaderLeaseExpiry(m) ==
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock,
                    leaseRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles>>
+                   flushMarkerEntries, hdfsHFiles,
+                   masterConfirmedTerm>>
 
 \* ---- Timing actions ----
 
@@ -885,7 +905,7 @@ ClockTick(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    partition, nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* ---- Crash recovery actions ----
 
@@ -938,7 +958,8 @@ CrashRestart(m) ==
     /\ CrashRestartEffect(m)
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles>>
+                   flushMarkerEntries, hdfsHFiles,
+                   masterConfirmedTerm>>
 
 \* ---- Network partition actions ----
 
@@ -953,7 +974,7 @@ CreatePartition ==
                        clock, leaseRemaining, timerRemaining,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, hibernateState>>
+                       writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Nondeterministically heal a partition between two members.
 \* Models individual network link recovery.
@@ -965,7 +986,7 @@ HealPartition ==
                        clock, leaseRemaining, timerRemaining,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, hibernateState>>
+                       writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Heal ALL partitions at once — full network recovery.
 \* This action is deterministic (no internal nondeterminism) so
@@ -981,7 +1002,7 @@ HealAllPartitions ==
                    clock, leaseRemaining, timerRemaining,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* ---- Leader write path actions ----
 
@@ -1013,7 +1034,7 @@ BeginWrite(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, flushVars,
-                   promotionPhase, hibernateState>>
+                   promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* WAL sync to HDFS completes successfully.  Models wal.sync(txid)
 \* returning without error (HRegion.doMiniBatchMutate step 4a).
@@ -1027,7 +1048,7 @@ WALSyncComplete(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, hibernateState>>
+                   promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* WAL sync to HDFS fails (HDFS pipeline broken, DataNode failure,
 \* network timeout).  Nondeterministic.  Models wal.sync(txid) throwing
@@ -1042,7 +1063,7 @@ WALSyncFail(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, hibernateState>>
+                   promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* RAFT propose succeeds: the entry is committed by majority ack.
 \* Models consensus.propose(stampedWALEdit, seqId) completing
@@ -1081,7 +1102,7 @@ RAFTCommitWrite(m) ==
                    nextSeqId, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch,
                    writePhase, walSync, writeSeqId, flushVars,
-                   promotionPhase, hibernateState>>
+                   promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
@@ -1107,7 +1128,7 @@ CompleteWrite(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    walSync, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, hibernateState>>
+                   promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
 \* doMiniBatchMutate (step 9) and resets the write pipeline for the
@@ -1122,7 +1143,7 @@ AckWrite(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   flushVars, promotionPhase, hibernateState>>
+                   flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Leader aborts the RegionServer process because WAL sync failed.
 \* This is the mandated response when the WAL is broken: the RS cannot
@@ -1155,7 +1176,8 @@ WALFailureAbort(m) ==
     /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles>>
+                   flushMarkerEntries, hdfsHFiles,
+                   masterConfirmedTerm>>
 
 \* ---- Marker actions ----
 
@@ -1194,7 +1216,7 @@ ProposeMarker(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    clock, leaseRemaining, timerRemaining, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* ---- Flush protocol actions ----
 \*
@@ -1236,7 +1258,7 @@ FlushStart(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, writeVars,
-                   promotionPhase, hibernateState>>
+                   promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* HFiles are moved from the tmp directory to the store directory
 \* (sfc.commit()).  After this step, the HFiles are durable on HDFS
@@ -1253,7 +1275,7 @@ FlushCommitHFiles(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, memstore, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, hibernateState>>
+                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Leader proposes the FLUSH_COMPLETE marker through RAFT.  The marker
 \* is proposed but not yet committed; FlushRAFTCommit handles the
@@ -1283,7 +1305,7 @@ FlushRAFTPropose(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, hibernateState>>
+                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Majority acknowledges the FLUSH_COMPLETE marker.  The marker is now
 \* RAFT-committed: its seqId is added to committedEntries and
@@ -1312,7 +1334,7 @@ FlushRAFTCommit(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, hdfsHFiles, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, hibernateState>>
+                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Flush completion: drop memstore entries at or below flushSeqId,
 \* write COMMIT_FLUSH to WAL, call wal.completeCacheFlush() to unblock
@@ -1336,7 +1358,7 @@ FlushComplete(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, promotionPhase, hibernateState>>
+                   writeVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* ---- Follower batch apply actions ----
 
@@ -1366,7 +1388,7 @@ FlushComplete(m) ==
 \* committed entries not yet in its memstore.
 FollowerBeginBatchApply(m) ==
     /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
+       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
     /\ fApplyBatch[m] = {}
     /\ LET applicable == ApplicableEntries(m)
        IN /\ applicable # {}
@@ -1382,7 +1404,7 @@ FollowerBeginBatchApply(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Follower completes applying a batch of committed mutation entries:
 \* stamp cells with the leader's sequence IDs, add all cells to the
@@ -1395,7 +1417,7 @@ FollowerBeginBatchApply(m) ==
 \* with a non-empty apply batch.
 FollowerCompleteBatchApply(m) ==
     /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
+       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
     /\ fApplyBatch[m] # {}
     /\ memstore' = [memstore EXCEPT ![m] = @ \union fApplyBatch[m]]
     /\ fApplyBatch' = [fApplyBatch EXCEPT ![m] = {}]
@@ -1403,7 +1425,7 @@ FollowerCompleteBatchApply(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Follower applies a committed marker entry.  When the next unapplied
 \* committed entry is a marker (flush-complete, compaction-complete),
@@ -1429,7 +1451,7 @@ FollowerCompleteBatchApply(m) ==
 \* a marker.  For flush markers, the HFiles must be accessible on HDFS.
 FollowerApplyMarker(m) ==
     /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
+       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
     /\ fApplyBatch[m] = {}
     /\ LET applicable == ApplicableEntries(m)
        IN /\ applicable # {}
@@ -1444,27 +1466,55 @@ FollowerApplyMarker(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* ---- Promotion protocol actions ----
 
-\* A leader in the Promoting phase completes the promotion protocol:
-\* step 1 (finish consuming RAFT log) is enforced by the
-\* ApplicableEntries(m) = {} guard; step 2 (setReadOnly(false)) is
-\* implicit; step 3 (acquire WAL reference) is the critical safety
-\* boundary modeled by this transition to "Complete".  Steps 4-9
-\* (write open marker, .regioninfo, seqId file, enable
-\* flush/compaction, notify master) are collapsed into this action
-\* since the safety-critical boundary is step 3.
+\* Master confirms a RAFT leader's promotion by validating the term
+\* and updating META (or in-memory state only for META's own group).
+\* Modeled as a nondeterministic oracle with a term-fencing guard,
+\* consistent with how the master is modeled in the split and merge
+\* lifecycle modules (MasterOpenDaughter, MasterOpenMerged).
 \*
-\* Guard: the member must be a Leader with a valid lease
-\* (models the isLeader() check, which includes lease validity),
-\* in Promoting phase, with no unapplied committed entries (memstore
-\* fully current).  The lease guard prevents a stale leader whose
-\* lease has expired from completing promotion — such a leader may
-\* have missed entries committed by a new leader in a higher term.
-\* LeaderLeaseExpiry or StepDown will transition the stale leader
-\* to Follower.
+\* Guard: the member must be a Leader with a valid lease, in
+\* Promoting phase, with all committed entries consumed
+\* (ApplicableEntries = {}).  The term-fencing guard
+\* (currentTerm[m] > masterConfirmedTerm) ensures the master
+\* rejects stale notifications — only the highest term wins.
+\* This models the design document's "master validates term >
+\* current known term" check in the LeaderChangeHandler.
+\*
+\* Effect: masterConfirmedTerm is advanced to the leader's term
+\* (the master records this as the current known term for the group),
+\* and promotionPhase transitions to "AwaitingMaster" (the
+\* RegionServer has received the master's confirmation and can
+\* proceed to local promotion steps).
+MasterConfirmPromotion(m) ==
+    /\ role[m] = "Leader"
+    /\ LeaseValid(m)
+    /\ promotionPhase[m] = "Promoting"
+    /\ ApplicableEntries(m) = {}
+    /\ currentTerm[m] > masterConfirmedTerm
+    /\ masterConfirmedTerm' = currentTerm[m]
+    /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "AwaitingMaster"]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   clock, leaseRemaining, timerRemaining, partition,
+                   nextSeqId, committedEntries, markerEntries,
+                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   writeVars, flushVars, hibernateState>>
+
+\* A leader that has received master confirmation completes the
+\* local promotion steps: setReadOnly(false) and acquire WAL
+\* reference.  This is the critical safety boundary — after this
+\* transition, the member can accept writes.
+\*
+\* Guard: the member must be a Leader with a valid lease, in
+\* AwaitingMaster phase (master confirmation received), with no
+\* unapplied committed entries.  The ApplicableEntries guard is
+\* retained to handle the edge case where new entries are committed
+\* (via NewLeaderCommitOrphanEntry) between MasterConfirmPromotion
+\* and PromotionComplete.  The lease guard prevents a stale leader
+\* whose lease has expired from completing promotion.
 \*
 \* MicroRaft implementation: promotion steps run on the actor thread
 \* and check isLeader() before proceeding.  In hbase-consensus,
@@ -1472,14 +1522,15 @@ FollowerApplyMarker(m) ==
 PromotionComplete(m) ==
     /\ role[m] = "Leader"
     /\ LeaseValid(m)
-    /\ promotionPhase[m] = "Promoting"
+    /\ promotionPhase[m] = "AwaitingMaster"
     /\ ApplicableEntries(m) = {}
     /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "Complete"]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, hibernateState>>
+                   writeVars, flushVars, masterConfirmedTerm,
+                   hibernateState>>
 
 \* ---- Orphan entry commitment ----
 
@@ -1532,7 +1583,7 @@ NewLeaderCommitOrphanEntry ==
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                        clock, leaseRemaining, timerRemaining, partition,
                        nextSeqId, hdfsHFiles, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, hibernateState>>
+                       writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* ---- RAFT log GC and catch-up actions ----
 
@@ -1558,7 +1609,7 @@ RaftLogGC(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Leader sends a catch-up reference (CatchUpReference) to a lagging
 \* follower whose needed RAFT log entries have been garbage-collected.
@@ -1598,7 +1649,7 @@ InstallSnapshot(leader, follower) ==
     /\ follower # leader
     /\ CanCommunicate(leader, follower)
     /\ \/ role[follower] = "Follower"
-       \/ promotionPhase[follower] = "Promoting"
+       \/ promotionPhase[follower] \in {"Promoting", "AwaitingMaster"}
     /\ fApplyBatch[follower] = {}
     /\ \E s \in flushMarkerEntries \cap hdfsHFiles :
         /\ \E needed \in (committedEntries \ memstore[follower]) :
@@ -1611,7 +1662,7 @@ InstallSnapshot(leader, follower) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* A new member bootstraps into the RAFT group, replacing a member
 \* whose instance has been terminated (e.g., a new Kubernetes pod with
@@ -1723,7 +1774,8 @@ NewMemberBootstrap(m) ==
             /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
             /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
         /\ UNCHANGED <<clock, partition, nextSeqId, committedEntries,
-                       markerEntries, flushMarkerEntries, hdfsHFiles>>
+                       markerEntries, flushMarkerEntries, hdfsHFiles,
+                       masterConfirmedTerm>>
 
 \* ---- Hibernate lifecycle actions ----
 
@@ -1755,7 +1807,7 @@ HibernateRequest(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Leader initiates wake on the next write attempt, sending WakeUp
 \* to all reachable Hibernated followers.  The leader transitions from
@@ -1787,7 +1839,7 @@ WakeGroup(m) ==
                    clock, leaseRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Leader receives acknowledgements from a majority and completes the
 \* wake protocol.  The leader transitions from Waking to Active and
@@ -1821,7 +1873,7 @@ WakeComplete(m) ==
                    clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 ----
 (* ---- Merged actions for data-path domain decomposition ---- *)
@@ -1835,7 +1887,7 @@ WakeComplete(m) ==
 \* FollowerCompleteBatchApply.  fApplyBatch is never modified.
 AtomicFollowerBatchApply(m) ==
     /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
+       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
     /\ fApplyBatch[m] = {}
     /\ LET applicable == ApplicableEntries(m)
        IN /\ applicable # {}
@@ -1852,7 +1904,7 @@ AtomicFollowerBatchApply(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writePhase, walSync, raftCommitted, writeSeqId,
-                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
+                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 \* Atomic write completion and ack: applies the write to memstore and
 \* resets the write pipeline in a single step.  Merges CompleteWrite +
@@ -1871,7 +1923,7 @@ AtomicCompleteWriteAndAck(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
+                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
 
 ----
 (* ---- Next-state relation and specification ---- *)
@@ -1935,6 +1987,7 @@ GatedMemberActions(m) ==
     \/ FollowerBeginBatchApply(m)
     \/ FollowerCompleteBatchApply(m)
     \* Promotion
+    \/ MasterConfirmPromotion(m)
     \/ PromotionComplete(m)
     \* Hibernate lifecycle
     \/ HibernateRequest(m)
@@ -1967,6 +2020,7 @@ GatedMemberDataPathActions(m) ==
     \* Follower apply (merged)
     \/ AtomicFollowerBatchApply(m)
     \* Promotion
+    \/ MasterConfirmPromotion(m)
     \/ PromotionComplete(m)
     \* Hibernate lifecycle
     \/ HibernateRequest(m)
@@ -2173,19 +2227,21 @@ HFilesBeforeFlushMarker ==
 
 \* ---- Promotion invariants ----
 
-\* A promoted replica does not acknowledge client writes until it holds
-\* a WAL reference (promotionPhase = "Complete").  This verifies the
-\* design's requirement that the write path gates on both isLeader() and
-\* the per-region promotionComplete flag.  During the gap between winning
-\* the RAFT election and completing promotion step 3 (WAL reference
-\* acquired), writes must be rejected with NotServingRegionException.
+\* A promoted replica does not acknowledge client writes until the
+\* master has confirmed the promotion and the replica holds a WAL
+\* reference (promotionPhase = "Complete").  This verifies the design's
+\* requirement that the write path gates on both isLeader() and the
+\* per-region promotionComplete flag.  During the gap between winning
+\* the RAFT election and completing promotion (which now includes master
+\* confirmation via MasterConfirmPromotion), writes must be rejected
+\* with NotServingRegionException.
 \*
 \* This is a cross-variable invariant (writePhase x promotionPhase) that
 \* catches any action that incorrectly allows a write to proceed during
-\* the Promoting phase.  The invariant is enforced by the
-\* promotionPhase[m] = "Complete" guard on BeginWrite: even though
-\* IsLeader(m) returns true during the Promoting phase, the promotion
-\* guard prevents BeginWrite from firing.
+\* the Promoting or AwaitingMaster phases.  The invariant is enforced by
+\* the promotionPhase[m] = "Complete" guard on BeginWrite: even though
+\* IsLeader(m) returns true during the Promoting and AwaitingMaster
+\* phases, the promotion guard prevents BeginWrite from firing.
 PromotionReadWriteGuard ==
     \A m \in Members :
         writePhase[m] # "Idle" => promotionPhase[m] = "Complete"
@@ -2262,7 +2318,7 @@ CatchUpCompleteness ==
     \A m \in Members :
         (/\ ApplicableEntries(m) = {}
          /\ fApplyBatch[m] = {}
-         /\ (role[m] = "Follower" \/ promotionPhase[m] = "Promoting"))
+         /\ (role[m] = "Follower" \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}))
         =>
         \A s \in committedEntries :
             \/ s \in memstore[m]
@@ -2332,7 +2388,8 @@ BaseFairness ==
     /\ \A m \in Members     : WF_vars(FollowerBeginBatchApply(m))
     /\ \A m \in Members     : WF_vars(FollowerCompleteBatchApply(m))
     /\ \A m \in Members     : WF_vars(FollowerApplyMarker(m))
-    \* Promotion (local: requires ApplicableEntries={}, no network)
+    \* Promotion (master confirmation + local completion, no network)
+    /\ \A m \in Members     : WF_vars(MasterConfirmPromotion(m))
     /\ \A m \in Members     : WF_vars(PromotionComplete(m))
     \* Orphan commitment (requires IsLeader but not CanCommunicate)
     /\ WF_vars(NewLeaderCommitOrphanEntry)
@@ -2412,11 +2469,16 @@ FlushCompletion ==
         flushPhase[m] # "Idle" ~> flushPhase[m] = "Idle"
 
 \* A member in the Promoting phase eventually leaves it — either
-\* PromotionComplete fires (after follower apply drains all
-\* committed entries), or the member steps down / crashes.
+\* MasterConfirmPromotion fires (advancing to AwaitingMaster) or the
+\* member steps down / crashes.  A member in the AwaitingMaster phase
+\* eventually leaves it — either PromotionComplete fires or the member
+\* steps down / crashes.  Together these ensure that promotion is
+\* transient: the member eventually reaches Complete or None.
 PromotionCompletion ==
-    \A m \in Members :
+    /\ \A m \in Members :
         promotionPhase[m] = "Promoting" ~> promotionPhase[m] # "Promoting"
+    /\ \A m \in Members :
+        promotionPhase[m] = "AwaitingMaster" ~> promotionPhase[m] # "AwaitingMaster"
 
 \* A follower with unapplied committed entries eventually catches
 \* up (ApplicableEntries drains to empty with no batch in flight)

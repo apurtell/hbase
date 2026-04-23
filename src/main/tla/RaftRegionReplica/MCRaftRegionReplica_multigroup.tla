@@ -59,7 +59,7 @@ PartitionConstraint == Cardinality(partition) <= 2
 \* MultiGroupRaftRegionReplica.
 MultiGroupDataPathNext ==
     \/ (G1!GroupDataPathNext /\ UNCHANGED g2_vars)
-    \/ (G2!GroupDataPathNext /\ UNCHANGED g1_vars)
+    \/ (G2GroupDataPathNextMetaGated /\ UNCHANGED g1_vars)
     \/ \E m \in Members : MultiGroupClockTick(m)
     \/ \E m \in Members : MultiGroupCrashRestart(m)
     \/ MultiGroupCreatePartition

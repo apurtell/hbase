@@ -44,7 +44,7 @@ CONSTANTS
 \* ---- Shared state ----
 VARIABLES clock, partition
 
-\* ---- Group 1 per-group state (22 variables) ----
+\* ---- Group 1 per-group state (23 variables) ----
 VARIABLES
     role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
     leaseRemaining_1, timerRemaining_1,
@@ -53,10 +53,10 @@ VARIABLES
     memstore_1, fApplyBatch_1,
     writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
     flushPhase_1, flushSeqId_1,
-    promotionPhase_1,
+    promotionPhase_1, masterConfirmedTerm_1,
     hibernateState_1
 
-\* ---- Group 2 per-group state (22 variables) ----
+\* ---- Group 2 per-group state (23 variables) ----
 VARIABLES
     role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
     leaseRemaining_2, timerRemaining_2,
@@ -65,7 +65,7 @@ VARIABLES
     memstore_2, fApplyBatch_2,
     writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
     flushPhase_2, flushSeqId_2,
-    promotionPhase_2,
+    promotionPhase_2, masterConfirmedTerm_2,
     hibernateState_2
 
 \* ---- Merge lifecycle state ----
@@ -83,7 +83,8 @@ g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
              memstore_1, fApplyBatch_1,
              writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
              flushPhase_1, flushSeqId_1,
-             promotionPhase_1, hibernateState_1>>
+             promotionPhase_1, masterConfirmedTerm_1,
+             hibernateState_1>>
 
 g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              leaseRemaining_2, timerRemaining_2,
@@ -92,7 +93,8 @@ g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              memstore_2, fApplyBatch_2,
              writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
              flushPhase_2, flushSeqId_2,
-             promotionPhase_2, hibernateState_2>>
+             promotionPhase_2, masterConfirmedTerm_2,
+             hibernateState_2>>
 
 mergeVars == <<mergeMarkerSeqId_1, mergeMarkerSeqId_2, mergedGroupActive>>
 
@@ -134,6 +136,7 @@ G1 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
     promotionPhase  <- promotionPhase_1,
+    masterConfirmedTerm <- masterConfirmedTerm_1,
     hibernateState  <- hibernateState_1
 
 G2 == INSTANCE RaftRegionReplica WITH
@@ -160,6 +163,7 @@ G2 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_2,
     flushSeqId      <- flushSeqId_2,
     promotionPhase  <- promotionPhase_2,
+    masterConfirmedTerm <- masterConfirmedTerm_2,
     hibernateState  <- hibernateState_2
 
 Majority == (Cardinality(Members) \div 2) + 1
@@ -197,13 +201,13 @@ MergeClockTick(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, masterConfirmedTerm_1, hibernateState_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, masterConfirmedTerm_2, hibernateState_2,
                    mergeVars>>
 
 \* Server crash resets volatile state for BOTH groups and the merged
@@ -219,9 +223,11 @@ MergeCrashRestart(m) ==
                    currentTerm_1, votedFor_1, raftLog_1,
                    nextSeqId_1, committedEntries_1, markerEntries_1,
                    flushMarkerEntries_1, hdfsHFiles_1,
+                   masterConfirmedTerm_1,
                    currentTerm_2, votedFor_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
+                   masterConfirmedTerm_2,
                    mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
 
 \* Network partition — shared across both groups.
@@ -256,14 +262,14 @@ MergeUnifiedLogGC(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, masterConfirmedTerm_1, hibernateState_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2,
                    leaseRemaining_2, timerRemaining_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, masterConfirmedTerm_2, hibernateState_2,
                    mergeVars>>
 
 ----
@@ -300,7 +306,7 @@ ProposeMergeMarker_1(m) ==
                    clock, leaseRemaining_1, timerRemaining_1, partition,
                    flushMarkerEntries_1, hdfsHFiles_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1, masterConfirmedTerm_1, hibernateState_1,
                    g2_vars, mergeMarkerSeqId_2, mergedGroupActive>>
 
 \* G2's leader proposes a "region-close / merge" marker through RAFT.
@@ -334,7 +340,7 @@ ProposeMergeMarker_2(m) ==
                    clock, leaseRemaining_2, timerRemaining_2, partition,
                    flushMarkerEntries_2, hdfsHFiles_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2,
+                   flushPhase_2, flushSeqId_2, promotionPhase_2, masterConfirmedTerm_2, hibernateState_2,
                    g1_vars, mergeMarkerSeqId_1, mergedGroupActive>>
 
 \* Master opens the merged group on member m after BOTH parent groups'

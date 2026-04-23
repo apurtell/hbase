@@ -26,7 +26,7 @@ In TLA+, a single step of the system is an action, a predicate over the current 
 
 ## Overview
 
-`RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the flush protocol (HFile commit, RAFT-proposed flush markers), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, network partitions (including individual link healing and full network recovery), and the hibernate/wake lifecycle with wake-race safety.
+`RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the flush protocol (HFile commit, RAFT-proposed flush markers), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, network partitions (including individual link healing and full network recovery), and the hibernate/wake lifecycle with wake-race safety.
 
 The base spec exports parameterized building-block operators (`GatedMemberActions(m)`, `GatedMemberDataPathActions(m)`) that collect all single-member normal-operation actions into a single disjunction. Composition modules (`SplitRaftRegionReplica`, `MergeRaftRegionReplica`, `MultiGroupRaftRegionReplica`) invoke these with per-member gating predicates to control when a RAFT group's operations are active on each member, enabling lifecycle transitions (split, merge) to deactivate a group per-member without duplicating action dispatch logic. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
 
@@ -56,13 +56,13 @@ The specification also defines 6 liveness properties checked under fairness cons
 | 1 | `ElectionProgress` | `LiveSpecElection` | If no leader exists, one is eventually elected |
 | 2 | `WriteCompletion` | `LiveSpecWrite` | A pending write eventually returns to idle |
 | 3 | `FlushCompletion` | `LiveSpecFlush` | A started flush eventually completes |
-| 4 | `PromotionCompletion` | `LiveSpecLocal` | A promoting member eventually completes promotion |
+| 4 | `PromotionCompletion` | `LiveSpecLocal` | A promoting member eventually leaves Promoting (via master confirmation) and AwaitingMaster (via local completion) |
 | 5 | `CatchUpCompletion` | `LiveSpecLocal` | A catching-up follower eventually finishes |
 | 6 | `HibernateConvergence` | `LiveSpecLocal` | A waking group eventually reaches active state |
 
 Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-6 are local and require only weak fairness (WF) on local actions — network instability cannot block them.
 
-Fairness is factored into `BaseFairness` (WF for all 19 local actions) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
+Fairness is factored into `BaseFairness` (WF for all 20 local actions, including `MasterConfirmPromotion`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
 
 ## Verification Strategy
 
@@ -88,7 +88,7 @@ This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeout
 
 ### Multi-Group (`MCRaftRegionReplica_multigroup`)
 
-Verifies that two RAFT groups sharing the same ConsensusServer (clock, network, unified log) do not violate each other's safety invariants.  Uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared-impact actions (ClockTick, CrashRestart, Create/HealPartition) using factored guard + effect operators and a `UnifiedLogGC` action modeling cross-group log segment deletion.  Per-group actions are dispatched via the base spec's `GroupNext`/`GroupDataPathNext` without gating (both groups are unconditionally active).  All 14 invariants are checked per-group; `CatchUpDataIntegrity` is the key cross-group invariant verifying that unified log GC does not delete entries needed for catch-up.
+Verifies that two RAFT groups sharing the same ConsensusServer (clock, network, unified log) do not violate each other's safety invariants.  Uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared-impact actions (ClockTick, CrashRestart, Create/HealPartition) using factored guard + effect operators and a `UnifiedLogGC` action modeling cross-group log segment deletion.  Group 1 is designated as the META group and Group 2 as a non-META group.  Group 2's `MasterConfirmPromotion` is gated on `MetaReady` (a derived operator: true when some G1 member has `promotionPhase = "Complete"`), modeling the META availability ordering constraint from the design document's "META Region Self-Promotion Bootstrap" section.  Group 1 uses the base spec's `MasterConfirmPromotion` unmodified (the master confirms META via an in-memory-only path with no META write dependency).  META promotion ordering is structural (enforced by the gate), not a state-based invariant.  All 14 invariants are checked per-group; `CatchUpDataIntegrity` is the key cross-group invariant verifying that unified log GC does not delete entries needed for catch-up.
 
 The two-group cross-product produces a large state space.  Exhaustive BFS requires a large machine.  Simulation mode provides high-confidence coverage locally.
 

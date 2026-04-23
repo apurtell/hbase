@@ -4,7 +4,7 @@
 
 ### Region Replicas Today
 
-HBase supports configuring a table with multiple region replicas. When a table has replicas, each region exists as a primary copy and one or more read-only copies hosted on different RegionServers. The primary handles all client reads and writes. It owns the write-ahead log (WAL), flushes memstore to HFiles on HDFS, and runs compactions. Two read-only replicas are opened on other RegionServers. They share the primary's HFiles on HDFS and receive memstore updates through an asynchronous WAL replication pipeline. Clients may read from replicas using `Consistency.TIMELINE`, which returns data that may be stale. Replicas cannot accept writes and cannot be promoted to primary.
+HBase supports configuring a table with multiple region replicas. When a table has replicas, each region exists as a primary copy and one or more read-only copies hosted on different RegionServers. The primary handles all client writes and serves the default read path. It owns the write-ahead log (WAL), flushes memstore to HFiles on HDFS, and runs compactions. Two read-only replicas are opened on other RegionServers. They share the primary's HFiles on HDFS and receive memstore updates through an asynchronous WAL replication pipeline. Clients may read from replicas using `Consistency.TIMELINE`, which returns data that may be stale. Replicas cannot accept writes and cannot be promoted to primary.
 
 ```
                      ┌────────────────────────────────────────┐
@@ -30,7 +30,7 @@ HBase supports configuring a table with multiple region replicas. When a table h
 
 This model improves read availability for stale-tolerant workloads, but it does nothing for write availability or fast failover.
 
-When the primary's RegionServer dies, the region becomes unavailable for reads and writes. Recovery follows a multi-step process orchestrated by the master scheduled `ServerCrashProcedure`, which splits the dead server's WAL on HDFS, assigns the region to a new RegionServer, and replays recovered edits to rebuild the memstore. This takes seconds to minutes depending on WAL size and cluster load. Throughout this window, the read-only replicas cannot step in as the new primary because they have no promotion mechanism.
+When the primary's RegionServer dies, the region becomes unavailable for writes and default-consistency reads. Read-only replicas can still serve `Consistency.TIMELINE` reads, but with increasingly stale data as replication lag grows. Recovery follows a multi-step process orchestrated by the master scheduled `ServerCrashProcedure`, which splits the dead server's WAL on HDFS, assigns the region to a new RegionServer, and replays recovered edits to rebuild the memstore. This takes seconds to minutes depending on WAL size and cluster load. Throughout this window, the read-only replicas cannot step in as the new primary because they have no promotion mechanism.
 
 The asynchronous WAL replication pipeline compounds the problem. Replication is best-effort with no ordering or consistency guarantees. Replicas can be arbitrarily behind the primary, so even their stale-read utility degrades under replication lag. There is no protocol to determine which replica is most current or to coordinate a handoff.
 
@@ -49,7 +49,8 @@ The key improvement is **promotability**. When the primary fails, the surviving 
     │ (best-effort, unordered)           │ (ordered, committed by majority)
     ▼                                    ▼
   Replica (R/O, stale reads)           Replica (R/O, warm memstore,
-  Cannot be promoted                   promotable to R/W primary)
+  Cannot be promoted                   fresh Timeline reads,
+                                       promotable to R/W primary)
 
   Failover: WAL split + reassign       Failover: RAFT election + META update
   (seconds to minutes)                 (sub-second to seconds)
@@ -106,7 +107,7 @@ In parallel, the master detects the dead RegionServer and launches ServerCrashPr
 
 We replace the current async replication model with RAFT consensus groups at the region level, using a purpose-built lightweight consensus layer tailored to the specific requirement of keeping read-only replica memstores warm for fast promotion to read-write primary. The consensus layer implements the subset of RAFT needed for region replication with an architecture designed from the outset for O(10000) groups per RegionServer.
 
-Each set of replicas for a region forms a RAFT group. The read-write leader accepts client writes, writes to the HBase WAL on HDFS for durability, and simultaneously replicates edits through RAFT to keep read-only replica memstores warm. WAL and RAFT operate in parallel on the leader, joined by a barrier. The read-write primary alone writes HFiles to HDFS. Read-only followers share those HFiles for reads and maintain their own memstores via RAFT log replay. RAFT is an internal implementation detail invisible to clients. Clients continue to interact with the read-write primary through the standard HBase client protocol, unchanged from non-replicated tables.
+Each set of replicas for a region forms a RAFT group. The read-write leader accepts client writes, writes to the HBase WAL on HDFS for durability, and simultaneously replicates edits through RAFT to keep read-only replica memstores warm. WAL and RAFT operate in parallel on the leader, joined by a barrier. The read-write primary alone writes HFiles to HDFS. Read-only followers share those HFiles for reads and maintain their own memstores via RAFT log replay. RAFT is an internal implementation detail invisible to clients. Clients continue to send writes and default-consistency reads to the read-write primary through the standard HBase client protocol. Timeline-consistent reads continue to be served by any replica, as before, but with much fresher data because replica memstores are now kept current by ordered RAFT replication rather than best-effort async replication.
 
 ```
           ┌───────────────── RAFT Group for Region R ────────────┐
@@ -504,7 +505,11 @@ When a candidate wins the RAFT election it must send its initial heartbeat to al
 
 ### Read Consistency
 
-All reads are served by the read-write primary through the standard HBase read path (memstore + HFiles). Reads do not flow through the consensus layer. Before serving a read, the read-write primary's RegionServer confirms it still holds the RAFT leader lease via the leader status check described above. This is a local in-memory check with no network round-trip: it verifies that the leader's role is leader and that the lease has not expired. If the lease is valid, the read proceeds through the normal HBase read path: memstore scanner + HFile scanners, MVCC filtering, etc. If the lease has expired (leader lost due to partition or failover), the RegionServer returns `NotServingRegionException`, triggering the client's standard retry-with-META-lookup path. The staleness window is bounded by the leader lease duration (slightly less than the RAFT election timeout): if the primary is partitioned from the majority, its lease expires within this duration and it stops serving reads.
+Reads do not flow through the consensus layer. All reads, whether served by the primary or by a read-only replica, use the standard HBase read path (memstore + HFile scanners, MVCC filtering). No RAFT round-trip is involved on the read path.
+
+Default-consistency reads are served by the read-write primary. Before serving a read, the primary's RegionServer confirms it still holds the RAFT leader lease via the leader status check described above. This is a local in-memory check with no network round-trip: it verifies that the leader's role is leader and that the lease has not expired. If the lease is valid, the read proceeds through the normal HBase read path. If the lease has expired (leader lost due to partition or failover), the RegionServer returns `NotServingRegionException`, triggering the client's standard retry-with-META-lookup path. The staleness window for a partitioned primary is bounded by the leader lease duration (slightly less than the RAFT election timeout): if the primary is partitioned from the majority, its lease expires within this duration and it stops serving reads.
+
+Timeline-consistent reads continue to be served by any replica, including the primary, exactly as in the existing region replica model. The client may contact any replica; the replica serves the read from its local memstore and shared HFiles with no leader lease check and no RAFT involvement. The key improvement over the current model is freshness: replica memstores are now kept current by ordered, synchronous RAFT replication rather than the best-effort async WAL replication pipeline. In a healthy cluster, replica memstores lag the primary by the RAFT replication round-trip (typically sub-millisecond to low-single-digit milliseconds inter-AZ), compared to the unbounded and unordered lag of the current async pipeline. Timeline reads from replicas therefore return much fresher data with this design.
 
 ## Storage Model
 
@@ -844,7 +849,7 @@ RegionReplicaFlushHandler is retired for RAFT-enabled tables. The RAFT log repla
 
 The design principle for failover is that the RAFT election determines the candidate for new primary region and RAFT leader yet the master remains in charge. Being a RAFT leader is a necessary but not sufficient condition for being the read-write primary. The promoted replica must not serve writes until the master's AssignmentManager has confirmed the promotion by updating META and returning an acknowledgment. This ensures AssignmentManager remains the sole arbiter of which region is primary, consistent with its existing role in all other region state transitions.
 
-Promotion proceeds in three phases. In the first phase, which is RAFT-internal with no master involvement, a surviving read-only replica wins the internal RAFT election and enters the promoting state. The newly elected leader finishes consuming any remaining RAFT log entries to bring its memstore fully current, including entries that the old leader had committed via RAFT but not yet applied to its own memstore. The new leader's MVCC write point correctly accounts for all such entries, and no MVCC sequence gaps are created (verified by the TLA+ model). In the second phase, the RegionServer hosting the newly elected leader sends a ReportLeaderElection RPC to the master. The master's LeaderChangeHandler validates the RAFT term against its current known term for this region, updates AssignmentManager's in-memory state and META to record the new primary location and replica ID, and returns confirmation to the RegionServer. In the third phase, the RegionServer completes the local promotion. It transitions the region from read-only to read-write, acquires a WAL reference, and enables flush and compaction. Only after this third phase completes does the promoted replica begin serving writes.
+Promotion proceeds in three phases (formally verified by the TLA+ model). In the first phase, which is RAFT-internal with no master involvement, a surviving read-only replica wins the internal RAFT election and enters the promoting state. The newly elected leader finishes consuming any remaining RAFT log entries to bring its memstore fully current, including entries that the old leader had committed via RAFT but not yet applied to its own memstore. The new leader's MVCC write point correctly accounts for all such entries, and no MVCC sequence gaps are created. In the second phase, the RegionServer hosting the newly elected leader sends a ReportLeaderElection RPC to the master. The master's LeaderChangeHandler validates the RAFT term against its current known term for this region, updates AssignmentManager's in-memory state and META to record the new primary location and replica ID, and returns confirmation to the RegionServer. In the third phase, the RegionServer completes the local promotion. It transitions the region from read-only to read-write, acquires a WAL reference, and enables flush and compaction. Only after this third phase completes does the promoted replica begin serving writes.
 
 This three-phase protocol runs independently of ServerCrashProcedure. The RAFT election and ReportLeaderElection RPC typically complete before SCP even begins iterating the dead server's regions. SCP's role is coordination and fallback. It ensures all regions on the dead server are accounted for, wakes hibernated groups whose election timers are suppressed, promotes regions whose fast-path promotion has not yet completed, and schedules replacement replicas to restore the replication factor. Non-RAFT regions on the same crashed server continue to follow the existing WAL-split-and-reassign path unchanged.
 
@@ -885,7 +890,7 @@ sequenceDiagram
     Note over M: Schedule replacement replica<br/>to restore replication factor
 ```
 
-### Promotion Protocol: HRegion State Transitions
+### Promotion Protocol (Region State Transitions)
 
 The promotion protocol executes in three phases. The region is already open (it was serving as a read-only replica), so no close/open cycle is needed. The promoted replica's RegionServer must execute a series of state changes on the HRegion instance, gated by master confirmation.
 
@@ -973,7 +978,15 @@ A special case arises if the old primary had a flush in progress when it crashed
 
 AssignmentManager gains a new LeaderChangeHandler that processes ReportLeaderElection RPCs from RegionServers independently of ServerCrashProcedure. This is the fast path for promotion. The RegionServer reports the RAFT election result directly to the master, and the handler validates and confirms it. The handler acquires the per-region lock on the RegionStateNode, validates that the reported RAFT term exceeds the current known term for the region, rejecting stale notifications, validates that the reporting RegionServer is alive and not in CRASHED state, updates the RegionStateNode with the new primary location, primary replica ID, and RAFT term, persists the update to META through the existing region state store, and returns confirmation to the RegionServer. This is a direct META update with no procedure framework overhead, no TRSP state machine, and no open/close cycle. It uses the same RegionStateNode lock, region state store, and META update path that TransitRegionStateProcedure already uses, maintaining design fidelity with the existing assignment machinery.
 
+A special case applies when the ReportLeaderElection is for a META region. If META is RAFT-enabled and its primary was in the failed AZ, the standard confirmation path would create a circular dependency. The handler detects this case and uses an in-memory-only confirmation path, updating the RegionStateNode in AssignmentManager's in-memory state but skipping the META persistence step. Confirmation is returned to the RegionServer immediately, allowing META's promoted replica to complete Phase 3 and begin serving writes. Once META is writable, the master writes META's own promotion record as a deferred idempotent operation. See "META Region Self-Promotion Bootstrap" below for the full protocol, ordering constraints, and failure analysis.
+
 Two new fields are added to RegionStateNode: a RAFT term field that records the RAFT term of the current primary, used for stale-notification fencing, and a primary replica ID field that records which replica ID is currently acting as primary, replacing the hardcoded assumption that the primary is always replica ID 0. Both fields are persisted to META. A new ReportLeaderElection RPC is added to the RegionServer status service, carrying the region name, replica ID, and RAFT term.
+
+**META Region Self-Promotion Bootstrap.**
+
+When META is a RAFT-replica-enabled region, its failover introduces a circular dependency in the promotion protocol. A two-tier confirmation protocol breaks the circular dependency while preserving the design principle that AssignmentManager remains the sole arbiter of primary status. For META's own promotion, the LeaderChangeHandler uses an in-memory-only confirmation path. After META is writable, the master writes META's own promotion record as a deferred idempotent operation, a self-referential write that records META's new primary location in META itself. This deferred write uses the same idempotent term-fenced update path as the standard confirmation, so retries are safe.
+
+For all non-META regions, the standard confirmation path applies. The handler persists to META before returning confirmation. If META is unavailable when a non-META ReportLeaderElection arrives, the handler returns a retry-eligible response. The RegionServer retries with backoff until META is available. This creates a natural ordering: META's promotion completes first via the in-memory-only path, then non-META promotions proceed via the standard META-writing path. (This ordering is modeled in the multi-group TLA+ composition.) If the master crashes after confirming META's promotion in memory but before the deferred self-write completes, the backup master takes over and reconstructs META's location. If both the master and META's primary are in the failed AZ, the backup master must first become active, then process META's ReportLeaderElection through the in-memory-only path. The META RAFT election proceeds independently of master election. Surviving META replicas elect a new RAFT leader as soon as heartbeat timeout fires, even before the backup master is active. The new master processes the backlogged ReportLeaderElection on startup. If META's RAFT leader crashes after completing promotion but before any non-META promotions are confirmed, META's RAFT group re-elects, the new META leader completes promotion through the same in-memory-only path, and non-META confirmations resume. No non-META region can reach the "Complete" promotion state without META being available, ensuring no write is ever acknowledged against a region whose promotion has not been persisted to META.
 
 **Changes to TransitRegionStateProcedure: PRIMARY_PROMOTED transition.**
 
@@ -982,12 +995,12 @@ TRSP gains a new transition type, PRIMARY_PROMOTED, which updates META (the serv
 **Changes to ServerCrashProcedure: coordinator and fallback role.**
 
 SCP gains a RAFT-aware path for regions that have RAFT enabled. SCP's role for these regions is coordination and fallback, not the primary promotion mechanism. In the happy path, the LeaderChangeHandler has already processed the leader change before SCP even begins iterating regions. SCP's RAFT-aware path proceeds as follows:
-(1) skip WAL splitting for RAFT-enabled regions;
-(2) for each RAFT-enabled region on the dead server, check whether the master has already confirmed a new leader by examining the RegionStateNode. If the current primary is on a live server, the promotion is already complete;
-(3) if no leader change has been processed yet, SCP either waits with a bounded timeout for the RAFT election to complete and for the RegionServer to send ReportLeaderElection, or if the election does not complete in time, SCP sends wake-up RPCs to surviving replicas to trigger elections, then waits;
-(4) if the dead server's replica was the primary and the fast path has not completed, SCP creates a TransitRegionStateProcedure with PRIMARY_PROMOTED type as a fallback. This provides the procedure framework's retry and persistence guarantees when the fast path has not completed;
-(5) if the dead server's replica was a follower rather than the primary, SCP schedules a replacement replica assignment;
-(6) SCP schedules a replacement replica to restore the replication factor from two back to three.
+1. skip WAL splitting for RAFT-enabled regions and if META is among the dead server's RAFT-enabled regions, process it first;
+2. for each RAFT-enabled region on the dead server, check whether the master has already confirmed a new leader by examining the RegionStateNode. If the current primary is on a live server, the promotion is already complete;
+3. if no leader change has been processed yet, SCP either waits with a bounded timeout for the RAFT election to complete and for the RegionServer to send ReportLeaderElection, or if the election does not complete in time, SCP sends wake-up RPCs to surviving replicas to trigger elections, then waits;
+4. if the dead server's replica was the primary and the fast path has not completed, SCP creates a TransitRegionStateProcedure with PRIMARY_PROMOTED type as a fallback. This provides the procedure framework's retry and persistence guarantees when the fast path has not completed;
+5. if the dead server's replica was a follower rather than the primary, SCP schedules a replacement replica assignment;
+6. SCP schedules a replacement replica to restore the replication factor from two back to three.
 
 When the crashed server was hosting a promoted non-default replica that was acting as primary, SCP must determine whether the crashed replica was the current primary by consulting the primary-replica-ID field in the RegionStateNode. If the crashed replica was the primary, SCP follows the RAFT-aware path. If the crashed replica was a follower, SCP simply schedules a replacement. The ABNORMALLY_CLOSED state requires special attention. The existing logic that skips recovered-edits replay for non-default replicas is correct for RAFT-enabled regions because RAFT replicas recover via the RAFT log, not via recovered edits. However, after a RAFT promotion, a crashed non-default replica that had been acting as primary also enters ABNORMALLY_CLOSED state, so SCP must recognize this situation via the primary registry and route it through the RAFT-aware failover path rather than the standard reassignment path.
 
@@ -1009,15 +1022,9 @@ META is updated before the RegionServer completes the local promotion steps. The
 
 If a client sends an RPC to a RegionServer that is no longer hosting the primary, because the master promoted a different replica, the RegionServer returns a `NotServingRegionException`, which is the standard response when a region has moved. The client invalidates its region location cache, re-reads META, and finds the new primary. Similarly, if a read-only replica's RegionServer receives a write RPC because the client's cache is stale, the replica is not the RAFT leader and does not have write authority, so it also returns `NotServingRegionException`, triggering the same client retry-with-META-lookup path. No new exception types are needed in either case.
 
-The scope of is-default-replica / replica-ID-equals-zero assumptions is broad. The following table categorizes them by the type of change needed:
+The scope of "is this the default replica" assumptions is broad. On the RegionServer, checks that ask "is this replica ID zero" must be replaced with "is this the RAFT leader" for RAFT-enabled tables. Today the read-only flag, WAL open and close markers, region info and sequence ID file writes, flush triggers, WAL markers for flush and compaction, and replication barrier updates all gate on whether the replica ID is zero. After this change they gate on whether the member is the RAFT leader, so that any replica can perform these operations when it is promoted to primary. On the master, operations that hardcode replica ID zero as the target must instead look up which replica ID is currently acting as primary, via the new primary-replica-ID column in META or AssignmentManager's in-memory primary registry. This affects table flush procedures, snapshot procedures, the assignment manager's meta-assigned bookkeeping, and the balancer's primary cost functions. The old async replication flush handler is retired entirely for RAFT-enabled tables because RAFT markers handle flush coordination. Filesystem path normalization to replica ID zero is correct because all replicas share the same HDFS directory. Table deletion archives using the replica-ID-zero encoded name for the same reason. Recovered-edits checks that return false for non-default replicas are correct because RAFT replicas recover via the RAFT log. The META row key uses replica ID zero as a schema convention unrelated to which replica is primary. The procedure sanity check that verifies the default replica's region definition exists concerns identity, not primary status.
 
-The first category of changes replaces server-side replica-ID-equals-zero checks with RAFT leader status checks. For RAFT-enabled tables, `ServerRegionReplicaUtil.isReadOnly()` (line 105), which currently returns true for any replica ID other than 0, must instead return false when the member is the RAFT leader; `HRegion.checkReadOnly()` delegates to this and inherits the change. `HRegion.openHRegion()` (line 7407) and `HRegion.close()` (line 1894) currently write WAL open and close markers only for replica ID 0; both must write these markers when the member is the RAFT leader. Similarly, `HRegion.initialize()` writes the region info file (line 1023) and the sequence ID file (line 1087) only for replica ID 0; both must gate on RAFT leader status instead. The flush trigger in `HRegion.internalPrepareFlushCache()` (line 2672), WAL marker writes for flush and compaction, and replication barrier updates in `RegionStateStore` all currently gate on the default-replica check and must likewise gate on RAFT leader status.
-
-The second category covers master-side operations that must target whichever replica ID is currently the primary, looked up via the primary-replica-ID META column or AssignmentManager's primary registry. `FlushTableProcedure.createFlushRegionProcedures()` (line 200) currently filters to replica ID 0 and must filter to the current primary replica ID per region. `SnapshotProcedure` (lines 302, 342, 401) filters to replica ID 0 for verify, snapshot creation, and remote snapshot RPCs, and must use the current primary replica ID instead. `AssignmentManager` (line 350) calls set-meta-assigned only for replica ID 0 and must use the current primary replica ID. `BalancerClusterState` (line 360) treats replica ID 0 as the primary index for cost functions and must use the registered primary replica ID. `RegionReplicaFlushHandler`, which targets the default replica for flush RPCs, is retired entirely for RAFT-enabled tables.
-
-A number of call sites require no change because their replica-ID-0 behavior is already correct for RAFT. `ServerRegionReplicaUtil.getRegionInfoForFs()` (line 93) normalizes to replica ID 0 for filesystem paths, which is correct because all replicas share the primary's HDFS directory regardless of which replica is currently primary. `DeleteTableProcedure` (line 338) archives region directories using the replica-ID-0 encoded name for the same reason. `ServerRegionReplicaUtil.shouldReplayRecoveredEdits()` (line 116) and `WALSplitUtil.hasRecoveredEdits()` (line 237) both return false for non-default replicas, which is correct because RAFT replicas recover via the RAFT log, not via recovered edits. The `TransitRegionStateProcedure` replica sanity check (line 421) verifies that the default replica's region definition exists in the region states, which concerns region identity rather than primary status. The ABNORMALLY_CLOSED skip (line 381) has non-default replicas skip recovered edits on abnormal close, which is correct since the new RAFT leader handles recovery. `MetaTableAccessor.addRegionsToMeta()` (line 1511) creates the META row using replica ID 0 as the canonical row key, which is META schema and unrelated to primary status.
-
-Finally, two special cases arise where the current code makes no provision for a non-default replica ID acting as primary. In `HRegion.initialize()` (line 1032), the recovered-edits replay check returns false for non-default replicas. A promoted replica should indeed not replay recovered edits but it must replay the RAFT log tail, so RAFT log tail replay is added in the re-initialization path for promoted replicas. In `HRegion.waitForFlushesAndCompactions()` (line 1935), the method returns immediately for read-only regions, but after promotion the new primary must wait for flushes; this is addressed by flipping the read-only write state at promotion time.
+Two special cases need new handling. First, a promoted replica must not replay recovered edits but must replay the RAFT log tail during re-initialization. Second, a method that returns immediately for read-only regions must instead wait for flushes after promotion, addressed by flipping the read-only state at promotion time.
 
 ## New Member Bootstrap
 
@@ -1071,9 +1078,9 @@ sequenceDiagram
     Note over N: Caught up, eligible for voting and promotion
 ```
 
-**Vote record on bootstrap.** When the leader bootstraps a new member, the new member must persistently record a vote for the bootstrapping leader in the current term. A replacement pod has no persistent state and therefore no prior vote record. If the new member were to join the group with no voted-for record at the leader's term, it could vote for a different candidate in the same term — violating the RAFT invariant that each member votes at most once per term and enabling a second leader election in the same term. Recording the bootstrapping leader as the voted-for member is safe because the leader is actively replicating data to this member. The member implicitly recognizes this leader's authority for the current term. In MicroRaft, this means `persistAndFlushTerm()` must be called during install-snapshot handling with the voted-for field set to the leader's endpoint, not null.
+When the leader bootstraps a new member, the new member must persistently record a vote for the bootstrapping leader in the current term. A replacement pod has no persistent state and therefore no prior vote record. If the new member were to join the group with no voted-for record at the leader's term, it could vote for a different candidate in the same term — violating the RAFT invariant that each member votes at most once per term and enabling a second leader election in the same term. Recording the bootstrapping leader as the voted-for member is safe because the leader is actively replicating data to this member. The member implicitly recognizes this leader's authority for the current term. In MicroRaft, this means `persistAndFlushTerm()` must be called during install-snapshot handling with the voted-for field set to the leader's endpoint, not null.
 
-**Stale leader rejection.** The bootstrap must only proceed if the bootstrapping leader's term is at least as high as the member's current term. In a partition scenario, a stale leader (lower term) could attempt to bootstrap a member that has already accepted a higher term from the current leader. If the stale leader were allowed to reset the member's term backward, it would gain a quorum of heartbeat responders, enabling it to refresh its lease while the current leader also holds a valid lease, violating the exclusive-lease invariant. The implementation must verify that the leader's term is at least as high as the local term before accepting a bootstrap. In MicroRaft, `AppendEntriesRequestHandler` already rejects requests from lower-term leaders; the same check must apply to the install-snapshot and catch-up-reference handlers.
+The bootstrap must only proceed if the bootstrapping leader's term is at least as high as the member's current term. In a partition scenario, a stale leader (lower term) could attempt to bootstrap a member that has already accepted a higher term from the current leader. If the stale leader were allowed to reset the member's term backward, it would gain a quorum of heartbeat responders, enabling it to refresh its lease while the current leader also holds a valid lease, violating the exclusive-lease invariant. The implementation must verify that the leader's term is at least as high as the local term before accepting a bootstrap. In MicroRaft, `AppendEntriesRequestHandler` already rejects requests from lower-term leaders; the same check must apply to the install-snapshot and catch-up-reference handlers.
 
 The new member's bootstrap is entirely network-driven: it receives entries from the leader via AppendEntries or loads HFiles from HDFS via CatchUpReference. At no point does the new member read a pre-existing local RAFT log. The local RAFT log on the new member's disk is created from scratch as entries are received from the leader. This is consistent with the RAFT log being a local-disk, non-durability mechanism (see "RAFT log on local disk" in Key Risks): loss of the local RAFT log (whether from instance replacement or disk failure) is recovered via the leader's log or via shared HFiles on HDFS.
 
@@ -1084,14 +1091,15 @@ In standard RAFT implementations, the InstallSnapshot RPC transfers the full sta
 MicroRaft's existing catch-up mechanism uses install-snapshot request/response to transfer snapshot chunks over the consensus transport, with a parallel transfer optimization that fetches chunks from both the leader and other followers via a snapshot chunk collector. For hbase-consensus, this mechanism is replaced entirely. MicroRaft's method that decides between sending AppendEntries or InstallSnapshot based on whether the follower's next index is behind the snapshot is modified. Instead of sending snapshot chunks, it sends a catch-up reference containing the HFile paths and flush sequence ID. The install-snapshot request handler, install-snapshot response, snapshot chunk collector, and the parallel chunk transfer logic are not used. The state machine's take-snapshot implementation produces a lightweight metadata-only snapshot, not a data snapshot. The install-snapshot callback receives this metadata and triggers the HDFS-based catch-up path: load the referenced HFiles from HDFS, then apply consensus log entries from the snapshot's commit index forward.
 
 The shared-storage catch-up path serves three scenarios:
-(1) new member bootstrap, where a freshly added member loads HFiles and receives the RAFT log tail from the leader via AppendEntries over the network;
-(2) old primary rejoin, where a crashed primary recovers as a follower and catches up via HFiles if its needed log entries have been GC'd;
-(3) promoting leader catch-up, where a newly elected leader in the promoting phase needs entries that have been GC'd from all members' logs and must load HFiles before completing Phase 1 of the promotion protocol.
+1. new member bootstrap, where a freshly added member loads HFiles and receives the RAFT log tail from the leader via AppendEntries over the network;
+2. old primary rejoin, where a crashed primary recovers as a follower and catches up via HFiles if its needed log entries have been GC'd;
+3. promoting leader catch-up, where a newly elected leader in the promoting phase needs entries that have been GC'd from all members' logs and must load HFiles before completing Phase 1 of the promotion protocol.
+
 All three scenarios use the same catch-up reference and install-snapshot mechanism. (The TLA+ formal model has verified the safety of this path across all three scenarios.) Every committed entry is recoverable via RAFT log replay, present in a majority of logs, or via HFiles on HDFS, covered by a committed flush marker with durable HFiles. No write is accepted until all three promotion phases complete, regardless of whether the promoting leader caught up via log replay or the shared-storage path.
 
 ## Key Risks and Corner Cases
 
-**Split-brain prevention.** A stale primary's proposals are rejected by replicas who have seen a higher RAFT term. A stale leader's ReportLeaderElection cannot overwrite a newer leader's META entry because the handler rejects any reported term that is less than or equal to the current known term. The combination of RAFT lease exclusivity and master term fencing provides two independent layers of split-brain prevention. A new member must also record a vote for the bootstrapping leader, preventing double-voting in the same term, and must reject bootstrap from a stale leader whose term is lower than the member's current term, preventing a stale leader from refreshing its lease. See the "Vote record on bootstrap" and "Stale leader rejection" paragraphs in the New Member Bootstrap section.
+**Split-brain prevention.** A stale primary's proposals are rejected by replicas who have seen a higher RAFT term. A stale leader's ReportLeaderElection cannot overwrite a newer leader's META entry because the handler rejects any reported term that is less than or equal to the current known term. The combination of RAFT lease exclusivity and master term fencing provides two independent layers of split-brain prevention. A new member must also record a vote for the bootstrapping leader, preventing double-voting in the same term, and must reject bootstrap from a stale leader whose term is lower than the member's current term, preventing a stale leader from refreshing its lease.
 
 **Master unavailable during promotion.** If the master is unavailable when the RAFT leader attempts the ReportLeaderElection RPC, the RAFT leader holds a valid lease and can continue to serve reads, but it cannot serve writes because the promotion-complete flag is not set without master confirmation. The RegionServer retries the ReportLeaderElection RPC with exponential backoff until the master is available. Failover latency during simultaneous master failure is bounded by master election time plus one RPC round-trip.
 
@@ -1111,7 +1119,7 @@ All three scenarios use the same catch-up reference and install-snapshot mechani
 
 **Clock skew.** Cell timestamps come from either the client or the server's current time. In the RAFT model, the primary assigns timestamps during mini-batch preparation before proposing through RAFT, so all members see the same timestamp. This is already the case for the current write path, so no change is needed.
 
-**Flush coordination.** The primary writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT. All members transition from memstore to HFiles at the same logical point in the RAFT log. Because HFiles are fully written before the marker is proposed, there is no window where a member has dropped its memstore but HFiles are unavailable. Replicas pick up the new HFiles from HDFS upon applying the flush-complete marker via an immediate store file refresh triggered by the marker, supplemented by StorefileRefresherChore as a fallback. Since all client reads and writes go through the primary, any brief delay in replica HFile discovery does not affect client-visible consistency.
+**Flush coordination.** The primary writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT. All members transition from memstore to HFiles at the same logical point in the RAFT log. Because HFiles are fully written before the marker is proposed, there is no window where a member has dropped its memstore but HFiles are unavailable. Replicas pick up the new HFiles from HDFS upon applying the flush-complete marker via an immediate store file refresh triggered by the marker, supplemented by StorefileRefresherChore as a fallback. A brief delay in replica HFile discovery does not affect client-visible consistency for either default reads or Timeline reads: the replica has not yet dropped its memstore when the marker-triggered refresh is delayed, so Timeline reads on that replica remain consistent throughout the transition.
 
 **Inter-AZ latency impact.** Every write now requires both a WAL sync and a RAFT round-trip to a majority, but these run in parallel. The write latency is the maximum of the WAL sync and the RAFT round-trip, not the sum. In a cross-AZ deployment with HDFS replication factor 3 (one DataNode per AZ), the HDFS WAL pipeline includes inter-AZ hops: the write must reach and be acknowledged by DataNodes in at least two AZs. Realistic HDFS WAL sync latency in this configuration is ~3-5ms, not the ~1-3ms typical of a single-AZ HDFS deployment. Inter-AZ RAFT RTT is ~1-2ms. Since max(3-5ms, 1-2ms) = 3-5ms, the RAFT consensus overhead is effectively hidden behind the already-cross-AZ HDFS WAL sync. The parallel barrier adds no additional latency over today's single-WAL path in a cross-AZ HDFS deployment. With the consensus layer's built-in batching and pipelining, the amortized per-write overhead is modest.
 
@@ -1284,7 +1292,7 @@ A TLA+ specification models the protocols described in the design document that 
 | 4 | `WriteBarrierSafety` | A write is made visible to readers (memstore.add + mvcc.completeAndWait) only after both WAL sync and RAFT commit have completed | Verified |
 | 5 | `FollowerSeqIdConsistency` | After applying a committed entry, the follower's memstore contains the same cells with the same sequence IDs as the leader's memstore at the corresponding log index | Verified |
 | 6 | `NoOrphanMemstoreDrop` | If the leader crashes between HFile commit and RAFT flush-marker commit, no member drops its memstore (the marker was never committed). Formalized as: `flushPhase[m] = "RAFTCommitted" => flushSeqId[m] ∈ markerEntries`. | Verified |
-| 7 | `PromotionReadWriteGuard` | A promoted replica does not acknowledge client writes until the master has confirmed the promotion and the replica holds a WAL reference. Formalized as: `writePhase[m] ≠ "Idle" ⇒ promotionPhase[m] = "Complete"`. After Iteration 22, "Complete" requires master confirmation in addition to log catch-up. | Verified |
+| 7 | `PromotionReadWriteGuard` | A promoted replica does not acknowledge client writes until the master has confirmed the promotion and the replica holds a WAL reference. Formalized as: `writePhase[m] ≠ "Idle" ⇒ promotionPhase[m] = "Complete"`. After Iteration 20, "Complete" requires master confirmation (via `MasterConfirmPromotion` with term-fencing guard) in addition to log catch-up. | Verified |
 | 8 | `PromotionMVCCContinuity` | For an active leader (valid lease) that has completed promotion, no committed entry is unapplied except the leader's own in-flight write. Formalized as: `promotionPhase[m] = "Complete" ∧ IsLeader(m) ⇒ ApplicableEntries(m) ⊆ {writeSeqId[m] if writing}`. | Verified |
 | 9 | `VoteDurabilityRequired` | Vote durability is an implementation requirement: `hbase-consensus` always uses a durable `RaftStore` that persists `votedFor` and `currentTerm` before responding to vote requests. The spec models this unconditionally: `CrashRestart` preserves `currentTerm` and `votedFor` (UNCHANGED). | Verified |
 | 10 | `NoSCPWALSplit` | RAFT-enabled regions bypass WAL splitting during SCP; recovery uses RAFT log replay, not recovered edits | Pending |
@@ -1305,7 +1313,7 @@ A TLA+ specification models the protocols described in the design document that 
 | 1 | `ElectionProgress` | BaseFairness + ElectionSF | If no member holds a valid leader lease, eventually some member acquires one. Requires SF on RequestVote, BecomeLeader, StepDown, and HealAllPartitions. | Verified (simulation) |
 | 2 | `WriteCompletion` | BaseFairness + WriteSF | A write in the Pending phase eventually returns to Idle — either the normal path completes or the WAL fails and the leader aborts. Requires SF on RAFTCommitWrite and HealAllPartitions. | Verified (simulation) |
 | 3 | `FlushCompletion` | BaseFairness + FlushSF | A flush in any non-Idle phase eventually returns to Idle — either the phase chain completes or a crash resets the flush state. Requires SF on FlushRAFTPropose, FlushRAFTCommit, and HealAllPartitions. | Verified (simulation) |
-| 4 | `PromotionCompletion` | BaseFairness | A member in the Promoting phase eventually leaves it — either PromotionComplete fires (after master confirmation, per Iteration 22) or the member steps down / crashes. After Iteration 22, requires master confirmation on the path from Promoting to Complete. | Verified (simulation) |
+| 4 | `PromotionCompletion` | BaseFairness | A member in the Promoting phase eventually leaves it (via `MasterConfirmPromotion` to AwaitingMaster), and a member in the AwaitingMaster phase eventually leaves it (via `PromotionComplete` to Complete, or step-down / crash). Both intermediate states are transient under WF on `MasterConfirmPromotion` and `PromotionComplete`. | Verified (simulation) |
 | 5 | `CatchUpCompletion` | BaseFairness | A follower with unapplied committed entries eventually catches up or leaves the Follower role. WF-only (no network dependency). | Verified (simulation) |
 | 6 | `HibernateConvergence` | BaseFairness | A member in the Waking hibernate state eventually transitions out — either WakeComplete fires, or lease expiry triggers a new election cycle, or a crash resets to Active. WF-only. | Verified (simulation) |
 | 7 | `OrphanHFileCleanup` | — | Orphan HFiles from an incomplete flush are eventually cleaned up if the new primary is alive and HDFS is accessible | Pending |
@@ -1334,8 +1342,7 @@ A TLA+ specification models the protocols described in the design document that 
 ~~**Iteration 17. Multi-group interactions.**~~
 ~~**Iteration 18. Fairness and liveness properties.**~~
 ~~**Iteration 19 — Region split/merge with RAFT groups.**~~
-
-**Iteration 20 — Master confirmation in the promotion protocol.** Extend the promotion protocol to model the master notification and META update as an explicit phase between RAFT log-tail consumption and promotion completion. The master is modeled as a nondeterministic oracle with a term-fencing guard, consistent with how the master is modeled in the split and merge lifecycle modules (the master open-daughter and master open-merged actions). A new intermediate promotion state ("AwaitingMaster") is introduced between "Promoting" and "Complete". A new action models the master's validation and META update: it fires when the member is in the "Promoting" phase, has consumed all applicable entries, and the master has not already confirmed a higher term for this group. The action transitions the member to the "AwaitingMaster" state. The promotion-complete action's guard is strengthened to require that the member is in the "AwaitingMaster" state (meaning master confirmation has been received) in addition to the existing condition that all applicable entries are consumed. The `PromotionReadWriteGuard` invariant continues to verify that no write pipeline is active without promotion completion, now with master confirmation included in the definition of completion. The `PromotionMVCCContinuity` invariant is unchanged. The `PromotionCompletion` liveness property is extended to require master confirmation on the path from "Promoting" to "Complete". Edge cases to verify: master confirmation arrives after lease expiry, master confirms a stale term, crash during the "AwaitingMaster" phase, and double election where two members simultaneously request master confirmation. Note that the master confirmation phase is a higher-layer protocol relative to the RAFT consensus core. The current TLA+ model already treats promotion as a purely local operation on the promoting member, which is correct from the consensus perspective. We extend the model to capture the interaction between the RAFT election result and the master's authority to grant primary status, bridging the gap between the consensus layer and the assignment layer.
+~~**Iteration 20 — Master confirmation in the promotion protocol.**~~
 
 **Iteration 21 — Datapath module refactor.** Refactor `MCRaftRegionReplica_datapath.tla` to use `GroupDataPathNext` from the base spec instead of defining its own `FollowerBatchApply` and `CompleteWriteAndAck` actions, which are functionally identical to the base spec's `AtomicFollowerBatchApply` and `AtomicCompleteWriteAndAck`. Express `DataPathNext` as `GroupDataPathNext` plus shared-impact actions (ClockTick, CrashRestart, CreatePartition, HealPartition, RaftLogGC), eliminating the duplicate definitions and reducing maintenance surface.
 
@@ -1352,7 +1359,7 @@ Seven categories of model-checking configurations are maintained:
 - **Exhaustive** (`MCRaftRegionReplica.tla` + `.cfg`): MaxSeqId = 3, symmetry-reduced, breadth-first. Proves absence of invariant violations across the complete state space. Expected runtime ~24 hours; run as a daily job after spec changes.
 - **Simulation (dev inner loop)** (`MCRaftRegionReplica_sim.tla` + `_sim.cfg`): MaxSeqId = 5, no symmetry, TLC `-simulate` mode with `-depth 120`. Used as the fast validation loop during spec development. Counterexamples from invariant violations are typically found within minutes if they exist. Depth 120 is tuned so that every trace is deep enough to complete the most complex 5-seqId scenario.
 - **Simulation (daily deep run)**: Same configuration as above but with `-Dtlc2.TLC.stopAfter=28800` (8 hours). Supplements the exhaustive run by exercising longer traces and higher seqId values.
-- **Multi-group** (`MCRaftRegionReplica_multigroup.tla` + `_multigroup.cfg`): Two RAFT groups sharing clock, network, and unified log. MaxSeqId = 2, zero clock drift, data-path action merges. Verifies that operations on one group do not violate another group's safety invariants.
+- **Multi-group** (`MCRaftRegionReplica_multigroup.tla` + `_multigroup.cfg`): Two RAFT groups sharing clock, network, and unified log. Group 1 is designated as the META group; Group 2's `MasterConfirmPromotion` is gated on `MetaReady` (derived operator: true when some G1 member has completed promotion), modeling the META availability ordering constraint. MaxSeqId = 2, zero clock drift, data-path action merges. Verifies that operations on one group do not violate another group's safety invariants.
 - **Split lifecycle** (`MCRaftRegionReplica_split.tla` + `.cfg`): One parent RAFT group with per-member daughter lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlap` (no overlap between parent and daughter key ranges) plus all 14 parent-group safety invariants.
 - **Merge lifecycle** (`MCRaftRegionReplica_merge.tla` + `.cfg`): Two parent RAFT groups with per-member merged-group lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlapMerge` (no overlap between parent and merged key ranges) plus all 14 per-group safety invariants for both parents.
 - **Liveness simulation** (six per-property configs, `MCRaftRegionReplica_liveness_*.cfg`): Each config pairs a per-property `SPECIFICATION` (`LiveSpecElection`, `LiveSpecWrite`, etc.) with the matching `PROPERTY`. The shared liveness MC module (`MCRaftRegionReplica_liveness.tla`) uses MaxTerm = 2, MaxClock = 4, MaxSeqId = 2; the election-specific MC module (`MCRaftRegionReplica_liveness_election.tla`) uses MaxTerm = 4, MaxClock = 12, MaxSeqId = 1 (more term/clock headroom, fewer seqIds). All use MaxClockDrift = 1.
@@ -1388,7 +1395,7 @@ In addition to the full exhaustive and simulation configurations above, two doma
 
 - **`MCRaftRegionReplica_datapath`** — Full data-path coverage (MaxSeqId=3) with simplified timing (MaxClockDrift=0). Merged and removed actions reduce the branching factor. Provides BFS proof of data-path protocol correctness (flush, write pipeline, log GC, catch-up, bootstrap).
 
-- **`MCRaftRegionReplica_election`** — Full timing/drift coverage (MaxClockDrift=1, ElectionTimeoutMin=4) with minimal data path (MaxSeqId=1). Uses the original unmodified `Next` with all 35 actions. Provides BFS proof of election safety, lease exclusivity, and term fencing.
+- **`MCRaftRegionReplica_election`** — Full timing/drift coverage (MaxClockDrift=1, ElectionTimeoutMin=4) with minimal data path (MaxSeqId=1). Uses the original unmodified `Next` with all 36 actions. Provides BFS proof of election safety, lease exclusivity, and term fencing.
 
 Together with simulation (which exercises both domains simultaneously at MaxSeqId=5), these configurations cover all 14 invariants non-trivially.
 
@@ -1446,8 +1453,8 @@ done
 
 | File | Purpose |
 |------|---------|
-| `RaftRegionReplica.tla` | Base specification (2,445 lines): election, leases, write path, flush, follower apply, promotion, crash recovery, catch-up, hibernate, safety invariants, liveness properties. Exports `GatedMemberActions(m)` / `GatedMemberDataPathActions(m)` building-block operators for composition modules. |
-| `MultiGroupRaftRegionReplica.tla` | Two-group composition: shared clock, network, unified log GC, cross-group safety |
+| `RaftRegionReplica.tla` | Base specification (~2,500 lines): election, leases, write path, flush, follower apply, promotion (with master confirmation via `MasterConfirmPromotion`), crash recovery, catch-up, hibernate, safety invariants, liveness properties. Exports `GatedMemberActions(m)` / `GatedMemberDataPathActions(m)` building-block operators for composition modules. |
+| `MultiGroupRaftRegionReplica.tla` | Two-group composition: shared clock, network, unified log GC, META promotion ordering (G2's `MasterConfirmPromotion` gated on `MetaReady`), cross-group safety |
 | `SplitRaftRegionReplica.tla` | Region split lifecycle: parent group gating, daughter activation, `NoKeyRangeOverlap` |
 | `MergeRaftRegionReplica.tla` | Region merge lifecycle: two-parent gating, merged group activation, `NoKeyRangeOverlapMerge` |
 | `MCRaftRegionReplica.tla` | Exhaustive model-checking configuration (MaxSeqId=3, symmetry-reduced) |
@@ -1497,7 +1504,8 @@ VARIABLES
     flushPhase,         \* flushPhase[m]: flush phase (Idle | FlushStarted | HFilesCommitted | RAFTProposed | RAFTCommitted)
     flushSeqId,         \* flushSeqId[m]: seqId consumed by m's current flush (0 = none)
     \* ---- Promotion pipeline ----
-    promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | Complete)
+    promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
+    masterConfirmedTerm,\* masterConfirmedTerm: highest RAFT term confirmed by master (Nat)
     \* ---- Hibernate lifecycle ----
     hibernateState      \* hibernateState[m]: hibernate lifecycle (Active | Hibernated | Waking)
 ```
@@ -1529,7 +1537,8 @@ TypeOK ==
     /\ flushPhase \in [Members -> {"Idle", "FlushStarted", "HFilesCommitted",
                                     "RAFTProposed", "RAFTCommitted"}]
     /\ flushSeqId \in [Members -> 0..MaxSeqId]
-    /\ promotionPhase \in [Members -> {"None", "Promoting", "Complete"}]
+    /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
+    /\ masterConfirmedTerm \in 0..MaxTerm
     /\ hibernateState \in [Members -> {"Active", "Hibernated", "Waking"}]
 ```
 
@@ -1936,13 +1945,23 @@ CatchUpCompleteness ==
 
 #### Promotion Protocol
 
-`PromotionComplete` models the transition from the Promoting phase to Complete, corresponding to the safety-critical boundary at promotion step 3 (WAL reference acquisition). The guard requires a valid lease and that all committed entries have been applied (`ApplicableEntries(m) = {}`), ensuring the promoted leader's memstore is fully current before accepting writes.
+Promotion is modeled as a two-action sequence. `MasterConfirmPromotion` models the master's validation and META update (Phase 2): the master confirms the RAFT term, updates META, and the member transitions from "Promoting" to "AwaitingMaster". The `masterConfirmedTerm` variable tracks the highest confirmed term, providing term fencing — the master does not confirm a stale term. `PromotionComplete` models the local promotion steps (Phase 3): WAL reference acquisition, read-write transition. The guard requires that the member is in "AwaitingMaster" (master confirmation received) and all applicable entries are consumed.
 
 ```tla
-PromotionComplete(m) ==
+MasterConfirmPromotion(m) ==
     /\ role[m] = "Leader"
     /\ LeaseValid(m)
     /\ promotionPhase[m] = "Promoting"
+    /\ ApplicableEntries(m) = {}
+    /\ currentTerm[m] > masterConfirmedTerm
+    /\ masterConfirmedTerm' = currentTerm[m]
+    /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "AwaitingMaster"]
+    \* ... UNCHANGED omitted ...
+
+PromotionComplete(m) ==
+    /\ role[m] = "Leader"
+    /\ LeaseValid(m)
+    /\ promotionPhase[m] = "AwaitingMaster"
     /\ ApplicableEntries(m) = {}
     /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "Complete"]
     \* ... UNCHANGED omitted ...
@@ -2025,7 +2044,7 @@ WakeComplete(m) ==
 
 #### Multi-Group Composition
 
-`MultiGroupRaftRegionReplica.tla` models two independent RAFT groups (G1, G2) sharing the same `ConsensusServer` resources on a set of RegionServers: shared physical clock, shared network (partitions affect both groups), unified multiplexed consensus log, and shared thread pool (modeled implicitly by TLA+'s nondeterministic interleaving). Five shared-impact actions are replaced with multi-group versions. Per-group actions are dispatched via `G1!GroupNext` / `G2!GroupNext`, which use the base spec's building-block operators without gating (both groups are unconditionally active).
+`MultiGroupRaftRegionReplica.tla` models two independent RAFT groups (G1, G2) sharing the same `ConsensusServer` resources on a set of RegionServers: shared physical clock, shared network (partitions affect both groups), unified multiplexed consensus log, and shared thread pool (modeled implicitly by TLA+'s nondeterministic interleaving). Five shared-impact actions are replaced with multi-group versions. Group 1 is designated as the META group and Group 2 as a non-META group. Group 1's per-group actions are dispatched unmodified via `G1!GroupNext`. Group 2's `MasterConfirmPromotion` is gated on a derived operator `MetaReady` (true when any G1 member has `promotionPhase = "Complete"`), modeling the META availability ordering constraint from the META Region Self-Promotion Bootstrap section above. This ordering is structural — enforced by the gate mechanism — and does not require an additional state-based invariant.
 
 The two groups are instantiated by substituting per-group variables into the base spec:
 
@@ -2054,6 +2073,7 @@ G1 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
     promotionPhase  <- promotionPhase_1,
+    masterConfirmedTerm <- masterConfirmedTerm_1,
     hibernateState  <- hibernateState_1
 \* G2 == INSTANCE RaftRegionReplica WITH ... (symmetric, using _2 variables)
 ```
@@ -2069,9 +2089,11 @@ MultiGroupCrashRestart(m) ==
                    currentTerm_1, votedFor_1, raftLog_1,
                    nextSeqId_1, committedEntries_1, markerEntries_1,
                    flushMarkerEntries_1, hdfsHFiles_1,
+                   masterConfirmedTerm_1,
                    currentTerm_2, votedFor_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
-                   flushMarkerEntries_2, hdfsHFiles_2>>
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   masterConfirmedTerm_2>>
 ```
 
 Unified log GC models physical segment deletion in the shared append-only consensus log. Both groups must have an applied flush marker on member m, and entries below each group's chosen flush watermark are removed from both groups' raftLogs simultaneously:
@@ -2092,10 +2114,13 @@ UnifiedLogGC(m) ==
 The next-state relation interleaves per-group steps with shared-impact actions:
 
 ```tla
+MetaReady == \E m \in Members : promotionPhase_1[m] = "Complete"
+
 Next ==
-    \* Per-group steps via INSTANCE
+    \* G1 (META group) — per-group steps unmodified
     \/ (G1!GroupNext /\ UNCHANGED g2_vars)
-    \/ (G2!GroupNext /\ UNCHANGED g1_vars)
+    \* G2 (non-META group) — MasterConfirmPromotion gated on MetaReady
+    \/ (G2GatedGroupNext /\ UNCHANGED g1_vars)
     \* Shared-impact actions
     \/ \E m \in Members : MultiGroupClockTick(m)
     \/ \E m \in Members : MultiGroupCrashRestart(m)
@@ -2296,8 +2321,10 @@ FlushCompletion ==
         flushPhase[m] # "Idle" ~> flushPhase[m] = "Idle"
 
 PromotionCompletion ==
-    \A m \in Members :
+    /\ \A m \in Members :
         promotionPhase[m] = "Promoting" ~> promotionPhase[m] # "Promoting"
+    /\ \A m \in Members :
+        promotionPhase[m] = "AwaitingMaster" ~> promotionPhase[m] # "AwaitingMaster"
 
 CatchUpCompletion ==
     \A m \in Members :

@@ -14,9 +14,16 @@
  *     by TLA+'s nondeterministic interleaving — any enabled action
  *     from either group may fire at each step.
  *
- * Per-group actions are dispatched via G1!GroupNext / G2!GroupNext.
- * LifecycleGate is set to TRUE (no gating) since multi-group
- * composition has no lifecycle markers.
+ * G1 is designated as the META group and G2 as a non-META group.
+ * G2's MasterConfirmPromotion is gated on MetaReady (derived from
+ * G1's promotion state), modeling the META availability ordering
+ * constraint: the master cannot persist non-META promotions to META
+ * until META itself is writable.  G1 uses the base spec's
+ * MasterConfirmPromotion unmodified (the master confirms META via
+ * an in-memory-only path with no META write dependency).
+ *
+ * Per-group actions are dispatched via G1!GroupNext / G2!GroupNext,
+ * with G2!MasterConfirmPromotion replaced by a gated version.
  *
  * Five "shared-impact" actions are replaced with multi-group
  * versions: ClockTick, CrashRestart, CreatePartition, HealPartition,
@@ -47,7 +54,7 @@ CONSTANTS
 \* ---- Shared state ----
 VARIABLES clock, partition
 
-\* ---- Group 1 per-group state (22 variables) ----
+\* ---- Group 1 per-group state (23 variables) ----
 VARIABLES
     role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
     leaseRemaining_1, timerRemaining_1,
@@ -56,10 +63,10 @@ VARIABLES
     memstore_1, fApplyBatch_1,
     writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
     flushPhase_1, flushSeqId_1,
-    promotionPhase_1,
+    promotionPhase_1, masterConfirmedTerm_1,
     hibernateState_1
 
-\* ---- Group 2 per-group state (22 variables) ----
+\* ---- Group 2 per-group state (23 variables) ----
 VARIABLES
     role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
     leaseRemaining_2, timerRemaining_2,
@@ -68,7 +75,7 @@ VARIABLES
     memstore_2, fApplyBatch_2,
     writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
     flushPhase_2, flushSeqId_2,
-    promotionPhase_2,
+    promotionPhase_2, masterConfirmedTerm_2,
     hibernateState_2
 
 \* ---- Variable tuples ----
@@ -80,7 +87,8 @@ g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
              memstore_1, fApplyBatch_1,
              writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
              flushPhase_1, flushSeqId_1,
-             promotionPhase_1, hibernateState_1>>
+             promotionPhase_1, masterConfirmedTerm_1,
+             hibernateState_1>>
 
 g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              leaseRemaining_2, timerRemaining_2,
@@ -89,7 +97,8 @@ g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              memstore_2, fApplyBatch_2,
              writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
              flushPhase_2, flushSeqId_2,
-             promotionPhase_2, hibernateState_2>>
+             promotionPhase_2, masterConfirmedTerm_2,
+             hibernateState_2>>
 
 vars == <<clock, partition, g1_vars, g2_vars>>
 
@@ -120,6 +129,7 @@ G1 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
     promotionPhase  <- promotionPhase_1,
+    masterConfirmedTerm <- masterConfirmedTerm_1,
     hibernateState  <- hibernateState_1
 
 G2 == INSTANCE RaftRegionReplica WITH
@@ -146,6 +156,7 @@ G2 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_2,
     flushSeqId      <- flushSeqId_2,
     promotionPhase  <- promotionPhase_2,
+    masterConfirmedTerm <- masterConfirmedTerm_2,
     hibernateState  <- hibernateState_2
 
 Majority == (Cardinality(Members) \div 2) + 1
@@ -179,13 +190,15 @@ MultiGroupClockTick(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1,
+                   masterConfirmedTerm_1, hibernateState_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2>>
+                   flushPhase_2, flushSeqId_2, promotionPhase_2,
+                   masterConfirmedTerm_2, hibernateState_2>>
 
 \* Server crash resets volatile state for BOTH groups on the crashed
 \* member.  Durable state (currentTerm, votedFor, raftLog) survives.
@@ -198,9 +211,11 @@ MultiGroupCrashRestart(m) ==
                    currentTerm_1, votedFor_1, raftLog_1,
                    nextSeqId_1, committedEntries_1, markerEntries_1,
                    flushMarkerEntries_1, hdfsHFiles_1,
+                   masterConfirmedTerm_1,
                    currentTerm_2, votedFor_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
-                   flushMarkerEntries_2, hdfsHFiles_2>>
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   masterConfirmedTerm_2>>
 
 \* Network partition — shared across both groups.
 MultiGroupCreatePartition ==
@@ -236,22 +251,115 @@ UnifiedLogGC(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, hibernateState_1,
+                   flushPhase_1, flushSeqId_1, promotionPhase_1,
+                   masterConfirmedTerm_1, hibernateState_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2,
                    leaseRemaining_2, timerRemaining_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, hibernateState_2>>
+                   flushPhase_2, flushSeqId_2, promotionPhase_2,
+                   masterConfirmedTerm_2, hibernateState_2>>
+
+----
+(* ---- META availability ordering ---- *)
+
+\* G1 is the META group.  MetaReady is TRUE when META's promoted
+\* leader has completed all three promotion phases (including master
+\* confirmation), meaning META is writable.  Derived operator — no
+\* explicit maintenance needed.
+MetaReady == \E m \in Members : promotionPhase_1[m] = "Complete"
+
+\* G2's MasterConfirmPromotion is gated on MetaReady.  The master
+\* cannot persist a non-META promotion to META if META is not writable.
+\* G1 (META) uses the base spec's MasterConfirmPromotion unmodified —
+\* the master confirms META via an in-memory-only path.
+G2MasterConfirmPromotion(m) ==
+    /\ MetaReady
+    /\ G2!MasterConfirmPromotion(m)
+
+\* G2's single-member actions with MasterConfirmPromotion replaced
+\* by the MetaReady-gated version.
+G2GatedMemberActions(m) ==
+    \/ G2!Timeout(m)
+    \/ G2!BecomeLeader(m)
+    \/ G2!Heartbeat(m)
+    \/ G2!StepDown(m)
+    \/ G2!LeaderLeaseExpiry(m)
+    \/ G2!BeginWrite(m)
+    \/ G2!WALSyncComplete(m)
+    \/ G2!RAFTCommitWrite(m)
+    \/ G2!WALSyncFail(m)
+    \/ G2!CompleteWrite(m)
+    \/ G2!AckWrite(m)
+    \/ G2!WALFailureAbort(m)
+    \/ G2!FlushStart(m)
+    \/ G2!FlushCommitHFiles(m)
+    \/ G2!FlushRAFTPropose(m)
+    \/ G2!FlushRAFTCommit(m)
+    \/ G2!FlushComplete(m)
+    \/ G2!ProposeMarker(m)
+    \/ G2!FollowerBeginBatchApply(m)
+    \/ G2!FollowerCompleteBatchApply(m)
+    \/ G2MasterConfirmPromotion(m)
+    \/ G2!PromotionComplete(m)
+    \/ G2!HibernateRequest(m)
+    \/ G2!WakeGroup(m)
+    \/ G2!WakeComplete(m)
+    \/ G2!NewMemberBootstrap(m)
+
+\* G2's GroupNext with MasterConfirmPromotion replaced by the
+\* MetaReady-gated version.
+G2GroupNextMetaGated ==
+    \/ \E m \in Members     : G2GatedMemberActions(m)
+    \/ \E c, v \in Members  : G2!RequestVote(c, v)
+    \/ \E l, f \in Members  : G2!InstallSnapshot(l, f)
+    \/ \E m \in Members     : G2!FollowerApplyMarker(m)
+    \/ G2!NewLeaderCommitOrphanEntry
+
+\* G2's data-path single-member actions with MasterConfirmPromotion
+\* replaced by the MetaReady-gated version.
+G2GatedMemberDataPathActions(m) ==
+    \/ G2!Timeout(m)
+    \/ G2!BecomeLeader(m)
+    \/ G2!Heartbeat(m)
+    \/ G2!StepDown(m)
+    \/ G2!LeaderLeaseExpiry(m)
+    \/ G2!BeginWrite(m)
+    \/ G2!WALSyncComplete(m)
+    \/ G2!RAFTCommitWrite(m)
+    \/ G2!AtomicCompleteWriteAndAck(m)
+    \/ G2!FlushStart(m)
+    \/ G2!FlushCommitHFiles(m)
+    \/ G2!FlushRAFTPropose(m)
+    \/ G2!FlushRAFTCommit(m)
+    \/ G2!FlushComplete(m)
+    \/ G2!AtomicFollowerBatchApply(m)
+    \/ G2MasterConfirmPromotion(m)
+    \/ G2!PromotionComplete(m)
+    \/ G2!HibernateRequest(m)
+    \/ G2!WakeGroup(m)
+    \/ G2!WakeComplete(m)
+    \/ G2!NewMemberBootstrap(m)
+
+\* G2's GroupDataPathNext with MasterConfirmPromotion replaced by
+\* the MetaReady-gated version.
+G2GroupDataPathNextMetaGated ==
+    \/ \E m \in Members     : G2GatedMemberDataPathActions(m)
+    \/ \E c, v \in Members  : G2!RequestVote(c, v)
+    \/ \E l, f \in Members  : G2!InstallSnapshot(l, f)
+    \/ \E m \in Members     : G2!FollowerApplyMarker(m)
+    \/ G2!NewLeaderCommitOrphanEntry
 
 ----
 (* ---- Next-state relation and specification ---- *)
 
 Next ==
-    \* Per-group steps via INSTANCE
+    \* G1 (META) uses base spec actions unmodified.
+    \* G2 (non-META) uses MetaReady-gated MasterConfirmPromotion.
     \/ (G1!GroupNext /\ UNCHANGED g2_vars)
-    \/ (G2!GroupNext /\ UNCHANGED g1_vars)
+    \/ (G2GroupNextMetaGated /\ UNCHANGED g1_vars)
     \* Shared-impact actions
     \/ \E m \in Members : MultiGroupClockTick(m)
     \/ \E m \in Members : MultiGroupCrashRestart(m)
