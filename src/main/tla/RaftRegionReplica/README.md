@@ -26,11 +26,11 @@ In TLA+, a single step of the system is an action, a predicate over the current 
 
 ## Overview
 
-`RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the flush protocol (HFile commit, RAFT-proposed flush markers), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, network partitions (including individual link healing and full network recovery), and the hibernate/wake lifecycle with wake-race safety.
+`RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the flush protocol (HFile commit, RAFT-proposed flush markers), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, and network partitions (including individual link healing and full network recovery).
 
 The base spec exports parameterized building-block operators (`GatedMemberActions(m)`, `GatedMemberDataPathActions(m)`) that collect all single-member normal-operation actions into a single disjunction. Composition modules (`SplitRaftRegionReplica`, `MergeRaftRegionReplica`, `MultiGroupRaftRegionReplica`) invoke these with per-member gating predicates to control when a RAFT group's operations are active on each member, enabling lifecycle transitions (split, merge) to deactivate a group per-member without duplicating action dispatch logic. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
 
-The specification defines 14 safety invariants and 6 liveness properties verified by TLC:
+The specification defines 14 safety invariants and 5 liveness properties verified by TLC:
 
 | # | Invariant | Category |
 |---|-----------|----------|
@@ -49,7 +49,7 @@ The specification defines 14 safety invariants and 6 liveness properties verifie
 | 13 | `PromotionMVCCContinuity` | Promotion |
 | 14 | `CatchUpCompleteness` | Catch-up |
 
-The specification also defines 6 liveness properties checked under fairness constraints:
+The specification also defines 5 liveness properties checked under fairness constraints:
 
 | # | Property | Fairness | Description |
 |---|----------|----------|-------------|
@@ -58,11 +58,10 @@ The specification also defines 6 liveness properties checked under fairness cons
 | 3 | `FlushCompletion` | `LiveSpecFlush` | A started flush eventually completes |
 | 4 | `PromotionCompletion` | `LiveSpecLocal` | A promoting member eventually leaves Promoting (via master confirmation) and AwaitingMaster (via local completion) |
 | 5 | `CatchUpCompletion` | `LiveSpecLocal` | A catching-up follower eventually finishes |
-| 6 | `HibernateConvergence` | `LiveSpecLocal` | A waking group eventually reaches active state |
 
-Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-6 are local and require only weak fairness (WF) on local actions — network instability cannot block them.
+Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-5 are local and require only weak fairness (WF) on local actions — network instability cannot block them.
 
-Fairness is factored into `BaseFairness` (WF for all 20 local actions, including `MasterConfirmPromotion`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
+Fairness is factored into `BaseFairness` (WF for all 17 local actions, including `MasterConfirmPromotion`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
 
 ## Verification Strategy
 
@@ -70,7 +69,7 @@ The model checking suite uses three verification layers that compose to provide 
 
 ### Simulation
 
-Exercises both timing and data-path domains simultaneously with the full unmodified spec, full timing (MaxClockDrift=1), deep data path (MaxSeqId=5), and all 34 actions.  Provides high-confidence statistical coverage of the cross-product of timing and data-path states.
+Exercises both timing and data-path domains simultaneously with the full unmodified spec, full timing (MaxClockDrift=1), deep data path (MaxSeqId=5), and all 31 actions.  Provides high-confidence statistical coverage of the cross-product of timing and data-path states.
 
 Simulation is critical because it is the ONLY configuration that exercises both domains simultaneously at full parameter ranges.  The domain-decomposed exhaustive configs provide mathematical proofs within their respective parameter slices, but they do not cover the full cross-product.  Simulation compensates by statistically exploring the cross-product at even deeper parameter ranges.
 
@@ -84,7 +83,7 @@ This domain retains full data-path depth (MaxSeqId = 3) while collapsing the tim
 
 #### Election Domain (`MCRaftRegionReplica_election`)
 
-This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeoutMin = 4, MaxClock = 4) while reducing the data-path dimension to MaxSeqId = 1, allowing at most one write or flush per trace.  No actions are merged or removed; the original unmodified `Next` relation with all 34 actions is used.
+This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeoutMin = 4, MaxClock = 4) while reducing the data-path dimension to MaxSeqId = 1, allowing at most one write or flush per trace.  No actions are merged or removed; the original unmodified `Next` relation with all 31 actions is used.
 
 ### Multi-Group (`MCRaftRegionReplica_multigroup`)
 
@@ -94,9 +93,9 @@ The two-group cross-product produces a large state space.  Exhaustive BFS requir
 
 ### Liveness Simulation
 
-Verifies the 6 liveness properties under fairness constraints using TLC's simulation mode.  Each property has a dedicated `.cfg` file selecting the appropriate `LiveSpec` (which includes only the SF terms that property's progress chain requires, avoiding DNF blowup).
+Verifies the 5 liveness properties under fairness constraints using TLC's simulation mode.  Each property has a dedicated `.cfg` file selecting the appropriate `LiveSpec` (which includes only the SF terms that property's progress chain requires, avoiding DNF blowup).
 
-The election property uses a dedicated MC module (`MCRaftRegionReplica_liveness_election`) with tuned constants: `MaxTerm=4`, `ElectionTimeoutMin=2`, `MaxClock=12`, `MaxSeqId=1`.  These provide sufficient clock/term headroom for election liveness while keeping the state space tractable.  The other 5 properties use the standard liveness MC module (`MCRaftRegionReplica_liveness`) with `MaxSeqId=2` and no symmetry reduction (symmetry is incompatible with TLC liveness checking).
+The election property uses a dedicated MC module (`MCRaftRegionReplica_liveness_election`) with tuned constants: `MaxTerm=4`, `ElectionTimeoutMin=2`, `MaxClock=12`, `MaxSeqId=1`.  These provide sufficient clock/term headroom for election liveness while keeping the state space tractable.  The other 4 properties use the standard liveness MC module (`MCRaftRegionReplica_liveness`) with `MaxSeqId=2` and no symmetry reduction (symmetry is incompatible with TLC liveness checking).
 
 Exhaustive liveness checking is intractable due to the large state space × tableau product.  Simulation provides statistical confidence.
 
@@ -177,15 +176,15 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ### Step 8: Interpret Results
 
-All checks (simulation, both single-group exhaustive domains, multi-group simulation, multi-group exhaustive, split simulation, merge simulation, and liveness simulation) must complete with no violations for the design to be considered validated.  Cross-reference the invariant coverage matrix to confirm every safety invariant received non-trivial verification in at least one exhaustive domain, and confirm all 6 liveness properties pass at least 3 simulation passes each.
+All checks (simulation, both single-group exhaustive domains, multi-group simulation, multi-group exhaustive, split simulation, merge simulation, and liveness simulation) must complete with no violations for the design to be considered validated.  Cross-reference the invariant coverage matrix to confirm every safety invariant received non-trivial verification in at least one exhaustive domain, and confirm all 5 liveness properties pass at least 3 simulation passes each.
 
 ### Step 9: Liveness Simulation
 
-Run each of the 6 liveness properties in simulation mode.  Each property uses a dedicated `.cfg` file. The election property uses a dedicated MC module (`MCRaftRegionReplica_liveness_election`) with tuned constants (MaxTerm=4, ElectionTimeoutMin=2, MaxClock=12) to provide sufficient clock/term headroom.
+Run each of the 5 liveness properties in simulation mode.  Each property uses a dedicated `.cfg` file. The election property uses a dedicated MC module (`MCRaftRegionReplica_liveness_election`) with tuned constants (MaxTerm=4, ElectionTimeoutMin=2, MaxClock=12) to provide sufficient clock/term headroom.
 
 ```bash
 JAVA_HOME=/path/to/temurin-17
-for prop in election write flush promotion catchup hibernate; do
+for prop in election write flush promotion catchup; do
   if [ "$prop" = "election" ]; then
     MC=MCRaftRegionReplica_liveness_election
   else

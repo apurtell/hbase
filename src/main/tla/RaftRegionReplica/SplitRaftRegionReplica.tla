@@ -54,8 +54,7 @@ VARIABLES
     flushMarkerEntries, hdfsHFiles,
     memstore, fApplyBatch,
     writePhase, walSync, raftCommitted, writeSeqId,
-    flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm,
-    hibernateState
+    flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm
 
 (* ---- Split lifecycle state ---- *)
 VARIABLES
@@ -69,8 +68,7 @@ parentVars == <<role, currentTerm, votedFor, votesGranted, raftLog,
                nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
                hdfsHFiles, memstore, fApplyBatch,
                writePhase, walSync, raftCommitted, writeSeqId,
-               flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm,
-               hibernateState>>
+               flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 vars == <<parentVars, splitVars>>
 
@@ -133,7 +131,7 @@ ProposeSplitMarker(m) ==
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writePhase, walSync, raftCommitted, writeSeqId,
                    flushPhase, flushSeqId, promotionPhase,
-                   masterConfirmedTerm, hibernateState,
+                   masterConfirmedTerm,
                    daughterGroupsActive>>
 
 \* Master opens daughter groups on member m after the split marker

@@ -10,7 +10,7 @@
  * shared-storage catch-up, new member bootstrap via leader-based
  * network catch-up, promotion MVCC continuity with in-flight
  * writes, catch-up completeness with concurrent flush, and
- * hibernate/wake lifecycle with wake-race safety.
+ * and crash recovery.
  *
  * Models RAFT member roles (Leader, Follower, Candidate), term fencing,
  * leader lease acquisition via majority heartbeat acknowledgement, bounded
@@ -375,17 +375,14 @@ VARIABLES
     flushSeqId,         \* flushSeqId[m]: seqId consumed by m's current flush (0 = none)
     \* ---- Promotion pipeline ----
     promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
-    masterConfirmedTerm,\* masterConfirmedTerm: highest RAFT term confirmed by master for this group (0 = none)
-    \* ---- Hibernate lifecycle ----
-    hibernateState      \* hibernateState[m]: hibernate lifecycle (Active | Hibernated | Waking)
+    masterConfirmedTerm \* masterConfirmedTerm: highest RAFT term confirmed by master for this group (0 = none)
 
 vars == <<role, currentTerm, votedFor, votesGranted, raftLog,
           clock, leaseRemaining, timerRemaining, partition,
           nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
           hdfsHFiles, memstore, fApplyBatch,
           writePhase, walSync, raftCommitted, writeSeqId,
-          flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm,
-          hibernateState>>
+          flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 writeVars == <<writePhase, walSync, raftCommitted, writeSeqId>>
 
@@ -419,7 +416,6 @@ TypeOK ==
     /\ flushSeqId \in [Members -> 0..MaxSeqId]
     /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
     /\ masterConfirmedTerm \in 0..MaxTerm
-    /\ hibernateState \in [Members -> {"Active", "Hibernated", "Waking"}]
 
 ----
 (* ---- Helper definitions ---- *)
@@ -506,8 +502,6 @@ Init ==
     \* Promotion pipeline
     /\ promotionPhase  = [m \in Members |-> "None"]
     /\ masterConfirmedTerm = 0
-    \* Hibernate lifecycle
-    /\ hibernateState  = [m \in Members |-> "Active"]
 
 ----
 (* ---- Actions ---- *)
@@ -526,7 +520,6 @@ Timeout(m) ==
     /\ role[m] \in {"Follower", "Candidate"}
     /\ currentTerm[m] < MaxTerm
     /\ timerRemaining[m] = 0
-    /\ hibernateState[m] # "Hibernated"
     /\ currentTerm'    = [currentTerm    EXCEPT ![m] = @ + 1]
     /\ role'           = [role           EXCEPT ![m] = "Candidate"]
     /\ votedFor'       = [votedFor       EXCEPT ![m] = m]
@@ -534,7 +527,6 @@ Timeout(m) ==
     /\ timerRemaining' = [timerRemaining EXCEPT ![m] = ElectionTimeoutMin]
     /\ leaseRemaining' = [leaseRemaining EXCEPT ![m] = 0]
     /\ fApplyBatch'    = [fApplyBatch    EXCEPT ![m] = {}]
-    /\ hibernateState' = [hibernateState EXCEPT ![m] = "Active"]
     /\ UNCHANGED <<raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore,
@@ -609,8 +601,6 @@ RequestVote(candidate, voter) ==
                                   IF steppingDown THEN 0 ELSE @]
           /\ promotionPhase' = [promotionPhase EXCEPT ![voter] =
                                   IF steppingDown THEN "None" ELSE @]
-          /\ hibernateState' = [hibernateState EXCEPT ![voter] =
-                                  IF steppingDown THEN "Active" ELSE @]
     /\ UNCHANGED <<raftLog, clock, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
@@ -690,10 +680,6 @@ BecomeLeader(m) ==
               IF r = m THEN "Promoting"
               ELSE IF r \in responders THEN "None"
               ELSE promotionPhase[r]]
-        /\ hibernateState' = [r \in Members |->
-              IF r = m THEN "Active"
-              ELSE IF r \in responders THEN "Active"
-              ELSE hibernateState[r]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, fApplyBatch,
@@ -724,7 +710,6 @@ BecomeLeader(m) ==
 \* AppendEntriesSuccessResponseHandler counts a quorum of acks.
 Heartbeat(leader) ==
     /\ role[leader] = "Leader"
-    /\ hibernateState[leader] # "Hibernated"
     /\ LET followers  == Members \ {leader}
            responders == {f \in followers :
                             /\ currentTerm[leader] >= currentTerm[f]
@@ -769,8 +754,6 @@ Heartbeat(leader) ==
                 IF m \in responders THEN 0 ELSE flushSeqId[m]]
         /\ promotionPhase' = [m \in Members |->
                 IF m \in responders THEN "None" ELSE promotionPhase[m]]
-        /\ hibernateState' = [m \in Members |->
-                IF m \in responders THEN "Active" ELSE hibernateState[m]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, fApplyBatch,
@@ -810,7 +793,6 @@ StepDown(m) ==
     /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-    /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
     /\ UNCHANGED <<raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
@@ -854,7 +836,6 @@ LeaderLeaseExpiry(m) ==
     /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-    /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
     /\ fApplyBatch'     = [fApplyBatch     EXCEPT ![m] = {}]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock,
                    leaseRemaining, partition,
@@ -905,7 +886,7 @@ ClockTick(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    partition, nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* ---- Crash recovery actions ----
 
@@ -935,7 +916,6 @@ CrashRestartGuard(m) ==
     \/ writePhase[m] # "Idle"
     \/ flushPhase[m] # "Idle"
     \/ promotionPhase[m] # "None"
-    \/ hibernateState[m] # "Active"
 
 CrashRestartEffect(m) ==
     /\ role'            = [role            EXCEPT ![m] = "Follower"]
@@ -951,7 +931,6 @@ CrashRestartEffect(m) ==
     /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-    /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
 
 CrashRestart(m) ==
     /\ CrashRestartGuard(m)
@@ -974,7 +953,7 @@ CreatePartition ==
                        clock, leaseRemaining, timerRemaining,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                       writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Nondeterministically heal a partition between two members.
 \* Models individual network link recovery.
@@ -986,7 +965,7 @@ HealPartition ==
                        clock, leaseRemaining, timerRemaining,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                       writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Heal ALL partitions at once — full network recovery.
 \* This action is deterministic (no internal nondeterminism) so
@@ -1002,7 +981,7 @@ HealAllPartitions ==
                    clock, leaseRemaining, timerRemaining,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* ---- Leader write path actions ----
 
@@ -1021,7 +1000,6 @@ HealAllPartitions ==
 BeginWrite(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
-    /\ hibernateState[m] = "Active"
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
@@ -1034,7 +1012,7 @@ BeginWrite(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, flushVars,
-                   promotionPhase, masterConfirmedTerm, hibernateState>>
+                   promotionPhase, masterConfirmedTerm>>
 
 \* WAL sync to HDFS completes successfully.  Models wal.sync(txid)
 \* returning without error (HRegion.doMiniBatchMutate step 4a).
@@ -1048,7 +1026,7 @@ WALSyncComplete(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm, hibernateState>>
+                   promotionPhase, masterConfirmedTerm>>
 
 \* WAL sync to HDFS fails (HDFS pipeline broken, DataNode failure,
 \* network timeout).  Nondeterministic.  Models wal.sync(txid) throwing
@@ -1063,7 +1041,7 @@ WALSyncFail(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm, hibernateState>>
+                   promotionPhase, masterConfirmedTerm>>
 
 \* RAFT propose succeeds: the entry is committed by majority ack.
 \* Models consensus.propose(stampedWALEdit, seqId) completing
@@ -1102,7 +1080,7 @@ RAFTCommitWrite(m) ==
                    nextSeqId, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch,
                    writePhase, walSync, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm, hibernateState>>
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
@@ -1128,7 +1106,7 @@ CompleteWrite(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    walSync, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm, hibernateState>>
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
 \* doMiniBatchMutate (step 9) and resets the write pipeline for the
@@ -1143,7 +1121,7 @@ AckWrite(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Leader aborts the RegionServer process because WAL sync failed.
 \* This is the mandated response when the WAL is broken: the RS cannot
@@ -1173,7 +1151,6 @@ WALFailureAbort(m) ==
     /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-    /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
@@ -1216,7 +1193,7 @@ ProposeMarker(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    clock, leaseRemaining, timerRemaining, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* ---- Flush protocol actions ----
 \*
@@ -1247,7 +1224,6 @@ ProposeMarker(m) ==
 FlushStart(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
-    /\ hibernateState[m] = "Active"
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
@@ -1258,7 +1234,7 @@ FlushStart(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, writeVars,
-                   promotionPhase, masterConfirmedTerm, hibernateState>>
+                   promotionPhase, masterConfirmedTerm>>
 
 \* HFiles are moved from the tmp directory to the store directory
 \* (sfc.commit()).  After this step, the HFiles are durable on HDFS
@@ -1275,7 +1251,7 @@ FlushCommitHFiles(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, memstore, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 \* Leader proposes the FLUSH_COMPLETE marker through RAFT.  The marker
 \* is proposed but not yet committed; FlushRAFTCommit handles the
@@ -1305,7 +1281,7 @@ FlushRAFTPropose(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 \* Majority acknowledges the FLUSH_COMPLETE marker.  The marker is now
 \* RAFT-committed: its seqId is added to committedEntries and
@@ -1334,7 +1310,7 @@ FlushRAFTCommit(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, hdfsHFiles, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 \* Flush completion: drop memstore entries at or below flushSeqId,
 \* write COMMIT_FLUSH to WAL, call wal.completeCacheFlush() to unblock
@@ -1358,7 +1334,7 @@ FlushComplete(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, promotionPhase, masterConfirmedTerm>>
 
 \* ---- Follower batch apply actions ----
 
@@ -1404,7 +1380,7 @@ FollowerBeginBatchApply(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Follower completes applying a batch of committed mutation entries:
 \* stamp cells with the leader's sequence IDs, add all cells to the
@@ -1425,7 +1401,7 @@ FollowerCompleteBatchApply(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Follower applies a committed marker entry.  When the next unapplied
 \* committed entry is a marker (flush-complete, compaction-complete),
@@ -1466,7 +1442,7 @@ FollowerApplyMarker(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* ---- Promotion protocol actions ----
 
@@ -1501,7 +1477,7 @@ MasterConfirmPromotion(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, hibernateState>>
+                   writeVars, flushVars>>
 
 \* A leader that has received master confirmation completes the
 \* local promotion steps: setReadOnly(false) and acquire WAL
@@ -1529,8 +1505,7 @@ PromotionComplete(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, masterConfirmedTerm,
-                   hibernateState>>
+                   writeVars, flushVars, masterConfirmedTerm>>
 
 \* ---- Orphan entry commitment ----
 
@@ -1583,7 +1558,7 @@ NewLeaderCommitOrphanEntry ==
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                        clock, leaseRemaining, timerRemaining, partition,
                        nextSeqId, hdfsHFiles, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                       writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* ---- RAFT log GC and catch-up actions ----
 
@@ -1609,7 +1584,7 @@ RaftLogGC(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* Leader sends a catch-up reference (CatchUpReference) to a lagging
 \* follower whose needed RAFT log entries have been garbage-collected.
@@ -1662,7 +1637,7 @@ InstallSnapshot(leader, follower) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 \* A new member bootstraps into the RAFT group, replacing a member
 \* whose instance has been terminated (e.g., a new Kubernetes pod with
@@ -1751,7 +1726,6 @@ NewMemberBootstrap(m) ==
            \/ writePhase[m] # "Idle"
            \/ flushPhase[m] # "Idle"
            \/ promotionPhase[m] # "None"
-           \/ hibernateState[m] # "Active"
         /\ LET uncoveredCommitted == {s \in committedEntries :
                    ~\E f \in flushMarkerEntries : f >= s}
            IN
@@ -1772,108 +1746,9 @@ NewMemberBootstrap(m) ==
             /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
             /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
             /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-            /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
         /\ UNCHANGED <<clock, partition, nextSeqId, committedEntries,
                        markerEntries, flushMarkerEntries, hdfsHFiles,
                        masterConfirmedTerm>>
-
-\* ---- Hibernate lifecycle actions ----
-
-\* Leader proposes hibernation for the group.  All followers must be
-\* reachable and acknowledge — a non-acking follower would retain an
-\* active election timer and trigger a spurious election while the
-\* leader has stopped heartbeating.  The group must be idle (no write
-\* or flush in progress) and the leader must have a valid lease.
-\*
-\* Effect: all members transition to Hibernated.  The leader stops
-\* including the group in HeartbeatBatch messages.  Followers stop
-\* expecting heartbeats (election timer suppression modeled by the
-\* Timeout guard on hibernateState # "Hibernated").
-HibernateRequest(m) ==
-    /\ IsLeader(m)
-    /\ promotionPhase[m] = "Complete"
-    /\ hibernateState[m] = "Active"
-    /\ writePhase[m] = "Idle"
-    /\ flushPhase[m] = "Idle"
-    /\ LET followers == Members \ {m}
-       IN
-        /\ \A f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[m] >= currentTerm[f]
-        /\ ~\E f \in followers :
-              currentTerm[f] > currentTerm[m]
-    /\ hibernateState' = [m2 \in Members |-> "Hibernated"]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
-
-\* Leader initiates wake on the next write attempt, sending WakeUp
-\* to all reachable Hibernated followers.  The leader transitions from
-\* Hibernated to Waking; reachable Hibernated followers transition to
-\* Waking with their election timer reset (so they can elect a new
-\* leader if the current one crashes before completing the wake).
-\* Non-reachable followers stay Hibernated.
-\*
-\* Guard: IsLeader(m) — if the lease expired while hibernated,
-\* LeaderLeaseExpiry resets hibernateState to Active and triggers
-\* a new election cycle, so this action is unreachable for an
-\* expired-lease leader.
-WakeGroup(m) ==
-    /\ IsLeader(m)
-    /\ hibernateState[m] = "Hibernated"
-    /\ LET followers == Members \ {m}
-           reachable == {f \in followers : CanCommunicate(m, f)}
-       IN
-        /\ hibernateState' = [m2 \in Members |->
-              IF m2 = m THEN "Waking"
-              ELSE IF m2 \in reachable /\ hibernateState[m2] = "Hibernated"
-              THEN "Waking"
-              ELSE hibernateState[m2]]
-        /\ timerRemaining' = [m2 \in Members |->
-              IF m2 \in reachable /\ hibernateState[m2] = "Hibernated"
-              THEN ElectionTimeoutMin
-              ELSE timerRemaining[m2]]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
-
-\* Leader receives acknowledgements from a majority and completes the
-\* wake protocol.  The leader transitions from Waking to Active and
-\* refreshes its lease (the acks serve as a quorum confirmation).
-\* Reachable Waking followers transition to Active with their election
-\* timer reset.
-\*
-\* Guard: IsLeader(m) (valid lease required — prevents a stale leader
-\* from an old term from refreshing its lease via WakeComplete after
-\* being woken by the real leader's WakeGroup), Waking state, and a
-\* majority of members (including self) are not Hibernated.
-WakeComplete(m) ==
-    /\ IsLeader(m)
-    /\ hibernateState[m] = "Waking"
-    /\ LET followers == Members \ {m}
-           reachable == {f \in followers : CanCommunicate(m, f)}
-           awakeReachable == {f \in reachable : hibernateState[f] # "Hibernated"}
-       IN
-        /\ Cardinality(awakeReachable) + 1 >= Majority
-        /\ hibernateState' = [m2 \in Members |->
-              IF m2 = m THEN "Active"
-              ELSE IF m2 \in reachable /\ hibernateState[m2] = "Waking"
-              THEN "Active"
-              ELSE hibernateState[m2]]
-        /\ timerRemaining' = [m2 \in Members |->
-              IF m2 \in reachable /\ hibernateState[m2] = "Waking"
-              THEN ElectionTimeoutMin
-              ELSE timerRemaining[m2]]
-        /\ leaseRemaining' = [leaseRemaining EXCEPT ![m] = LeaderLeaseDuration]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
 
 ----
 (* ---- Merged actions for data-path domain decomposition ---- *)
@@ -1904,7 +1779,7 @@ AtomicFollowerBatchApply(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writePhase, walSync, raftCommitted, writeSeqId,
-                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 \* Atomic write completion and ack: applies the write to memstore and
 \* resets the write pipeline in a single step.  Merges CompleteWrite +
@@ -1923,7 +1798,7 @@ AtomicCompleteWriteAndAck(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm, hibernateState>>
+                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
 
 ----
 (* ---- Next-state relation and specification ---- *)
@@ -1989,10 +1864,6 @@ GatedMemberActions(m) ==
     \* Promotion
     \/ MasterConfirmPromotion(m)
     \/ PromotionComplete(m)
-    \* Hibernate lifecycle
-    \/ HibernateRequest(m)
-    \/ WakeGroup(m)
-    \/ WakeComplete(m)
     \* State-loss actions (gated on m = initiator/leader)
     \/ NewMemberBootstrap(m)
 
@@ -2022,10 +1893,6 @@ GatedMemberDataPathActions(m) ==
     \* Promotion
     \/ MasterConfirmPromotion(m)
     \/ PromotionComplete(m)
-    \* Hibernate lifecycle
-    \/ HibernateRequest(m)
-    \/ WakeGroup(m)
-    \/ WakeComplete(m)
     \* State-loss actions (gated on m = initiator/leader)
     \/ NewMemberBootstrap(m)
 
@@ -2395,8 +2262,6 @@ BaseFairness ==
     /\ WF_vars(NewLeaderCommitOrphanEntry)
     \* Log GC (local)
     /\ \A m \in Members     : WF_vars(RaftLogGC(m))
-    \* Hibernate (WakeGroup sends to reachable; no majority gate)
-    /\ \A m \in Members     : WF_vars(WakeGroup(m))
 
 \* SF additions for ElectionProgress.
 \* RequestVote + BecomeLeader + StepDown all require CanCommunicate;
@@ -2436,10 +2301,9 @@ LiveSpecElection == Init /\ [][Next]_vars /\ BaseFairness /\ ElectionSF
 LiveSpecWrite    == Init /\ [][Next]_vars /\ BaseFairness /\ WriteSF
 LiveSpecFlush    == Init /\ [][Next]_vars /\ BaseFairness /\ FlushSF
 
-\* PromotionCompletion, CatchUpCompletion, HibernateConvergence need
-\* only local actions (all WF in BaseFairness, no network dependency):
-\* follower apply drains committed entries for Promotion/CatchUp;
-\* ClockTick + Timeout exits the Waking state for Hibernate.
+\* PromotionCompletion and CatchUpCompletion need only local actions
+\* (all WF in BaseFairness, no network dependency): follower apply
+\* drains committed entries for Promotion/CatchUp.
 LiveSpecLocal    == Init /\ [][Next]_vars /\ BaseFairness
 
 \* ---- Liveness properties ----
@@ -2489,19 +2353,10 @@ CatchUpCompletion ==
             ~> (role[m] # "Follower"
                 \/ (ApplicableEntries(m) = {} /\ fApplyBatch[m] = {}))
 
-\* A member in the Waking hibernate state eventually transitions
-\* out — either WakeComplete fires, or lease expiry triggers a
-\* new election cycle that resets hibernate state, or a crash
-\* resets to Active.
-HibernateConvergence ==
-    \A m \in Members :
-        hibernateState[m] = "Waking" ~> hibernateState[m] # "Waking"
-
 THEOREM ElectionProgressTHM  == LiveSpecElection => ElectionProgress
 THEOREM WriteCompletionTHM   == LiveSpecWrite    => WriteCompletion
 THEOREM FlushCompletionTHM   == LiveSpecFlush    => FlushCompletion
 THEOREM PromotionCompletionTHM == LiveSpecLocal  => PromotionCompletion
 THEOREM CatchUpCompletionTHM == LiveSpecLocal    => CatchUpCompletion
-THEOREM HibernateConvergenceTHM == LiveSpecLocal => HibernateConvergence
 
 ====

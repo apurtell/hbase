@@ -101,7 +101,7 @@ The replication factor is 3, with one RAFT member per AZ. Loss of any single AZ 
 
 If AZ-1 is lost, the consensus layer on the surviving RegionServers detects the missing member via heartbeat timeout and elects a new RAFT leader among the surviving read-only replicas. The newly elected leader finishes consuming any remaining RAFT log entries to bring its memstore fully current, then reports the election result to the master. The master validates the RAFT term, updates META to record the new primary location, and returns confirmation to the RegionServer. Only after receiving this confirmation does the promoted replica complete its local state transitions and begin serving reads and writes as the new read-write primary using the shared HFiles on HDFS. This master confirmation is expected to complete before ServerCrashProcedure would even begin iterating the dead server's regions.
 
-In parallel, the master detects the dead RegionServer and launches ServerCrashProcedure. SCP skips WAL splitting for RAFT-enabled regions because the promoted read-only replica already has a warm memstore from RAFT replication and does not need WAL splitting. For each RAFT-enabled region on the dead server, SCP checks whether the master has already confirmed a new leader via the fast path described above. If so, SCP simply notes the promotion is complete. If the fast path has not yet completed, because the RAFT election was delayed for hibernated groups, SCP wakes the surviving replicas, waits for the election, and promotes the elected leader through the procedure framework as a fallback. SCP also schedules a replacement replica assignment in a healthy AZ to restore the required replication factor. The old primary's WAL on HDFS still exists but is not needed for the promoted replica's recovery; WAL splitting may still run for housekeeping but is not on the critical failover path. Clients discover the new primary through the standard HBase region location mechanism, the same path used for any region move.
+In parallel, the master detects the dead RegionServer and launches ServerCrashProcedure. SCP skips WAL splitting for RAFT-enabled regions because the promoted read-only replica already has a warm memstore from RAFT replication and does not need WAL splitting. For each RAFT-enabled region on the dead server, SCP checks whether the master has already confirmed a new leader via the fast path described above. If so, SCP simply notes the promotion is complete. If the fast path has not yet completed, SCP waits for the RAFT election to complete and promotes the elected leader through the procedure framework as a fallback. SCP also schedules a replacement replica assignment in a healthy AZ to restore the required replication factor. The old primary's WAL on HDFS still exists but is not needed for the promoted replica's recovery; WAL splitting may still run for housekeeping but is not on the critical failover path. Clients discover the new primary through the standard HBase region location mechanism, the same path used for any region move.
 
 ## Design Overview
 
@@ -146,7 +146,7 @@ MicroRaft provides a single-threaded actor model Raft implementation with only o
 
 Architecturally, the `ConsensusServer` is a general-purpose RAFT engine. It manages groups, replicates opaque log entries, runs leader elections, and invokes pluggable callbacks on commit. The region-specific logic lives entirely in the callback implementation and in `RegionGroupManager`, not in the consensus engine itself. This separation is deliberate. It keeps the door open for the consensus layer to serve other coordination needs in HBase's architecture over time (see Appendix A).
 
-The architecture is designed from the start for O(10000) groups per RegionServer, incorporating proven patterns from TiKV (shared event loop, hibernate regions), CockroachDB (store-level heartbeat coalescing), and Redpanda (lightweight heartbeats).
+The architecture is designed from the start for O(10000) groups per RegionServer, incorporating proven patterns from TiKV (shared event loop), CockroachDB (store-level heartbeat coalescing), and Redpanda (lightweight heartbeats).
 
 ```mermaid
 flowchart TD
@@ -243,15 +243,19 @@ MicroRaft's `Transport` interface is similarly wrapped by a coalescing transport
 
 As regions are opened and closed, RAFT groups are dynamically added and removed via the `RegionGroupManager`.
 
-### Leader Proposal Micro-Batching
+### Batching Hierarchy
 
-When the event loop schedules a group, it drains the group's mailbox of all pending proposals rather than processing one at a time. Multiple proposals are combined into a single AppendEntries message carrying multiple WALEdit entries. One serialization pass, one consensus log write, one network send, and one consensus round amortize across N proposals.
+Three levels of batching compose to reduce per-mutation consensus overhead from O(mutations) toward O(peers):
 
-Under low load the batch is typically one entry (no added latency). Under sustained write load, proposals naturally accumulate while the previous AppendEntries is in flight, filling batches without any artificial delay. The maximum batch size is capped by `hbase.consensus.propose.batch.max.entries` (default 16) to bound per-message size and keep apply latency predictable.
+**Level 1: Intra-proposal batching (mini-batch grouping).** A `multi()` RPC is grouped by region on the RegionServer. Each region's sub-batch is processed by `doMiniBatchMutate()`, producing one WALEdit per mini-batch. Each WALEdit is one RAFT proposal. A  batch of 1000 mutations touching 5 regions yields approximately 5 proposals , each carrying approximately 200 mutations. This is the coarsest grain of batching. Many mutations share a single proposal, a single consensus log entry, and a single network frame. This first level alone reduces the number of RAFT proposals from O(mutations) to O(regions touched), dominating the reduction. The per-proposal WALEdit size is additionally bounded by `hbase.consensus.propose.max.bytes` (default 10MB). If the accumulated WALEdit for a mini-batch exceeds this limit, `doMiniBatchMutate()` splits the mini-batch at the mutation boundary that crosses the threshold, producing an additional proposal. This trades more proposals for bounded per-proposal size and more predictable follower apply latency.
+
+**Level 2: Inter-proposal batching (mailbox drain).** When the event loop schedules a group, it drains the group's mailbox of all pending proposals rather than processing one at a time. Multiple proposals are combined into a single AppendEntries message carrying multiple WALEdit entries. One serialization pass, one consensus log write, one network send, and one consensus round amortize across N proposals. Under sustained write load, proposals naturally accumulate while the previous AppendEntries is in flight, filling batches without any artificial delay. The maximum batch size is capped by `hbase.consensus.propose.batch.max.entries` (default 32) to bound per-message size and keep apply latency predictable.
+
+**Level 3: Cross-group transport coalescing.** The `CoalescingTransport` combines AppendEntries from multiple groups destined for the same peer into one `BatchAppendEntries` network frame, reducing syscall and TCP framing overhead from O(active groups) to O(peers) per tick (described in the Transport section below).
 
 On the follower side, the batched AppendEntries is persisted to the consensus log as a single write and acknowledged as a unit. The entries within the batch share one log fsync via the unified multiplexed log's coalescing window, further amortizing I/O.
 
-This is the single highest-impact CPU optimization for the consensus layer. TiKV's adaptive batching (default wait_duration 20us, batch_size_hint 8KB) and CockroachDB's entry application batching (measured at +48% throughput, -34% average latency on sequential write workloads, per CockroachDB PR #38568) demonstrate the effectiveness of this pattern in production multi-RAFT systems.
+This batching hierarchy is the single highest-impact CPU optimization for the consensus layer. TiKV's adaptive batching and CockroachDB's entry application batching (measured at +48% throughput, -34% average latency on sequential write workloads, per CockroachDB PR #38568) demonstrate the effectiveness of this pattern in production multi-RAFT systems.
 
 ### Transport: Netty+Protobuf
 
@@ -259,7 +263,9 @@ MicroRaft's `Transport` interface is instantiated per `RaftNode`. Each `RaftNode
 
 The consensus module registers a protocol handler on a dedicated Netty port (`hbase.consensus.port`), reusing HBase's existing Netty infrastructure. The wire format is Protobuf. No TLS configuration is needed because the encrypted overlay network already provides confidentiality and integrity for inter-AZ traffic. The `CoalescingTransport` implements MicroRaft's `Transport` interface and maintains one Netty TCP connection per peer, lazily connected with automatic reconnection on failure. All network-dependent consensus operations require retry-with-backoff semantics because partition oscillation can repeatedly disable them. The transport layer's automatic reconnection handles the TCP-level recovery, and the consensus protocol must also retry the logical operation. MicroRaft's single-threaded actor model naturally provides this with the periodic heartbeat sweep and the group executor's drain loop. Netty is already a core HBase dependency (used by AsyncFSWAL and the async RPC client), so no new dependencies are introduced.
 
-Each peer has an outbound buffer backed by a lock-free MPSC queue. When send is called by any `RaftNode`, the message is appended to the target peer's outbound buffer. A flush hook, invoked by the heartbeat sweep timer or a dedicated flush timer at the consensus log sync batch interval (`hbase.consensus.log.sync.batch.ms`), drains each peer's buffer and builds coalesced frames. Data-carrying messages are coalesced into batch-append-entries frames; heartbeats are coalesced into heartbeat-batch frames. The Protobuf entries field carries the WALEdit's pre-serialized byte buffer directly (the same bytes destined for the WAL write path), avoiding re-serialization through the Protobuf envelope.
+Each peer has an outbound buffer backed by a lock-free MPSC queue. When send is called by any `RaftNode`, the message is appended to the target peer's outbound buffer. A flush hook, invoked by the heartbeat sweep timer or a dedicated flush timer at the consensus log sync batch interval (`hbase.consensus.log.sync.batch.ms`), drains each peer's buffer and builds coalesced frames. Data-carrying messages are coalesced into batch-append-entries frames; heartbeats are coalesced into heartbeat-batch frames.
+
+All data-carrying entries are Snappy-compressed before transmission and stored compressed in the consensus log. On the leader, the WALEdit is already serialized to bytes. This is Snappy-compressed. The compressed bytes are the unit proposed through RAFT. They flow to the outbound buffer, to the consensus log, and over the wire. On the follower, the compressed bytes are received, stored as-is in the consensus log, and decompressed only during the apply callback when the entry is committed. This design minimizes cross-AZ transfer volume, reduces consensus log disk I/O, and avoids redundant CPU on the replication hot path. Snappy is chosen for its sub-microsecond per-KB compression latency and zero-allocation streaming API, which adds negligible CPU overhead to the proposal path. With workloads whose schemas carry significant VARCHAR and VARBINARY fields, observed compression ratios on comparable data range from 2:1 to 3:1; the analysis below uses a conservative 2.5:1 midpoint. Compression is mandatory (`hbase.consensus.transport.compression = snappy`); it is not optional because cross-AZ transfer volume is a significant cost driver and uncompressed replication would waste network capacity that the design budgets for headroom.
 
 All messages for all groups between two RegionServers multiplex over a single TCP connection per peer.
 
@@ -315,7 +321,7 @@ message GroupAppendEntries {
   uint64 term = 2;
   uint64 prev_log_index = 3;
   uint64 prev_log_term = 4;
-  repeated bytes entries = 5;   // opaque WALEdit bytes, no re-encoding
+  repeated bytes entries = 5;   // Snappy-compressed WALEdit bytes
   uint64 leader_commit = 6;
 }
 ```
@@ -328,7 +334,7 @@ On the inbound side, the Netty handler deserializes the batch frame, iterates pe
 
 MicroRaft's heartbeat task is a per-group runnable that self-reschedules at the leader heartbeat period (default 2 seconds). On each firing, a leader group broadcasts append-entries requests to all followers, while a follower group checks whether the leader heartbeat timeout has elapsed and triggers a pre-vote if so. At ten thousand groups, ten thousand independent timers fire and process independently, consuming scheduler slots and producing ten thousand individual network messages per heartbeat period. The store-level sweep replaces these per-group timers with a single timer at the `ConsensusServer` level.
 
-A single scheduled executor timer fires at `hbase.consensus.heartbeat.interval.ms` (default 500ms). On each tick, the sweep iterates all active groups, partitioned by role. For leader groups, the sweep collects per-group metadata from all groups destined for the same peer and builds one coalesced heartbeat message per peer, sent via the shared transport. For follower groups, the sweep checks each group's last heartbeat received time against the leader heartbeat timeout and, if elapsed, triggers election via the group's executor to preserve serial execution. The sweep itself runs on a dedicated timer thread (not the group executor pool) to avoid priority inversion; the actual election processing and heartbeat response handling runs within each group's execute method and therefore within the drain loop of the `MultiGroupExecutor`.
+A single scheduled executor timer fires at `hbase.consensus.heartbeat.interval.ms` (default 250ms). On each tick, the sweep iterates all active groups, partitioned by role. For leader groups, the sweep collects per-group metadata from all groups destined for the same peer and builds one coalesced heartbeat message per peer, sent via the shared transport. For follower groups, the sweep checks each group's last heartbeat received time against the leader heartbeat timeout and, if elapsed, triggers election via the group's executor to preserve serial execution. The sweep itself runs on a dedicated timer thread (not the group executor pool) to avoid priority inversion; the actual election processing and heartbeat response handling runs within each group's execute method and therefore within the drain loop of the `MultiGroupExecutor`.
 
 Each RegionServer maintains one connection per remote RS. The sweep builds a single coalesced `HeartbeatBatch` message per peer per tick:
 
@@ -344,39 +350,17 @@ message GroupHeartbeat {
 }
 ```
 
-This reduces heartbeat network messages from O(groups) to O(peers) = O(2) per tick, regardless of group count. When the lightweight flag is set, the follower skips full validation and simply confirms liveness.
+This reduces heartbeat network messages from O(groups) to O(distinct peer RSes) per tick. Each coalesced batch carries only the groups for which that peer is a follower, so the per-batch size scales with the number of shared groups per RS pair (see "ConsensusServer Connectivity Mesh" in the Performance section). When the lightweight flag is set, the follower skips full validation and simply confirms liveness.
 
 When a heartbeat batch response arrives from a peer, it carries per-group ack or nack results. The transport demultiplexes the response and dispatches each group's result via the group's executor, preserving per-group serial execution. This demultiplexing is a constant-time lookup in the group registry and does not require iterating all groups.
-
-### Hibernate Idle Groups
-
-After a flush-complete marker is committed and no subsequent writes arrive for a configurable timeout (`hbase.consensus.hibernate.timeout.ms`, default 30000), the leader proposes a hibernate request through the group. When all members acknowledge, the group enters hibernate state. The leader stops including the group in heartbeat batch messages, followers stop expecting heartbeats for it, preventing false election timeouts, and the group's FSM remains in memory but consumes no CPU and network. On the next write to the region the write path wakes the group by having the leader send a wake-up message to followers, wait for acknowledgment, then resume normal operation and propose the write. The cost of waking a hibernated group is one additional round-trip (roughly 1-2ms inter-AZ) on the first write after hibernation, amortized over the write burst that follows. The wake-complete step requires the leader to hold a valid lease. This prevents a stale leader from a previous term from refreshing its own expired lease, which would violate lease exclusivity (formally verified).
-
-A follower's hibernate/wake lifecycle has three states: Hibernated, Waking, and Active. In the Hibernated state the follower's election timer is suppressed. When a follower receives a wake-up message from the leader it transitions to Waking, sends a wake-up response, and starts its election timer. The transition to Active occurs when the follower receives the first AppendEntries or heartbeat batch entry for this group from the leader, confirming the leader is alive and operating normally. If the leader crashes during the wake protocol, having sent the wake-up but not yet any AppendEntries, the follower is in the Waking state with its election timer already running. When the timer fires the follower transitions to Active and initiates a normal election, ensuring liveness is maintained. The key invariant is that a follower's election timer must be started no later than receipt of the wake-up, so a leader crash mid-wake cannot leave followers permanently hibernated without election capability.
-
-The Waking-to-Active transition is local. It requires only that the follower's own election timer fires or a message arrives. No RAFT majority or network quorum is needed. This ensures hibernate convergence is immune to network instability. Once a follower is in the Waking state, it will reach Active regardless of partition conditions.
-
-```mermaid
-flowchart LR
-    H["Hibernated<br/>(timer suppressed)"]
-    W["Waking<br/>(timer started)"]
-    A["Active<br/>(normal follower)"]
-
-    H -->|"Receive WakeUp<br/>from leader"| W
-    W -->|"Receive AppendEntries<br/>or HeartbeatBatch"| A
-    W -->|"Election timer fires<br/>(leader crash mid-wake)"| A
-    A -->|"HibernateRequest<br/>committed, all ack"| H
-```
-
-Since RAFT is not the durability mechanism, hibernation is safe. If the leader crashes while groups are hibernated, followers recover from HFiles on HDFS plus WAL splitting. For fully hibernated groups the followers' election timers are suppressed, so these groups must be woken by an external mechanism. When SCP detects the crashed RegionServer it triggers a wake for all hibernated groups on that server by sending region-open RPCs to the surviving replicas, which restarts the RAFT state machine and initiates elections. Failover latency for hibernated groups is therefore bounded by SCP detection time. This is an acceptable tradeoff. Hibernated groups have no in-flight data because all data was flushed before hibernation, so the longer recovery path does not risk data loss, and the idle regions were not serving active traffic. Many regions may be idle at any given moment, so hibernation eliminates the majority of unnecessary per-group overhead.
 
 ### Unified Multiplexed Consensus Log
 
 MicroRaft's `RaftStore` interface is instantiated per `RaftNode`. Each `RaftNode` receives its own store instance, managing independent storage and issuing independent flush calls for fsync. The interface has nine methods covering endpoint persistence, membership persistence, term and vote persistence, log entry persistence, snapshot chunk persistence, log truncation in both directions, snapshot deletion, and flush. At ten thousand groups, ten thousand independent flush calls means ten thousand independent fdatasync syscalls, which is untenable.
 
-Instead of per-group log files, the consensus layer writes a single append-only log file per RS to local NVMe, multiplexing entries from all groups, exactly as `AbstractFSWAL` already multiplexes entries from all regions into one WAL file. The `UnifiedRaftStore` is a single instance wrapping the shared append-only log file. Each `RaftNode` receives a `GroupRaftStore` adapter that implements MicroRaft's `RaftStore` interface by delegating to the shared store with its group ID prefix. When log entries are persisted, each entry is tagged with the group ID and appended to the shared log. When the term and vote state are persisted, a term-update record tagged with the group ID is written to the shared log. When flush is called, a sync request is enqueued; the `UnifiedRaftStore` batches fdatasync across all groups with pending writes per coalescing window (`hbase.consensus.log.sync.batch.ms`, default 10ms), amortizing the syscall cost across all concurrent writers. When log truncation is requested, a truncation tombstone record is appended to the shared log rather than physically deleting entries; physical deletion is deferred to log file GC.
+Instead of per-group log files, the consensus layer writes a single append-only log file per RS to local NVMe, multiplexing entries from all groups, exactly as `AbstractFSWAL` already multiplexes entries from all regions into one WAL file. The `UnifiedRaftStore` is a single instance wrapping the shared append-only log file. Each `RaftNode` receives a `GroupRaftStore` adapter that implements MicroRaft's `RaftStore` interface by delegating to the shared store with its group ID prefix. When log entries are persisted, each entry is tagged with the group ID and appended to the shared log. When the term and vote state are persisted, a term-update record tagged with the group ID is written to the shared log. When flush is called, a write request is enqueued; the `UnifiedRaftStore` batches writes across all groups with pending entries per coalescing window (`hbase.consensus.log.sync.batch.ms`, default 10ms), amortizing the write cost across all concurrent writers. Writes go to the OS page cache and the consensus round completes without waiting for fdatasync. A separate timer calls fdatasync on the consensus log every `hbase.consensus.log.fdatasync.interval.ms` (default 100ms), bounding the replay window on crash recovery while keeping the consensus round latency at network RTT. When log truncation is requested, a truncation tombstone record is appended to the shared log rather than physically deleting entries; physical deletion is deferred to log file GC.
 
-A per-group in-memory index maps each (group ID, log index) pair to a file offset for fast replay during catch-up. This index is rebuilt lazily on first access after restart by scanning the relevant log segments. Log rolling occurs at a segment size threshold (`hbase.consensus.log.segment.size.mb`, default 256MB). Old segments are deleted when all groups referenced in them have advanced past their entries. GC accounting uses a map from group ID to last-applied flush sequence ID; a segment is eligible for deletion when the minimum last-applied flush sequence ID across all groups referenced in the segment exceeds the segment's maximum sequence ID. On flush-complete for a group, that group's accounting is updated and the GC check is triggered. Since the consensus log is not the durability mechanism, crash safety requirements are relaxed: a crash loses at most one coalescing window of RAFT entries, which are recovered from the HDFS WAL or from the leader's RAFT log via AppendEntries.
+A per-group in-memory index maps each (group ID, log index) pair to a file offset for fast replay during catch-up. This index is rebuilt lazily on first access after restart by scanning the relevant log segments. Log rolling occurs at a segment size threshold (`hbase.consensus.log.segment.size.mb`, default 256MB). Old segments are deleted when all groups referenced in them have advanced past their entries. GC accounting uses a map from group ID to last-applied flush sequence ID; a segment is eligible for deletion when the minimum last-applied flush sequence ID across all groups referenced in the segment exceeds the segment's maximum sequence ID. On flush-complete for a group, that group's accounting is updated and the GC check is triggered. Since the consensus log is not the durability mechanism, crash safety requirements are relaxed. A crash loses at most one fdatasync interval (up to 100ms) of RAFT entries, which are recovered from the HDFS WAL or from the leader's RAFT log via AppendEntries.
 
 ```mermaid
 flowchart TD
@@ -388,7 +372,7 @@ flowchart TD
 
     subgraph unified ["UnifiedRaftStore (single instance per RS)"]
         AppendQ["Append Queue:<br/>entries tagged with group ID"]
-        SyncBatch["Batched fdatasync<br/>(coalescing window:<br/>hbase.consensus.log<br/>.sync.batch.ms)"]
+        SyncBatch["Batched writes to page cache<br/>(coalescing window:<br/>hbase.consensus.log<br/>.sync.batch.ms)<br/>fdatasync every 100ms<br/>(hbase.consensus.log<br/>.fdatasync.interval.ms)"]
         Index["Per-Group In-Memory Index<br/>(groupId, logIndex) to file offset"]
         GC["Segment GC Accounting<br/>groupId to lastAppliedFlushSeqId"]
     end
@@ -418,7 +402,7 @@ On the leader, RAFT entries flow through the normal MVCC path; the leader writes
 
 `SequenceIdAccounting` is extended with a parallel `RaftSequenceIdAccounting` that tracks the oldest unflushed RAFT log index per group. On flush-complete for a group, the accounting is updated. The existing are-all-lower check in the log cleanup path is extended so that a WAL segment is eligible for archival only when both all HBase regions referenced in it have flushed past it and all RAFT groups referenced in it have flushed past it. This parallel accounting ensures that the consensus log instance's GC does not prematurely delete segments containing un-flushed RAFT entries for any group.
 
-The consensus log instance uses a time-based coalescing window rather than the byte-based batch threshold used by the HDFS WAL. A periodic timer publishes a sync future to the ring buffer, triggering a batched fdatasync for all entries accumulated since the last sync. Since the RAFT log is not the durability mechanism, the relaxed sync semantics are acceptable; a crash loses at most one coalescing window of RAFT entries, which are recovered from the HDFS WAL or from the leader's RAFT log via AppendEntries.
+The consensus log instance uses a time-based coalescing window rather than the byte-based batch threshold used by the HDFS WAL. A periodic timer at the coalescing interval (`hbase.consensus.log.sync.batch.ms`, default 10ms) publishes a write future to the ring buffer, triggering a batched write to the OS page cache for all entries accumulated since the last write. Consensus round completion is gated on this page-cache write, not on fdatasync, so the consensus round adds only network RTT to the write path. A separate fdatasync timer (`hbase.consensus.log.fdatasync.interval.ms`, default 100ms) periodically flushes the page cache to durable storage, bounding the crash replay window. Since the RAFT log is not the durability mechanism, this relaxed fdatasync cadence is acceptable. A crash loses at most one fdatasync interval (up to 100ms) of RAFT entries, which are recovered from the HDFS WAL or from the leader's RAFT log via AppendEntries.
 
 Log rolling for the consensus log instance uses the existing wait-for-safe-point mechanism. Since RAFT entries do not hold MVCC write entries open (followers use begin-at/complete-and-wait only during the apply callback, which completes within a single drain loop iteration), the safe-point check completes quickly, and rolling does not block the consensus pipeline.
 
@@ -426,7 +410,7 @@ Log rolling for the consensus log instance uses the existing wait-for-safe-point
 
 The integration point between the consensus layer and HRegion is a `StateMachine` adapter that bridges MicroRaft's general-purpose state machine interface to HBase-specific callbacks. MicroRaft's `StateMachine` interface has four methods: run-operation for executing committed entries, take-snapshot for snapshot creation, install-snapshot for snapshot restoration, and get-new-term-operation for the no-op entry appended on election. The HBase adapter implements these as follows. The run-operation method dispatches to the appropriate callback based on the operation type (mutation batch, flush marker, compaction marker). The get-new-term-operation method returns a lightweight no-op that triggers the leader-election callback. The take-snapshot and install-snapshot methods are implemented for the shared-storage catch-up model (see the New Member Bootstrap section): take-snapshot produces a metadata-only snapshot containing HFile paths at the snapshot point, and install-snapshot triggers the HDFS-based catch-up path.
 
-The primary callback is on-commit, called when one or more consensus entries are committed. On the leader this signals that the write-path barrier is satisfied (the consensus side is complete). On followers the callback receives the full batch of committed entries and applies them as a unit rather than one at a time. Because the leader assigns contiguous sequence IDs via proposal batching, the follower creates a single MVCC bracket for the batch: it calls `beginAt(lastSeqId)` to advance the write point, stamps and collects all cells from all entries in the batch, performs one memstore add with the combined cell set, then one complete-and-wait. This reduces MVCC overhead from N begin/complete cycles to one per batch. Marker entries (flush, compaction) break the batch boundary: when a marker is encountered the preceding mutation entries are applied as a batch, then the marker is processed separately. During catch-up replay the same batching applies. The follower groups committed entries into batches up to the batch size cap and applies them in bulk, accelerating catch-up significantly. CockroachDB's equivalent optimization measured +48% throughput and -34% average latency on sequential write workloads.
+The primary callback is on-commit, called when one or more consensus entries are committed. On the leader this signals that the write-path barrier is satisfied (the consensus side is complete). On followers the callback receives the full batch of committed entries and applies them as a unit rather than one at a time. Because the leader assigns contiguous sequence IDs via proposal batching, the follower creates a single MVCC bracket for the batch: it calls `beginAt(lastSeqId)` to advance the write point, stamps and collects all cells from all entries in the batch, performs one memstore add with the combined cell set, then one complete-and-wait. This reduces MVCC overhead from N begin/complete cycles to one per batch. Each committed entry may itself carry many mutations, so the batching is doubly effective. When N entries are applied as a batch, each carrying M mutations, the total work is N*M mutations with one MVCC bracket, one memstore add call, and one completeAndWait. Under Phoenix workloads where M is large, a single follower apply cycle can absorb thousands of mutations. Marker entries break the batch boundary. When a marker is encountered the preceding mutation entries are applied as a batch, then the marker is processed separately. During catch-up replay the same batching applies. The follower groups committed entries into batches up to the batch size cap and applies them in bulk, accelerating catch-up significantly. CockroachDB's equivalent optimization measured +48% throughput and -34% average latency on sequential write workloads.
 
 The remaining callbacks handle coordination events. The on-flush-complete callback fires when a flush-complete marker is committed. All members refresh their store file lists to pick up the new HFiles from HDFS, then drop memstore entries below the flush sequence ID. The on-leader-elected callback fires when a new RAFT leader is elected. The new leader's RegionServer sends a ReportLeaderElection RPC to the master, which processes it through a LeaderChangeHandler in AssignmentManager. The handler validates the RAFT term, updates the region's primary location and replica ID in AssignmentManager's in-memory state and in META, and returns confirmation to the RegionServer. Any leader change, whether triggered by server death, higher-term step-down, or a balancer-initiated region close, fires the same callback and follows the same master confirmation path. The on-follower-lagging callback alerts the master that a replica is lagging, which could trigger proactive rebalancing or replacement. The on-no-leader callback alerts the RegionServer that a group has had no leader for an extended period, which could trigger error reporting.
 
@@ -458,7 +442,7 @@ void onHeartbeatResponse(GroupId g, PeerId p) {
 
 The lease safety analysis depends on the leader heartbeating *all* followers every tick, not a subset. The implementation satisfies this because the heartbeat batch is sent to all peers every tick and the lease is refreshed only when a majority of acks from that round have arrived. Atomic heartbeat rounds are required.
 
-The leader lease duration must be strictly less than the election timeout minus twice the max clock drift, ensuring the leader's lease expires before any follower's election timer fires even under worst-case clock drift (formally verified by TLA+ model under all partition configurations and worst-case clock drift). With the default configuration (`hbase.consensus.leader.heartbeat.timeout.ms` = 3000, `hbase.consensus.heartbeat.interval.ms` = 500), a conservative max clock drift of 200ms gives an upper bound of 2600ms; the implementation uses a leader lease duration of 2500ms to maintain strict inequality (2500 < 3000 - 400 = 2600). The leader considers itself authoritative for reads as long as the current time is less than the lease expiry.
+The leader lease duration must be strictly less than the election timeout minus twice the max clock drift, ensuring the leader's lease expires before any follower's election timer fires even under worst-case clock drift (formally verified by TLA+ model under all partition configurations and worst-case clock drift). With the default configuration (`hbase.consensus.leader.heartbeat.timeout.ms` = 1500, `hbase.consensus.heartbeat.interval.ms` = 250), a conservative max clock drift of 200ms gives an upper bound of 1100ms. The implementation uses a leader lease duration of 1000ms to maintain strict inequality (1000 < 1500 - 400 = 1100). The leader considers itself authoritative for reads as long as the current time is less than the lease expiry.
 
 The max clock drift parameter must bound the maximum relative drift between any two nodes, not the maximum absolute drift of a single node. With NTP-synchronized hosts, the maximum relative drift is bounded by twice the maximum absolute drift to NTP, since both can drift in opposite directions. The default of 200ms assumes each node's clock is within 100ms of NTP truth, yielding a 200ms worst-case relative drift. The factor of 2 in the formula (lease duration < election timeout - 2 * max clock drift) accounts for two independent sources of timing error: (1) the leader's clock may run slow by up to the max drift, causing the lease to expire later in real time; (2) a follower's clock may run fast by up to the max drift, causing the election timer to fire earlier in real time. These combine to a worst-case timing error of twice the max clock drift.
 
@@ -479,21 +463,21 @@ flowchart TD
         HB["Last heartbeat ack<br/>at real time T0"]
         HB --> LP["Old Leader<br/>(clock slow by D)"]
         HB --> FP["Follower<br/>(clock fast by D)"]
-        LP --> LE["Lease expires at real time<br/>T0 + LD + D<br/>= T0 + 2500 + 200<br/>= T0 + 2700ms"]
-        FP --> FE["Election timer fires at real time<br/>T0 + ET - D<br/>= T0 + 3000 - 200<br/>= T0 + 2800ms"]
+        LP --> LE["Lease expires at real time<br/>T0 + LD + D<br/>= T0 + 1000 + 200<br/>= T0 + 1200ms"]
+        FP --> FE["Election timer fires at real time<br/>T0 + ET - D<br/>= T0 + 1500 - 200<br/>= T0 + 1300ms"]
         LE --> Safe["Lease expires 100ms before election fires"]
         FE --> Safe
     end
 
     subgraph formula ["Key Parameters (defaults)"]
-        P1["ET = electionTimeout = 3000ms"]
+        P1["ET = electionTimeout = 1500ms"]
         P2["D = maxClockDrift = 200ms"]
-        P3["LD = 2500ms, strictly less than ET - 2D = 2600ms"]
+        P3["LD = 1000ms, strictly less than ET - 2D = 1100ms"]
         P1 --- P2 --- P3
     end
 ```
 
-MicroRaft's existing `QueryPolicy.LEADER_LEASE` implements a weaker variant: it checks whether the leader has received heartbeat responses from a quorum within the leader heartbeat timeout, using the same timeout for both leader self-demotion and follower leader-death detection, with no clock drift margin. MicroRaft's own documentation warns this "cannot guarantee linearizability." Implementing the clock-drift-compensated lease described above requires several modifications to MicroRaft. A max clock drift field (default 200ms) is added to `RaftConfig`, and a lease expiry field is added to `LeaderState`. In `AppendEntriesSuccessResponseHandler`, after counting a quorum of acks (where MicroRaft currently updates the follower's response timestamp), the lease expiry is set to the current clock time plus the leader lease duration, where the lease duration is strictly less than the leader heartbeat timeout minus twice the max clock drift (default: 2500ms < 3000 - 400 = 2600ms). The leader status check is exposed as a combined role and lease-expiry test, replacing the current `demoteToFollowerIfQuorumHeartbeatTimeoutElapsed()` check. In the heartbeat task, if the lease has expired, the leader steps down to follower before sending heartbeats. The election timer in followers is unchanged. The timing relationship where the lease duration strictly less than election timeout minus twice the max clock drift ensures the leader's lease expires before any follower's election timer fires (verified by the TLA+ model).
+MicroRaft's existing `QueryPolicy.LEADER_LEASE` implements a weaker variant. It checks whether the leader has received heartbeat responses from a quorum within the leader heartbeat timeout, using the same timeout for both leader self-demotion and follower leader-death detection, with no clock drift margin. MicroRaft's own documentation warns this "cannot guarantee linearizability." Implementing the clock-drift-compensated lease described above requires several modifications to MicroRaft. A max clock drift field (default 200ms) is added to `RaftConfig`, and a lease expiry field is added to `LeaderState`. In `AppendEntriesSuccessResponseHandler`, after counting a quorum of acks, the lease expiry is set to the current clock time plus the leader lease duration, where the lease duration is strictly less than the leader heartbeat timeout minus twice the max clock drift (default: 1000ms < 1500 - 400 = 1100ms). The leader status check is exposed as a combined role and lease-expiry test, replacing the current `demoteToFollowerIfQuorumHeartbeatTimeoutElapsed()` check. In the heartbeat task, if the lease has expired, the leader steps down to follower before sending heartbeats. The election timer in followers is unchanged. The timing relationship where the lease duration strictly less than election timeout minus twice the max clock drift ensures the leader's lease expires before any follower's election timer fires (verified by the TLA+ model).
 
 A third MicroRaft improvement addresses stale liveness. If a `VoteResponse` carries a term higher than the candidate's current term, the candidate must step down immediately rather than continuing to collect votes it cannot use. A candidate that collected majority votes in a lower term but cannot become leader, because a higher-term member exists but is temporarily unreachable, blocks progress for all members. MicroRaft's candidate state machine should eagerly abandon candidacy when it discovers any reachable member with a higher term during the vote-counting path. Without this, the candidate sits with enough votes to block elections but cannot transition to leader. The fix is to add a term check in `VoteResponseHandler.handleResponse()` that triggers `toFollower()` on a higher-term response, the same step-down logic already present in `AppendEntriesRequestHandler`.
 
@@ -527,6 +511,8 @@ The existing WAL subsystem (AsyncFSWAL / FSHLog) is retained for the leader. The
 
 On the read-write primary and RAFT leader the write path proceeds through the existing WAL-append code path, which atomically assigns a sequence ID via MVCC begin, claims a WAL ring buffer slot, stamps cells, and publishes the entry to the ring buffer, all under the MVCC write-queue lock inside `AbstractFSWAL.stampSequenceIdAndPublishToRingBuffer()`. This atomic coupling is preserved unchanged for RAFT-enabled regions because it guarantees that WAL entries appear in the same order as MVCC sequence IDs. Decoupling them would allow concurrent writes to the same region to interleave, producing non-monotonic sequence IDs in the WAL. HBase's WAL replay treats this as a serious defect. After the ring buffer entry is published, but before the WAL is synced to HDFS, the write path forks two parallel slow I/O operations: (a) WAL sync to HDFS for durability, and (b) consensus replication to followers. A barrier waits for both to complete. Only then does the primary apply the edit to its local memstore and complete the MVCC write entry.
 
+A Phoenix batch commit or any `multi()` RPC delivers potentially hundreds of mutations for a single region in one call. The RegionServer's `multi()` handler groups mutations by region and calls `HRegion.batchMutate()` for each region's sub-batch. `batchMutate()` invokes `doMiniBatchMutate()`, which produces one WALEdit per mini-batch. This WALEdit is both the unit appended to the WAL and the unit proposed through RAFT. No re-grouping or re-serialization is needed at the RAFT boundary. The same pre-serialized byte buffer feeds both paths. A Phoenix batch of 1000 mutations touching 5 regions yields approximately 5 RAFT proposals, one per region, each carrying approximately 200 mutations. For RAFT-enabled regions, the mini-batch size is additionally bounded by `hbase.consensus.propose.max.bytes` (default 10MB). If the accumulated WALEdit for a mini-batch exceeds this limit, the mini-batch is split at the mutation boundary that crosses the threshold, producing an additional proposal, allowing operators to cap per-proposal network and log I/O cost independently of the WAL mini-batch size.
+
 The refactoring target is `HRegion.doMiniBatchMutate()` step 4 (the WAL append): the existing call to append-data followed by sync is split so that append-data which publishes to the ring buffer runs first, then the sync and RAFT proposal run in parallel. The `AbstractFSWAL` internals are unchanged. A new append-without-sync method (or equivalent) returns the transaction ID without blocking on HDFS, and the caller explicitly calls sync in the parallel fork.
 
 ```mermaid
@@ -536,7 +522,7 @@ flowchart TD
     Entry --> Fork{"Fork parallel I/O"}
 
     Fork --> WAL["WAL sync to HDFS<br/>(~3-5ms cross-AZ)"]
-    Fork --> RAFT["RAFT propose to followers<br/>(~1-2ms cross-AZ)"]
+    Fork --> RAFT["RAFT propose to followers<br/>(~2ms cross-AZ)"]
 
     WAL --> WALResult{"WAL sync<br/>result?"}
     RAFT --> RAFTResult{"RAFT propose<br/>result?"}
@@ -628,23 +614,23 @@ sequenceDiagram
 
     C->>L: Mutate RPC
 
-    Note over L: 0. Verify isLeader()
+    Note over L: 0. Verify isLeader
     Note over L: 1. Acquire row lock
-    Note over L: 2. Prepare mini-batch
-    Note over L: 3. doWALAppend (atomic):<br/>mvcc.begin() + ringBuffer.publish()
+    Note over L: 2. Prepare mini-batch: timestamps, cells, up to hundreds of mutations
+    Note over L: 3. doWALAppend atomic: mvcc.begin + ringBuffer.publish
 
     par Parallel I/O Fork
-        L->>WAL: 4a. wal.sync(txid)
-        WAL-->>L: sync complete (~3-5ms cross-AZ)
+        L->>WAL: 4a. wal.sync
+        WAL-->>L: sync complete, ~3-5ms cross-AZ
     and
-        L->>F: 4b. consensus.propose(WALEdit, seqId)
-        F-->>L: majority ack (~1-2ms cross-AZ)
+        L->>F: 4b. consensus.propose WALEdit + seqId
+        F-->>L: majority ack, ~2ms cross-AZ
     end
 
     Note over L: 5. Barrier: both complete
     Note over L: 6. Verify role == LEADER
-    Note over L: 7. memstore.add() (cells already stamped)
-    Note over L: 8. mvcc.completeAndWait()
+    Note over L: 7. memstore.add, cells already stamped
+    Note over L: 8. mvcc.completeAndWait
 
     L-->>C: 9. Return success
 ```
@@ -662,7 +648,7 @@ Leader write path:
      (WAL entry is queued but NOT yet synced to HDFS)
   4. Fork two parallel I/O operations:
      a. WAL: wal.sync(txid)                                  [HDFS durability, ~3-5ms cross-AZ]
-     b. RAFT: consensus.propose(stampedWALEdit, seqId)       [memstore replication, ~1-2ms]
+     b. RAFT: consensus.propose(stampedWALEdit, seqId)       [~2ms cross-AZ; WALEdit carries 1..N mutations]
   5. Barrier: both complete successfully
      On WAL sync failure: abort RS (WALFailureAbort)
      On RAFT propose failure: skip to error return
@@ -672,7 +658,8 @@ Leader write path:
   8. mvcc.completeAndWait(we)                                [make visible to readers]
   9. Return to client
 
-Follower path (driven by consensus apply callback, batch of N entries):
+Follower path (driven by consensus apply callback, batch of N entries;
+  each entry may carry M mutations from a mini-batch, so N*M total mutations):
   1. for each entry: deserialize(walEdit_i, seqId_i)
   2. if entry is a marker: break batch
   3. WriteEntry we = mvcc.beginAt(seqId_N)                   [single bracket at last seqId]
@@ -688,6 +675,8 @@ Follower marker handling (flush/compaction/open/close markers):
   3. Process marker (refresh store files, drop memstore)
   4. Resume batching subsequent mutation entries
 ```
+
+When a Phoenix batch commit targets a single region with hundreds of mutations, the entire sub-batch is a single WALEdit and a single RAFT proposal. The consensus overhead is amortized across all mutations in the mini-batch: one serialization pass, one consensus log entry, one network frame, one majority-ack round, and one follower apply cycle.
 
 ## Region Split and Merge
 
@@ -705,7 +694,7 @@ In both split and merge, the parent RAFT group is closed on a majority of member
 
 ```mermaid
 sequenceDiagram
-    participant L as Leader (Primary)
+    participant L as Leader, Primary
     participant F as Followers
     participant M as Master
 
@@ -714,16 +703,16 @@ sequenceDiagram
     L->>F: Propose "region-close / split" marker via RAFT
     F-->>L: Majority acknowledge
 
-    Note over L,F: All members apply marker:<br/>regionGroupManager.removeGroup()<br/>(parent group closed at same logical point)
+    Note over L,F: All members apply marker: regionGroupManager.removeGroup, parent group closed at same logical point
 
     M->>M: SplitTableRegionProcedure proceeds
 
-    M->>L: Open daughter region A (addGroup)
-    M->>L: Open daughter region B (addGroup)
-    M->>F: Open daughter region A (addGroup)
-    M->>F: Open daughter region B (addGroup)
+    M->>L: Open daughter region A via addGroup
+    M->>L: Open daughter region B via addGroup
+    M->>F: Open daughter region A via addGroup
+    M->>F: Open daughter region B via addGroup
 
-    Note over L,F: Daughters start with empty RAFT logs,<br/>inherit HFiles via reference files
+    Note over L,F: Daughters start with empty RAFT logs, inherit HFiles via reference files
 ```
 
 ### Safety: No Key-Range Overlap
@@ -851,7 +840,7 @@ The design principle for failover is that the RAFT election determines the candi
 
 Promotion proceeds in three phases (formally verified by the TLA+ model). In the first phase, which is RAFT-internal with no master involvement, a surviving read-only replica wins the internal RAFT election and enters the promoting state. The newly elected leader finishes consuming any remaining RAFT log entries to bring its memstore fully current, including entries that the old leader had committed via RAFT but not yet applied to its own memstore. The new leader's MVCC write point correctly accounts for all such entries, and no MVCC sequence gaps are created. In the second phase, the RegionServer hosting the newly elected leader sends a ReportLeaderElection RPC to the master. The master's LeaderChangeHandler validates the RAFT term against its current known term for this region, updates AssignmentManager's in-memory state and META to record the new primary location and replica ID, and returns confirmation to the RegionServer. In the third phase, the RegionServer completes the local promotion. It transitions the region from read-only to read-write, acquires a WAL reference, and enables flush and compaction. Only after this third phase completes does the promoted replica begin serving writes.
 
-This three-phase protocol runs independently of ServerCrashProcedure. The RAFT election and ReportLeaderElection RPC typically complete before SCP even begins iterating the dead server's regions. SCP's role is coordination and fallback. It ensures all regions on the dead server are accounted for, wakes hibernated groups whose election timers are suppressed, promotes regions whose fast-path promotion has not yet completed, and schedules replacement replicas to restore the replication factor. Non-RAFT regions on the same crashed server continue to follow the existing WAL-split-and-reassign path unchanged.
+This three-phase protocol runs independently of ServerCrashProcedure. The RAFT election and ReportLeaderElection RPC typically complete before SCP even begins iterating the dead server's regions. SCP's role is coordination and fallback. It ensures all regions on the dead server are accounted for, promotes regions whose fast-path promotion has not yet completed, and schedules replacement replicas to restore the replication factor. Non-RAFT regions on the same crashed server continue to follow the existing WAL-split-and-reassign path unchanged.
 
 The result is a failover with no WAL splitting, no recovered-edits replay, and no full region close/open cycle. The total promotion time from read-only replica to read-write primary is bounded by the consensus layer's election timeout plus memstore catch-up time plus one master RPC round-trip, typically sub-second to a few seconds. Since the HFiles are already on HDFS and accessible, the promoted replica is ready to serve as the new read-write primary as soon as the local promotion steps complete. Clients whose region location cache still points to the old primary will receive a connection error or `NotServingRegionException` and will invalidate their cache and re-read META to find the new primary, exactly as they would during any other region move.
 
@@ -865,29 +854,29 @@ sequenceDiagram
 
     Note over AZ1: AZ-1 FAILS
 
-    Note over AZ2,AZ3: Heartbeat timeout expires (~3s)
+    Note over AZ2,AZ3: Heartbeat timeout expires, ~1.5s
 
-    AZ2->>AZ3: RequestVote(term+1)
+    AZ2->>AZ3: RequestVote term+1
     AZ3-->>AZ2: VoteGranted
 
     Note over AZ2: Phase 1: Becomes RAFT Leader
     AZ2->>AZ2: Consume remaining RAFT log entries
 
-    AZ2->>M: Phase 2: ReportLeaderElection(region, replicaId, term)
+    AZ2->>M: Phase 2: ReportLeaderElection
     Note over M: Validate term > current known term
     M->>M: Update META: primary = AZ-2 RS
     M-->>AZ2: Confirmation
 
     Note over AZ2: Phase 3: Local promotion
-    Note over AZ2: Acquire WAL reference,<br/>enable flush + compaction
+    Note over AZ2: Acquire WAL reference, enable flush + compaction
     Note over AZ2: Now serving as R/W primary
 
-    C->>AZ1: Mutate (connection error)
+    C->>AZ1: Mutate - connection error
     C->>C: Invalidate cache, re-read META
-    C->>AZ2: Mutate (success)
+    C->>AZ2: Mutate - success
 
-    Note over M: SCP detects dead RS,<br/>finds promotion already confirmed
-    Note over M: Schedule replacement replica<br/>to restore replication factor
+    Note over M: SCP detects dead RS, finds promotion already confirmed
+    Note over M: Schedule replacement replica to restore replication factor
 ```
 
 ### Promotion Protocol (Region State Transitions)
@@ -938,21 +927,21 @@ sequenceDiagram
     participant C as Client
 
     Note over R: Wins RAFT election
-    Note over R: isLeader() = true
+    Note over R: isLeader = true
     Note over R: promotionComplete = false
 
-    Note over R,C: GAP: RAFT leader with valid lease,<br/>but writes rejected
+    Note over R,C: GAP: RAFT leader with valid lease, but writes rejected
 
     C->>R: Mutate
     R-->>C: NotServingRegionException
 
     R->>R: Phase 1: Finish consuming RAFT log
 
-    R->>M: Phase 2: ReportLeaderElection(region, replicaId, term)
+    R->>M: Phase 2: ReportLeaderElection
     Note over M: Validate term, update META
-    M-->>R: Confirmation (primary authority granted)
+    M-->>R: Confirmation, primary authority granted
 
-    R->>R: Phase 3: setReadOnly(false)
+    R->>R: Phase 3: setReadOnly false
     R->>WAL: Acquire WAL reference
 
     Note over R: promotionComplete = true
@@ -961,7 +950,7 @@ sequenceDiagram
     R->>R: Write .regioninfo, seqId file
     R->>R: Enable flush + compaction
 
-    C->>R: Mutate (success)
+    C->>R: Mutate - success
 ```
 
 Three edge cases during the promotion gap are worth noting. First, if the promoting leader's lease expires before promotion completes, the leader steps down to follower, and promotion is abandoned. The promotion-complete flag is reset, and no writes were accepted during the gap. If the master has already updated META before the RS stepped down, the stale META entry is harmless. the next leader's ReportLeaderElection will overwrite it with a higher term, and clients that read the stale entry will receive `NotServingRegionException` and re-read META. Second, if a second election occurs while a leader is still in the promotion gap, the old leader's promotion is abandoned when it discovers the higher term and steps down. The new leader starts its own independent promotion. The master's term validation ensures that if both leaders report concurrently, only the higher term wins. In both cases, the promotion-complete flag being per-region and reset on any leadership loss ensures safety (verified by the TLA+ model).
@@ -997,7 +986,7 @@ TRSP gains a new transition type, PRIMARY_PROMOTED, which updates META (the serv
 SCP gains a RAFT-aware path for regions that have RAFT enabled. SCP's role for these regions is coordination and fallback, not the primary promotion mechanism. In the happy path, the LeaderChangeHandler has already processed the leader change before SCP even begins iterating regions. SCP's RAFT-aware path proceeds as follows:
 1. skip WAL splitting for RAFT-enabled regions and if META is among the dead server's RAFT-enabled regions, process it first;
 2. for each RAFT-enabled region on the dead server, check whether the master has already confirmed a new leader by examining the RegionStateNode. If the current primary is on a live server, the promotion is already complete;
-3. if no leader change has been processed yet, SCP either waits with a bounded timeout for the RAFT election to complete and for the RegionServer to send ReportLeaderElection, or if the election does not complete in time, SCP sends wake-up RPCs to surviving replicas to trigger elections, then waits;
+3. if no leader change has been processed yet, SCP waits with a bounded timeout for the RAFT election to complete and for the RegionServer to send ReportLeaderElection;
 4. if the dead server's replica was the primary and the fast path has not completed, SCP creates a TransitRegionStateProcedure with PRIMARY_PROMOTED type as a fallback. This provides the procedure framework's retry and persistence guarantees when the fast path has not completed;
 5. if the dead server's replica was a follower rather than the primary, SCP schedules a replacement replica assignment;
 6. SCP schedules a replacement replica to restore the replication factor from two back to three.
@@ -1050,31 +1039,31 @@ sequenceDiagram
     participant HDFS as HDFS
 
     M->>N: Assign replacement replica
-    N->>N: regionGroupManager.addGroup()
+    N->>N: regionGroupManager.addGroup
 
-    N->>HDFS: Load shared HFiles (data up to last flush)
+    N->>HDFS: Load shared HFiles, data up to last flush
 
     L->>L: Detect new member lagging
 
     alt RAFT log entries available
-        L->>N: AppendEntries (post-flush log tail)
+        L->>N: AppendEntries, post-flush log tail
         N->>N: Apply entries via consensus callback
         N->>N: Build memstore to current state
-    else Log entries GC'd (prior flush materialized them)
-        L->>N: CatchUpReference (HFile paths + flushSeqId)
+    else Log entries GC'd, prior flush materialized them
+        L->>N: CatchUpReference: HFile paths + flushSeqId
         N->>HDFS: Load referenced HFiles
         N->>N: Start with empty memstore
-        L->>N: AppendEntries (post-flush entries)
+        L->>N: AppendEntries, post-flush entries
         N->>N: Apply entries, rebuild memstore
     else No flush yet, member too far behind
         L->>L: Trigger flush
         L->>HDFS: Write HFiles
-        L->>N: CatchUpReference (fresh HFile paths + flushSeqId)
+        L->>N: CatchUpReference: fresh HFile paths + flushSeqId
         N->>HDFS: Load fresh HFiles
         N->>N: Start with empty memstore
     end
 
-    Note over N: persistAndFlushTerm(votedFor=leader)
+    Note over N: persistAndFlushTerm, votedFor=leader
     Note over N: Caught up, eligible for voting and promotion
 ```
 
@@ -1117,11 +1106,13 @@ All three scenarios use the same catch-up reference and install-snapshot mechani
 
 **Phoenix coprocessor interactions.** Phoenix deploys several coprocessors that are sensitive to the RAFT replication model. `IndexRegionObserver` runs the pre-batch-mutate hook synchronously in the write path, generating index table mutations as a side effect. On the leader, these index mutations are generated before the RAFT proposal. On followers, the apply callback writes data cells directly to the memstore without triggering the pre-batch-mutate hook, so no index mutations are generated on followers. This is correct: index mutations are a leader-side concern. However, during failover, if the old leader committed a RAFT entry but the corresponding index table mutations from `IndexWriter` had not yet committed, the data table and index table will be temporarily inconsistent. This is handled by Phoenix's existing `GlobalIndexChecker` read-repair mechanism, which detects unverified index rows and back-checks them against the data table. No new index consistency mechanism is needed, but operators must be aware that index read-repair activity may spike briefly after a failover. Other Phoenix coprocessors that must execute only on the RAFT leader include `UngroupedAggregateRegionObserver` (server-side DELETE/UPSERT SELECT), `SequenceRegionObserver` (sequence increments on SYSTEM.SEQUENCE), and `MetaDataEndpointImpl` (DDL operations on SYSTEM.CATALOG). The leader status check in the write path gates all of these correctly.
 
+**Phoenix batch mutation sizing.** A Phoenix mutation commit can contain up to `phoenix.mutate.batchSize` (default 1000) individual HBase mutations, arriving as a `multi()` RPC. The RegionServer groups these by region. Each region's sub-batch passes through `doMiniBatchMutate()` and produces one WALEdit per mini-batch, which is one RAFT proposal. No Phoenix-specific logic is needed in the consensus layer. However, a large per-region sub-batch produces a proportionally large RAFT proposal. For deployments where per-proposal size must be bounded, `hbase.consensus.propose.max.bytes` triggers mini-batch subdivision at the RAFT boundary. Operators should monitor `consensus_proposal_bytes` to track per-proposal size and tune the threshold if needed.
+
 **Clock skew.** Cell timestamps come from either the client or the server's current time. In the RAFT model, the primary assigns timestamps during mini-batch preparation before proposing through RAFT, so all members see the same timestamp. This is already the case for the current write path, so no change is needed.
 
 **Flush coordination.** The primary writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT. All members transition from memstore to HFiles at the same logical point in the RAFT log. Because HFiles are fully written before the marker is proposed, there is no window where a member has dropped its memstore but HFiles are unavailable. Replicas pick up the new HFiles from HDFS upon applying the flush-complete marker via an immediate store file refresh triggered by the marker, supplemented by StorefileRefresherChore as a fallback. A brief delay in replica HFile discovery does not affect client-visible consistency for either default reads or Timeline reads: the replica has not yet dropped its memstore when the marker-triggered refresh is delayed, so Timeline reads on that replica remain consistent throughout the transition.
 
-**Inter-AZ latency impact.** Every write now requires both a WAL sync and a RAFT round-trip to a majority, but these run in parallel. The write latency is the maximum of the WAL sync and the RAFT round-trip, not the sum. In a cross-AZ deployment with HDFS replication factor 3 (one DataNode per AZ), the HDFS WAL pipeline includes inter-AZ hops: the write must reach and be acknowledged by DataNodes in at least two AZs. Realistic HDFS WAL sync latency in this configuration is ~3-5ms, not the ~1-3ms typical of a single-AZ HDFS deployment. Inter-AZ RAFT RTT is ~1-2ms. Since max(3-5ms, 1-2ms) = 3-5ms, the RAFT consensus overhead is effectively hidden behind the already-cross-AZ HDFS WAL sync. The parallel barrier adds no additional latency over today's single-WAL path in a cross-AZ HDFS deployment. With the consensus layer's built-in batching and pipelining, the amortized per-write overhead is modest.
+**Inter-AZ latency impact.** Every write now requires both a WAL sync and a RAFT round-trip to a majority, but these run in parallel. The write latency is the maximum of the WAL sync and the RAFT round-trip, not the sum. In a cross-AZ deployment with HDFS replication factor 3, the HDFS WAL pipeline includes inter-AZ hops. The write must reach and be acknowledged by DataNodes in at least two AZs. Realistic HDFS WAL sync latency in this configuration is ~3-5ms. The RAFT consensus round requires only a network round-trip to the nearest follower (~2ms cross-AZ) because fdatasync on the consensus log is decoupled from the consensus round. The RAFT consensus overhead is fully hidden behind the HDFS WAL sync. The parallel barrier adds no additional latency over today's single-WAL path in a cross-AZ HDFS deployment. The trade-off is that on crash recovery, up to 100ms of consensus log entries may need to be replayed from peers, which is trivial given that the HDFS WAL is the durability mechanism.
 
 **ASYNC_WAL incompatibility.** RAFT-enabled tables must use `SYNC_WAL` or `FSYNC_WAL` durability. `ASYNC_WAL` is incompatible with the "no data loss" failover guarantee: `ASYNC_WAL` skips WAL sync (the data is appended to the ring buffer but the caller does not wait for HDFS ack), and if RAFT replication were also fire-and-forget, neither WAL durability nor RAFT replication would be guaranteed. A client-acknowledged write could be lost if the leader crashes before either path completes. Table creation and alteration should reject `ASYNC_WAL` for tables with `hbase.raft.enabled = true`.
 
@@ -1129,31 +1120,33 @@ All three scenarios use the same catch-up reference and install-snapshot mechani
 
 **Election liveness under adversarial schedules.** Election liveness depends on unbounded RAFT terms and unbounded real time. Any implementation that caps election retry attempts, limits the maximum term number, or imposes a hard timeout on the election process risks violating liveness. If election terms are capped at some maximum value, a series of failed elections can exhaust the cap. Operators who introduce circuit breakers or rate limiters around election retries must ensure they bound the *rate* of attempts, not the total *number* of attempts.
 
-**Scalability at thousands of groups per RegionServer.** A typical RegionServer hosts hundreds to thousands of regions. The consensus layer's architecture (shared event loop, store-level heartbeat coalescing, hibernate idle groups, and unified multiplexed log, all described in the "Consensus Layer Architecture" section) is designed to handle O(10000) groups per RS with overhead proportional to the active write rate, not the total group count.
+**Scalability at thousands of groups per RegionServer.** A typical RegionServer hosts hundreds to thousands of regions. The consensus layer's architecture (shared event loop, store-level heartbeat coalescing, and unified multiplexed log, all described in the "Consensus Layer Architecture" section) is designed to handle O(10000) groups per RS with overhead proportional to the active write rate, not the total group count.
 
 *Expected resource profile at N=10000 groups per RS:*
 
 - **Threads:** O(CPU cores)
 - **Heartbeat network messages:** 2 per tick (one coalesced message per peer)
 - **Data-path network messages:** O(peers) per tick (one coalesced batch-append-entries per peer)
-- **Active heartbeating groups:** 5-20% of total, rest hibernated.
+- **Heartbeat network cost:** O(peers) per tick regardless of group count, thanks to store-level heartbeat coalescing. All groups are actively heartbeated but the network cost is constant.
 - **Consensus log I/O:** 1 sequential write stream to NVMe, not 10000 file handles. fdatasync amortized across all groups with pending writes per coalescing window.
-- **Per-hibernated-group memory:** a small fixed-size struct (group ID, term, voted-for record, commit index, role, last-activity timestamp) with no per-group threads, timers, or network traffic.
 - **Proposal batching:** Under sustained write load, N proposals per group are amortized into 1 AppendEntries. Follower apply batching reduces MVCC overhead from N begin/complete cycles to 1 per batch.
+- **Per-proposal size:** A Phoenix batch of `phoenix.mutate.batchSize` (default 1000) mutations touching K regions yields approximately K RAFT proposals, each carrying approximately 1000/K mutations. The per-proposal WALEdit size is tens to hundreds of KB. The three-level batching hierarchy (mini-batch grouping, mailbox drain, transport coalescing) ensures that consensus overhead scales with the number of regions written, not the number of individual mutations. `hbase.consensus.propose.max.bytes` provides an upper bound on per-proposal size for deployments with very large batches.
 
 *Configuration:*
 
 - `hbase.consensus.port`: Dedicated Netty port for consensus traffic.
 - `hbase.consensus.worker.threads`: Shared thread pool size (default: 2 * cores).
-- `hbase.consensus.heartbeat.interval.ms`: Heartbeat tick interval (default: 500).
-- `hbase.consensus.leader.heartbeat.timeout.ms`: Leader heartbeat timeout, i.e., how long a follower waits before declaring the leader dead and initiating an election (default: 3000). Maps to MicroRaft's leader heartbeat timeout. This is the timing-critical parameter for lease safety: the leader lease duration must be strictly less than the heartbeat timeout minus twice the max clock drift (default: 2500ms < 3000 - 400 = 2600ms).
-- `hbase.consensus.hibernate.timeout.ms`: Inactivity timeout before hibernation (default: 30000).
+- `hbase.consensus.heartbeat.interval.ms`: Heartbeat tick interval (default: 250).
+- `hbase.consensus.leader.heartbeat.timeout.ms`: Leader heartbeat timeout, i.e., how long a follower waits before declaring the leader dead and initiating an election (default: 1500). Maps to MicroRaft's leader heartbeat timeout. This is the timing-critical parameter for lease safety: the leader lease duration must be strictly less than the heartbeat timeout minus twice the max clock drift (default: 1000ms < 1500 - 400 = 1100ms).
 - `hbase.consensus.log.segment.size.mb`: Unified log segment size (default: 256).
-- `hbase.consensus.log.sync.batch.ms`: Batched fdatasync interval (default: 10).
-- `hbase.consensus.propose.batch.max.entries`: Maximum proposals combined into a single AppendEntries per group (default: 16).
+- `hbase.consensus.log.sync.batch.ms`: Consensus log write coalescing window and transport flush interval (default: 10). Entries accumulated within this window are written to the OS page cache in a single batch. The consensus round completes on page-cache write, not fdatasync.
+- `hbase.consensus.log.fdatasync.interval.ms`: Consensus log fdatasync interval (default: 100). Controls how often fdatasync is called on the consensus log. Decoupled from the consensus round to keep RAFT latency at network RTT. On crash, up to this interval of entries may need peer replay.
+- `hbase.consensus.propose.batch.max.entries`: Maximum proposals combined into a single AppendEntries per group (default: 32).
+- `hbase.consensus.propose.max.bytes`: Maximum WALEdit size (in bytes) for a single RAFT proposal (default: 10MB). Mini-batches whose accumulated WALEdit exceeds this size are subdivided into multiple proposals. Controls intra-proposal size independently of the WAL mini-batch size.
 - `hbase.consensus.maxgroups`: Maximum RAFT groups per RS (default: the value of `hbase.regionserver.maxregions`).
+- `hbase.consensus.transport.compression`: Compression codec for RAFT entries on the wire and in the consensus log (default: `snappy`). Entries are compressed once on the leader before proposal and decompressed on followers during the apply callback.
 
-*Monitoring:* Expose per-RS metrics for RAFT group count (active, hibernated), aggregate heartbeat rate, consensus log disk usage, apply latency, propose latency, `consensus_proposals_batched` (histogram of entries per AppendEntries), `consensus_apply_batch_size` (histogram of entries per follower apply), and `consensus_appends_coalesced` (histogram of groups per BatchAppendEntries frame). Alert on group count approaching the configured limit. Network health must be tracked per member-to-member link, not just per RegionServer. A `consensus_peer_link_up` gauge per peer reports whether the Netty connection to that peer is currently established. A `consensus_peer_last_response_ms` gauge per peer tracks time since the last successful message exchange. Partial partitions can leave some members fully connected while others are isolated.
+*Monitoring:* Expose per-RS metrics for RAFT group count, aggregate heartbeat rate, consensus log disk usage, apply latency, propose latency, `consensus_proposals_batched` (histogram of entries per AppendEntries), `consensus_apply_batch_size` (histogram of entries per follower apply), `consensus_appends_coalesced` (histogram of groups per BatchAppendEntries frame), and `consensus_proposal_bytes` (histogram of WALEdit bytes per proposal, for visibility into per-proposal size under Phoenix batch workloads). Alert on group count approaching the configured limit. Network health must be tracked per member-to-member link, not just per RegionServer. A `consensus_peer_link_up` gauge per peer reports whether the Netty connection to that peer is currently established. A `consensus_peer_last_response_ms` gauge per peer tracks time since the last successful message exchange. Partial partitions can leave some members fully connected while others are isolated.
 
 Since only the primary writes HFiles to HDFS, the primary's ability to flush depends on HDFS availability. If HDFS is degraded (e.g., the NameNode in the primary's AZ is unreachable), the primary cannot flush but can continue to accept writes in memstore (bounded by memstore size limits). RAFT replication continues independently of HDFS. Replicas receive and apply RAFT log entries to their memstores regardless of the primary's flush status. If the primary cannot flush for an extended period, it will hit memstore back-pressure and slow down writes, which is the same behavior as a non-replicated region under HDFS pressure.
 
@@ -1173,6 +1166,264 @@ flowchart LR
     D --> E["Disable RAFT<br/>on table"]
     E --> F["Normal primary,<br/>no replicas"]
 ```
+
+## Performance and Scalability
+
+This section provides a quantitative scalability analysis for a representative production deployment. All configuration parameter names, batching terminology, and architectural references are aligned to the design above.
+
+### Deployment Profile and Cluster Parameters
+
+#### Hardware (per RegionServer: m7g.8xlarge on EKS)
+
+| Resource | Value |
+|---|---|
+| Instance type | m7g.8xlarge (AWS Graviton3, arm64) |
+| vCPUs | 32 |
+| RAM | 128 GiB (JVM heap ~48–64 GB; memstore budget ~25 GB) |
+| Network | 15 Gbps (1,875 MB/s) |
+| Inter-AZ RTT | 1–2 ms |
+| EBS aggregate bandwidth | 10 Gbps (1,250 MB/s) across all attached volumes |
+| EBS aggregate IOPS | 40,000 |
+
+#### Storage layout (per worker node)
+
+| Volume | Type | Specs | Role |
+|---|---|---|---|
+| 6 × 2 TB | ST1 HDD | 80 MB/s baseline each; 480 MB/s aggregate | HDFS data (HFiles, compaction) |
+| 1 × GP3 SSD | GP3 | 125 MB/s, 3,000 IOPS baseline; fdatasync 2–4 ms p50, 6–8 ms p99 | HDFS WAL blocks (tiered storage) |
+| 1 × GP3 SSD | GP3 | 125 MB/s, 3,000 IOPS baseline | RAFT consensus log (`AsyncFSWAL` instance) |
+
+#### HBase cluster parameters
+
+- **RegionServers:** N_RS = 500 across 3 AZs (~167 per AZ)
+- **Regions per RS:** G = 1,500
+- **RAFT groups per RS:** G = R = 1,500 (one group per region, RF=3)
+- **Peers per group:** P = 2 (one in each other AZ)
+- **Replication factor:** RF = 3
+
+### Workload Model
+
+Most Phoenix tables have 1–2 global indexes (some up to 10). Each global index is a separate HBase table. A Phoenix UPSERT generates 1 + I_avg HBase mutations. Of the 1,500 regions per RS, approximately 500 are base-table regions and 1,000 are index-table regions. Write amplification: W_amp = 1 + I_avg = 1 + 2 = 3.
+
+#### Steady-state write rates
+
+| Metric | Value |
+|---|---|
+| Phoenix logical write throughput per RS | W_phoenix ≈ 4 MB/s |
+| After write amplification (W_amp=3) | W_hbase = 12 MB/s per RS |
+| Average mutation size w | 400 bytes |
+| HBase mutations per RS | λ_RS = 12,000,000 / 400 = 30,000/s |
+| Mutations per group (avg) | λ_g = λ_RS / G = 20/s |
+| Workload mix | 60% OLTP (single-row UPSERT VALUES), 40% archival/ETL |
+
+Level 1 batching: Phoenix batch → RAFT proposal: OLTP batches (60%) concentrate in ~3 regions (1 base + 2 index) yielding M ≈ 333 mutations per proposal. Archival/ETL batches (40%) spread across many regions yielding M ≈ 5–20. Conservative weighted average: M_proposal ≈ 20. This is the dominant batching mechanism, reducing proposals from O(mutations) to O(regions).
+
+RAFT proposal rates: λ_proposals = λ_RS / M_proposal = 30,000 / 20 = 1,500 proposals/s per RS. All proposals originate from leader groups. Per leader group: λ_proposals,leader = 1,500 / 500 = 3.0 proposals/s. Each follower receives entries at the same rate from its leader, so per follower group: 3.0 entries/s.
+
+#### Zipfian per-group rate distribution
+
+With multitenant Phoenix tables keyed by tenant ID, activity follows a Zipfian distribution. At s = 1.0 (classic Zipf):
+
+| Rank k | Mutations/s | Proposals/s | Interpretation |
+|---|---|---|---|
+| 1 (hottest) | 3,802 | ~190 | Mega-tenant's primary table region |
+| 100 | 38 | ~1.9 | Moderate-activity tenant |
+| 750 (median) | 5.1 | ~0.25 | Typical tenant |
+| 1,500 (coldest) | 2.5 | ~0.13 | Low-activity tenant (still active) |
+
+Even the coldest region writes every 400 ms. All 1,500 groups are actively written during business hours.
+
+### Three-Level Batching Analysis
+
+The batching hierarchy (see "Batching Hierarchy" above) reduces per-mutation consensus overhead from O(mutations) toward O(peers).
+
+#### Level 1: Intra-proposal batching (mini-batch grouping)
+
+At T_consensus ≈ 2 ms and M_proposal = 20: T_amortized = 2 ms / 20 = 0.1 ms per mutation. For OLTP single-tenant commits (M_proposal = 333): T_amortized = 6 μs per mutation. Level 1 alone provides 20–333× amortization.
+
+#### Level 2: Inter-proposal batching (mailbox drain)
+
+The `MultiGroupExecutor` drain loop collects pending proposals up to `hbase.consensus.propose.batch.max.entries` (default 32). Proposals accumulated during one consensus round: b = λ_proposals,g × T_consensus.
+
+| Group rank | Proposals/s | b (per 2 ms round) | Level 2 effective? |
+|---|---|---|---|
+| Average leader | 3.0 | 0.006 | No (always b=1) |
+| Hottest (k=1) | 190 | 0.38 | No (b=1 at steady state) |
+| UPSERT SELECT burst | 500 | 1.0 | Marginal |
+
+Level 2 is irrelevant for the average group because Level 1 already provides mutation-level batching. With the 2 ms consensus round (down from ~10 ms with fdatasync-coupled sync), even the hottest groups rarely accumulate multiple proposals per round. Level 2 remains available as headroom for extreme bursts.
+
+#### Level 3: Cross-group transport coalescing
+
+The `CoalescingTransport` combines AppendEntries from multiple groups destined for the same peer into one `BatchAppendEntries` frame. Within one `hbase.consensus.log.sync.batch.ms` (10 ms) coalescing window: total proposals per window (all leaders, one AZ direction) = 1,500 × 0.01 / 2 = 7.5. These are spread across ~167 peer RSes in that AZ, so per peer RS: ~0.05 per window. Coalescing is most effective for hot groups and during bursts, where multiple AppendEntries accumulate for the same peer within one window. At the aggregate level, coalescing reduces per-tick syscalls from O(proposals) = 30 to O(active peers) ≈ 30 at steady state, with greater benefit under bursty Zipfian workloads where hot groups concentrate traffic on specific peers.
+
+#### Compound batching effectiveness
+
+A Phoenix batch of 1,000 mutations touching 5 regions generates 5 RAFT proposals (Level 1). All 5 AppendEntries destined for the same peer are coalesced into one `BatchAppendEntries` frame (Level 3). Net result: 1,000 mutations → 5 proposals → 2 coalesced network frames. Overhead reduction: 500× vs. naive per-mutation consensus.
+
+### Thread Pool Model (M/G/c Queue)
+
+The `MultiGroupExecutor` is a shared pool of T = 2 × cores = 64 worker threads. Each job is a drain-loop invocation on one group.
+
+#### Service time model
+
+With Level 1 batching, each proposal carries M_proposal ≈ 20 mutations: T_service(b) = S_drain + b × t_proposal. S_drain (dequeue + scheduled-flag manipulation): ~5 μs. t_proposal (serialize 20 mutations, enqueue to transport, update FSM): ~100 μs. At b=1: T_service(1) = 105 μs.
+
+| Job type | Rate | Service time | CPU/s |
+|---|---|---|---|
+| Leader proposals (500 leader groups × 3.0/s) | 1,500/s | 105 μs | 157.5 ms |
+| Follower applies (1,000 follower groups × 3.0/s) | 3,000/s | 105 μs | 315 ms |
+| Heartbeat dispatches (250 ms tick) | 6,000/s | 5 μs | 30 ms |
+| **Total** | **10,500/s** | | **502.5 ms** |
+
+Pool utilization: ρ = 502.5 ms / (64 × 1,000 ms) = **0.8%**. At 10× the modeled write rate: 7.4%. The thread pool has massive headroom.
+
+#### UPSERT SELECT burst
+
+10 groups burst to 500 proposals/s (each M_proposal=100), service time ~500 μs: CPU_burst = 490 × 3.0 × 105 μs + 10 × 500 × 500 μs + 315 ms + 30 ms = 154 ms + 2,500 ms + 315 ms + 30 ms ≈ 3.0 s. ρ_burst = 3.0 / 64 = 4.7%.
+
+### Network Model
+
+#### Heartbeat Traffic
+
+Each `HeartbeatBatch` carries only the groups for which the target peer is a follower. With ~9 shared groups per RS pair (see "ConsensusServer Connectivity Mesh" below) and ~3 leader groups per pair: per-batch size = 24 + 3 × 33 ≈ 123 bytes. Each RS sends one coalesced batch to each of ~334 distinct peer RSes per tick: 334 × 123 = 41 KB per tick. At `hbase.consensus.heartbeat.interval.ms` = 250: HB bandwidth = 41 KB × 2 directions / 0.25 s = 328 KB/s. This is <0.02% of the 15 Gbps network limit.
+
+Heartbeat coalescing is mandatory. Without coalescing, each group sends individual heartbeats to 2 peers: 1,500 × 2 = 3,000 uncoalesced sends per tick. At ~100–200 μs per `send()` syscall: 300–600 ms, which would exceed the 250 ms tick interval. With coalescing, the 3,000 per-group heartbeats are batched into ~334 coalesced sends per tick, each carrying ~3 GroupHeartbeats. At ~20 μs per small-message send: 334 × 20 μs ≈ 7 ms per tick, well within the 250 ms budget. Heartbeat coalescing is a hard architectural requirement.
+
+#### ConsensusServer Connectivity Mesh
+
+With RF=3 and one RAFT member per AZ, each of the 1,500 regions on an RS in AZ-1 has exactly one member in AZ-2, assigned uniformly at random to one of ~167 RSes. The probability that a given RS pair (one in AZ-1, one in AZ-2) shares at least one RAFT group follows the birthday-problem complement:
+
+P(no shared group) = (1 − 1/167)^1500 ≈ e^(−1500/167) = e^(−8.98) ≈ 1.25 × 10^(−4)
+
+P(at least one shared group) ≈ 99.99%
+
+Expected shared groups per RS pair: E = 1,500 / 167 ≈ 9.0. Expected RS pairs in AZ-1 × AZ-2 with zero shared groups: 167 × 167 × 1.25 × 10^(−4) ≈ 3.5 out of 27,889 pairs. The mesh is essentially fully connected. Each `ConsensusServer` therefore maintains TCP connections to virtually every RS in both remote AZs. Of the ~9 shared groups per RS pair, approximately 3 are led by this RS (it leads ~1/3 of its groups), 3 are led by the remote RS, and 3 are led by a third RS in the remaining AZ. Only groups where one endpoint is the leader and the other is a follower generate data-path traffic on that connection. Groups led by a third AZ do not produce direct traffic between this pair. Per connection: ~3 leader→follower AppendEntries at 3.0 entries/s = ~9 entries/s outbound, ~9 entries/s inbound from the peer's leader groups.
+
+#### Data-path traffic
+
+Each proposal carries M_proposal × w + header = 20 × 400 + 48 = 8,048 bytes uncompressed. With Snappy compression at ~2.5:1 on the WALEdit payload, the on-wire size drops to 20 × 400 / 2.5 + 48 = 3,248 bytes. Data outbound from the 500 leader groups: 500 × 3.0 proposals/s × 3,248 bytes × 2 peers = 9.7 MB/s. Data inbound to the 1,000 follower groups: 1,000 × 3.0 entries/s × 3,248 = 9.7 MB/s. Adding heartbeats (~0.3 MB/s bidirectional), total RAFT network traffic is ~20 MB/s per RS, 1.1% of the 15 Gbps NIC. With HDFS WAL pipeline traffic (~36 MB/s) the aggregate is ~56 MB/s, well under the 1,875 MB/s ceiling. All RAFT consensus traffic is cross-AZ by construction, so the entirety of this 20 MB/s is cross-AZ transfer.
+
+#### Cross-AZ Traffic Summary
+
+Every byte of RAFT data traffic crosses an AZ boundary. The RAFT layer sends each mutation's data to two cross-AZ followers (RF − 1 = 2), so the raw RAFT cross-AZ transfer is 2× the WALEdit data volume. The HDFS WAL pipeline already generates its own cross-AZ traffic (RF=3, pipeline forwarding across 2 AZ hops). The table below separates RAFT-introduced cross-AZ transfer from the HDFS baseline that exists today.
+
+| Traffic source | Per RS | Per cluster (500 RS) | Notes |
+|---|---|---|---|
+| RAFT data (compressed) | 20 MB/s | 10 GB/s | New cross-AZ traffic introduced by this design |
+| RAFT heartbeats | 0.3 MB/s | 0.15 GB/s | New; negligible |
+| HDFS WAL pipeline (existing) | ~30 MB/s | ~15 GB/s | 15 MB/s × 2 cross-AZ hops in RF=3 pipeline |
+| RAFT as fraction of WAL baseline | | | 0.7× |
+
+Snappy compression reduces the incremental cross-AZ transfer to ~20 MB/s per RS. At the cluster level, the RAFT layer adds ~10 GB/s of compressed cross-AZ transfer on top of the ~15 GB/s HDFS WAL baseline.
+
+### Disk I/O Model
+
+#### RAFT consensus log (AsyncFSWAL on GP3)
+
+The consensus log is a second `AbstractFSWAL` instance on the dedicated GP3 volume. All groups share one sequential write stream.
+
+The consensus log stores Snappy-compressed entries. Per-mutation compressed size: w_c = 400 / 2.5 + 64 (overhead) = 224 bytes. Log write rate for leader proposals: λ_RS × w_c = 30,000 × 224 = 6.7 MB/s. Follower groups on this RS also write to the consensus log: 1,000 followers × 3.0 entries/s × 20 mutations × 224 bytes = 13.4 MB/s. Total consensus log write rate: 6.7 + 13.4 = 20.1 MB/s. GP3 baseline throughput: 125 MB/s. Utilization: 16.1%.
+
+#### fdatasync amortization
+
+One fdatasync per `hbase.consensus.log.fdatasync.interval.ms` (100 ms):
+
+- fdatasync rate: 1 / 0.1 = 10/s (GP3 baseline: 3,000 IOPS → **0.3%**)
+- Bytes per fdatasync: 20.1 MB/s × 100 ms = 2.01 MB
+- A 2.01 MB sequential write + fdatasync on GP3 takes 2–4 ms (p50), 6–8 ms (p99)
+- The 100 ms fdatasync interval accommodates this with >90 ms margin at p99
+
+Without the unified log: 1,500 × 20 = 30,000 fdatasync/s → 10× GP3 baseline IOPS. The unified log is essential.
+
+#### HDFS WAL (GP3 via tiered storage)
+
+Each DataNode has a dedicated GP3 volume for WAL blocks. HDFS WAL sync with RF=3 cross-AZ pipeline: T_WAL = T_pipeline + T_fdatasync + T_ack ≈ (1–2) + (2–4) + (1–2) = 4–8 ms. p50 ≈ 5 ms, p99 ≈ 10 ms. WAL throughput: 30,000 × 500 = 15 MB/s, within GP3's 125 MB/s baseline.
+
+#### EBS bandwidth
+
+EBS total ≈ 20 (consensus log, compressed) + 15 (WAL) + 75 (HFiles, compaction) = 110 MB/s → 8.8% of 1,250 MB/s ceiling.
+
+### Parallel Barrier Latency
+
+The leader write path forks WAL sync and RAFT proposal in parallel, joined by a barrier (see "Write Path: Parallel WAL + RAFT Replication"):
+
+T_write = max(T_WAL, T_RAFT)
+
+#### RAFT Consensus Round Timing
+
+With fdatasync decoupled from the consensus round, the RAFT consensus round requires only a network round-trip. The leader appends the proposal to the consensus log's page cache (sub-millisecond), sends AppendEntries to followers, and the nearest follower appends to its own page cache and returns an ack:
+
+T_RAFT = T_network + T_page_cache_write + T_network ≈ 1 + 0 + 1 = ~2 ms
+
+#### Parallel Barrier
+
+RAFT consensus is fully hidden behind the HDFS WAL sync. The write path latency is identical to today's single-WAL path in a cross-AZ HDFS deployment. The cost is bounded. On crash recovery, up to 100 ms of consensus log entries may need to be replayed from the leader's RAFT log via AppendEntries.
+
+### Memory Model
+
+Per-group memory (active): ~4 KB (RaftNode FSM, MPSC mailbox, adapters, in-memory log index).
+
+Mem_groups = G × 4 KB = 1,500 × 4,096 = 6.14 MB
+
+Negligible vs. ~25 GB memstore budget on 128 GiB. The dominant memory cost is memstore (~17 MB per region), unchanged by RAFT.
+
+### Composite Scalability Table
+
+All 1,500 groups active, steady-state Phoenix workload, `heartbeat.interval.ms` = 250:
+
+| Resource | Value | Capacity | Utilization |
+|---|---|---|---|
+| Thread pool (jobs/s) | 10,500 | 2,560,000 | 0.4% |
+| Network, compressed (MB/s) | 20 | 1,875 | 1.1% |
+| Cross-AZ RAFT transfer, compressed (MB/s) | 20 | — | 0.7× of WAL baseline |
+| GP3 consensus log write, compressed (MB/s) | 20.1 | 125 | 16.1% |
+| GP3 consensus log fdatasync/s | 10 | 3,000 | 0.3% |
+| GP3 fdatasync latency vs interval | 2–4 ms | 100 ms | 2–4% |
+| EBS aggregate bandwidth (MB/s) | ~110 | 1,250 | 8.8% |
+| Memory (RAFT state) | 6.14 MB | ~48,000 MB | 0.01% |
+| Heartbeat sweep time | 0.15 ms | 250 ms (tick) | 0.06% |
+| Heartbeat syscalls (coalesced) | 334/tick | — | 7 ms/tick |
+| Heartbeat syscalls (if NOT coalesced) | 3,000/tick | ~1,250 budget | 240% |
+| TCP connections per RS | ~334 | — | full cross-AZ mesh |
+
+All resources are within budget with coalescing and compression. The heartbeat row demonstrates that coalescing is structurally mandatory. The cross-AZ row shows the incremental transfer introduced by RAFT relative to the existing HDFS WAL cross-AZ baseline.
+
+### Breaking Point Analysis
+
+The binding constraint is GP3 consensus log throughput. The consensus log sees writes from both leader proposals and follower appends; at uniform load scaling, the total log write rate is 3 × λ_RS × w_c. Setting utilization to 80%:
+
+λ_RS,max = (0.8 × 125 MB/s) / (3 × 224 bytes) = 148,810 mutations/s = 59.5 MB/s per RS
+
+Provisioning GP3 with 250 MB/s throughput doubles the headroom to 10×. Without Snappy compression, the breaking point drops to 71,839 mutations/s (2.4× the modeled load), underscoring the importance of mandatory compression for both network and disk budgets.
+
+At the extreme Phoenix index fan-out (W_amp = 11, 10 indexes per table): λ_RS = 110,000 mutations/s → GP3: 59%, thread pool: 5%, network: 4% (compressed). All resources remain within budget, though GP3 headroom narrows and 250 MB/s provisioning is recommended.
+
+### RPC Handler Pool
+
+With RAFT fully hidden behind WAL sync, the parallel barrier latency equals the WAL sync latency. By Little's Law at T_write ≈ 5 ms:
+
+L = λ_RS × T_write = 30,000 × 0.005 = 150 concurrent mutations
+
+A 320-thread RPC handler pool has 53% headroom. No handler count increase is needed beyond the existing default. (If fdatasync were coupled to the consensus round, T_write would be ~10 ms, L = 300, and the 320-thread pool would have only 6% headroom, requiring an increase to 400+.)
+
+### Key Findings
+
+1. RAFT adds zero latency to the write path with relaxed consensus log fdatasync (every 100 ms). The parallel barrier = max(WAL ~5 ms, RAFT ~2 ms) = ~5 ms. RAFT is fully hidden behind the HDFS WAL sync in both GP3-on-GP3 and cross-AZ HDFS deployments. The cost is up to 100 ms of consensus log entries needing peer replay on crash recovery.
+
+2. Heartbeat coalescing is mandatory. At `heartbeat.interval.ms` = 250 with 1,500 groups, uncoalesced heartbeats would consume 240% of the tick budget (3,000 syscalls per 250 ms). Coalescing reduces this to ~334 sends/tick (7 ms), exploiting the per-peer filtering in the full RS mesh.
+
+3. The three-level batching hierarchy is the single highest-impact optimization. Level 1 (Phoenix mini-batch grouping) provides 20–333× per-mutation amortization. Level 3 (transport coalescing) reduces network syscalls from O(proposals) to O(peers). Level 2 (mailbox drain) provides headroom for extreme bursts.
+
+4. GP3 consensus log throughput is the binding I/O constraint at 16% utilization (compressed, including both leader and follower writes). Provisioning 250 MB/s (~$15/month extra) provides ample headroom for growth.
+
+5. Mandatory Snappy compression reduces cross-AZ RAFT transfer from ~49 MB/s to ~20 MB/s per RS (2.5× reduction). At the cluster level, the RAFT layer adds ~10 GB/s of compressed cross-AZ transfer on top of the ~15 GB/s HDFS WAL baseline, a 0.7× increment. Compression also reduces consensus log disk I/O from 41.8 MB/s to 20.1 MB/s (2.1× reduction), keeping the GP3 binding constraint within budget.
+
+6. The ConsensusServer connectivity mesh is essentially fully connected: with 1,500 groups per RS and ~167 RSes per remote AZ, the probability of at least one shared group between any RS pair is 99.99%. Each RS maintains ~334 TCP connections carrying ~9 groups each, forming a uniform mesh that naturally load-balances both data-path and heartbeat traffic.
+
+7. Phoenix write amplification (3× from global indexes) is accommodated without approaching any resource ceiling, even at the extreme of 10 indexes per table (W_amp=11), though GP3 headroom narrows to 59% and 250 MB/s provisioning is recommended.
+
+8. The RPC handler pool is comfortable at the modeled load because RAFT's zero-latency contribution keeps the parallel barrier at ~5 ms. Little's Law: L = 30,000 × 0.005 = 150 in-flight mutations against a 320-thread pool (53% headroom). No increase to `hbase.regionserver.handler.count` is needed.
 
 ---
 
@@ -1205,7 +1456,7 @@ flowchart LR
 
 ### Current ZooKeeper Roles (What Must Be Replaced)
 
-**HBase roles:**
+#### HBase Roles
 
 | Role | ZK Mechanism | Data |
 |---|---|---|
@@ -1218,7 +1469,7 @@ flowchart LR
 | Replication peer config | Persistent znodes under `/hbase/replication/peers` | Peer config protobuf |
 | Replication WAL queues | Persistent znodes under `/hbase/replication/rs` | WAL positions |
 
-**Phoenix roles:**
+#### Phoenix Roles
 
 | Role | ZK Mechanism | Data |
 |---|---|---|
@@ -1278,7 +1529,7 @@ HBase and Phoenix together become a self-contained distributed system with no ex
 
 ### Scope
 
-A TLA+ specification models the protocols described in the design document that are susceptible to subtle concurrency bugs: leader election and lease management, the parallel WAL+RAFT write barrier, flush coordination across RAFT members, MVCC sequencing on followers, the promotion protocol and shared-storage catch-up path, RAFT log garbage collection, old primary rejoin and recovery via log replay or shared-storage catch-up, catch-up completeness with concurrent flush, and the hibernate/wake lifecycle. The model does not attempt to re-verify the RAFT consensus algorithm itself. The `hbase-consensus` implementation is built on MicroRaft's consensus core, which faithfully implements the RAFT protocol, and we take several of its properties as axiomatic, grounded in MicroRaft's implementation and verified by its test suite.
+A TLA+ specification models the protocols described in the design document that are susceptible to subtle concurrency bugs: leader election and lease management, the parallel WAL+RAFT write barrier, flush coordination across RAFT members, MVCC sequencing on followers, the promotion protocol and shared-storage catch-up path, RAFT log garbage collection, old primary rejoin and recovery via log replay or shared-storage catch-up, and catch-up completeness with concurrent flush. The model does not attempt to re-verify the RAFT consensus algorithm itself. The `hbase-consensus` implementation is built on MicroRaft's consensus core, which faithfully implements the RAFT protocol, and we take several of its properties as axiomatic, grounded in MicroRaft's implementation and verified by its test suite.
 
 ### Key Properties to Verify
 
@@ -1292,7 +1543,7 @@ A TLA+ specification models the protocols described in the design document that 
 | 4 | `WriteBarrierSafety` | A write is made visible to readers (memstore.add + mvcc.completeAndWait) only after both WAL sync and RAFT commit have completed | Verified |
 | 5 | `FollowerSeqIdConsistency` | After applying a committed entry, the follower's memstore contains the same cells with the same sequence IDs as the leader's memstore at the corresponding log index | Verified |
 | 6 | `NoOrphanMemstoreDrop` | If the leader crashes between HFile commit and RAFT flush-marker commit, no member drops its memstore (the marker was never committed). Formalized as: `flushPhase[m] = "RAFTCommitted" => flushSeqId[m] ∈ markerEntries`. | Verified |
-| 7 | `PromotionReadWriteGuard` | A promoted replica does not acknowledge client writes until the master has confirmed the promotion and the replica holds a WAL reference. Formalized as: `writePhase[m] ≠ "Idle" ⇒ promotionPhase[m] = "Complete"`. After Iteration 20, "Complete" requires master confirmation (via `MasterConfirmPromotion` with term-fencing guard) in addition to log catch-up. | Verified |
+| 7 | `PromotionReadWriteGuard` | A promoted replica does not acknowledge client writes until the master has confirmed the promotion and the replica holds a WAL reference. Formalized as: `writePhase[m] ≠ "Idle" ⇒ promotionPhase[m] = "Complete"`. "Complete" requires master confirmation (via `MasterConfirmPromotion` with term-fencing guard) in addition to log catch-up. | Verified |
 | 8 | `PromotionMVCCContinuity` | For an active leader (valid lease) that has completed promotion, no committed entry is unapplied except the leader's own in-flight write. Formalized as: `promotionPhase[m] = "Complete" ∧ IsLeader(m) ⇒ ApplicableEntries(m) ⊆ {writeSeqId[m] if writing}`. | Verified |
 | 9 | `VoteDurabilityRequired` | Vote durability is an implementation requirement: `hbase-consensus` always uses a durable `RaftStore` that persists `votedFor` and `currentTerm` before responding to vote requests. The spec models this unconditionally: `CrashRestart` preserves `currentTerm` and `votedFor` (UNCHANGED). | Verified |
 | 10 | `NoSCPWALSplit` | RAFT-enabled regions bypass WAL splitting during SCP; recovery uses RAFT log replay, not recovered edits | Pending |
@@ -1315,9 +1566,7 @@ A TLA+ specification models the protocols described in the design document that 
 | 3 | `FlushCompletion` | BaseFairness + FlushSF | A flush in any non-Idle phase eventually returns to Idle — either the phase chain completes or a crash resets the flush state. Requires SF on FlushRAFTPropose, FlushRAFTCommit, and HealAllPartitions. | Verified (simulation) |
 | 4 | `PromotionCompletion` | BaseFairness | A member in the Promoting phase eventually leaves it (via `MasterConfirmPromotion` to AwaitingMaster), and a member in the AwaitingMaster phase eventually leaves it (via `PromotionComplete` to Complete, or step-down / crash). Both intermediate states are transient under WF on `MasterConfirmPromotion` and `PromotionComplete`. | Verified (simulation) |
 | 5 | `CatchUpCompletion` | BaseFairness | A follower with unapplied committed entries eventually catches up or leaves the Follower role. WF-only (no network dependency). | Verified (simulation) |
-| 6 | `HibernateConvergence` | BaseFairness | A member in the Waking hibernate state eventually transitions out — either WakeComplete fires, or lease expiry triggers a new election cycle, or a crash resets to Active. WF-only. | Verified (simulation) |
-| 7 | `OrphanHFileCleanup` | — | Orphan HFiles from an incomplete flush are eventually cleaned up if the new primary is alive and HDFS is accessible | Pending |
-| 8 | `WakeElectionProgress` | — | If the leader dies mid-wake, the partially-awake followers eventually start their election timers and elect a new leader | Pending |
+| 6 | `OrphanHFileCleanup` | — | Orphan HFiles from an incomplete flush are eventually cleaned up if the new primary is alive and HDFS is accessible | Pending |
 
 ### Iterative Development Plan
 
@@ -1338,7 +1587,6 @@ A TLA+ specification models the protocols described in the design document that 
 ~~**Iteration 13. New member bootstrap.**~~
 ~~**Iteration 14. Promotion + in-flight writes.**~~
 ~~**Iteration 15. Catch-up + concurrent flush.**~~
-~~**Iteration 16. Hibernate/wake lifecycle and wake race.**~~
 ~~**Iteration 17. Multi-group interactions.**~~
 ~~**Iteration 18. Fairness and liveness properties.**~~
 ~~**Iteration 19 — Region split/merge with RAFT groups.**~~
@@ -1346,7 +1594,7 @@ A TLA+ specification models the protocols described in the design document that 
 
 **Iteration 21 — Datapath module refactor.** Refactor `MCRaftRegionReplica_datapath.tla` to use `GroupDataPathNext` from the base spec instead of defining its own `FollowerBatchApply` and `CompleteWriteAndAck` actions, which are functionally identical to the base spec's `AtomicFollowerBatchApply` and `AtomicCompleteWriteAndAck`. Express `DataPathNext` as `GroupDataPathNext` plus shared-impact actions (ClockTick, CrashRestart, CreatePartition, HealPartition, RaftLogGC), eliminating the duplicate definitions and reducing maintenance surface.
 
-**Iteration 22 — Combined simulation-mode liveness checking.** Define `LiveSpecAll` (combined fairness with all SF terms: ElectionSF + WriteSF + FlushSF) in `RaftRegionReplica.tla` and create `MCRaftRegionReplica_liveness_all.cfg` listing all 6 liveness properties. This is only useful for TLC `-simulate` mode (exhaustive checking would hit DNF blowup with the combined SF terms). Enables a single simulation run to check all liveness properties simultaneously rather than requiring 6 separate runs.
+**Iteration 22 — Combined simulation-mode liveness checking.** Define `LiveSpecAll` (combined fairness with all SF terms: ElectionSF + WriteSF + FlushSF) in `RaftRegionReplica.tla` and create `MCRaftRegionReplica_liveness_all.cfg` listing all 5 liveness properties. This is only useful for TLC `-simulate` mode (exhaustive checking would hit DNF blowup with the combined SF terms). Enables a single simulation run to check all liveness properties simultaneously rather than requiring 5 separate runs.
 
 ### Specification
 
@@ -1439,7 +1687,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
   -config MCRaftRegionReplica_liveness_election.cfg \
   -simulate -depth 150 -workers auto
 
-for prop in write flush promotion catchup hibernate; do
+for prop in write flush promotion catchup; do
   echo "=== Liveness: $prop ==="
   java -XX:+UseParallelGC -cp tla2tools.jar \
     -Dtlc2.TLC.stopAfter=1800 \
@@ -1453,7 +1701,7 @@ done
 
 | File | Purpose |
 |------|---------|
-| `RaftRegionReplica.tla` | Base specification (~2,500 lines): election, leases, write path, flush, follower apply, promotion (with master confirmation via `MasterConfirmPromotion`), crash recovery, catch-up, hibernate, safety invariants, liveness properties. Exports `GatedMemberActions(m)` / `GatedMemberDataPathActions(m)` building-block operators for composition modules. |
+| `RaftRegionReplica.tla` | Base specification (~2,400 lines): election, leases, write path, flush, follower apply, promotion (with master confirmation via `MasterConfirmPromotion`), crash recovery, catch-up, safety invariants, liveness properties. Exports `GatedMemberActions(m)` / `GatedMemberDataPathActions(m)` building-block operators for composition modules. |
 | `MultiGroupRaftRegionReplica.tla` | Two-group composition: shared clock, network, unified log GC, META promotion ordering (G2's `MasterConfirmPromotion` gated on `MetaReady`), cross-group safety |
 | `SplitRaftRegionReplica.tla` | Region split lifecycle: parent group gating, daughter activation, `NoKeyRangeOverlap` |
 | `MergeRaftRegionReplica.tla` | Region merge lifecycle: two-parent gating, merged group activation, `NoKeyRangeOverlapMerge` |
@@ -1469,7 +1717,7 @@ done
 
 #### State Model
 
-The specification tracks 24 state variables per RAFT group member. The variables are partitioned into consensus core (roles, terms, votes, logs), timing (clocks, leases, election timers), network (partition set), committed state (entries, markers), durable HDFS state (HFiles), per-member data state (memstore, batch apply), and pipeline state (write, flush, promotion, hibernate).
+The specification tracks 23 state variables per RAFT group member. The variables are partitioned into consensus core (roles, terms, votes, logs), timing (clocks, leases, election timers), network (partition set), committed state (entries, markers), durable HDFS state (HFiles), per-member data state (memstore, batch apply), and pipeline state (write, flush, promotion).
 
 ```tla
 VARIABLES
@@ -1505,9 +1753,7 @@ VARIABLES
     flushSeqId,         \* flushSeqId[m]: seqId consumed by m's current flush (0 = none)
     \* ---- Promotion pipeline ----
     promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
-    masterConfirmedTerm,\* masterConfirmedTerm: highest RAFT term confirmed by master (Nat)
-    \* ---- Hibernate lifecycle ----
-    hibernateState      \* hibernateState[m]: hibernate lifecycle (Active | Hibernated | Waking)
+    masterConfirmedTerm \* masterConfirmedTerm: highest RAFT term confirmed by master (Nat)
 ```
 
 The type invariant defines the legal domain for each variable and serves as the model's shape:
@@ -1539,7 +1785,6 @@ TypeOK ==
     /\ flushSeqId \in [Members -> 0..MaxSeqId]
     /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
     /\ masterConfirmedTerm \in 0..MaxTerm
-    /\ hibernateState \in [Members -> {"Active", "Hibernated", "Waking"}]
 ```
 
 #### Key Helpers
@@ -1657,7 +1902,6 @@ The write path models the parallel WAL sync + RAFT propose pipeline from `HRegio
 BeginWrite(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
-    /\ hibernateState[m] = "Active"
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
@@ -1739,7 +1983,6 @@ The flush protocol models the 14-step primary flush sequence from the design doc
 FlushStart(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
-    /\ hibernateState[m] = "Active"
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
@@ -1839,7 +2082,6 @@ CrashRestartGuard(m) ==
     \/ writePhase[m] # "Idle"
     \/ flushPhase[m] # "Idle"
     \/ promotionPhase[m] # "None"
-    \/ hibernateState[m] # "Active"
 
 CrashRestartEffect(m) ==
     /\ role'            = [role            EXCEPT ![m] = "Follower"]
@@ -1855,7 +2097,6 @@ CrashRestartEffect(m) ==
     /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-    /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
 
 CrashRestart(m) ==
     /\ CrashRestartGuard(m)
@@ -1899,7 +2140,7 @@ NewMemberBootstrap(m) ==
            \/ memstore[m] # {} \/ raftLog[m] # {}
            \/ votesGranted[m] # {} \/ leaseRemaining[m] > 0
            \/ writePhase[m] # "Idle" \/ flushPhase[m] # "Idle"
-           \/ promotionPhase[m] # "None" \/ hibernateState[m] # "Active"
+           \/ promotionPhase[m] # "None"
         /\ LET uncoveredCommitted == {s \in committedEntries :
                    ~\E f \in flushMarkerEntries : f >= s}
            IN
@@ -1920,7 +2161,6 @@ NewMemberBootstrap(m) ==
             /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
             /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
             /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-            /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
         \* ... UNCHANGED omitted ...
 ```
 
@@ -1983,65 +2223,6 @@ PromotionMVCCContinuity ==
            IN ApplicableEntries(m) \subseteq inFlight
 ```
 
-#### Hibernate Lifecycle
-
-The hibernate lifecycle models three states: Active, Hibernated, and Waking. `HibernateRequest` requires all followers to be reachable and acknowledge, preventing spurious elections from non-acking followers. `WakeGroup` transitions the leader and reachable followers from Hibernated to Waking, resetting followers' election timers so they can elect a new leader if the current one crashes mid-wake. `WakeComplete` requires a majority of non-Hibernated members before transitioning to Active and refreshing the lease.
-
-```tla
-HibernateRequest(m) ==
-    /\ IsLeader(m)
-    /\ promotionPhase[m] = "Complete"
-    /\ hibernateState[m] = "Active"
-    /\ writePhase[m] = "Idle"
-    /\ flushPhase[m] = "Idle"
-    /\ LET followers == Members \ {m}
-       IN
-        /\ \A f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[m] >= currentTerm[f]
-        /\ ~\E f \in followers :
-              currentTerm[f] > currentTerm[m]
-    /\ hibernateState' = [m2 \in Members |-> "Hibernated"]
-    \* ... UNCHANGED omitted ...
-
-WakeGroup(m) ==
-    /\ IsLeader(m)
-    /\ hibernateState[m] = "Hibernated"
-    /\ LET followers == Members \ {m}
-           reachable == {f \in followers : CanCommunicate(m, f)}
-       IN
-        /\ hibernateState' = [m2 \in Members |->
-              IF m2 = m THEN "Waking"
-              ELSE IF m2 \in reachable /\ hibernateState[m2] = "Hibernated"
-              THEN "Waking"
-              ELSE hibernateState[m2]]
-        /\ timerRemaining' = [m2 \in Members |->
-              IF m2 \in reachable /\ hibernateState[m2] = "Hibernated"
-              THEN ElectionTimeoutMin
-              ELSE timerRemaining[m2]]
-    \* ... UNCHANGED omitted ...
-
-WakeComplete(m) ==
-    /\ IsLeader(m)
-    /\ hibernateState[m] = "Waking"
-    /\ LET followers == Members \ {m}
-           reachable == {f \in followers : CanCommunicate(m, f)}
-           awakeReachable == {f \in reachable : hibernateState[f] # "Hibernated"}
-       IN
-        /\ Cardinality(awakeReachable) + 1 >= Majority
-        /\ hibernateState' = [m2 \in Members |->
-              IF m2 = m THEN "Active"
-              ELSE IF m2 \in reachable /\ hibernateState[m2] = "Waking"
-              THEN "Active"
-              ELSE hibernateState[m2]]
-        /\ timerRemaining' = [m2 \in Members |->
-              IF m2 \in reachable /\ hibernateState[m2] = "Waking"
-              THEN ElectionTimeoutMin
-              ELSE timerRemaining[m2]]
-        /\ leaseRemaining' = [leaseRemaining EXCEPT ![m] = LeaderLeaseDuration]
-    \* ... UNCHANGED omitted ...
-```
-
 #### Multi-Group Composition
 
 `MultiGroupRaftRegionReplica.tla` models two independent RAFT groups (G1, G2) sharing the same `ConsensusServer` resources on a set of RegionServers: shared physical clock, shared network (partitions affect both groups), unified multiplexed consensus log, and shared thread pool (modeled implicitly by TLA+'s nondeterministic interleaving). Five shared-impact actions are replaced with multi-group versions. Group 1 is designated as the META group and Group 2 as a non-META group. Group 1's per-group actions are dispatched unmodified via `G1!GroupNext`. Group 2's `MasterConfirmPromotion` is gated on a derived operator `MetaReady` (true when any G1 member has `promotionPhase = "Complete"`), modeling the META availability ordering constraint from the META Region Self-Promotion Bootstrap section above. This ordering is structural — enforced by the gate mechanism — and does not require an additional state-based invariant.
@@ -2073,8 +2254,7 @@ G1 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
     promotionPhase  <- promotionPhase_1,
-    masterConfirmedTerm <- masterConfirmedTerm_1,
-    hibernateState  <- hibernateState_1
+    masterConfirmedTerm <- masterConfirmedTerm_1
 \* G2 == INSTANCE RaftRegionReplica WITH ... (symmetric, using _2 variables)
 ```
 
@@ -2306,7 +2486,7 @@ FlushSF ==
     /\ \A m \in Members     : SF_vars(FlushRAFTCommit(m))
 ```
 
-The six liveness properties:
+The five liveness properties:
 
 ```tla
 ElectionProgress ==
@@ -2331,8 +2511,4 @@ CatchUpCompletion ==
         (role[m] = "Follower" /\ ApplicableEntries(m) # {})
             ~> (role[m] # "Follower"
                 \/ (ApplicableEntries(m) = {} /\ fApplyBatch[m] = {}))
-
-HibernateConvergence ==
-    \A m \in Members :
-        hibernateState[m] = "Waking" ~> hibernateState[m] # "Waking"
 ```

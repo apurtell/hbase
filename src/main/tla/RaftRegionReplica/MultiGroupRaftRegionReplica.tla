@@ -54,7 +54,7 @@ CONSTANTS
 \* ---- Shared state ----
 VARIABLES clock, partition
 
-\* ---- Group 1 per-group state (23 variables) ----
+\* ---- Group 1 per-group state (22 variables) ----
 VARIABLES
     role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
     leaseRemaining_1, timerRemaining_1,
@@ -63,10 +63,9 @@ VARIABLES
     memstore_1, fApplyBatch_1,
     writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
     flushPhase_1, flushSeqId_1,
-    promotionPhase_1, masterConfirmedTerm_1,
-    hibernateState_1
+    promotionPhase_1, masterConfirmedTerm_1
 
-\* ---- Group 2 per-group state (23 variables) ----
+\* ---- Group 2 per-group state (22 variables) ----
 VARIABLES
     role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
     leaseRemaining_2, timerRemaining_2,
@@ -75,8 +74,7 @@ VARIABLES
     memstore_2, fApplyBatch_2,
     writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
     flushPhase_2, flushSeqId_2,
-    promotionPhase_2, masterConfirmedTerm_2,
-    hibernateState_2
+    promotionPhase_2, masterConfirmedTerm_2
 
 \* ---- Variable tuples ----
 
@@ -87,8 +85,7 @@ g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
              memstore_1, fApplyBatch_1,
              writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
              flushPhase_1, flushSeqId_1,
-             promotionPhase_1, masterConfirmedTerm_1,
-             hibernateState_1>>
+             promotionPhase_1, masterConfirmedTerm_1>>
 
 g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              leaseRemaining_2, timerRemaining_2,
@@ -97,8 +94,7 @@ g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              memstore_2, fApplyBatch_2,
              writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
              flushPhase_2, flushSeqId_2,
-             promotionPhase_2, masterConfirmedTerm_2,
-             hibernateState_2>>
+             promotionPhase_2, masterConfirmedTerm_2>>
 
 vars == <<clock, partition, g1_vars, g2_vars>>
 
@@ -129,8 +125,7 @@ G1 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
     promotionPhase  <- promotionPhase_1,
-    masterConfirmedTerm <- masterConfirmedTerm_1,
-    hibernateState  <- hibernateState_1
+    masterConfirmedTerm <- masterConfirmedTerm_1
 
 G2 == INSTANCE RaftRegionReplica WITH
     role            <- role_2,
@@ -156,8 +151,7 @@ G2 == INSTANCE RaftRegionReplica WITH
     flushPhase      <- flushPhase_2,
     flushSeqId      <- flushSeqId_2,
     promotionPhase  <- promotionPhase_2,
-    masterConfirmedTerm <- masterConfirmedTerm_2,
-    hibernateState  <- hibernateState_2
+    masterConfirmedTerm <- masterConfirmedTerm_2
 
 Majority == (Cardinality(Members) \div 2) + 1
 
@@ -191,14 +185,14 @@ MultiGroupClockTick(m) ==
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, promotionPhase_1,
-                   masterConfirmedTerm_1, hibernateState_1,
+                   masterConfirmedTerm_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, promotionPhase_2,
-                   masterConfirmedTerm_2, hibernateState_2>>
+                   masterConfirmedTerm_2>>
 
 \* Server crash resets volatile state for BOTH groups on the crashed
 \* member.  Durable state (currentTerm, votedFor, raftLog) survives.
@@ -252,7 +246,7 @@ UnifiedLogGC(m) ==
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, promotionPhase_1,
-                   masterConfirmedTerm_1, hibernateState_1,
+                   masterConfirmedTerm_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2,
                    leaseRemaining_2, timerRemaining_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
@@ -260,7 +254,7 @@ UnifiedLogGC(m) ==
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, promotionPhase_2,
-                   masterConfirmedTerm_2, hibernateState_2>>
+                   masterConfirmedTerm_2>>
 
 ----
 (* ---- META availability ordering ---- *)
@@ -304,9 +298,6 @@ G2GatedMemberActions(m) ==
     \/ G2!FollowerCompleteBatchApply(m)
     \/ G2MasterConfirmPromotion(m)
     \/ G2!PromotionComplete(m)
-    \/ G2!HibernateRequest(m)
-    \/ G2!WakeGroup(m)
-    \/ G2!WakeComplete(m)
     \/ G2!NewMemberBootstrap(m)
 
 \* G2's GroupNext with MasterConfirmPromotion replaced by the
@@ -338,9 +329,6 @@ G2GatedMemberDataPathActions(m) ==
     \/ G2!AtomicFollowerBatchApply(m)
     \/ G2MasterConfirmPromotion(m)
     \/ G2!PromotionComplete(m)
-    \/ G2!HibernateRequest(m)
-    \/ G2!WakeGroup(m)
-    \/ G2!WakeComplete(m)
     \/ G2!NewMemberBootstrap(m)
 
 \* G2's GroupDataPathNext with MasterConfirmPromotion replaced by
