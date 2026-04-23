@@ -864,7 +864,7 @@ LeaderLeaseExpiry(m) ==
 \* clock position.  Timeout fires at timerRemaining = 0 (no tick
 \* needed), and BecomeLeader/Heartbeat set countdowns atomically,
 \* so no interesting behavior is lost.
-ClockTick(m) ==
+ClockTickGuard(m) ==
     /\ clock[m] < MaxClock
     /\ \A other \in Members :
         clock[m] + 1 - clock[other] <= MaxClockDrift
@@ -873,9 +873,15 @@ ClockTick(m) ==
           /\ Cardinality(votesGranted[c]) >= Majority
     /\ \E m2 \in Members :
           timerRemaining[m2] > 0 \/ leaseRemaining[m2] > 0
+
+ClockTickEffect(m) ==
     /\ clock' = [clock EXCEPT ![m] = @ + 1]
     /\ timerRemaining' = [timerRemaining EXCEPT ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
     /\ leaseRemaining' = [leaseRemaining EXCEPT ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+
+ClockTick(m) ==
+    /\ ClockTickGuard(m)
+    /\ ClockTickEffect(m)
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    partition, nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
@@ -899,17 +905,19 @@ ClockTick(m) ==
 \* MicroRaft does NOT increment term on restart.  votedFor is preserved
 \* by the durable RaftStore (e.g., RaftSqliteStore with SYNCHRONOUS =
 \* EXTRA).
-CrashRestart(m) ==
-    /\ \/ role[m] # "Follower"
-       \/ memstore[m] # {}
-       \/ fApplyBatch[m] # {}
-       \/ votesGranted[m] # {}
-       \/ leaseRemaining[m] > 0
-       \/ timerRemaining[m] # ElectionTimeoutMin
-       \/ writePhase[m] # "Idle"
-       \/ flushPhase[m] # "Idle"
-       \/ promotionPhase[m] # "None"
-       \/ hibernateState[m] # "Active"
+CrashRestartGuard(m) ==
+    \/ role[m] # "Follower"
+    \/ memstore[m] # {}
+    \/ fApplyBatch[m] # {}
+    \/ votesGranted[m] # {}
+    \/ leaseRemaining[m] > 0
+    \/ timerRemaining[m] # ElectionTimeoutMin
+    \/ writePhase[m] # "Idle"
+    \/ flushPhase[m] # "Idle"
+    \/ promotionPhase[m] # "None"
+    \/ hibernateState[m] # "Active"
+
+CrashRestartEffect(m) ==
     /\ role'            = [role            EXCEPT ![m] = "Follower"]
     /\ votesGranted'    = [votesGranted    EXCEPT ![m] = {}]
     /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
@@ -924,6 +932,10 @@ CrashRestart(m) ==
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
     /\ hibernateState'  = [hibernateState  EXCEPT ![m] = "Active"]
+
+CrashRestart(m) ==
+    /\ CrashRestartGuard(m)
+    /\ CrashRestartEffect(m)
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles>>
@@ -1812,81 +1824,10 @@ WakeComplete(m) ==
                    writeVars, flushVars, promotionPhase>>
 
 ----
-(* ---- Next-state relation and specification ---- *)
+(* ---- Merged actions for data-path domain decomposition ---- *)
 
-\* Base per-group actions common to all composition variants.  Excludes
-\* "state-loss" actions (InstallSnapshot, NewMemberBootstrap) that clear
-\* or replace a member's memstore.  Composition modules that track
-\* per-member lifecycle state (e.g., split/merge group activation) must
-\* intercept state-loss actions to reset lifecycle variables, since the
-\* memstore clearing implies the member has lost all group state.
-\* GroupCoreNextBase provides the safe subset; state-loss actions are
-\* added back by GroupCoreNext (for single-group use) or by custom
-\* wrappers in composition modules.
-GroupCoreNextBase ==
-    \* Election
-    \/ \E m \in Members     : Timeout(m)
-    \/ \E c, v \in Members  : RequestVote(c, v)
-    \/ \E m \in Members     : BecomeLeader(m)
-    \* Leadership
-    \/ \E m \in Members     : Heartbeat(m)
-    \/ \E m \in Members     : StepDown(m)
-    \/ \E m \in Members     : LeaderLeaseExpiry(m)
-    \* Write path (common subset)
-    \/ \E m \in Members     : BeginWrite(m)
-    \/ \E m \in Members     : WALSyncComplete(m)
-    \/ \E m \in Members     : RAFTCommitWrite(m)
-    \* Flush protocol
-    \/ \E m \in Members     : FlushStart(m)
-    \/ \E m \in Members     : FlushCommitHFiles(m)
-    \/ \E m \in Members     : FlushRAFTPropose(m)
-    \/ \E m \in Members     : FlushRAFTCommit(m)
-    \/ \E m \in Members     : FlushComplete(m)
-    \* Follower apply (common subset)
-    \/ \E m \in Members     : FollowerApplyMarker(m)
-    \* Promotion
-    \/ \E m \in Members     : PromotionComplete(m)
-    \* Orphan commitment
-    \/ NewLeaderCommitOrphanEntry
-    \* Hibernate lifecycle
-    \/ \E m \in Members     : HibernateRequest(m)
-    \/ \E m \in Members     : WakeGroup(m)
-    \/ \E m \in Members     : WakeComplete(m)
-
-\* Full per-group core actions including state-loss actions.
-\* Used by single-group Next and by composition modules that do not
-\* need to intercept state-loss events.
-GroupCoreNext ==
-    \/ GroupCoreNextBase
-    \* State-loss actions (clear/replace member memstore)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
-    \/ \E m \in Members     : NewMemberBootstrap(m)
-
-\* Per-group subset of Next for multi-group composition.  Excludes the
-\* five "shared-impact" actions whose effects span all groups on a
-\* server: ClockTick (shared physical clock), CrashRestart (server
-\* crash kills all groups), CreatePartition / HealPartition (network
-\* link affects all groups), and RaftLogGC (unified log segment
-\* deletion affects all groups).  The multi-group module
-\* (MultiGroupRaftRegionReplica) provides custom versions of these
-\* five actions that correctly apply to all co-located groups, and
-\* uses G1!GroupNext / G2!GroupNext for per-group steps.
-GroupNext ==
-    \/ GroupCoreNext
-    \* Write path (unmerged actions not in GroupCoreNext)
-    \/ \E m \in Members     : WALSyncFail(m)
-    \/ \E m \in Members     : CompleteWrite(m)
-    \/ \E m \in Members     : AckWrite(m)
-    \/ \E m \in Members     : WALFailureAbort(m)
-    \* Markers
-    \/ \E m \in Members     : ProposeMarker(m)
-    \* Follower apply (unmerged actions not in GroupCoreNext)
-    \/ \E m \in Members     : FollowerBeginBatchApply(m)
-    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
-
-\* Merged actions for data-path domain decomposition.  These are used
-\* by GroupDataPathNext (below) and the multi-group MC configuration.
-\* The rationale for each merge is documented in
+\* These are used by GroupDataPathNext (below) and data-path MC
+\* configurations.  The rationale for each merge is documented in
 \* MCRaftRegionReplica_datapath.tla.
 
 \* Atomic follower batch apply: computes the mutation batch and applies
@@ -1932,42 +1873,127 @@ AtomicCompleteWriteAndAck(m) ==
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    flushPhase, flushSeqId, promotionPhase, hibernateState>>
 
-\* Per-group data-path next-state relation for multi-group composition.
-\* Like GroupNext but with the same action merges and removals as
-\* MCRaftRegionReplica_datapath.tla:
-\*   - FollowerBeginBatchApply + FollowerCompleteBatchApply merged
-\*   - CompleteWrite + AckWrite merged
-\*   - ProposeMarker, WALSyncFail, WALFailureAbort removed
-GroupDataPathNext ==
-    \/ GroupCoreNext
-    \* Write path (merged)
-    \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
-    \* Follower apply (merged)
-    \/ \E m \in Members     : AtomicFollowerBatchApply(m)
+----
+(* ---- Next-state relation and specification ---- *)
 
-\* Base variants excluding state-loss actions for lifecycle-aware
-\* composition.  Split/merge modules use these and add custom wrappers
-\* for InstallSnapshot and NewMemberBootstrap that reset per-member
-\* lifecycle state (e.g., daughterGroupsActive, mergedGroupActive).
-GroupNextBase ==
-    \/ GroupCoreNextBase
-    \* Write path (unmerged actions not in GroupCoreNextBase)
-    \/ \E m \in Members     : WALSyncFail(m)
-    \/ \E m \in Members     : CompleteWrite(m)
-    \/ \E m \in Members     : AckWrite(m)
-    \/ \E m \in Members     : WALFailureAbort(m)
+\* Per-group actions are partitioned into "gateable" (single-member
+\* normal-operation actions that lifecycle composition modules gate with
+\* a state-level predicate) and "always-enabled" (FollowerApplyMarker,
+\* NewLeaderCommitOrphanEntry, and the two multi-member actions
+\* RequestVote and InstallSnapshot which are gated on the initiator by
+\* composition modules).
+\*
+\* GatedMemberActions(m) collects all single-member-parameter normal-op
+\* actions into a single disjunction.  Composition modules call it with
+\* a per-member gate, e.g.:
+\*   \E m \in Members : ParentGroupActive(m) /\ Parent!GatedMemberActions(m)
+\* This replaces the original per-action enumeration, eliminating ~200
+\* lines of mechanical dispatch per composition module.
+\*
+\* GatedMemberDataPathActions(m) is the data-path variant with merged
+\* write/follower actions and ProposeMarker/WALSyncFail/WALFailureAbort
+\* removed.
+\*
+\* GroupNext / GroupDataPathNext use these building blocks with no
+\* gating (all actions always enabled).  Standalone and multi-group
+\* modules use these directly.  Split/merge modules construct their own
+\* gated Next relations using the building blocks.
+\*
+\* Shared-impact actions (ClockTick, CrashRestart, CreatePartition,
+\* HealPartition, HealAllPartitions, RaftLogGC) are excluded from
+\* GroupNext / GroupDataPathNext.  Multi-group and lifecycle composition
+\* modules provide custom versions of these actions that correctly
+\* apply to all co-located groups.
+
+\* All single-member-parameter normal-operation actions.
+\* Composition modules gate this on the member for lifecycle control.
+GatedMemberActions(m) ==
+    \* Election
+    \/ Timeout(m)
+    \/ BecomeLeader(m)
+    \* Leadership
+    \/ Heartbeat(m)
+    \/ StepDown(m)
+    \/ LeaderLeaseExpiry(m)
+    \* Write path
+    \/ BeginWrite(m)
+    \/ WALSyncComplete(m)
+    \/ RAFTCommitWrite(m)
+    \/ WALSyncFail(m)
+    \/ CompleteWrite(m)
+    \/ AckWrite(m)
+    \/ WALFailureAbort(m)
+    \* Flush protocol
+    \/ FlushStart(m)
+    \/ FlushCommitHFiles(m)
+    \/ FlushRAFTPropose(m)
+    \/ FlushRAFTCommit(m)
+    \/ FlushComplete(m)
     \* Markers
-    \/ \E m \in Members     : ProposeMarker(m)
-    \* Follower apply (unmerged actions not in GroupCoreNextBase)
-    \/ \E m \in Members     : FollowerBeginBatchApply(m)
-    \/ \E m \in Members     : FollowerCompleteBatchApply(m)
+    \/ ProposeMarker(m)
+    \* Follower batch apply
+    \/ FollowerBeginBatchApply(m)
+    \/ FollowerCompleteBatchApply(m)
+    \* Promotion
+    \/ PromotionComplete(m)
+    \* Hibernate lifecycle
+    \/ HibernateRequest(m)
+    \/ WakeGroup(m)
+    \/ WakeComplete(m)
+    \* State-loss actions (gated on m = initiator/leader)
+    \/ NewMemberBootstrap(m)
 
-GroupDataPathNextBase ==
-    \/ GroupCoreNextBase
+\* Data-path variant: merged write/follower actions,
+\* ProposeMarker/WALSyncFail/WALFailureAbort removed.
+GatedMemberDataPathActions(m) ==
+    \* Election
+    \/ Timeout(m)
+    \/ BecomeLeader(m)
+    \* Leadership
+    \/ Heartbeat(m)
+    \/ StepDown(m)
+    \/ LeaderLeaseExpiry(m)
     \* Write path (merged)
-    \/ \E m \in Members     : AtomicCompleteWriteAndAck(m)
+    \/ BeginWrite(m)
+    \/ WALSyncComplete(m)
+    \/ RAFTCommitWrite(m)
+    \/ AtomicCompleteWriteAndAck(m)
+    \* Flush protocol
+    \/ FlushStart(m)
+    \/ FlushCommitHFiles(m)
+    \/ FlushRAFTPropose(m)
+    \/ FlushRAFTCommit(m)
+    \/ FlushComplete(m)
     \* Follower apply (merged)
-    \/ \E m \in Members     : AtomicFollowerBatchApply(m)
+    \/ AtomicFollowerBatchApply(m)
+    \* Promotion
+    \/ PromotionComplete(m)
+    \* Hibernate lifecycle
+    \/ HibernateRequest(m)
+    \/ WakeGroup(m)
+    \/ WakeComplete(m)
+    \* State-loss actions (gated on m = initiator/leader)
+    \/ NewMemberBootstrap(m)
+
+\* Per-group subset of Next for multi-group composition.  Excludes the
+\* shared-impact actions whose effects span all groups on a server.
+\* No lifecycle gating — all actions always enabled.
+GroupNext ==
+    \/ \E m \in Members     : GatedMemberActions(m)
+    \/ \E c, v \in Members  : RequestVote(c, v)
+    \/ \E l, f \in Members  : InstallSnapshot(l, f)
+    \/ \E m \in Members     : FollowerApplyMarker(m)
+    \/ NewLeaderCommitOrphanEntry
+
+\* Per-group data-path next-state relation for multi-group composition.
+\* Like GroupNext but with action merges and removals per
+\* MCRaftRegionReplica_datapath.tla.
+GroupDataPathNext ==
+    \/ \E m \in Members     : GatedMemberDataPathActions(m)
+    \/ \E c, v \in Members  : RequestVote(c, v)
+    \/ \E l, f \in Members  : InstallSnapshot(l, f)
+    \/ \E m \in Members     : FollowerApplyMarker(m)
+    \/ NewLeaderCommitOrphanEntry
 
 \* Full next-state relation: per-group actions plus shared-impact actions.
 Next ==

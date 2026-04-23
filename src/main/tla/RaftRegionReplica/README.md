@@ -28,6 +28,8 @@ In TLA+, a single step of the system is an action, a predicate over the current 
 
 `RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the flush protocol (HFile commit, RAFT-proposed flush markers), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, network partitions (including individual link healing and full network recovery), and the hibernate/wake lifecycle with wake-race safety.
 
+The base spec exports parameterized building-block operators (`GatedMemberActions(m)`, `GatedMemberDataPathActions(m)`) that collect all single-member normal-operation actions into a single disjunction. Composition modules (`SplitRaftRegionReplica`, `MergeRaftRegionReplica`, `MultiGroupRaftRegionReplica`) invoke these with per-member gating predicates to control when a RAFT group's operations are active on each member, enabling lifecycle transitions (split, merge) to deactivate a group per-member without duplicating action dispatch logic. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
+
 The specification defines 14 safety invariants and 6 liveness properties verified by TLC:
 
 | # | Invariant | Category |
@@ -86,7 +88,7 @@ This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeout
 
 ### Multi-Group (`MCRaftRegionReplica_multigroup`)
 
-Verifies that two RAFT groups sharing the same ConsensusServer (clock, network, unified log) do not violate each other's safety invariants.  Uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared-impact actions (ClockTick, CrashRestart, Create/HealPartition) and a `UnifiedLogGC` action modeling cross-group log segment deletion.  All 14 invariants are checked per-group; `CatchUpDataIntegrity` is the key cross-group invariant verifying that unified log GC does not delete entries needed for catch-up.
+Verifies that two RAFT groups sharing the same ConsensusServer (clock, network, unified log) do not violate each other's safety invariants.  Uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared-impact actions (ClockTick, CrashRestart, Create/HealPartition) using factored guard + effect operators and a `UnifiedLogGC` action modeling cross-group log segment deletion.  Per-group actions are dispatched via the base spec's `GroupNext`/`GroupDataPathNext` without gating (both groups are unconditionally active).  All 14 invariants are checked per-group; `CatchUpDataIntegrity` is the key cross-group invariant verifying that unified log GC does not delete entries needed for catch-up.
 
 The two-group cross-product produces a large state space.  Exhaustive BFS requires a large machine.  Simulation mode provides high-confidence coverage locally.
 
@@ -153,11 +155,31 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
   tlc2.TLC MCRaftRegionReplica_multigroup -workers auto
 ```
 
-### Step 6: Interpret Results
+### Step 6: Split Lifecycle Simulation (30 min, local)
 
-All checks (simulation, both single-group exhaustive domains, multi-group simulation, multi-group exhaustive, and liveness simulation) must complete with no violations for the design to be considered validated.  Cross-reference the invariant coverage matrix to confirm every safety invariant received non-trivial verification in at least one exhaustive domain, and confirm all 6 liveness properties pass at least 3 simulation passes each.
+Verify that the region split protocol preserves `NoKeyRangeOverlap` and all 14 parent-group safety invariants.  Uses `SplitRaftRegionReplica.tla`, which gates parent-group actions per-member after the split marker is applied.
 
-### Step 7: Liveness Simulation
+```bash
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  -Dtlc2.TLC.stopAfter=1800 \
+  tlc2.TLC MCRaftRegionReplica_split -simulate -depth 150 -workers auto
+```
+
+### Step 7: Merge Lifecycle Simulation (30 min, local)
+
+Verify that the region merge protocol preserves `NoKeyRangeOverlapMerge` and all 14 per-group safety invariants for both parent groups.  Uses `MergeRaftRegionReplica.tla`, which gates each parent group independently.
+
+```bash
+java -XX:+UseParallelGC -cp tla2tools.jar \
+  -Dtlc2.TLC.stopAfter=1800 \
+  tlc2.TLC MCRaftRegionReplica_merge -simulate -depth 150 -workers auto
+```
+
+### Step 8: Interpret Results
+
+All checks (simulation, both single-group exhaustive domains, multi-group simulation, multi-group exhaustive, split simulation, merge simulation, and liveness simulation) must complete with no violations for the design to be considered validated.  Cross-reference the invariant coverage matrix to confirm every safety invariant received non-trivial verification in at least one exhaustive domain, and confirm all 6 liveness properties pass at least 3 simulation passes each.
+
+### Step 9: Liveness Simulation
 
 Run each of the 6 liveness properties in simulation mode.  Each property uses a dedicated `.cfg` file. The election property uses a dedicated MC module (`MCRaftRegionReplica_liveness_election`) with tuned constants (MaxTerm=4, ElectionTimeoutMin=2, MaxClock=12) to provide sufficient clock/term headroom.
 
@@ -178,7 +200,7 @@ for prop in election write flush promotion catchup hibernate; do
 done
 ```
 
-### Step 8: Daily Deep Simulation
+### Step 10: Daily Deep Simulation
 
 Run overnight for ongoing regression coverage.
 

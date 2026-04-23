@@ -14,8 +14,10 @@
  *     by TLA+'s nondeterministic interleaving — any enabled action
  *     from either group may fire at each step.
  *
- * Per-group actions are dispatched via G1!GroupNext / G2!GroupNext
- * (the per-group subset of Next defined in RaftRegionReplica.tla).
+ * Per-group actions are dispatched via G1!GroupNext / G2!GroupNext.
+ * LifecycleGate is set to TRUE (no gating) since multi-group
+ * composition has no lifecycle markers.
+ *
  * Five "shared-impact" actions are replaced with multi-group
  * versions: ClockTick, CrashRestart, CreatePartition, HealPartition,
  * and RaftLogGC (replaced by UnifiedLogGC).
@@ -159,22 +161,14 @@ Init == G1!Init /\ G2!Init
 \* Clock tick decrements both groups' timers on the ticking member.
 \* Guards check both groups' candidate and timer state.
 MultiGroupClockTick(m) ==
-    /\ clock[m] < MaxClock
-    /\ \A other \in Members :
-        clock[m] + 1 - clock[other] <= MaxClockDrift
+    /\ G1!ClockTickGuard(m)
     /\ ~\E c \in Members :
-          \/ (role_1[c] = "Candidate"
-              /\ Cardinality(votesGranted_1[c]) >= Majority)
-          \/ (role_2[c] = "Candidate"
-              /\ Cardinality(votesGranted_2[c]) >= Majority)
+          role_2[c] = "Candidate"
+              /\ Cardinality(votesGranted_2[c]) >= Majority
     /\ \E m2 \in Members :
           \/ timerRemaining_1[m2] > 0 \/ leaseRemaining_1[m2] > 0
           \/ timerRemaining_2[m2] > 0 \/ leaseRemaining_2[m2] > 0
-    /\ clock' = [clock EXCEPT ![m] = @ + 1]
-    /\ timerRemaining_1' = [timerRemaining_1 EXCEPT
-                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
-    /\ leaseRemaining_1' = [leaseRemaining_1 EXCEPT
-                            ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
+    /\ G1!ClockTickEffect(m)
     /\ timerRemaining_2' = [timerRemaining_2 EXCEPT
                             ![m] = IF @ > 0 THEN @ - 1 ELSE 0]
     /\ leaseRemaining_2' = [leaseRemaining_2 EXCEPT
@@ -197,57 +191,9 @@ MultiGroupClockTick(m) ==
 \* member.  Durable state (currentTerm, votedFor, raftLog) survives.
 \* Guard: at least one group has volatile state worth resetting.
 MultiGroupCrashRestart(m) ==
-    /\ \/ role_1[m] # "Follower"
-       \/ memstore_1[m] # {}
-       \/ fApplyBatch_1[m] # {}
-       \/ votesGranted_1[m] # {}
-       \/ leaseRemaining_1[m] > 0
-       \/ timerRemaining_1[m] # ElectionTimeoutMin
-       \/ writePhase_1[m] # "Idle"
-       \/ flushPhase_1[m] # "Idle"
-       \/ promotionPhase_1[m] # "None"
-       \/ hibernateState_1[m] # "Active"
-       \/ role_2[m] # "Follower"
-       \/ memstore_2[m] # {}
-       \/ fApplyBatch_2[m] # {}
-       \/ votesGranted_2[m] # {}
-       \/ leaseRemaining_2[m] > 0
-       \/ timerRemaining_2[m] # ElectionTimeoutMin
-       \/ writePhase_2[m] # "Idle"
-       \/ flushPhase_2[m] # "Idle"
-       \/ promotionPhase_2[m] # "None"
-       \/ hibernateState_2[m] # "Active"
-    \* Reset group 1 volatile state
-    /\ role_1'           = [role_1           EXCEPT ![m] = "Follower"]
-    /\ votesGranted_1'   = [votesGranted_1   EXCEPT ![m] = {}]
-    /\ leaseRemaining_1' = [leaseRemaining_1 EXCEPT ![m] = 0]
-    /\ timerRemaining_1' = [timerRemaining_1 EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore_1'       = [memstore_1       EXCEPT ![m] = {}]
-    /\ fApplyBatch_1'    = [fApplyBatch_1    EXCEPT ![m] = {}]
-    /\ writePhase_1'     = [writePhase_1     EXCEPT ![m] = "Idle"]
-    /\ walSync_1'        = [walSync_1        EXCEPT ![m] = "Pending"]
-    /\ raftCommitted_1'  = [raftCommitted_1  EXCEPT ![m] = FALSE]
-    /\ writeSeqId_1'     = [writeSeqId_1     EXCEPT ![m] = 0]
-    /\ flushPhase_1'     = [flushPhase_1     EXCEPT ![m] = "Idle"]
-    /\ flushSeqId_1'     = [flushSeqId_1     EXCEPT ![m] = 0]
-    /\ promotionPhase_1' = [promotionPhase_1 EXCEPT ![m] = "None"]
-    /\ hibernateState_1' = [hibernateState_1 EXCEPT ![m] = "Active"]
-    \* Reset group 2 volatile state
-    /\ role_2'           = [role_2           EXCEPT ![m] = "Follower"]
-    /\ votesGranted_2'   = [votesGranted_2   EXCEPT ![m] = {}]
-    /\ leaseRemaining_2' = [leaseRemaining_2 EXCEPT ![m] = 0]
-    /\ timerRemaining_2' = [timerRemaining_2 EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore_2'       = [memstore_2       EXCEPT ![m] = {}]
-    /\ fApplyBatch_2'    = [fApplyBatch_2    EXCEPT ![m] = {}]
-    /\ writePhase_2'     = [writePhase_2     EXCEPT ![m] = "Idle"]
-    /\ walSync_2'        = [walSync_2        EXCEPT ![m] = "Pending"]
-    /\ raftCommitted_2'  = [raftCommitted_2  EXCEPT ![m] = FALSE]
-    /\ writeSeqId_2'     = [writeSeqId_2     EXCEPT ![m] = 0]
-    /\ flushPhase_2'     = [flushPhase_2     EXCEPT ![m] = "Idle"]
-    /\ flushSeqId_2'     = [flushSeqId_2     EXCEPT ![m] = 0]
-    /\ promotionPhase_2' = [promotionPhase_2 EXCEPT ![m] = "None"]
-    /\ hibernateState_2' = [hibernateState_2 EXCEPT ![m] = "Active"]
-    \* Preserve durable state for both groups
+    /\ G1!CrashRestartGuard(m) \/ G2!CrashRestartGuard(m)
+    /\ G1!CrashRestartEffect(m)
+    /\ G2!CrashRestartEffect(m)
     /\ UNCHANGED <<clock, partition,
                    currentTerm_1, votedFor_1, raftLog_1,
                    nextSeqId_1, committedEntries_1, markerEntries_1,
@@ -271,11 +217,9 @@ MultiGroupHealPartition ==
         /\ UNCHANGED <<clock, g1_vars, g2_vars>>
 
 \* Unified log GC: models physical segment deletion in the shared
-\* append-only consensus log.  A segment is eligible for deletion
-\* only when ALL groups referenced in it have flushed past their
-\* entries.  Both groups must have an applied flush marker on member
-\* m, and entries below each group's chosen flush watermark are
-\* removed from both groups' raftLogs simultaneously.
+\* append-only consensus log.  Both groups must have an applied flush
+\* marker on member m, and entries below each group's chosen flush
+\* watermark are removed from both groups' raftLogs simultaneously.
 UnifiedLogGC(m) ==
     /\ \E s1 \in flushMarkerEntries_1 \cap memstore_1[m] :
        \E s2 \in flushMarkerEntries_2 \cap memstore_2[m] :

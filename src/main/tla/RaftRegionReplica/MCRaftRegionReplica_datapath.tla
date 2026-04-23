@@ -124,102 +124,18 @@ Symmetry == Permutations(MC_Members)
 PartitionConstraint == Cardinality(partition) <= 2
 
 ----
-(* ---- Merged actions ---- *)
-
-\* Atomic follower batch apply: computes the mutation batch and applies
-\* it to memstore in a single step.  Merges FollowerBeginBatchApply +
-\* FollowerCompleteBatchApply.  The fApplyBatch variable is never modified
-\* (remains {}).
-FollowerBatchApply(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
-    /\ fApplyBatch[m] = {}
-    /\ LET applicable == ApplicableEntries(m)
-       IN /\ applicable # {}
-          /\ LET nextEntry == SetMin(applicable)
-             IN /\ nextEntry \notin markerEntries
-                /\ LET applicableMarkers == applicable \cap markerEntries
-                       boundary == IF applicableMarkers # {}
-                                   THEN SetMin(applicableMarkers)
-                                   ELSE MaxSeqId + 1
-                       batch == {s \in applicable \ markerEntries : s < boundary}
-                   IN memstore' = [memstore EXCEPT ![m] = @ \union batch]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writePhase, walSync, raftCommitted, writeSeqId,
-                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
-
-\* Atomic write completion and acknowledgement: applies the write to
-\* memstore and resets the write pipeline in a single step.  Merges
-\* CompleteWrite + AckWrite, skipping the transient "Applied" phase.
-CompleteWriteAndAck(m) ==
-    /\ writePhase[m] = "Pending"
-    /\ walSync[m] = "Done"
-    /\ raftCommitted[m]
-    /\ role[m] = "Leader"
-    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
-    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
-    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
-    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
-    /\ memstore'      = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   flushPhase, flushSeqId, promotionPhase, hibernateState>>
-
-----
 (* ---- Data-path next-state relation ---- *)
 
+\* Uses GroupDataPathNext from the base spec (merged follower batch
+\* apply, merged write completion, ProposeMarker/WALSyncFail/
+\* WALFailureAbort removed) plus shared-impact actions.
 DataPathNext ==
-    \* ---- Election (unchanged from base spec) ----
-    \/ \E m \in Members     : Timeout(m)
-    \/ \E c, v \in Members  : RequestVote(c, v)
-    \/ \E m \in Members     : BecomeLeader(m)
-    \* ---- Leadership (unchanged) ----
-    \/ \E m \in Members     : Heartbeat(m)
-    \/ \E m \in Members     : StepDown(m)
-    \/ \E m \in Members     : LeaderLeaseExpiry(m)
-    \* ---- Timing (unchanged) ----
-    \/ \E m \in Members     : ClockTick(m)
-    \* ---- Crash recovery (unchanged) ----
-    \/ \E m \in Members     : CrashRestart(m)
-    \* ---- Network (unchanged) ----
+    \/ GroupDataPathNext
+    \/ \E m \in Members : ClockTick(m)
+    \/ \E m \in Members : CrashRestart(m)
     \/ CreatePartition
     \/ HealPartition
-    \* ---- Write path (WALSyncFail/WALFailureAbort removed,
-    \*       CompleteWrite+AckWrite merged into CompleteWriteAndAck) ----
-    \/ \E m \in Members     : BeginWrite(m)
-    \/ \E m \in Members     : WALSyncComplete(m)
-    \/ \E m \in Members     : RAFTCommitWrite(m)
-    \/ \E m \in Members     : CompleteWriteAndAck(m)
-    \* ---- Markers (ProposeMarker removed — compaction markers are a
-    \*       trivial subset of flush markers; election domain retains it) ----
-    \* ---- Flush protocol (unchanged) ----
-    \/ \E m \in Members     : FlushStart(m)
-    \/ \E m \in Members     : FlushCommitHFiles(m)
-    \/ \E m \in Members     : FlushRAFTPropose(m)
-    \/ \E m \in Members     : FlushRAFTCommit(m)
-    \/ \E m \in Members     : FlushComplete(m)
-    \* ---- Follower apply (FollowerBeginBatchApply+FollowerCompleteBatchApply
-    \*       merged into atomic FollowerBatchApply) ----
-    \/ \E m \in Members     : FollowerBatchApply(m)
-    \/ \E m \in Members     : FollowerApplyMarker(m)
-    \* ---- Promotion (unchanged) ----
-    \/ \E m \in Members     : PromotionComplete(m)
-    \* ---- Orphan commitment (unchanged) ----
-    \/ NewLeaderCommitOrphanEntry
-    \* ---- RAFT log GC and catch-up (unchanged) ----
-    \/ \E m \in Members     : RaftLogGC(m)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
-    \* ---- New member bootstrap (unchanged) ----
-    \/ \E m \in Members     : NewMemberBootstrap(m)
-    \* ---- Hibernate lifecycle (unchanged) ----
-    \/ \E m \in Members     : HibernateRequest(m)
-    \/ \E m \in Members     : WakeGroup(m)
-    \/ \E m \in Members     : WakeComplete(m)
+    \/ \E m \in Members : RaftLogGC(m)
 
 DataPathSpec == Init /\ [][DataPathNext]_vars
 
