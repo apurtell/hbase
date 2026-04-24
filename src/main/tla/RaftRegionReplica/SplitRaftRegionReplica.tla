@@ -117,16 +117,10 @@ ProposeSplitMarker(m) ==
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
+    /\ Parent!QuorumReachable(m)
     /\ LET seqId == nextSeqId
-           followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ Parent!CanCommunicate(m, f)}
+           responders == Parent!Responders(m)
        IN
-        /\ ~\E f \in followers :
-              /\ Parent!CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
         /\ nextSeqId' = nextSeqId + 1
         /\ committedEntries' = committedEntries \union {seqId}
         /\ markerEntries' = markerEntries \union {seqId}

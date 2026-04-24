@@ -46,19 +46,12 @@
  * MCRaftRegionReplica_sim, which runs TLC in -simulate mode with no
  * symmetry reduction.
  *)
-EXTENDS RaftRegionReplica, TLC
+EXTENDS RaftRegionReplica, MCRaftRegionReplica_base
 
-CONSTANTS m1, m2, m3, NoVote
-
-MC_Members == {m1, m2, m3}
-MC_None == NoVote
 MC_MaxTerm == 2
-MC_LeaderLeaseDuration == 1
 MC_ElectionTimeoutMin == 4
 MC_MaxClockDrift == 1
 MC_MaxClock == 4
 MC_MaxSeqId == 3
-
-Symmetry == Permutations(MC_Members)
 
 ====

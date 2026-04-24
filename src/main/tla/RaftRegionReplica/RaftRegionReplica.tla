@@ -404,6 +404,13 @@ writeVars == <<writePhase, walSync, raftCommitted, writeSeqId>>
 
 flushVars == <<flushPhase, flushSeqId, snapshotMaxSeqId>>
 
+timerVars == <<clock, leaseRemaining, timerRemaining>>
+
+promotionVars == <<promotionPhase, masterConfirmedTerm>>
+
+globalCommitVars == <<nextSeqId, committedEntries, markerEntries,
+                      flushMarkerEntries, hdfsHFiles>>
+
 ----
 (* ---- Type invariant ---- *)
 
@@ -484,6 +491,56 @@ ApplicableEntries(m) ==
     IN {s \in committedEntries \ memstore[m] :
             \A f \in appliedFlushMarkers : s > flushDropBound[f]}
 
+Responders(m) ==
+    {f \in Members \ {m} :
+        /\ currentTerm[m] >= currentTerm[f]
+        /\ CanCommunicate(m, f)}
+
+NoHigherTermReachable(m) ==
+    ~\E f \in Members \ {m} :
+        /\ CanCommunicate(m, f)
+        /\ currentTerm[f] > currentTerm[m]
+
+QuorumReachable(m) ==
+    /\ NoHigherTermReachable(m)
+    /\ Cardinality(Responders(m)) + 1 >= Majority
+
+PhaseAwareMemstoreDrop(m) ==
+    IF flushPhase[m] = "RAFTCommitted"
+    THEN {s \in memstore[m] : s > snapshotMaxSeqId[m]}
+    ELSE memstore[m]
+
+FollowerOrPromoting(m) ==
+    \/ role[m] = "Follower"
+    \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
+
+MutationBatch(m) ==
+    LET applicable == ApplicableEntries(m)
+        applicableMarkers == applicable \cap markerEntries
+        boundary == IF applicableMarkers # {}
+                    THEN SetMin(applicableMarkers)
+                    ELSE MaxSeqId + 1
+    IN {s \in applicable \ markerEntries : s < boundary}
+
+MutationBatchReady(m) ==
+    /\ FollowerOrPromoting(m)
+    /\ fApplyBatch[m] = {}
+    /\ LET applicable == ApplicableEntries(m)
+       IN /\ applicable # {}
+          /\ SetMin(applicable) \notin markerEntries
+
+WriteBarrierPassed(m) ==
+    /\ writePhase[m] = "Pending"
+    /\ walSync[m] = "Done"
+    /\ raftCommitted[m]
+    /\ role[m] = "Leader"
+
+WritePipelineReset(m) ==
+    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
+    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
+    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
+    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
+
 ----
 (* ---- Initial state ---- *)
 
@@ -549,10 +606,9 @@ Timeout(m) ==
     /\ leaseRemaining' = [leaseRemaining EXCEPT ![m] = 0]
     /\ fApplyBatch'    = [fApplyBatch    EXCEPT ![m] = {}]
     /\ UNCHANGED <<raftLog, clock, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore,
+                   globalCommitVars, memstore,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* A candidate requests and receives a vote from another member (atomic).
 \* Requires that candidate and voter can communicate (not partitioned).
@@ -614,8 +670,7 @@ RequestVote(candidate, voter) ==
                                                     ![voter] =
                                   IF steppingDown THEN {} ELSE @]
           /\ memstore'      = [memstore      EXCEPT ![voter] =
-                                  IF steppingDown /\ flushPhase[voter] = "RAFTCommitted"
-                                  THEN {s \in @ : s > snapshotMaxSeqId[voter]}
+                                  IF steppingDown THEN PhaseAwareMemstoreDrop(voter)
                                   ELSE @]
           /\ flushPhase'    = [flushPhase    EXCEPT ![voter] =
                                   IF steppingDown THEN "Idle" ELSE @]
@@ -626,8 +681,7 @@ RequestVote(candidate, voter) ==
           /\ promotionPhase' = [promotionPhase EXCEPT ![voter] =
                                   IF steppingDown THEN "None" ELSE @]
     /\ UNCHANGED <<raftLog, clock, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
 
 \* A candidate with a majority of votes becomes leader AND immediately
@@ -654,15 +708,9 @@ RequestVote(candidate, voter) ==
 BecomeLeader(m) ==
     /\ role[m] = "Candidate"
     /\ Cardinality(votesGranted[m]) >= Majority
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
+    /\ QuorumReachable(m)
+    /\ LET responders == Responders(m)
        IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
         /\ role' = [r \in Members |->
               IF r = m THEN "Leader"
               ELSE IF r \in responders THEN "Follower"
@@ -693,8 +741,7 @@ BecomeLeader(m) ==
         /\ writeSeqId' = [r \in Members |->
               IF r \in responders THEN 0 ELSE writeSeqId[r]]
         /\ memstore' = [r \in Members |->
-              IF r \in responders /\ flushPhase[r] = "RAFTCommitted"
-              THEN {s \in memstore[r] : s > snapshotMaxSeqId[r]}
+              IF r \in responders THEN PhaseAwareMemstoreDrop(r)
               ELSE memstore[r]]
         /\ flushPhase' = [r \in Members |->
               IF r \in responders THEN "Idle" ELSE flushPhase[r]]
@@ -707,8 +754,7 @@ BecomeLeader(m) ==
               ELSE IF r \in responders THEN "None"
               ELSE promotionPhase[r]]
         /\ UNCHANGED <<raftLog, clock, partition,
-                       nextSeqId, committedEntries, markerEntries,
-                       flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                       globalCommitVars, fApplyBatch,
                        flushDropBound, masterConfirmedTerm>>
 
 \* ---- RAFT leadership actions ----
@@ -736,15 +782,9 @@ BecomeLeader(m) ==
 \* AppendEntriesSuccessResponseHandler counts a quorum of acks.
 Heartbeat(leader) ==
     /\ role[leader] = "Leader"
-    /\ LET followers  == Members \ {leader}
-           responders == {f \in followers :
-                            /\ currentTerm[leader] >= currentTerm[f]
-                            /\ CanCommunicate(leader, f)}
+    /\ QuorumReachable(leader)
+    /\ LET responders == Responders(leader)
        IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(leader, f)
-              /\ currentTerm[f] > currentTerm[leader]
-        /\ Cardinality(responders) + 1 >= Majority
         /\ currentTerm'   = [m \in Members |->
                 IF m \in responders THEN currentTerm[leader] ELSE currentTerm[m]]
         /\ role'          = [m \in Members |->
@@ -763,8 +803,7 @@ Heartbeat(leader) ==
                 ELSE IF m \in responders THEN 0
                 ELSE leaseRemaining[m]]
         /\ memstore'      = [m \in Members |->
-                IF m \in responders /\ flushPhase[m] = "RAFTCommitted"
-                THEN {s \in memstore[m] : s > snapshotMaxSeqId[m]}
+                IF m \in responders THEN PhaseAwareMemstoreDrop(m)
                 ELSE memstore[m]]
         /\ writePhase'    = [m \in Members |->
                 IF m \in responders THEN "Idle" ELSE writePhase[m]]
@@ -783,8 +822,7 @@ Heartbeat(leader) ==
         /\ promotionPhase' = [m \in Members |->
                 IF m \in responders THEN "None" ELSE promotionPhase[m]]
         /\ UNCHANGED <<raftLog, clock, partition,
-                       nextSeqId, committedEntries, markerEntries,
-                       flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                       globalCommitVars, fApplyBatch,
                        flushDropBound, masterConfirmedTerm>>
 
 \* A member discovers a higher term and steps down to Follower.
@@ -810,10 +848,7 @@ StepDown(m) ==
     /\ votesGranted'  = [votesGranted  EXCEPT ![m] = {}]
     /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
     /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'        = [memstore        EXCEPT ![m] =
-                              IF flushPhase[m] = "RAFTCommitted"
-                              THEN {s \in @ : s > snapshotMaxSeqId[m]}
-                              ELSE @]
+    /\ memstore'        = [memstore        EXCEPT ![m] = PhaseAwareMemstoreDrop(m)]
     /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
     /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
     /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
@@ -823,8 +858,7 @@ StepDown(m) ==
     /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
     /\ UNCHANGED <<raftLog, clock, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
 
 \* A leader whose lease has expired (it could not heartbeat a quorum
@@ -854,10 +888,7 @@ LeaderLeaseExpiry(m) ==
     /\ role'             = [role            EXCEPT ![m] = "Follower"]
     /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
     /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'         = [memstore        EXCEPT ![m] =
-                              IF flushPhase[m] = "RAFTCommitted"
-                              THEN {s \in @ : s > snapshotMaxSeqId[m]}
-                              ELSE @]
+    /\ memstore'         = [memstore        EXCEPT ![m] = PhaseAwareMemstoreDrop(m)]
     /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
     /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
     /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
@@ -869,8 +900,7 @@ LeaderLeaseExpiry(m) ==
     /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock,
                    leaseRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles,
+                   globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
 
 \* ---- Timing actions ----
@@ -914,10 +944,9 @@ ClockTick(m) ==
     /\ ClockTickGuard(m)
     /\ ClockTickEffect(m)
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   partition, nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   partition, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* ---- Crash recovery actions ----
 
@@ -968,8 +997,7 @@ CrashRestart(m) ==
     /\ CrashRestartGuard(m)
     /\ CrashRestartEffect(m)
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles,
+                   globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
 
 \* ---- Network partition actions ----
@@ -982,11 +1010,9 @@ CreatePartition ==
         /\ <<m1, m2>> \notin partition
         /\ partition' = partition \union {<<m1, m2>>, <<m2, m1>>}
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                       clock, leaseRemaining, timerRemaining,
-                       nextSeqId, committedEntries, markerEntries,
-                       flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                       timerVars, globalCommitVars, memstore, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
-                       promotionPhase, masterConfirmedTerm>>
+                       promotionVars>>
 
 \* Nondeterministically heal a partition between two members.
 \* Models individual network link recovery.
@@ -995,11 +1021,9 @@ HealPartition ==
         /\ <<m1, m2>> \in partition
         /\ partition' = partition \ {<<m1, m2>>, <<m2, m1>>}
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                       clock, leaseRemaining, timerRemaining,
-                       nextSeqId, committedEntries, markerEntries,
-                       flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                       timerVars, globalCommitVars, memstore, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
-                       promotionPhase, masterConfirmedTerm>>
+                       promotionVars>>
 
 \* Heal ALL partitions at once — full network recovery.
 \* This action is deterministic (no internal nondeterminism) so
@@ -1012,11 +1036,9 @@ HealAllPartitions ==
     /\ partition # {}
     /\ partition' = {}
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* ---- Leader write path actions ----
 
@@ -1048,10 +1070,10 @@ BeginWrite(m) ==
     /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = nextSeqId]
     /\ nextSeqId' = nextSeqId + 1
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
+                   timerVars, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, flushVars,
-                   flushDropBound, promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionVars>>
 
 \* WAL sync to HDFS completes successfully.  Models wal.sync(txid)
 \* returning without error (HRegion.doMiniBatchMutate step 4a).
@@ -1061,11 +1083,10 @@ WALSyncComplete(m) ==
     /\ walSync[m] = "Pending"
     /\ walSync' = [walSync EXCEPT ![m] = "Done"]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   flushDropBound, promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionVars>>
 
 \* WAL sync to HDFS fails (HDFS pipeline broken, DataNode failure,
 \* network timeout).  Nondeterministic.  Models wal.sync(txid) throwing
@@ -1076,11 +1097,10 @@ WALSyncFail(m) ==
     /\ walSync[m] = "Pending"
     /\ walSync' = [walSync EXCEPT ![m] = "Failed"]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   flushDropBound, promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionVars>>
 
 \* RAFT propose succeeds: the entry is committed by majority ack.
 \* Models consensus.propose(stampedWALEdit, seqId) completing
@@ -1099,27 +1119,20 @@ RAFTCommitWrite(m) ==
     /\ writePhase[m] = "Pending"
     /\ ~raftCommitted[m]
     /\ role[m] = "Leader"
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
-       IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
-        /\ raftLog' = [r \in Members |->
+    /\ QuorumReachable(m)
+    /\ LET responders == Responders(m)
+       IN raftLog' = [r \in Members |->
               IF r = m \/ r \in responders
               THEN raftLog[r] \union {writeSeqId[m]}
               ELSE raftLog[r]]
     /\ raftCommitted' = [raftCommitted EXCEPT ![m] = TRUE]
     /\ committedEntries' = committedEntries \union {writeSeqId[m]}
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
-                   clock, leaseRemaining, timerRemaining, partition,
+                   timerVars, partition,
                    nextSeqId, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch,
                    writePhase, walSync, writeSeqId, flushVars,
-                   flushDropBound, promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionVars>>
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
@@ -1134,34 +1147,26 @@ RAFTCommitWrite(m) ==
 \* becomes visible without both local durability (WAL) and replicated
 \* durability (RAFT).
 CompleteWrite(m) ==
-    /\ writePhase[m] = "Pending"
-    /\ walSync[m] = "Done"
-    /\ raftCommitted[m]
-    /\ role[m] = "Leader"
+    /\ WriteBarrierPassed(m)
     /\ writePhase' = [writePhase EXCEPT ![m] = "Applied"]
     /\ memstore' = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   fApplyBatch,
                    walSync, raftCommitted, writeSeqId, flushVars,
-                   flushDropBound, promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionVars>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
 \* doMiniBatchMutate (step 9) and resets the write pipeline for the
 \* next write.
 AckWrite(m) ==
     /\ writePhase[m] = "Applied"
-    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
-    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
-    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
-    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
+    /\ WritePipelineReset(m)
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Leader aborts the RegionServer process because WAL sync failed.
 \* This is the mandated response when the WAL is broken: the RS cannot
@@ -1178,23 +1183,9 @@ AckWrite(m) ==
 WALFailureAbort(m) ==
     /\ writePhase[m] = "Pending"
     /\ walSync[m] = "Failed"
-    /\ role'             = [role            EXCEPT ![m] = "Follower"]
-    /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
-    /\ leaseRemaining'   = [leaseRemaining  EXCEPT ![m] = 0]
-    /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'         = [memstore        EXCEPT ![m] = {}]
-    /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
-    /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
-    /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
-    /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
-    /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
-    /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
-    /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
-    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
-    /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ CrashRestartEffect(m)
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles,
+                   globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
 
 \* ---- Marker actions ----
@@ -1213,16 +1204,10 @@ ProposeMarker(m) ==
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
+    /\ QuorumReachable(m)
     /\ LET seqId == nextSeqId
-           followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
+           responders == Responders(m)
        IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
         /\ nextSeqId' = nextSeqId + 1
         /\ committedEntries' = committedEntries \union {seqId}
         /\ markerEntries' = markerEntries \union {seqId}
@@ -1232,10 +1217,10 @@ ProposeMarker(m) ==
               THEN raftLog[r] \union {seqId}
               ELSE raftLog[r]]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
-                   clock, leaseRemaining, timerRemaining, partition,
+                   timerVars, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* ---- Flush protocol actions ----
 \*
@@ -1294,10 +1279,10 @@ FlushStart(m) ==
           /\ flushDropBound' = [flushDropBound EXCEPT ![nextSeqId] = snapBound]
     /\ nextSeqId'  = nextSeqId + 1
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
+                   timerVars, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, writeVars,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* HFiles are moved from the tmp directory to the store directory
 \* (sfc.commit()).  After this step, the HFiles are durable on HDFS
@@ -1311,11 +1296,11 @@ FlushCommitHFiles(m) ==
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "HFilesCommitted"]
     /\ hdfsHFiles' = hdfsHFiles \union {flushSeqId[m]}
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
+                   timerVars, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, memstore, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Leader proposes the FLUSH_COMPLETE marker through RAFT.  The marker
 \* is proposed but not yet committed; FlushRAFTCommit handles the
@@ -1327,26 +1312,18 @@ FlushCommitHFiles(m) ==
 FlushRAFTPropose(m) ==
     /\ role[m] = "Leader"
     /\ flushPhase[m] = "HFilesCommitted"
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
-       IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
-        /\ raftLog' = [r \in Members |->
+    /\ QuorumReachable(m)
+    /\ LET responders == Responders(m)
+       IN raftLog' = [r \in Members |->
               IF r = m \/ r \in responders
               THEN raftLog[r] \union {flushSeqId[m]}
               ELSE raftLog[r]]
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "RAFTProposed"]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Majority acknowledges the FLUSH_COMPLETE marker.  The marker is now
 \* RAFT-committed: its seqId is added to committedEntries and
@@ -1358,25 +1335,17 @@ FlushRAFTPropose(m) ==
 FlushRAFTCommit(m) ==
     /\ role[m] = "Leader"
     /\ flushPhase[m] = "RAFTProposed"
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
-       IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
+    /\ QuorumReachable(m)
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "RAFTCommitted"]
     /\ committedEntries' = committedEntries \union {flushSeqId[m]}
     /\ markerEntries' = markerEntries \union {flushSeqId[m]}
     /\ flushMarkerEntries' = flushMarkerEntries \union {flushSeqId[m]}
     /\ memstore' = [memstore EXCEPT ![m] = @ \union {flushSeqId[m]}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
+                   timerVars, partition,
                    nextSeqId, hdfsHFiles, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Flush completion: drop memstore entries at or below snapshotMaxSeqId
 \* (the actual HFile coverage boundary), write COMMIT_FLUSH to WAL,
@@ -1396,11 +1365,10 @@ FlushComplete(m) ==
     /\ flushSeqId' = [flushSeqId EXCEPT ![m] = 0]
     /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   fApplyBatch,
                    writeVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* ---- Follower batch apply actions ----
 
@@ -1429,25 +1397,13 @@ FlushComplete(m) ==
 \* committed entry must be a mutation (not a marker), and there must be
 \* committed entries not yet in its memstore.
 FollowerBeginBatchApply(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
-    /\ fApplyBatch[m] = {}
-    /\ LET applicable == ApplicableEntries(m)
-       IN /\ applicable # {}
-          /\ LET nextEntry == SetMin(applicable)
-             IN /\ nextEntry \notin markerEntries
-                /\ LET applicableMarkers == applicable \cap markerEntries
-                       boundary == IF applicableMarkers # {}
-                                   THEN SetMin(applicableMarkers)
-                                   ELSE MaxSeqId + 1
-                       batch == {s \in applicable \ markerEntries : s < boundary}
-                   IN fApplyBatch' = [fApplyBatch EXCEPT ![m] = batch]
+    /\ MutationBatchReady(m)
+    /\ fApplyBatch' = [fApplyBatch EXCEPT ![m] = MutationBatch(m)]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore,
+                   timerVars, partition, globalCommitVars,
+                   memstore,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Follower completes applying a batch of committed mutation entries:
 \* stamp cells with the leader's sequence IDs, add all cells to the
@@ -1459,17 +1415,14 @@ FollowerBeginBatchApply(m) ==
 \* Guard: the member must be a Follower (or a Leader in Promoting phase)
 \* with a non-empty apply batch.
 FollowerCompleteBatchApply(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
+    /\ FollowerOrPromoting(m)
     /\ fApplyBatch[m] # {}
     /\ memstore' = [memstore EXCEPT ![m] = @ \union fApplyBatch[m]]
     /\ fApplyBatch' = [fApplyBatch EXCEPT ![m] = {}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles,
+                   timerVars, partition, globalCommitVars,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Follower applies a committed marker entry.  When the next unapplied
 \* committed entry is a marker (flush-complete, compaction-complete),
@@ -1498,8 +1451,7 @@ FollowerCompleteBatchApply(m) ==
 \* no batch in progress, and the next unapplied committed entry must be
 \* a marker.  For flush markers, the HFiles must be accessible on HDFS.
 FollowerApplyMarker(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
+    /\ FollowerOrPromoting(m)
     /\ fApplyBatch[m] = {}
     /\ LET applicable == ApplicableEntries(m)
        IN /\ applicable # {}
@@ -1511,11 +1463,10 @@ FollowerApplyMarker(m) ==
                             {s \in @ : s > flushDropBound[nextEntry]} \union {nextEntry}]
                    ELSE /\ memstore' = [memstore EXCEPT ![m] = @ \union {nextEntry}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* ---- Promotion protocol actions ----
 
@@ -1547,9 +1498,8 @@ MasterConfirmPromotion(m) ==
     /\ masterConfirmedTerm' = currentTerm[m]
     /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "AwaitingMaster"]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound>>
 
 \* A leader that has received master confirmation completes the
@@ -1575,9 +1525,8 @@ PromotionComplete(m) ==
     /\ ApplicableEntries(m) = {}
     /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "Complete"]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
                    masterConfirmedTerm>>
 
@@ -1630,10 +1579,10 @@ NewLeaderCommitOrphanEntry ==
                     /\ memstore' = [memstore EXCEPT ![leader] = @ \union {s}]
                     /\ UNCHANGED <<markerEntries, flushMarkerEntries>>
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                       clock, leaseRemaining, timerRemaining, partition,
+                       timerVars, partition,
                        nextSeqId, hdfsHFiles, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
-                       promotionPhase, masterConfirmedTerm>>
+                       promotionVars>>
 
 \* ---- RAFT log GC and catch-up actions ----
 
@@ -1652,16 +1601,23 @@ NewLeaderCommitOrphanEntry ==
 \* Effect: entries at or below flushDropBound[S] are removed from
 \* raftLog[m].  The flush marker seqId S and any in-flight writes
 \* between flushDropBound[S] and S are retained.
-RaftLogGC(m) ==
-    /\ \E s \in flushMarkerEntries \cap memstore[m] :
+RaftLogGCGuard(m) ==
+    \E s \in flushMarkerEntries \cap memstore[m] :
+        \E e \in raftLog[m] : e <= flushDropBound[s]
+
+RaftLogGCEffect(m) ==
+    \E s \in flushMarkerEntries \cap memstore[m] :
         /\ \E e \in raftLog[m] : e <= flushDropBound[s]
         /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e > flushDropBound[s]}]
+
+RaftLogGC(m) ==
+    /\ RaftLogGCGuard(m)
+    /\ RaftLogGCEffect(m)
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* Leader sends a catch-up reference (CatchUpReference) to a lagging
 \* follower whose needed RAFT log entries have been garbage-collected.
@@ -1700,8 +1656,7 @@ InstallSnapshot(leader, follower) ==
     /\ role[leader] = "Leader"
     /\ follower # leader
     /\ CanCommunicate(leader, follower)
-    /\ \/ role[follower] = "Follower"
-       \/ promotionPhase[follower] \in {"Promoting", "AwaitingMaster"}
+    /\ FollowerOrPromoting(follower)
     /\ fApplyBatch[follower] = {}
     /\ \E s \in flushMarkerEntries \cap hdfsHFiles :
         /\ \E needed \in (committedEntries \ memstore[follower]) :
@@ -1711,11 +1666,10 @@ InstallSnapshot(leader, follower) ==
         /\ raftLog' = [raftLog EXCEPT ![follower] =
               {e \in @ : e > flushDropBound[s]} \union {s}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
+                   timerVars, partition, globalCommitVars,
+                   fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   promotionVars>>
 
 \* A new member bootstraps into the RAFT group, replacing a member
 \* whose instance has been terminated (e.g., a new Kubernetes pod with
@@ -1825,8 +1779,7 @@ NewMemberBootstrap(m) ==
             /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
             /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
             /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
-        /\ UNCHANGED <<clock, partition, nextSeqId, committedEntries,
-                       markerEntries, flushMarkerEntries, hdfsHFiles,
+        /\ UNCHANGED <<clock, partition, globalCommitVars,
                        flushDropBound, masterConfirmedTerm>>
 
 ----
@@ -1840,46 +1793,26 @@ NewMemberBootstrap(m) ==
 \* it to memstore in a single step.  Merges FollowerBeginBatchApply +
 \* FollowerCompleteBatchApply.  fApplyBatch is never modified.
 AtomicFollowerBatchApply(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
-    /\ fApplyBatch[m] = {}
-    /\ LET applicable == ApplicableEntries(m)
-       IN /\ applicable # {}
-          /\ LET nextEntry == SetMin(applicable)
-             IN /\ nextEntry \notin markerEntries
-                /\ LET applicableMarkers == applicable \cap markerEntries
-                       boundary == IF applicableMarkers # {}
-                                   THEN SetMin(applicableMarkers)
-                                   ELSE MaxSeqId + 1
-                       batch == {s \in applicable \ markerEntries : s < boundary}
-                   IN memstore' = [memstore EXCEPT ![m] = @ \union batch]
+    /\ MutationBatchReady(m)
+    /\ memstore' = [memstore EXCEPT ![m] = @ \union MutationBatch(m)]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writePhase, walSync, raftCommitted, writeSeqId,
-                   flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   timerVars, partition, globalCommitVars,
+                   fApplyBatch,
+                   writeVars, flushVars, flushDropBound,
+                   promotionVars>>
 
 \* Atomic write completion and ack: applies the write to memstore and
 \* resets the write pipeline in a single step.  Merges CompleteWrite +
 \* AckWrite, skipping the transient "Applied" phase.
 AtomicCompleteWriteAndAck(m) ==
-    /\ writePhase[m] = "Pending"
-    /\ walSync[m] = "Done"
-    /\ raftCommitted[m]
-    /\ role[m] = "Leader"
-    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
-    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
-    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
-    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
+    /\ WriteBarrierPassed(m)
+    /\ WritePipelineReset(m)
     /\ memstore'      = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   clock, leaseRemaining, timerRemaining, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionPhase, masterConfirmedTerm>>
+                   timerVars, partition, globalCommitVars,
+                   fApplyBatch,
+                   flushVars, flushDropBound,
+                   promotionVars>>
 
 ----
 (* ---- Next-state relation and specification ---- *)
@@ -1913,89 +1846,86 @@ AtomicCompleteWriteAndAck(m) ==
 \* modules provide custom versions of these actions that correctly
 \* apply to all co-located groups.
 
-\* All single-member-parameter normal-operation actions.
-\* Composition modules gate this on the member for lifecycle control.
-GatedMemberActions(m) ==
-    \* Election
+\* ---- Action group building blocks ----
+
+ElectionAndLeadershipActions(m) ==
     \/ Timeout(m)
     \/ BecomeLeader(m)
-    \* Leadership
     \/ Heartbeat(m)
     \/ StepDown(m)
     \/ LeaderLeaseExpiry(m)
-    \* Write path
+
+WritePathCommonActions(m) ==
     \/ BeginWrite(m)
     \/ WALSyncComplete(m)
     \/ RAFTCommitWrite(m)
+
+FlushActions(m) ==
+    \/ FlushStart(m)
+    \/ FlushCommitHFiles(m)
+    \/ FlushRAFTPropose(m)
+    \/ FlushRAFTCommit(m)
+    \/ FlushComplete(m)
+
+PromotionAndBootstrapActions(m) ==
+    \/ MasterConfirmPromotion(m)
+    \/ PromotionComplete(m)
+    \/ NewMemberBootstrap(m)
+
+\* All single-member-parameter normal-operation actions excluding
+\* MasterConfirmPromotion.  Used by multi-group composition to replace
+\* MasterConfirmPromotion with a META-gated variant.
+GatedMemberActionsNoMasterConfirm(m) ==
+    \/ ElectionAndLeadershipActions(m)
+    \/ WritePathCommonActions(m)
     \/ WALSyncFail(m)
     \/ CompleteWrite(m)
     \/ AckWrite(m)
     \/ WALFailureAbort(m)
-    \* Flush protocol
-    \/ FlushStart(m)
-    \/ FlushCommitHFiles(m)
-    \/ FlushRAFTPropose(m)
-    \/ FlushRAFTCommit(m)
-    \/ FlushComplete(m)
-    \* Markers
+    \/ FlushActions(m)
     \/ ProposeMarker(m)
-    \* Follower batch apply
     \/ FollowerBeginBatchApply(m)
     \/ FollowerCompleteBatchApply(m)
-    \* Promotion
-    \/ MasterConfirmPromotion(m)
     \/ PromotionComplete(m)
-    \* State-loss actions (gated on m = initiator/leader)
     \/ NewMemberBootstrap(m)
+
+\* All single-member-parameter normal-operation actions.
+\* Composition modules gate this on the member for lifecycle control.
+GatedMemberActions(m) ==
+    \/ GatedMemberActionsNoMasterConfirm(m)
+    \/ MasterConfirmPromotion(m)
 
 \* Data-path variant: merged write/follower actions,
 \* ProposeMarker/WALSyncFail/WALFailureAbort removed.
 GatedMemberDataPathActions(m) ==
-    \* Election
-    \/ Timeout(m)
-    \/ BecomeLeader(m)
-    \* Leadership
-    \/ Heartbeat(m)
-    \/ StepDown(m)
-    \/ LeaderLeaseExpiry(m)
-    \* Write path (merged)
-    \/ BeginWrite(m)
-    \/ WALSyncComplete(m)
-    \/ RAFTCommitWrite(m)
+    \/ ElectionAndLeadershipActions(m)
+    \/ WritePathCommonActions(m)
     \/ AtomicCompleteWriteAndAck(m)
-    \* Flush protocol
-    \/ FlushStart(m)
-    \/ FlushCommitHFiles(m)
-    \/ FlushRAFTPropose(m)
-    \/ FlushRAFTCommit(m)
-    \/ FlushComplete(m)
-    \* Follower apply (merged)
+    \/ FlushActions(m)
     \/ AtomicFollowerBatchApply(m)
-    \* Promotion
-    \/ MasterConfirmPromotion(m)
-    \/ PromotionComplete(m)
-    \* State-loss actions (gated on m = initiator/leader)
-    \/ NewMemberBootstrap(m)
+    \/ PromotionAndBootstrapActions(m)
+
+\* Multi-member and always-enabled actions shared by GroupNext and
+\* GroupDataPathNext.
+UngatedGroupActions ==
+    \/ \E c, v \in Members  : RequestVote(c, v)
+    \/ \E l, f \in Members  : InstallSnapshot(l, f)
+    \/ \E m \in Members     : FollowerApplyMarker(m)
+    \/ NewLeaderCommitOrphanEntry
 
 \* Per-group subset of Next for multi-group composition.  Excludes the
 \* shared-impact actions whose effects span all groups on a server.
 \* No lifecycle gating — all actions always enabled.
 GroupNext ==
-    \/ \E m \in Members     : GatedMemberActions(m)
-    \/ \E c, v \in Members  : RequestVote(c, v)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
-    \/ \E m \in Members     : FollowerApplyMarker(m)
-    \/ NewLeaderCommitOrphanEntry
+    \/ \E m \in Members : GatedMemberActions(m)
+    \/ UngatedGroupActions
 
 \* Per-group data-path next-state relation for multi-group composition.
 \* Like GroupNext but with action merges and removals per
 \* MCRaftRegionReplica_datapath.tla.
 GroupDataPathNext ==
-    \/ \E m \in Members     : GatedMemberDataPathActions(m)
-    \/ \E c, v \in Members  : RequestVote(c, v)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
-    \/ \E m \in Members     : FollowerApplyMarker(m)
-    \/ NewLeaderCommitOrphanEntry
+    \/ \E m \in Members : GatedMemberDataPathActions(m)
+    \/ UngatedGroupActions
 
 \* Full next-state relation: per-group actions plus shared-impact actions.
 Next ==

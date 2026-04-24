@@ -26,20 +26,13 @@
  * exercises the critical paths.  3 members with symmetry.
  * Partitions limited to at most 1 link.
  *)
-EXTENDS SplitRaftRegionReplica, TLC
+EXTENDS SplitRaftRegionReplica, MCRaftRegionReplica_base
 
-CONSTANTS m1, m2, m3, NoVote
-
-MC_Members == {m1, m2, m3}
-MC_None == NoVote
 MC_MaxTerm == 2
-MC_LeaderLeaseDuration == 1
 MC_ElectionTimeoutMin == 2
 MC_MaxClockDrift == 0
 MC_MaxClock == 2
 MC_MaxSeqId == 2
-
-Symmetry == Permutations(MC_Members)
 
 PartitionConstraint == Cardinality(partition) <= 2
 

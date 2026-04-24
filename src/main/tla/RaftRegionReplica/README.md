@@ -28,7 +28,9 @@ In TLA+, a single step of the system is an action, a predicate over the current 
 
 `RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the snapshot-boundary flush protocol (concurrent write+flush via `snapshotMaxSeqId` / `flushDropBound`, HFile commit, RAFT-proposed flush markers with HFile coverage boundary), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, and network partitions (including individual link healing and full network recovery).
 
-The base spec exports parameterized building-block operators that collect all single-member normal-operation actions into a single disjunction. Composition modules invoke these with per-member gating predicates to control when a RAFT group's write path and RAFT operations are active on each member, enabling lifecycle transitions (split, merge) to write-close a group per-member without duplicating action dispatch logic. In the real system, the parent's read path remains active after write-closure (frozen-parent read continuation), serving Timeline reads from the frozen, immutable memstore + HFiles until daughter or merged groups are ready. The read path is not modeled because reads do not flow through the consensus layer. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
+The base spec exports parameterized building-block operators that collect all single-member normal-operation actions into a single disjunction. Composition modules invoke these with per-member gating predicates to control when a RAFT group's write path and RAFT operations are active on each member, enabling lifecycle transitions (split, merge) to write-close a group per-member without duplicating action dispatch logic. In the real system, the parent's read path remains active after write-closure (frozen-parent read continuation), serving Timeline reads from the frozen, immutable memstore + HFiles until daughter or merged groups are ready. The read path is not modeled because reads do not flow through the consensus layer. Guard + effect factoring of `CrashRestart`, `ClockTick`, and `RaftLogGC` allows multi-group and lifecycle modules to reuse crash/tick/GC effects across groups without copy-paste. Named variable tuples and shared helper operators reduce UNCHANGED clause verbosity and eliminate duplicated guard logic across actions.
+
+Dual-group compositions (`MultiGroupRaftRegionReplica.tla` and `MergeRaftRegionReplica.tla`) share common infrastructure via `DualGroupBase.tla`, which provides per-group variable declarations, INSTANCE blocks, variable tuples, and the `PerGroupSafety` invariant. Single-group MC configurations share common constants via `MCRaftRegionReplica_base.tla`.
 
 The specification defines 14 safety invariants and 5 liveness properties verified by TLC:
 
@@ -62,6 +64,25 @@ The specification also defines 5 liveness properties checked under fairness cons
 Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-5 are local and require only weak fairness (WF) on local actions — network instability cannot block them.
 
 Fairness is factored into `BaseFairness` (WF for all 17 local actions, including `MasterConfirmPromotion`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
+
+## Latest Results
+
+| # | Configuration | Module (+ config file) | States generated | Wall time | Result |
+|---|---|---|---|---|---|
+| 1 | Base simulation | `MCRaftRegionReplica_sim` | 1,167,284,500 | 15m | Pass |
+| 2 | Datapath domain | `MCRaftRegionReplica_datapath` | 1,226,965,995 | 15m | Pass |
+| 3 | Election domain | `MCRaftRegionReplica_election` | 1,278,598,301 | 15m | Pass |
+| 4 | Multi-group | `MCRaftRegionReplica_multigroup` | 254,440,915 | 15m | Pass |
+| 5 | Split lifecycle | `MCRaftRegionReplica_split` | 521,235,119 | 15m | Pass |
+| 6 | Merge lifecycle | `MCRaftRegionReplica_merge` | 236,765,899 | 15m | Pass |
+| 7 | Full cross-product | `MCRaftRegionReplica` | 1,176,078,499 | 15m | Pass |
+| 8 | Liveness: election | `MCRaftRegionReplica_liveness_election` (`_liveness_election.cfg`) | 3,397,323 | 18m 14s | Pass |
+| 9 | Liveness: write | `MCRaftRegionReplica_liveness` (`_liveness_write.cfg`) | 71,391,615 | 15m | Pass |
+| 10 | Liveness: flush | `MCRaftRegionReplica_liveness` (`_liveness_flush.cfg`) | 75,178,436 | 15m | Pass |
+| 11 | Liveness: promotion | `MCRaftRegionReplica_liveness` (`_liveness_promotion.cfg`) | 51,867,035 | 15m | Pass |
+| 12 | Liveness: catchup | `MCRaftRegionReplica_liveness` (`_liveness_catchup.cfg`) | 106,405,908 | 15m | Pass |
+
+Across the twelve configurations, approximately 5.17 billion distinct states were explored with no invariant violations and no liveness counterexamples.  Each safety configuration checks the full invariant list for its spec and each liveness configuration checks exactly the `~>` property wired to its `SPECIFICATION`.
 
 ## Verification Strategy
 
@@ -206,7 +227,7 @@ Run overnight for ongoing regression coverage.
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
   -Dtlc2.TLC.stopAfter=28800 \
-  tlc2.TLC MCRaftRegionReplica_sim -simulate -depth 120 -workers auto 
+  tlc2.TLC MCRaftRegionReplica_sim -simulate -depth 120 -workers auto
 ```
 
 ## Running TLC
@@ -214,26 +235,26 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 For simulation (dev inner loop):
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
-  tlc2.TLC MCRaftRegionReplica_sim -simulate -depth 120 -workers auto 
+  tlc2.TLC MCRaftRegionReplica_sim -simulate -depth 120 -workers auto
 ```
 
 For election exhaustive (fast enough for local):
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
-  tlc2.TLC MCRaftRegionReplica_election -workers auto 
+  tlc2.TLC MCRaftRegionReplica_election -workers auto
 ```
 
 For datapath exhaustive:
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
-  tlc2.TLC MCRaftRegionReplica_datapath -workers auto -checkpoint 60 
+  tlc2.TLC MCRaftRegionReplica_datapath -workers auto -checkpoint 60
 ```
 
 For multi-group simulation (local):
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
   -Dtlc2.TLC.stopAfter=1800 \
-  tlc2.TLC MCRaftRegionReplica_multigroup -simulate -depth 150 -workers auto 
+  tlc2.TLC MCRaftRegionReplica_multigroup -simulate -depth 150 -workers auto
 ```
 
 For multi-group exhaustive (large machine):

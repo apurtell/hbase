@@ -105,20 +105,13 @@
  * statistical coverage of the cross-product that neither exhaustive
  * domain covers alone.
  *)
-EXTENDS RaftRegionReplica, TLC
+EXTENDS RaftRegionReplica, MCRaftRegionReplica_base
 
-CONSTANTS m1, m2, m3, NoVote
-
-MC_Members == {m1, m2, m3}
-MC_None == NoVote
 MC_MaxTerm == 2
-MC_LeaderLeaseDuration == 1
 MC_ElectionTimeoutMin == 2
 MC_MaxClockDrift == 0
 MC_MaxClock == 2
 MC_MaxSeqId == 3
-
-Symmetry == Permutations(MC_Members)
 
 \* State constraint: limit partitions to at most 1 link
 PartitionConstraint == Cardinality(partition) <= 2

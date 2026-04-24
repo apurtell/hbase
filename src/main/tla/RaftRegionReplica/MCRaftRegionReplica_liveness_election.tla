@@ -16,14 +16,9 @@
  *
  * No Symmetry (incompatible with liveness checking in TLC).
  *)
-EXTENDS RaftRegionReplica, TLC
+EXTENDS RaftRegionReplica, MCRaftRegionReplica_base
 
-CONSTANTS m1, m2, m3, NoVote
-
-MC_Members == {m1, m2, m3}
-MC_None == NoVote
 MC_MaxTerm == 4
-MC_LeaderLeaseDuration == 1
 MC_ElectionTimeoutMin == 2
 MC_MaxClockDrift == 1
 MC_MaxClock == 12

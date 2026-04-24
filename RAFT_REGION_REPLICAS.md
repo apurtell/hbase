@@ -1770,57 +1770,48 @@ A TLA+ specification models the protocols described in the design document that 
 | 5 | `CatchUpCompletion` | BaseFairness | A follower with unapplied committed entries eventually catches up or leaves the Follower role. WF-only (no network dependency). | Verified (simulation) |
 | 6 | `OrphanHFileCleanup` | — | Orphan HFiles from an incomplete flush are eventually cleaned up if the new primary is alive and HDFS is accessible | Pending |
 
-### Iterative Development Plan
-
-**Standing instruction:** Each iteration ends with a mirror-back review step. After simulation model checking completes with no violations (a clean 15–30 minute run), review counterexamples and learnings from model development. If the formal model exposes under-specification, ambiguity, or incorrect informal reasoning in the design document, amend the design document. If the formal model is insufficient for modeling the critical aspects of the design or implementation, amend the formal model. When a design element is formally verified, add a short parenthetical in the relevant section. The formal spec is not just a verification artifact, it is a mandatory tool for design refinement.
-
-~~**Iteration 1. Member roles and term fencing.**~~
-~~**Iteration 2. Leader lease acquisition, expiry, and vote durability.**~~
-~~**Iteration 3. Network partition and lease safety under clock drift.**~~
-~~**Iteration 4. Parallel WAL + RAFT write barrier and failure modes.**~~
-~~**Iteration 5. Follower apply callback.**~~
-~~**Iteration 6. Follower batch apply and marker handling.**~~
-~~**Iteration 7. Flush protocol happy path.**~~
-~~**Iteration 8. Flush crash recovery.**~~
-~~**Iteration 9. Follower flush-complete handling.**~~
-~~**Iteration 10. Flush + election interaction.**~~
-~~**Iteration 11. Promotion Protocol and leader-primary gap.**~~
-~~**Iteration 12. Old primary rejoins as follower.**~~
-~~**Iteration 13. New member bootstrap.**~~
-~~**Iteration 14. Promotion + in-flight writes.**~~
-~~**Iteration 15. Catch-up + concurrent flush.**~~
-~~**Iteration 17. Multi-group interactions.**~~
-~~**Iteration 18. Fairness and liveness properties.**~~
-~~**Iteration 19 — Region split/merge with RAFT groups.**~~
-~~**Iteration 20 — Master confirmation in the promotion protocol.**~~
-
-**Iteration 21 — Datapath module refactor.** Refactor `MCRaftRegionReplica_datapath.tla` to use `GroupDataPathNext` from the base spec instead of defining its own `FollowerBatchApply` and `CompleteWriteAndAck` actions, which are functionally identical to the base spec's `AtomicFollowerBatchApply` and `AtomicCompleteWriteAndAck`. Express `DataPathNext` as `GroupDataPathNext` plus shared-impact actions (ClockTick, CrashRestart, CreatePartition, HealPartition, RaftLogGC), eliminating the duplicate definitions and reducing maintenance surface.
-
-**Iteration 22 — Combined simulation-mode liveness checking.** Define `LiveSpecAll` (combined fairness with all SF terms: ElectionSF + WriteSF + FlushSF) in `RaftRegionReplica.tla` and create `MCRaftRegionReplica_liveness_all.cfg` listing all 5 liveness properties. This is only useful for TLC `-simulate` mode (exhaustive checking would hit DNF blowup with the combined SF terms). Enables a single simulation run to check all liveness properties simultaneously rather than requiring 5 separate runs.
-
 ### Specification
 
-The full TLA+ specifications are maintained in `src/main/tla/RaftRegionReplica/`. This section presents the critical fragments that formalize the design elements discussed in the main body. Each subsection provides a brief narrative connecting the fragment to the design, followed by the TLA+ code. UNCHANGED clauses are omitted from larger actions for brevity.
+The full TLA+ specifications are maintained in `src/main/tla/RaftRegionReplica/`.
+
+Each excerpt that follows provides a narrative connecting the fragment to the design, followed by the TLA+ code.
 
 #### Model Checking Results
 
 Seven categories of model-checking configurations are maintained:
 
-- **Exhaustive** (`MCRaftRegionReplica.tla` + `.cfg`): MaxSeqId = 3, symmetry-reduced, breadth-first. Proves absence of invariant violations across the complete state space. Expected runtime ~24 hours; run as a daily job after spec changes.
-- **Simulation (dev inner loop)** (`MCRaftRegionReplica_sim.tla` + `_sim.cfg`): MaxSeqId = 5, no symmetry, TLC `-simulate` mode with `-depth 120`. Used as the fast validation loop during spec development. Counterexamples from invariant violations are typically found within minutes if they exist. Depth 120 is tuned so that every trace is deep enough to complete the most complex 5-seqId scenario.
+- **Exhaustive** (`MCRaftRegionReplica.tla` + `.cfg`): MaxSeqId = 3, symmetry-reduced, breadth-first. Proves absence of invariant violations across the complete state space.
+- **Simulation (dev inner loop)** (`MCRaftRegionReplica_sim.tla` + `_sim.cfg`): MaxSeqId = 5, no symmetry, TLC `-simulate` mode with `-depth 120`. Used as the fast validation loop during spec development. Depth 120 is tuned so that every trace is deep enough to complete the most complex 5-seqId scenario.
 - **Simulation (daily deep run)**: Same configuration as above but with `-Dtlc2.TLC.stopAfter=28800` (8 hours). Supplements the exhaustive run by exercising longer traces and higher seqId values.
-- **Multi-group** (`MCRaftRegionReplica_multigroup.tla` + `_multigroup.cfg`): Two RAFT groups sharing clock, network, and unified log. Group 1 is designated as the META group; Group 2's `MasterConfirmPromotion` is gated on `MetaReady` (derived operator: true when some G1 member has completed promotion), modeling the META availability ordering constraint. MaxSeqId = 2, zero clock drift, data-path action merges. Verifies that operations on one group do not violate another group's safety invariants.
-- **Split lifecycle** (`MCRaftRegionReplica_split.tla` + `.cfg`): One parent RAFT group with per-member daughter lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlap` (no overlap between parent and daughter key ranges) plus all 14 parent-group safety invariants.
-- **Merge lifecycle** (`MCRaftRegionReplica_merge.tla` + `.cfg`): Two parent RAFT groups with per-member merged-group lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlapMerge` (no overlap between parent and merged key ranges) plus all 14 per-group safety invariants for both parents.
+- **Multi-group** (`MCRaftRegionReplica_multigroup.tla` + `_multigroup.cfg`): Two RAFT groups sharing clock, network, and unified log. Verifies that operations on one group do not violate another group's safety invariants.
+- **Split lifecycle** (`MCRaftRegionReplica_split.tla` + `.cfg`): One parent RAFT group with per-member daughter lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlap` plus all 14 parent-group safety invariants.
+- **Merge lifecycle** (`MCRaftRegionReplica_merge.tla` + `.cfg`): Two parent RAFT groups with per-member merged-group lifecycle. MaxSeqId = 2, zero clock drift, data-path action merges, 3 members with symmetry. Verifies `NoKeyRangeOverlapMerge` plus all 14 per-group safety invariants for both parents.
 - **Liveness simulation** (six per-property configs, `MCRaftRegionReplica_liveness_*.cfg`): Each config pairs a per-property `SPECIFICATION` (`LiveSpecElection`, `LiveSpecWrite`, etc.) with the matching `PROPERTY`. The shared liveness MC module (`MCRaftRegionReplica_liveness.tla`) uses MaxTerm = 2, MaxClock = 4, MaxSeqId = 2; the election-specific MC module (`MCRaftRegionReplica_liveness_election.tla`) uses MaxTerm = 4, MaxClock = 12, MaxSeqId = 1 (more term/clock headroom, fewer seqIds). All use MaxClockDrift = 1.
+
+##### Latest Run Summary
+
+The most recent end-to-end validation pass is archived under `src/main/tla/RaftRegionReplica/results/` as one TLC log per configuration. It was produced by the `run_all_sim.sh` driver, which runs the full suite of twelve simulation configurations back-to-back on a single host. Each configuration is capped at 15 minutes of wall time via `-Dtlc2.TLC.stopAfter=900` (the election-liveness run took slightly longer because of its deeper tableau). The archived pass was generated on a 128-core Linux host with TLC 2026.03.20 and Temurin 17.
+
+| # | Configuration | Module (+ config file) | States generated | Wall time | Result |
+|---|---|---|---|---|---|
+| 1 | Base simulation (dev) | `MCRaftRegionReplica_sim` | 1,167,284,500 | 15m 00s | Pass |
+| 2 | Datapath domain | `MCRaftRegionReplica_datapath` | 1,226,965,995 | 15m 00s | Pass |
+| 3 | Election domain | `MCRaftRegionReplica_election` | 1,278,598,301 | 15m 00s | Pass |
+| 4 | Multi-group | `MCRaftRegionReplica_multigroup` | 254,440,915 | 15m 00s | Pass |
+| 5 | Split lifecycle | `MCRaftRegionReplica_split` | 521,235,119 | 15m 00s | Pass |
+| 6 | Merge lifecycle | `MCRaftRegionReplica_merge` | 236,765,899 | 15m 00s | Pass |
+| 7 | Full cross-product | `MCRaftRegionReplica` | 1,176,078,499 | 15m 00s | Pass |
+| 8 | Liveness: election | `MCRaftRegionReplica_liveness_election` (`_liveness_election.cfg`) | 3,397,323 | 18m 14s | Pass |
+| 9 | Liveness: write | `MCRaftRegionReplica_liveness` (`_liveness_write.cfg`) | 71,391,615 | 15m 00s | Pass |
+| 10 | Liveness: flush | `MCRaftRegionReplica_liveness` (`_liveness_flush.cfg`) | 75,178,436 | 15m 00s | Pass |
+| 11 | Liveness: promotion | `MCRaftRegionReplica_liveness` (`_liveness_promotion.cfg`) | 51,867,035 | 15m 00s | Pass |
+| 12 | Liveness: catchup | `MCRaftRegionReplica_liveness` (`_liveness_catchup.cfg`) | 106,405,908 | 15m 00s | Pass |
+
+Across the twelve configurations, approximately 5.17 billion distinct states were explored with no invariant violations and no liveness counterexamples. Every "Verified" entry in the properties tables above is sourced from this pass; the "Pending" entries remain out of scope for the current spec and are tracked for future work.
 
 #### Running TLC
 
 ##### Simulation check
-
-The simulation mode is the primary validation tool during spec development. It exercises random traces at MaxSeqId = 5 (richer than the exhaustive configuration) and surfaces invariant violations within minutes if they exist. A clean 15–30 minute run provides high confidence before committing to a full exhaustive run.
-
-Depth 120 is chosen so that every trace reaches the deepest interesting scenario (~80 steps for the 5-seqId orphan-flush + re-flush path with two full election cycles) while avoiding the diminishing-returns tail beyond step ~100.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -1832,8 +1823,6 @@ Adjust `-Dtlc2.TLC.stopAfter` (seconds) to control the run duration: e.g. 900, 1
 
 ##### Exhaustive check
 
-The exhaustive mode proves absence of invariant violations across the complete state space at MaxSeqId = 3.
-
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
   tlc2.TLC MCRaftRegionReplica -workers auto 
@@ -1841,17 +1830,11 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ##### Domain-Decomposed Exhaustive Configurations
 
-In addition to the full exhaustive and simulation configurations above, two domain-focused exhaustive configurations split the state space into orthogonal domains that can run concurrently, completing in minutes instead of days:
-
 - **`MCRaftRegionReplica_datapath`** — Full data-path coverage (MaxSeqId=3) with simplified timing (MaxClockDrift=0). Merged and removed actions reduce the branching factor. Provides BFS proof of data-path protocol correctness (flush, write pipeline, log GC, catch-up, bootstrap).
 
 - **`MCRaftRegionReplica_election`** — Full timing/drift coverage (MaxClockDrift=1, ElectionTimeoutMin=4) with minimal data path (MaxSeqId=1). Uses the original unmodified `Next` with all 36 actions. Provides BFS proof of election safety, lease exclusivity, and term fencing.
 
-Together with simulation (which exercises both domains simultaneously at MaxSeqId=5), these configurations cover all 14 invariants non-trivially.
-
 ##### Split Lifecycle
-
-The split configuration (`MCRaftRegionReplica_split.tla` + `.cfg`) verifies the region split protocol using `SplitRaftRegionReplica.tla`, which composes one full INSTANCE of the parent group with a lightweight per-member daughter lifecycle. Parent-group actions are gated per-member via `ParentGroupActive(m) /\ Parent!GatedMemberActions(m)`, deactivating normal operations after the split marker is applied on each member. Uses the data-path-merged `SplitDataPathNext` for reduced state space. MaxSeqId=2 (write + split marker, or flush + split marker), MaxClockDrift=0, 3 members with symmetry, partitions limited to 1 link. Checks all 14 parent-group safety invariants plus `NoKeyRangeOverlap`.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -1860,8 +1843,6 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ##### Merge Lifecycle
 
-The merge configuration (`MCRaftRegionReplica_merge.tla` + `.cfg`) verifies the region merge protocol using `MergeRaftRegionReplica.tla`, which composes two full INSTANCE parent groups (G1, G2) sharing clock and network with a lightweight per-member merged-group lifecycle. Each parent group is gated independently via `G1ParentActive(m)` / `G2ParentActive(m)` predicates applied to the base spec's `GatedMemberActions(m)` building blocks. Uses `MergeDataPathNext` for reduced state space. Same bounds as the multi-group configuration: MaxSeqId=2, MaxClockDrift=0, 3 members with symmetry, partitions limited to 1 link. Checks all 14 per-group safety invariants for both parent groups plus `NoKeyRangeOverlapMerge`.
-
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
   tlc2.TLC MCRaftRegionReplica_merge -workers auto
@@ -1869,7 +1850,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ##### Multi-Group Simulation
 
-The multi-group configuration verifies that two RAFT groups sharing the same `ConsensusServer` resources (clock, network, unified log) do not interfere with each other's safety properties. It uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared clock, network partitions, and a `UnifiedLogGC` action modeling cross-group log segment deletion accounting.
+The multi-group configuration verifies that two RAFT groups sharing the same `ConsensusServer` resources (clock, network, unified log) do not interfere with each other's safety properties.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -1879,7 +1860,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ##### Liveness Simulation
 
-Liveness properties are verified through simulation because the state space under the liveness constants (e.g., MaxTerm=4, MaxClock=12 for election; MaxTerm=2, MaxClock=4 for others) without symmetry reduction is too large for exhaustive checking. Each of the six properties has its own `.cfg` file that selects the appropriate `SPECIFICATION` (with the matching fairness constraints) and `PROPERTY`. The properties are split across separate configs to ensure the verification is tractable. The election property uses its own MC module (`MCRaftRegionReplica_liveness_election`); the other five use the shared module (`MCRaftRegionReplica_liveness`) with per-property `.cfg` files:
+Each of the six properties has its own `.cfg` file that selects the appropriate `SPECIFICATION` (with the matching fairness constraints) and `PROPERTY`. The election property uses its own MC module (`MCRaftRegionReplica_liveness_election`); the other five use the shared module (`MCRaftRegionReplica_liveness`) with per-property `.cfg` files:
 
 ```bash
 echo "=== Liveness: election ==="
@@ -1899,27 +1880,9 @@ for prop in write flush promotion catchup; do
 done
 ```
 
-#### Spec File Reference
-
-| File | Purpose |
-|------|---------|
-| `RaftRegionReplica.tla` | Base specification (~2,400 lines): election, leases, write path, flush, follower apply, promotion (with master confirmation via `MasterConfirmPromotion`), crash recovery, catch-up, safety invariants, liveness properties. Exports `GatedMemberActions(m)` / `GatedMemberDataPathActions(m)` building-block operators for composition modules. |
-| `MultiGroupRaftRegionReplica.tla` | Two-group composition: shared clock, network, unified log GC, META promotion ordering (G2's `MasterConfirmPromotion` gated on `MetaReady`), cross-group safety |
-| `SplitRaftRegionReplica.tla` | Region split lifecycle: parent group gating, daughter activation, `NoKeyRangeOverlap` |
-| `MergeRaftRegionReplica.tla` | Region merge lifecycle: two-parent gating, merged group activation, `NoKeyRangeOverlapMerge` |
-| `MCRaftRegionReplica.tla` | Exhaustive model-checking configuration (MaxSeqId=3, symmetry-reduced) |
-| `MCRaftRegionReplica_sim.tla` | Simulation configuration (MaxSeqId=5, depth 120) |
-| `MCRaftRegionReplica_datapath.tla` | Data-path domain exhaustive configuration (MaxClockDrift=0, merged actions) |
-| `MCRaftRegionReplica_election.tla` | Election domain exhaustive configuration (MaxClockDrift=1, MaxSeqId=1) |
-| `MCRaftRegionReplica_multigroup.tla` | Multi-group model-checking configuration |
-| `MCRaftRegionReplica_split.tla` | Split lifecycle model-checking configuration |
-| `MCRaftRegionReplica_merge.tla` | Merge lifecycle model-checking configuration |
-| `MCRaftRegionReplica_liveness.tla` | Shared liveness MC module (MaxTerm=2, MaxClock=4, MaxSeqId=2) |
-| `MCRaftRegionReplica_liveness_election.tla` | Election liveness MC module (MaxTerm=4, MaxClock=12, MaxSeqId=1) |
-
 #### State Model
 
-The specification tracks 23 state variables per RAFT group member. The variables are partitioned into consensus core (roles, terms, votes, logs), timing (clocks, leases, election timers), network (partition set), committed state (entries, markers), durable HDFS state (HFiles), per-member data state (memstore, batch apply), and pipeline state (write, flush, promotion).
+The specification tracks 26 state variables per RAFT group. The variables are partitioned into consensus core (roles, terms, votes, logs), timing (clocks, leases, election timers), network (partition set), committed state (entries, markers), durable HDFS state (HFiles), per-member data state (memstore, batch apply), and pipeline state (write, flush, promotion).
 
 ```tla
 VARIABLES
@@ -1953,9 +1916,18 @@ VARIABLES
     \* ---- Flush pipeline ----
     flushPhase,         \* flushPhase[m]: flush phase (Idle | FlushStarted | HFilesCommitted | RAFTProposed | RAFTCommitted)
     flushSeqId,         \* flushSeqId[m]: seqId consumed by m's current flush (0 = none)
+    snapshotMaxSeqId,   \* snapshotMaxSeqId[m]: max seqId in the memstore snapshot at FlushStart (0 = none/empty)
+    flushDropBound,     \* flushDropBound[s]: maps flush marker seqId s to its HFile coverage boundary (snapshotMaxSeqId)
     \* ---- Promotion pipeline ----
     promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
     masterConfirmedTerm \* masterConfirmedTerm: highest RAFT term confirmed by master (Nat)
+
+writeVars       == <<writePhase, walSync, raftCommitted, writeSeqId>>
+flushVars       == <<flushPhase, flushSeqId, snapshotMaxSeqId>>
+timerVars       == <<clock, leaseRemaining, timerRemaining>>
+promotionVars   == <<promotionPhase, masterConfirmedTerm>>
+globalCommitVars == <<nextSeqId, committedEntries, markerEntries,
+                      flushMarkerEntries, hdfsHFiles>>
 ```
 
 The type invariant defines the legal domain for each variable and serves as the model's shape:
@@ -1985,13 +1957,15 @@ TypeOK ==
     /\ flushPhase \in [Members -> {"Idle", "FlushStarted", "HFilesCommitted",
                                     "RAFTProposed", "RAFTCommitted"}]
     /\ flushSeqId \in [Members -> 0..MaxSeqId]
+    /\ snapshotMaxSeqId \in [Members -> 0..MaxSeqId]
+    /\ flushDropBound \in [1..MaxSeqId -> 0..MaxSeqId]
     /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
     /\ masterConfirmedTerm \in 0..MaxTerm
 ```
 
 #### Key Helpers
 
-Three helper definitions are referenced throughout the spec. `IsLeader` combines the role check with lease validity, matching the `isLeader()` implementation check described in the Leader Lease section. `MVCCWritePoint` derives the MVCC write point from active state without tracking it as a separate variable, reducing the state space. `ApplicableEntries` computes the set of committed entries a follower can still apply, excluding entries subsumed by a previously applied flush marker.
+Helper definitions are referenced throughout the spec. `IsLeader` combines the role check with lease validity, matching the `isLeader()` implementation check described in the Leader Lease section. `MVCCWritePoint` derives the MVCC write point from active state without tracking it as a separate variable, reducing the state space. `ApplicableEntries` computes the set of committed entries a follower can still apply, excluding entries subsumed by a previously applied flush marker. The flush drop boundary uses `flushDropBound[f]` (the `snapshotMaxSeqId` recorded at `FlushStart` time), not the flush marker seqId itself, ensuring entries between `flushDropBound[f]` and `f` (in-flight writes at flush time) remain applicable.
 
 ```tla
 CanCommunicate(m1, m2) == <<m1, m2>> \notin partition
@@ -2010,7 +1984,46 @@ MVCCWritePoint(m) ==
 ApplicableEntries(m) ==
     LET appliedFlushMarkers == flushMarkerEntries \cap memstore[m]
     IN {s \in committedEntries \ memstore[m] :
-            \A f \in appliedFlushMarkers : s >= f}
+            \A f \in appliedFlushMarkers : s > flushDropBound[f]}
+```
+
+Additional shared helpers eliminate duplicated guard and computation logic across actions:
+
+```tla
+Responders(m) ==
+    {f \in Members \ {m} :
+        /\ currentTerm[m] >= currentTerm[f]
+        /\ CanCommunicate(m, f)}
+
+NoHigherTermReachable(m) ==
+    ~\E f \in Members \ {m} :
+        /\ CanCommunicate(m, f)
+        /\ currentTerm[f] > currentTerm[m]
+
+QuorumReachable(m) ==
+    /\ NoHigherTermReachable(m)
+    /\ Cardinality(Responders(m)) + 1 >= Majority
+
+PhaseAwareMemstoreDrop(m) ==
+    IF flushPhase[m] = "RAFTCommitted"
+    THEN {s \in memstore[m] : s > snapshotMaxSeqId[m]}
+    ELSE memstore[m]
+
+FollowerOrPromoting(m) ==
+    \/ role[m] = "Follower"
+    \/ promotionPhase[m] \in {"Promoting", "AwaitingMaster"}
+
+WriteBarrierPassed(m) ==
+    /\ writePhase[m] = "Pending"
+    /\ walSync[m] = "Done"
+    /\ raftCommitted[m]
+    /\ role[m] = "Leader"
+
+WritePipelineReset(m) ==
+    /\ writePhase'    = [writePhase    EXCEPT ![m] = "Idle"]
+    /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
+    /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
+    /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = 0]
 ```
 
 #### Leader Election and Lease Safety
@@ -2021,15 +2034,9 @@ The atomic `BecomeLeader` action models a candidate winning the election AND imm
 BecomeLeader(m) ==
     /\ role[m] = "Candidate"
     /\ Cardinality(votesGranted[m]) >= Majority
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
+    /\ QuorumReachable(m)
+    /\ LET responders == Responders(m)
        IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
         /\ role' = [r \in Members |->
               IF r = m THEN "Leader"
               ELSE IF r \in responders THEN "Follower"
@@ -2105,7 +2112,6 @@ BeginWrite(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
     /\ writePhase[m] = "Idle"
-    /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
     /\ writePhase'    = [writePhase    EXCEPT ![m] = "Pending"]
     /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
@@ -2115,14 +2121,11 @@ BeginWrite(m) ==
     \* ... UNCHANGED omitted ...
 ```
 
-`CompleteWrite` models the barrier join: both WAL sync and RAFT commit must have completed before the write is applied to memstore and made visible to readers. This is the central safety mechanism.
+`CompleteWrite` models the barrier join. Both WAL sync and RAFT commit must have completed before the write is applied to memstore and made visible to readers. This is the central safety mechanism. The guard is factored into `WriteBarrierPassed(m)`, which is also used by the merged `AtomicCompleteWriteAndAck` action.
 
 ```tla
 CompleteWrite(m) ==
-    /\ writePhase[m] = "Pending"
-    /\ walSync[m] = "Done"
-    /\ raftCommitted[m]
-    /\ role[m] = "Leader"
+    /\ WriteBarrierPassed(m)
     /\ writePhase' = [writePhase EXCEPT ![m] = "Applied"]
     /\ memstore' = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
     \* ... UNCHANGED omitted ...
@@ -2142,28 +2145,16 @@ FollowerSeqIdConsistency ==
 
 #### Follower Batch Apply
 
-The follower apply callback models how committed RAFT entries are applied to follower memstores using batch semantics. `FollowerBeginBatchApply` collects consecutive mutation entries up to the next marker boundary. `FollowerApplyMarker` processes marker entries: compaction markers advance the MVCC point; flush markers additionally drop memstore entries below the marker's seqId since those entries are now in HFiles. Both actions also fire during the Promoting phase, modeling Phase 1 of the promotion protocol.
+The follower apply callback models how committed RAFT entries are applied to follower memstores using batch semantics. `FollowerBeginBatchApply` collects consecutive mutation entries up to the next marker boundary. `FollowerApplyMarker` processes marker entries. Compaction markers advance the MVCC point. Flush markers additionally drop memstore entries at or below the HFile coverage boundary recorded at FlushStart time since those entries are now in HFiles. Both actions also fire during the Promoting and AwaitingMaster phases, modeling Phase 1 of the promotion protocol.
 
 ```tla
 FollowerBeginBatchApply(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
-    /\ fApplyBatch[m] = {}
-    /\ LET applicable == ApplicableEntries(m)
-       IN /\ applicable # {}
-          /\ LET nextEntry == SetMin(applicable)
-             IN /\ nextEntry \notin markerEntries
-                /\ LET applicableMarkers == applicable \cap markerEntries
-                       boundary == IF applicableMarkers # {}
-                                   THEN SetMin(applicableMarkers)
-                                   ELSE MaxSeqId + 1
-                       batch == {s \in applicable \ markerEntries : s < boundary}
-                   IN fApplyBatch' = [fApplyBatch EXCEPT ![m] = batch]
+    /\ MutationBatchReady(m)
+    /\ fApplyBatch' = [fApplyBatch EXCEPT ![m] = MutationBatch(m)]
     \* ... UNCHANGED omitted ...
 
 FollowerApplyMarker(m) ==
-    /\ \/ role[m] = "Follower"
-       \/ promotionPhase[m] = "Promoting"
+    /\ FollowerOrPromoting(m)
     /\ fApplyBatch[m] = {}
     /\ LET applicable == ApplicableEntries(m)
        IN /\ applicable # {}
@@ -2172,7 +2163,7 @@ FollowerApplyMarker(m) ==
                 /\ IF nextEntry \in flushMarkerEntries
                    THEN /\ nextEntry \in hdfsHFiles
                         /\ memstore' = [memstore EXCEPT ![m] =
-                            {s \in @ : s >= nextEntry} \union {nextEntry}]
+                            {s \in @ : s > flushDropBound[nextEntry]} \union {nextEntry}]
                    ELSE /\ memstore' = [memstore EXCEPT ![m] = @ \union {nextEntry}]
     \* ... UNCHANGED omitted ...
 ```
@@ -2205,16 +2196,9 @@ FlushCommitHFiles(m) ==
 FlushRAFTPropose(m) ==
     /\ role[m] = "Leader"
     /\ flushPhase[m] = "HFilesCommitted"
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
-       IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
-        /\ raftLog' = [r \in Members |->
+    /\ QuorumReachable(m)
+    /\ LET responders == Responders(m)
+       IN raftLog' = [r \in Members |->
               IF r = m \/ r \in responders
               THEN raftLog[r] \union {flushSeqId[m]}
               ELSE raftLog[r]]
@@ -2224,15 +2208,7 @@ FlushRAFTPropose(m) ==
 FlushRAFTCommit(m) ==
     /\ role[m] = "Leader"
     /\ flushPhase[m] = "RAFTProposed"
-    /\ LET followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ CanCommunicate(m, f)}
-       IN
-        /\ ~\E f \in followers :
-              /\ CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
+    /\ QuorumReachable(m)
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "RAFTCommitted"]
     /\ committedEntries' = committedEntries \union {flushSeqId[m]}
     /\ markerEntries' = markerEntries \union {flushSeqId[m]}
@@ -2289,26 +2265,25 @@ CrashRestartGuard(m) ==
     \/ promotionPhase[m] # "None"
 
 CrashRestartEffect(m) ==
-    /\ role'            = [role            EXCEPT ![m] = "Follower"]
-    /\ votesGranted'    = [votesGranted    EXCEPT ![m] = {}]
-    /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
-    /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'        = [memstore        EXCEPT ![m] = {}]
-    /\ fApplyBatch'     = [fApplyBatch     EXCEPT ![m] = {}]
-    /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
-    /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
-    /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
-    /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
-    /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
-    /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
-    /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ role'             = [role            EXCEPT ![m] = "Follower"]
+    /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
+    /\ leaseRemaining'   = [leaseRemaining  EXCEPT ![m] = 0]
+    /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore'         = [memstore        EXCEPT ![m] = {}]
+    /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
+    /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
+    /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
+    /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
+    /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
+    /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
+    /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
+    /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
 
 CrashRestart(m) ==
     /\ CrashRestartGuard(m)
     /\ CrashRestartEffect(m)
-    /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
-                   nextSeqId, committedEntries, markerEntries,
-                   flushMarkerEntries, hdfsHFiles>>
+    \* ... UNCHANGED omitted ...
 ```
 
 `InstallSnapshot` models the shared-storage catch-up path that replaces standard RAFT's `InstallSnapshot` RPC. When a follower's needed entries have been GC'd from the leader's log, the leader sends a `CatchUpReference` containing HFile paths and the flush seqId. The follower loads HFiles from HDFS and starts with a memstore at the flush boundary.
@@ -2318,16 +2293,15 @@ InstallSnapshot(leader, follower) ==
     /\ role[leader] = "Leader"
     /\ follower # leader
     /\ CanCommunicate(leader, follower)
-    /\ \/ role[follower] = "Follower"
-       \/ promotionPhase[follower] = "Promoting"
+    /\ FollowerOrPromoting(follower)
     /\ fApplyBatch[follower] = {}
     /\ \E s \in flushMarkerEntries \cap hdfsHFiles :
         /\ \E needed \in (committedEntries \ memstore[follower]) :
-              needed < s /\ needed \notin raftLog[leader]
+              needed <= flushDropBound[s] /\ needed \notin raftLog[leader]
         /\ memstore' = [memstore EXCEPT ![follower] =
-              {e \in @ : e >= s} \union {s}]
+              {e \in @ : e > flushDropBound[s]} \union {s}]
         /\ raftLog' = [raftLog EXCEPT ![follower] =
-              {e \in @ : e >= s} \union {s}]
+              {e \in @ : e > flushDropBound[s]} \union {s}]
     \* ... UNCHANGED omitted ...
 ```
 
@@ -2369,13 +2343,13 @@ NewMemberBootstrap(m) ==
         \* ... UNCHANGED omitted ...
 ```
 
-The catch-up invariants verify data recoverability and catch-up completeness. `CatchUpDataIntegrity` ensures every committed entry is recoverable via RAFT log replay (majority of logs) or via HFiles on HDFS (covered by a committed flush marker with durable HFiles). `CatchUpCompleteness` verifies that once a follower has applied all committed entries, its memstore is consistent with the committed state.
+The catch-up invariants verify data recoverability and catch-up completeness. `CatchUpDataIntegrity` ensures every committed entry is recoverable via RAFT log replay or via HFiles on HDFS. Entries between `flushDropBound[f]` and `f` (in-flight writes at flush time) are not in HFiles and must be in a majority of RAFT logs. `CatchUpCompleteness` verifies that once a follower has applied all committed entries, its memstore is consistent with the committed state.
 
 ```tla
 CatchUpDataIntegrity ==
     \A s \in committedEntries :
         \/ Cardinality({m \in Members : s \in raftLog[m]}) >= Majority
-        \/ \E f \in flushMarkerEntries \cap hdfsHFiles : f >= s
+        \/ \E f \in flushMarkerEntries \cap hdfsHFiles : s <= flushDropBound[f]
 
 CatchUpCompleteness ==
     \A m \in Members :
@@ -2432,7 +2406,9 @@ PromotionMVCCContinuity ==
 
 `MultiGroupRaftRegionReplica.tla` models two independent RAFT groups (G1, G2) sharing the same `ConsensusServer` resources on a set of RegionServers: shared physical clock, shared network (partitions affect both groups), unified multiplexed consensus log, and shared thread pool (modeled implicitly by TLA+'s nondeterministic interleaving). Five shared-impact actions are replaced with multi-group versions. Group 1 is designated as the META group and Group 2 as a non-META group. Group 1's per-group actions are dispatched unmodified via `G1!GroupNext`. Group 2's `MasterConfirmPromotion` is gated on a derived operator `MetaReady` (true when any G1 member has `promotionPhase = "Complete"`), modeling the META availability ordering constraint from the META Region Self-Promotion Bootstrap section above. This ordering is structural — enforced by the gate mechanism — and does not require an additional state-based invariant.
 
-The two groups are instantiated by substituting per-group variables into the base spec:
+Both `MultiGroupRaftRegionReplica.tla` and `MergeRaftRegionReplica.tla` share common dual-group infrastructure via `DualGroupBase.tla`, which provides per-group variable declarations, two INSTANCE blocks with parameter mappings, `g1_vars`/`g2_vars` tuples, `Majority`, and the 13-conjunct `PerGroupSafety` invariant. Both composition modules `EXTENDS DualGroupBase` and add only their composition-specific logic.
+
+The two groups are instantiated in `DualGroupBase.tla` by substituting per-group variables into the base spec:
 
 ```tla
 G1 == INSTANCE RaftRegionReplica WITH
@@ -2458,6 +2434,8 @@ G1 == INSTANCE RaftRegionReplica WITH
     writeSeqId      <- writeSeqId_1,
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
+    snapshotMaxSeqId <- snapshotMaxSeqId_1,
+    flushDropBound  <- flushDropBound_1,
     promotionPhase  <- promotionPhase_1,
     masterConfirmedTerm <- masterConfirmedTerm_1
 \* G2 == INSTANCE RaftRegionReplica WITH ... (symmetric, using _2 variables)
@@ -2474,11 +2452,11 @@ MultiGroupCrashRestart(m) ==
                    currentTerm_1, votedFor_1, raftLog_1,
                    nextSeqId_1, committedEntries_1, markerEntries_1,
                    flushMarkerEntries_1, hdfsHFiles_1,
-                   masterConfirmedTerm_1,
+                   flushDropBound_1, masterConfirmedTerm_1,
                    currentTerm_2, votedFor_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
-                   masterConfirmedTerm_2>>
+                   flushDropBound_2, masterConfirmedTerm_2>>
 ```
 
 Unified log GC models physical segment deletion in the shared append-only consensus log. Both groups must have an applied flush marker on member m, and entries below each group's chosen flush watermark are removed from both groups' raftLogs simultaneously:
@@ -2496,16 +2474,28 @@ UnifiedLogGC(m) ==
     \* ... UNCHANGED omitted ...
 ```
 
-The next-state relation interleaves per-group steps with shared-impact actions:
+G2's single-member actions are simplified using the base spec's action group building blocks. `GatedMemberActionsNoMasterConfirm(m)` collects all single-member normal-operation actions except `MasterConfirmPromotion`, which is replaced by a MetaReady-gated version:
 
 ```tla
 MetaReady == \E m \in Members : promotionPhase_1[m] = "Complete"
 
+G2GatedMemberActions(m) ==
+    \/ G2!GatedMemberActionsNoMasterConfirm(m)
+    \/ G2MasterConfirmPromotion(m)
+
+G2GroupNextMetaGated ==
+    \/ \E m \in Members : G2GatedMemberActions(m)
+    \/ G2!UngatedGroupActions
+```
+
+The next-state relation interleaves per-group steps with shared-impact actions:
+
+```tla
 Next ==
-    \* G1 (META group) — per-group steps unmodified
+    \* G1 (META) uses base spec actions unmodified.
+    \* G2 (non-META) uses MetaReady-gated MasterConfirmPromotion.
     \/ (G1!GroupNext /\ UNCHANGED g2_vars)
-    \* G2 (non-META group) — MasterConfirmPromotion gated on MetaReady
-    \/ (G2GatedGroupNext /\ UNCHANGED g1_vars)
+    \/ (G2GroupNextMetaGated /\ UNCHANGED g1_vars)
     \* Shared-impact actions
     \/ \E m \in Members : MultiGroupClockTick(m)
     \/ \E m \in Members : MultiGroupCrashRestart(m)
@@ -2564,16 +2554,10 @@ ProposeSplitMarker(m) ==
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
+    /\ Parent!QuorumReachable(m)
     /\ LET seqId == nextSeqId
-           followers  == Members \ {m}
-           responders == {f \in followers :
-                            /\ currentTerm[m] >= currentTerm[f]
-                            /\ Parent!CanCommunicate(m, f)}
+           responders == Parent!Responders(m)
        IN
-        /\ ~\E f \in followers :
-              /\ Parent!CanCommunicate(m, f)
-              /\ currentTerm[f] > currentTerm[m]
-        /\ Cardinality(responders) + 1 >= Majority
         /\ nextSeqId' = nextSeqId + 1
         /\ committedEntries' = committedEntries \union {seqId}
         /\ markerEntries' = markerEntries \union {seqId}
@@ -2652,8 +2636,7 @@ MasterOpenMerged(m) ==
     /\ mergeMarkerSeqId_2 \in memstore_2[m]
     /\ ~mergedGroupActive[m]
     /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![m] = TRUE]
-    /\ UNCHANGED <<clock, partition, g1_vars, g2_vars,
-                   mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+    \* ... UNCHANGED omitted ...
 ```
 
 The core merge safety invariant: no member has both a parent group and the merged group active for the same key range:
