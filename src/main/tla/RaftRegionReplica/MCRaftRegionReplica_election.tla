@@ -49,7 +49,7 @@
  *     CatchUpCompleteness
  *
  *   Shallow coverage (MaxSeqId = 1 limits scenario depth):
- *     FlushWriteExclusion    -- mutual exclusion guards tested but only
+ *     FlushDropBoundary      -- snapshot-boundary flush guards tested but only
  *                               one operation possible per trace
  *     PromotionMVCCContinuity -- requires in-flight write + crash +
  *                               re-election (needs MaxSeqId >= 2 for
@@ -62,7 +62,7 @@
  * with simplified timing (MaxClockDrift = 0) and merged/removed actions
  * for deep verification of multi-operation data-path interleavings.
  * It provides primary verification for the invariants that receive only
- * shallow coverage here (FlushWriteExclusion).
+ * shallow coverage here (FlushDropBoundary).
  *
  * Simulation mode (MCRaftRegionReplica_sim) exercises both domains
  * simultaneously with MaxSeqId = 5 and full timing, providing statistical

@@ -78,7 +78,7 @@
  *
  *   Non-trivial (primary verification in this domain):
  *     CatchUpDataIntegrity, FollowerSeqIdConsistency,
- *     NoOrphanMemstoreDrop, FlushWriteExclusion,
+ *     NoOrphanMemstoreDrop, FlushDropBoundary,
  *     FollowerFlushMemstoreDrop, HFilesBeforeFlushMarker,
  *     PromotionReadWriteGuard, PromotionMVCCContinuity,
  *     CatchUpCompleteness

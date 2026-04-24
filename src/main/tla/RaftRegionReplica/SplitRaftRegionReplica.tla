@@ -227,7 +227,7 @@ ParentGroupSafety ==
     /\ Parent!WriteBarrierSafety
     /\ Parent!FollowerSeqIdConsistency
     /\ Parent!NoOrphanMemstoreDrop
-    /\ Parent!FlushWriteExclusion
+    /\ Parent!FlushDropBoundary
     /\ Parent!FollowerFlushMemstoreDrop
     /\ Parent!HFilesBeforeFlushMarker
     /\ Parent!PromotionReadWriteGuard

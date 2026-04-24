@@ -743,11 +743,11 @@ An important ordering change is required. In the current HBase code the memstore
 
 ```mermaid
 flowchart LR
-    Idle["Idle"] -->|"isLeader() and<br/>writePhase = Idle"| FS["FlushStarted<br/>(steps 1-7:<br/>block WAL, snapshot,<br/>write HFiles to tmp)"]
+    Idle["Idle"] -->|"isLeader()"| FS["FlushStarted<br/>(steps 1-7:<br/>record snapshotMaxSeqId,<br/>snapshot, write HFiles)"]
     FS -->|"sfc.commit()<br/>(step 8)"| HC["HFilesCommitted<br/>(HFiles durable<br/>on HDFS)"]
     HC -->|"consensus.propose()<br/>(step 9)"| RP["RAFTProposed"]
     RP -->|"Majority ack<br/>(step 10)"| RC["RAFTCommitted"]
-    RC -->|"Drop memstore,<br/>COMMIT_FLUSH,<br/>GC log<br/>(steps 11-14)"| Idle
+    RC -->|"Drop memstore ≤<br/>snapshotMaxSeqId,<br/>COMMIT_FLUSH,<br/>GC log<br/>(steps 11-15)"| Idle
 
     FS -.->|"Leadership lost"| Idle
     HC -.->|"Leadership lost<br/>(orphan HFiles<br/>on HDFS)"| Idle
@@ -758,42 +758,56 @@ flowchart LR
 The detailed flush sequence for RAFT-enabled regions:
 
 ```
-Primary flush protocol:
-  1. wal.startCacheFlush()                            [mark flush in progress for this region;
-                                                       for RAFT-enabled regions, a per-region
-                                                       flushInProgress flag gates the write path
-                                                       (see mutual exclusion note below)]
-  2. flushOpSeqId = getNextSequenceId(wal)            [consume a seqId for the flush;
+Primary flush protocol (snapshot-boundary):
+  1. wal.startCacheFlush()                            [mark flush in progress for this region]
+  2. snapshotMaxSeqId = mvcc.getWritePoint()          [record the actual HFile coverage boundary:
+                                                       the highest seqId currently in the memstore.
+                                                       Any concurrent in-flight writes have seqIds
+                                                       above this value (assigned from the monotonic
+                                                       WAL seqId counter) and will NOT be included
+                                                       in the HFile snapshot.]
+  3. flushOpSeqId = getNextSequenceId(wal)            [consume a seqId for the flush WAL marker;
                                                        same WAL seqId generator as mutations --
-                                                       single-source property is a hard requirement]
-  3. WALUtil.writeFlushMarker(START_FLUSH)            [to local WAL, no sync]
-  4. Take memstore snapshot
-  5. Release updatesLock.writeLock()
-     (Steps 1-7 are indivisible from a safety perspective: the
-      updatesLock.writeLock() held during steps 1-5 prevents concurrent
-      writes, and steps 6-7 occur before any RAFT interaction.)
-  6. doSyncOfUnflushedWALChanges()                    [sync START_FLUSH to HDFS]
-  7. Flush memstore snapshot to HFiles in tmp dir     [local operation with HDFS]
-  8. sfc.commit()                                     [move HFiles from tmp to store dir]
-     (HFiles are now durable and accessible on HDFS)
-  9. consensus.propose(FLUSH_COMPLETE marker)         [propose through RAFT]
-     Marker includes: flushOpSeqId, list of new HFile paths
- 10. Wait for RAFT commit (majority acknowledge)
- 11. decrMemStoreSize()                               [drop memstore snapshot]
- 12. WALUtil.writeFlushMarker(COMMIT_FLUSH)           [to local WAL, with sync]
- 13. wal.completeCacheFlush()                         [clear flushInProgress, unblock writes]
- 14. GC RAFT log entries prior to flushOpSeqId
+                                                       single-source property is a hard requirement.
+                                                       flushOpSeqId > snapshotMaxSeqId always.]
+  4. WALUtil.writeFlushMarker(START_FLUSH)            [to local WAL, no sync]
+  5. Take memstore snapshot                           [snapshot covers entries ≤ snapshotMaxSeqId]
+  6. Release updatesLock.writeLock()
+     (Steps 1-6 are indivisible from a safety perspective: the
+      updatesLock.writeLock() held during steps 1-6 prevents concurrent
+      writes from modifying the memstore during snapshot, and steps 7-8
+      occur before any RAFT interaction.)
+  7. doSyncOfUnflushedWALChanges()                    [sync START_FLUSH to HDFS]
+  8. Flush memstore snapshot to HFiles in tmp dir     [local operation with HDFS]
+  9. sfc.commit()                                     [move HFiles from tmp to store dir]
+     (HFiles are now durable and accessible on HDFS.
+      HFiles cover entries ≤ snapshotMaxSeqId.)
+ 10. consensus.propose(FLUSH_COMPLETE marker)         [propose through RAFT]
+     Marker includes: flushOpSeqId, snapshotMaxSeqId, list of new HFile paths
+ 11. Wait for RAFT commit (majority acknowledge)
+ 12. decrMemStoreSize()                               [drop memstore entries ≤ snapshotMaxSeqId;
+                                                       entries above snapshotMaxSeqId (including
+                                                       any concurrent in-flight writes) survive]
+ 13. WALUtil.writeFlushMarker(COMMIT_FLUSH)           [to local WAL, with sync]
+ 14. wal.completeCacheFlush()                         [clear flushInProgress]
+ 15. GC RAFT log entries at or below snapshotMaxSeqId
 ```
 
-The flush protocol checks lease validity only at step 1. Steps 2 through 14 require only that the node's role is leader, not a valid lease. A transient lease expiry during flush is resolved by the next heartbeat refresh, which re-validates the lease, or by step-down, which aborts the flush via the role-transition reset described below. Adding redundant lease checks mid-flush would increase abort frequency without improving safety (verified by the TLA+ model).
+The flush protocol checks lease validity only at step 1. Steps 2 through 15 require only that the node's role is leader, not a valid lease. A transient lease expiry during flush is resolved by the next heartbeat refresh, which re-validates the lease, or by step-down, which aborts the flush via the role-transition reset described below. Adding redundant lease checks mid-flush would increase abort frequency without improving safety (verified by the TLA+ model).
 
-The write pipeline and flush pipeline are mutually exclusive on each member for the duration of the entire flush protocol. In the stock HBase implementation, starting a cache flush does not block WAL writes; write blocking is limited to the updates write lock held during the snapshot phase (steps 1-5), after which writes resume while HFiles are still being written and committed. For RAFT-enabled regions, this is insufficient. The RAFT flush protocol requires mutual exclusion through step 14 (not just step 5), because writes must not proceed while the flush is between HFile commit and memstore drop. A per-region flush-in-progress flag is set at step 1 and cleared at step 13 when the cache flush completes. The write path checks this flag at the start of the mini-batch mutate and rejects writes with a retry-eligible error while a flush is in progress (verified by the TLA+ model). This mutual exclusion is a hard requirement for correctness. Without it, a write could be in-flight while the flush is between HFile commit and memstore drop, creating a window where the write's sequence ID is both present in the memstore and below the flush's sequence ID, making it eligible for drop.
+The write pipeline and flush pipeline run concurrently using a snapshot-boundary protocol. Unlike the original design, which required mutual exclusion through the entire flush protocol (blocking writes from step 1 to step 14), the snapshot-boundary protocol eliminates the write pause by recording the actual HFile coverage boundary (`snapshotMaxSeqId`) at flush time and using it — rather than `flushOpSeqId` — as the memstore drop boundary. This decoupling is safe because of the monotonic seqId counter: any write that starts after (or concurrently with) the flush receives a seqId from `getNextSequenceId(wal)`, which is always greater than `snapshotMaxSeqId` (since `snapshotMaxSeqId` is recorded before `flushOpSeqId` is consumed, and all future seqIds are above `flushOpSeqId`). Therefore, concurrent writes are above the drop boundary and survive the memstore drop at step 12.
 
-The error-handling behavior depends on where in the protocol a failure occurs. If the leader crashes before step 8, no HFiles have been written and no RAFT marker has been proposed. The catch block aborts the cache flush, the memstore remains intact on all members, and recovery replays from the WAL. If the crash happens between steps 8 and 10, HFiles exist on HDFS but no member has dropped its memstore. The RAFT proposal may or may not have reached followers. If it reached a majority the marker can be committed by the new leader's log advancement (verified by the TLA+ model). When this occurs, MicroRaft's commit-index advancement must atomically apply the committed entry to the leader's own state machine via the run-operation callback, including the memstore drop for flush markers. Without this atomicity, a window exists where the entry is committed but unapplied on the leader, violating MVCC continuity if the leader has already completed promotion (verified by the TLA+ model). If the proposal did not reach a majority, the marker is not committed and all members retain their memstores. The orphan HFiles on HDFS are cleaned up by the new primary or by HFileCleaner, and the new primary may re-flush if needed. A related subtlety is the concurrent-flush scenario. If the new leader initiates its own flush before those orphan HFiles are cleaned up, two sets of HFiles may cover overlapping sequence ID ranges. This is safe because HBase's compaction and read path use sequence ID ranges in HFile metadata to identify overlapping files, and compaction will merge and deduplicate them (verified by the TLA+ model). Between the new flush and the next compaction, scanners may momentarily see duplicate cells from both HFile sets, but HBase's scanner merge logic deduplicates cells with identical row/family/qualifier/timestamp/type, and sequence ID tie-breaking ensures consistent ordering.
+The only write pause is the brief `updatesLock.writeLock()` held during the memstore snapshot (steps 1-6), which is the same narrow lock that stock HBase holds during flush. After the lock is released at step 6, writes proceed concurrently with HFile writing (steps 7-8), HFile commit (step 9), RAFT proposal (step 10), RAFT commit (step 11), and memstore drop (step 12). This reduces the flush-induced write pause from the full flush duration (potentially hundreds of milliseconds to seconds for large memstores or slow HDFS) to just the snapshot duration (typically single-digit milliseconds).
 
-If the crash occurs between steps 10 and 12, the RAFT marker has been committed but the local WAL marker has not been written. All surviving members apply the RAFT marker, refresh their store file lists, and drop their memstores. The crashed leader's WAL is missing the COMMIT_FLUSH marker, but this is harmless: WAL splitting may find a START_FLUSH without a matching COMMIT_FLUSH, yet the promoted replica does not need WAL recovery because it has the data from RAFT. The RAFT-aware SCP path skips WAL splitting for this region. A crash after step 12 is a normal completion; all members have already transitioned.
+The `flushInProgress` flag is still set at step 1 and cleared at step 14 to prevent overlapping flushes on the same member, but it no longer gates the write path. The write path has no flush-phase check. Safety is ensured by the boundary separation: entries at or below `snapshotMaxSeqId` are in HFiles and eligible for drop; entries above `snapshotMaxSeqId` are not in HFiles and are preserved (verified by the TLA+ model's `FlushDropBoundary` invariant).
 
-Finally, any event that causes the flushing member to lose leadership atomically resets the flush state to idle, with one exception. If the flush marker has already been RAFT-committed, the step-down handler must atomically complete the memstore drop rather than aborting it. Aborting at this point would leave the member's memstore inconsistent. The step-down handler is therefore phase-aware: abort at the flush-started, HFiles-committed, or RAFT-proposed phases; complete at the RAFT-committed phase (verified by the TLA+ model). If the cache flush had already been started and the flush is being aborted, the catch block writes an abort-flush marker to the local WAL, aborts the cache flush, and clears the per-region flush-in-progress flag, unblocking writes for the region. The memstore is not dropped. Any HFiles already committed to HDFS become orphans, cleaned up by the new primary or HFileCleaner. Unlike the current HBase code, which kills the RegionServer on a dropped-snapshot exception, a flush abort due to leadership loss does not kill the RS, because the memstore is intact and no data has been lost. This applies uniformly to all leadership-loss scenarios: RAFT proposal failure due to partition, step-down via higher-term discovery such as heartbeat response, vote request, or any RPC carrying a higher term, crash-restart, and new leader election. The new leader in a surviving AZ will re-flush as needed (verified by the TLA+ model).
+On followers, the RAFT flush-complete marker carries `snapshotMaxSeqId` alongside `flushOpSeqId`. When a follower applies the marker, it drops memstore entries at or below `snapshotMaxSeqId` (not `flushOpSeqId`), preserving any in-flight entries between `snapshotMaxSeqId` and `flushOpSeqId` that are not covered by HFiles. RAFT log GC similarly uses `snapshotMaxSeqId` as the boundary: entries at or below `snapshotMaxSeqId` are in HFiles and can be GC'd from the log; entries between `snapshotMaxSeqId` and `flushOpSeqId` must be retained in the log because they are only recoverable via RAFT replay (verified by the TLA+ model's `CatchUpDataIntegrity` invariant).
+
+The error-handling behavior depends on where in the protocol a failure occurs. If the leader crashes before step 9, no HFiles have been written and no RAFT marker has been proposed. The catch block aborts the cache flush, the memstore remains intact on all members, and recovery replays from the WAL. If the crash happens between steps 9 and 11, HFiles exist on HDFS but no member has dropped its memstore. The RAFT proposal may or may not have reached followers. If it reached a majority the marker can be committed by the new leader's log advancement (verified by the TLA+ model). When this occurs, MicroRaft's commit-index advancement must atomically apply the committed entry to the leader's own state machine via the run-operation callback, including the memstore drop for flush markers. The drop uses `snapshotMaxSeqId` from the marker, preserving any in-flight writes between `snapshotMaxSeqId` and `flushOpSeqId`. Without this atomicity, a window exists where the entry is committed but unapplied on the leader, violating MVCC continuity if the leader has already completed promotion (verified by the TLA+ model). If the proposal did not reach a majority, the marker is not committed and all members retain their memstores. The orphan HFiles on HDFS are cleaned up by the new primary or by HFileCleaner, and the new primary may re-flush if needed. A related subtlety is the concurrent-flush scenario. If the new leader initiates its own flush before those orphan HFiles are cleaned up, two sets of HFiles may cover overlapping sequence ID ranges. This is safe because HBase's compaction and read path use sequence ID ranges in HFile metadata to identify overlapping files, and compaction will merge and deduplicate them (verified by the TLA+ model). Between the new flush and the next compaction, scanners may momentarily see duplicate cells from both HFile sets, but HBase's scanner merge logic deduplicates cells with identical row/family/qualifier/timestamp/type, and sequence ID tie-breaking ensures consistent ordering.
+
+If the crash occurs between steps 11 and 13, the RAFT marker has been committed but the local WAL marker has not been written. All surviving members apply the RAFT marker, refresh their store file lists, and drop memstore entries at or below `snapshotMaxSeqId`. The crashed leader's WAL is missing the COMMIT_FLUSH marker, but this is harmless: WAL splitting may find a START_FLUSH without a matching COMMIT_FLUSH, yet the promoted replica does not need WAL recovery because it has the data from RAFT. The RAFT-aware SCP path skips WAL splitting for this region. A crash after step 13 is a normal completion; all members have already transitioned.
+
+Finally, any event that causes the flushing member to lose leadership atomically resets the flush state to idle, with one exception. If the flush marker has already been RAFT-committed, the step-down handler must atomically complete the memstore drop rather than aborting it. Aborting at this point would leave the member's memstore inconsistent. The step-down handler is therefore phase-aware: abort at the flush-started, HFiles-committed, or RAFT-proposed phases; complete at the RAFT-committed phase. In the RAFT-committed case, the step-down handler drops memstore entries at or below `snapshotMaxSeqId`, preserving any concurrent in-flight writes with seqIds above `snapshotMaxSeqId` (verified by the TLA+ model). If the cache flush had already been started and the flush is being aborted, the catch block writes an abort-flush marker to the local WAL, aborts the cache flush, and clears the per-region flush-in-progress flag. The memstore is not dropped. Any HFiles already committed to HDFS become orphans, cleaned up by the new primary or HFileCleaner. Unlike the current HBase code, which kills the RegionServer on a dropped-snapshot exception, a flush abort due to leadership loss does not kill the RS, because the memstore is intact and no data has been lost. This applies uniformly to all leadership-loss scenarios: RAFT proposal failure due to partition, step-down via higher-term discovery such as heartbeat response, vote request, or any RPC carrying a higher term, crash-restart, and new leader election. The new leader in a surviving AZ will re-flush as needed (verified by the TLA+ model).
 
 ```mermaid
 flowchart TD
@@ -817,18 +831,23 @@ Follower handling of RAFT FLUSH_COMPLETE marker (in the consensus apply callback
 ```
 Follower flush-complete handling:
   1. Complete any preceding mutation batch (mvcc.completeAndWait)
-  2. mvcc.advanceTo(flushOpSeqId)                    [safe: no in-flight writes]
+  2. mvcc.advanceTo(flushOpSeqId)                    [advance MVCC past the marker]
   3. Refresh store file lists from HDFS              [pick up new HFiles]
   4. Confirm HFiles are accessible                   [retry with backoff if HDFS is slow]
-  5. Drop memstore entries below flushOpSeqId
-  6. GC local RAFT log entries prior to flushOpSeqId
+  5. Drop memstore entries at or below snapshotMaxSeqId
+     (snapshotMaxSeqId is carried in the RAFT flush-complete marker;
+      entries between snapshotMaxSeqId and flushOpSeqId are in-flight
+      writes that are NOT in HFiles and must be preserved)
+  6. GC local RAFT log entries at or below snapshotMaxSeqId
+     (entries between snapshotMaxSeqId and flushOpSeqId must remain
+      in the log for catch-up recovery)
 ```
 
 This ensures all members transition from memstore to HFiles at the same logical point in the RAFT log, maintaining consistency (verified by the TLA+ model).
 
-Step 6 (RAFT log GC) is not merely an optimization. Without it, the monotonic apply index invariant can be violated. Entries below the flush sequence ID that were already dropped from the memstore during step 5 would still be visible in the RAFT log and could be re-applied by subsequent apply callbacks, restoring stale data into the memstore.
+Step 6 is not merely an optimization. Without it, the monotonic apply index invariant can be violated. Entries at or below `snapshotMaxSeqId` that were already dropped from the memstore during step 5 would still be visible in the RAFT log and could be re-applied by subsequent apply callbacks, restoring stale data into the memstore. Note that the GC boundary is `snapshotMaxSeqId`, not `flushOpSeqId`: entries between `snapshotMaxSeqId` and `flushOpSeqId` are only in the RAFT log and must be retained for catch-up recovery (verified by the TLA+ model).
 
-The primary runs compaction. When compaction completes, the primary proposes a compaction marker through RAFT. Replicas pick up the new compacted HFiles via StorefileRefresherChore or an explicit refresh triggered by the compaction marker. Compaction is crash-safe by construction: compacted HFiles are written to a temporary directory and atomically committed (moved into the store directory) only when complete. If the primary crashes mid-compaction, the incomplete output in the temporary directory is ignored and cleaned up by existing HBase housekeeping (HFileCleaner / TempDir cleanup). The original input HFiles remain valid, and the new primary may re-run the compaction if needed.
+The primary runs compaction. When compaction completes, the primary proposes a compaction marker through RAFT. Replicas pick up the new compacted HFiles via StorefileRefresherChore or an explicit refresh triggered by the compaction marker. Compaction is crash-safe by construction: compacted HFiles are written to a temporary directory and atomically committed (moved into the store directory) only when complete. If the primary crashes mid-compaction, the incomplete output in the temporary directory is ignored and cleaned up by existing HBase housekeeping. The original input HFiles remain valid, and the new primary may re-run the compaction if needed.
 
 StorefileRefresherChore is retained for RAFT-enabled tables as a fallback safety net. The primary mechanism for replicas to discover new HFiles is the immediate store file refresh triggered by the RAFT flush and compaction markers; StorefileRefresherChore supplements this in case marker-triggered refreshes are delayed. The `hbase-consensus` module auto-enables the chore for RAFT-enabled deployments: when any table has `hbase.raft.enabled = true`, the module sets `hbase.regionserver.storefile.refresh.period` to 30000ms and `hbase.regionserver.storefile.refresh.all` to `true` at RegionServer startup, provided these values have not been explicitly configured by the operator. This avoids a configuration gotcha where the chore is left disabled (the HBase default is 0 / meta-only) and replicas silently fail to discover new HFiles when marker-triggered refreshes are delayed.
 
@@ -1110,7 +1129,7 @@ All three scenarios use the same catch-up reference and install-snapshot mechani
 
 **Clock skew.** Cell timestamps come from either the client or the server's current time. In the RAFT model, the primary assigns timestamps during mini-batch preparation before proposing through RAFT, so all members see the same timestamp. This is already the case for the current write path, so no change is needed.
 
-**Flush coordination.** The primary writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT. All members transition from memstore to HFiles at the same logical point in the RAFT log. Because HFiles are fully written before the marker is proposed, there is no window where a member has dropped its memstore but HFiles are unavailable. Replicas pick up the new HFiles from HDFS upon applying the flush-complete marker via an immediate store file refresh triggered by the marker, supplemented by StorefileRefresherChore as a fallback. A brief delay in replica HFile discovery does not affect client-visible consistency for either default reads or Timeline reads: the replica has not yet dropped its memstore when the marker-triggered refresh is delayed, so Timeline reads on that replica remain consistent throughout the transition.
+**Flush coordination.** The primary writes HFiles to HDFS first, then proposes a flush-complete marker through RAFT. All members transition from memstore to HFiles at the same logical point in the RAFT log. Because HFiles are fully written before the marker is proposed, there is no window where a member has dropped its memstore but HFiles are unavailable. The flush-complete marker carries both `flushOpSeqId` and `snapshotMaxSeqId` . The memstore drop on all members uses `snapshotMaxSeqId` as the boundary, not `flushOpSeqId`, so that concurrent in-flight writes are preserved. RAFT log GC also uses `snapshotMaxSeqId` as the boundary, retaining entries between `snapshotMaxSeqId` and `flushOpSeqId` in the log because they are only recoverable via RAFT replay. Replicas pick up the new HFiles from HDFS upon applying the flush-complete marker via an immediate store file refresh triggered by the marker, supplemented by StorefileRefresherChore as a fallback. A brief delay in replica HFile discovery does not affect client-visible consistency for either default reads or Timeline reads.
 
 **Inter-AZ latency impact.** Every write now requires both a WAL sync and a RAFT round-trip to a majority, but these run in parallel. The write latency is the maximum of the WAL sync and the RAFT round-trip, not the sum. In a cross-AZ deployment with HDFS replication factor 3, the HDFS WAL pipeline includes inter-AZ hops. The write must reach and be acknowledged by DataNodes in at least two AZs. Realistic HDFS WAL sync latency in this configuration is ~3-5ms. The RAFT consensus round requires only a network round-trip to the nearest follower (~2ms cross-AZ) because fdatasync on the consensus log is decoupled from the consensus round. The RAFT consensus overhead is fully hidden behind the HDFS WAL sync. The parallel barrier adds no additional latency over today's single-WAL path in a cross-AZ HDFS deployment. The trade-off is that on crash recovery, up to 100ms of consensus log entries may need to be replayed from peers, which is trivial given that the HDFS WAL is the durability mechanism.
 
@@ -1166,6 +1185,66 @@ flowchart LR
     D --> E["Disable RAFT<br/>on table"]
     E --> F["Normal primary,<br/>no replicas"]
 ```
+
+## Availability Impact
+
+This section assesses the availability characteristics of the RAFT-based region replica design relative to the current HBase model, examining each class of failure and operational event.
+
+### Steady-State Write Availability
+
+Under normal operation a RAFT-enabled region accepts writes whenever the leader holds a valid lease and the promotion-complete flag is set. The parallel write path requires both the HDFS WAL sync and the RAFT majority acknowledgment to succeed before the client is acknowledged. If either path fails, the write is rejected and the client retries. The RAFT majority requirement means that at least two of the three members must be reachable for writes to proceed. A single slow or unreachable follower does not block writes because the leader and one healthy follower suffice for a majority. In practice, this means that the write path tolerates one member being down, partitioned, or slow without any write unavailability. This is a strict improvement over the current model, where the loss of the single primary makes the region entirely unavailable for writes until SCP completes WAL splitting and reassignment.
+
+### Steady-State Read Availability
+
+Default-consistency reads continue to be served exclusively by the primary, as they are today. The availability of default reads is therefore identical to write availability. As long as the leader is healthy and promoted, default reads succeed. Timeline-consistency reads are served by any replica, including the leader. Under the current async replication model, replica staleness is unbounded and grows during replication lag. Under RAFT replication, follower memstores are kept current by ordered, majority-committed log entries, so Timeline reads return much fresher data. During normal operation all three members can serve reads, providing three-way read availability. If one member is down, two members still serve Timeline reads. If two members are down the surviving member, if it is the leader, continues serving both default and Timeline reads while RAFT writes are blocked, and if it is a follower, it can serve Timeline reads from its last-applied state but writes and default reads are unavailable until the leader recovers or a new election completes.
+
+### Single AZ Failure
+
+The design's primary availability improvement is tolerance of a full AZ outage. When one AZ fails, the surviving two members in the remaining AZs detect the failure via heartbeat timeout (default 1500ms) and elect a new RAFT leader. The promotion protocol then runs in three phases: RAFT-internal log catch-up, master confirmation via ReportLeaderElection, and local state transitions on the promoted replica. The total failover time from AZ failure to the new primary accepting writes is bounded by the heartbeat timeout plus log catch-up time plus one master RPC round-trip, typically sub-second to a few seconds. Throughout this promotion window, the region is unavailable for writes and default-consistency reads, but Timeline reads continue to be served by the surviving replicas whose memstore is warm from RAFT replication.
+
+This is a qualitative change from the current model. Today, an AZ failure taking down the primary's RegionServer triggers ServerCrashProcedure, which must split the dead server's WAL on HDFS, assign the region to a new RegionServer, and replay recovered edits to rebuild the memstore. This process takes seconds to minutes depending on WAL size and cluster load, and during the entire window the region is unavailable for all operations except Timeline reads on replicas. Under the RAFT model, the promotion bypasses WAL splitting entirely because the promoted replica's memstore is already warm, and SCP's role is reduced to coordination and fallback.
+
+### Simultaneous Master and AZ Failure
+
+If the master and the primary's AZ fail simultaneously, the RAFT election proceeds independently of master election because the consensus protocol operates peer-to-peer among RegionServers. The surviving replicas elect a new RAFT leader as soon as the heartbeat timeout fires, even before the backup master becomes active. The newly elected leader holds a valid RAFT lease and can serve Timeline reads immediately. However, it cannot serve writes because the promotion-complete flag requires master confirmation, which is unavailable until the backup master wins its own election and processes the backlogged ReportLeaderElection RPC. Write unavailability in this scenario is bounded by master election time plus one RPC round-trip. Once the backup master is active and processes the report, the region completes promotion and begins serving writes. This is strictly better than the current model, where simultaneous master and primary failure leaves the region completely unavailable until both the master recovers and SCP runs to completion.
+
+A special case arises when the META region's primary is in the failed AZ and the master also fails. META's promotion uses an in-memory-only confirmation path, bypassing the META persistence step. Once META is writable, the master writes META's own promotion record as a deferred idempotent operation. Non-META promotions queue behind META's promotion because they require META to be writable for persistence of the new primary location. This creates a natural ordering where META recovers first, then all other regions. The additional latency for non-META regions is one META write round-trip beyond their own RAFT election time.
+
+### Promotion Gap
+
+Between the moment a replica wins the RAFT election and the moment the promotion-complete flag is set after master confirmation, the region is in a promotion gap. During this gap, the RAFT leader holds a valid lease and can serve Timeline reads, but writes are rejected with `NotServingRegionException`. Clients that attempt writes during this window receive an error and retry through the standard client retry loop. The promotion gap duration is the sum of Phase 1 (consuming remaining RAFT log entries to bring the memstore current), Phase 2 (the ReportLeaderElection RPC round-trip to the master), and Phase 3 (local state transitions including WAL reference acquisition). In the common case where the promoting replica's memstore is nearly current and the master is healthy, this gap is on the order of tens to hundreds of milliseconds.
+
+If the promoting leader's lease expires before promotion completes, or if a second election occurs during the gap, the promotion is abandoned safely. The promotion-complete flag is never set, so no writes were accepted. The new leader starts its own independent promotion. These edge cases extend the total unavailability window by one additional election cycle but do not compromise safety.
+
+### Flush-Induced Write Pauses
+
+The snapshot-boundary protocol decouples the memstore drop boundary from the flush marker seqId. Writes proceed concurrently with HFile writing, RAFT proposal, RAFT commit, and memstore drop, and are not affected by the drop. The only write-blocking interval is the `updatesLock.writeLock()` held during the memstore snapshot (steps 1-6 of the flush protocol), which is the same narrow lock that stock HBase holds during flush. This lock prevents concurrent writes from modifying the memstore while the snapshot boundary is being captured. The duration of this lock is typically single-digit milliseconds, independent of memstore size, HDFS throughput, or RAFT commit latency. After the lock is released, all remaining flush steps proceed concurrently with the write pipeline.
+
+### Balancer-Initiated Region Moves
+
+When the balancer decides to move a region, it sends a region close to the current primary's RegionServer. The primary closes the region, the RAFT leader steps down, the surviving members elect a new leader, and the full three-phase promotion protocol runs. During this sequence the region is unavailable for writes. The unavailability window is the same duration as a crash-triggered promotion, on the order of sub-second to a few seconds. This is comparable to the current model's region move latency, where a close-open cycle also causes a write unavailability gap.
+
+The balancer is extended with a cost function that penalizes moving the current RAFT primary, biasing the stochastic search toward moving followers when possible. Moving a follower is lightweight and does not cause any write unavailability for the region. Only when moving the primary is unavoidable does the election-and-promotion cycle occur.
+
+### Region Split and Merge
+
+Region splits and merges cause unavailability for the affected regions during the procedure. For splits, the primary proposes a region-close/split marker through RAFT, and the master waits for this marker to be RAFT-committed before opening daughter regions. During the window between the parent group's closure and the daughter groups' readiness, the key range is unavailable. For merges, both parent groups must close before the merged group opens. These unavailability windows are similar in duration to the current model's split and merge procedures because the RAFT commit of the close marker adds only a few milliseconds to the existing procedure latency. The safety property that no member has both a parent group and a daughter group active for the same key range simultaneously is enforced by RAFT log ordering, which is a stronger guarantee than the current model's asynchronous coordination.
+
+### HDFS Degradation
+
+The primary's ability to flush depends on HDFS availability. If HDFS is degraded, the primary cannot flush but can continue accepting writes into the memstore, bounded by memstore size limits. RAFT replication continues independently of HDFS because RAFT entries are replicated over the consensus transport, not through HDFS. Replicas receive and apply entries to their memstores regardless of the primary's flush status. If the primary cannot flush for an extended period, it hits memstore back-pressure and slows down writes, which is the same behavior as a non-replicated region under HDFS pressure. In this sense, HDFS degradation affects write throughput but not write availability until the memstore is full, and the impact is identical to the current model.
+
+However, the promoted replica's initial ability to serve as primary after failover depends on HDFS for HFile access. If HDFS is simultaneously degraded when a failover occurs, the promoted replica may be unable to serve reads that require HFile data. RAFT replication ensures the promoted replica has a warm memstore covering all data since the last flush, so reads for recently written data succeed, but reads for older data that has been flushed to HFiles depend on HDFS accessibility. In practice, the three-AZ HDFS deployment with rack-aware placement means that an AZ failure does not take down HDFS because the NameNode and sufficient DataNodes survive in the remaining AZs.
+
+### New Member Bootstrap and Replication Factor Recovery
+
+After a failure, the surviving two members continue operating at a reduced replication factor of two. The cluster remains available for reads and writes, but a second member failure before the replication factor is restored would leave only one surviving member, which cannot form a RAFT majority. The master schedules a replacement replica as part of SCP's post-promotion cleanup. The new member loads shared HFiles from HDFS and catches up via RAFT log replay or the shared-storage catch-up path. During bootstrap, the new member is not eligible for voting or promotion, so the cluster operates with a two-member quorum until bootstrap completes. The time to restore the full replication factor depends on the region's data size (for HFile loading) and the write rate (for RAFT log catch-up), typically seconds to minutes. Until the third member is fully caught up, the system can not tolerate additional member failures for that region without losing write availability.
+
+### Availability Summary
+
+The net effect of the RAFT-based design on availability is strongly positive.
+
+The dominant improvement is the elimination of WAL splitting from the failover path, which reduces region unavailability after a primary failure from seconds-to-minutes to sub-second-to-seconds. Write availability during single AZ failures is maintained after a brief promotion gap, whereas the current model provides no write availability until SCP completes. Read availability is improved by keeping replica memstores current through ordered RAFT replication rather than best-effort async replication, making Timeline reads useful during and after failover rather than increasingly stale. A new source of per-region unavailability is the promotion gap, on the order of hundreds of milliseconds in the common case. This is a modest cost relative to the large gains in failover speed and write availability under failure.
 
 ## Performance and Scalability
 
@@ -1548,12 +1627,12 @@ A TLA+ specification models the protocols described in the design document that 
 | 9 | `VoteDurabilityRequired` | Vote durability is an implementation requirement: `hbase-consensus` always uses a durable `RaftStore` that persists `votedFor` and `currentTerm` before responding to vote requests. The spec models this unconditionally: `CrashRestart` preserves `currentTerm` and `votedFor` (UNCHANGED). | Verified |
 | 10 | `NoSCPWALSplit` | RAFT-enabled regions bypass WAL splitting during SCP; recovery uses RAFT log replay, not recovered edits | Pending |
 | 11 | `PromotionMemstoreEquivalence` | At promotion completion, the promoted replica's memstore is equivalent to the old primary's memstore at the crash point (all RAFT-committed entries applied, no uncommitted entries) | Pending |
-| 12 | `FlushWriteExclusion` | The write pipeline and flush pipeline are never simultaneously active on the same member; for RAFT-enabled regions, a per-region flush-in-progress flag (set at step 1, cleared at step 13) blocks writes for the duration of the flush protocol, and the write path is guarded by flush idle state. Formalized as: `¬(writePhase[m] ≠ "Idle" ∧ flushPhase[m] ≠ "Idle")`. | Verified |
-| 13 | `FollowerFlushMemstoreDrop` | After a follower processes a flush-complete marker with sequence ID S, the follower's memstore contains no entry with sequence ID < S (non-marker entries only; marker entries represent advance-to points). Formalized as: `∀ m ∈ Members : role[m] = "Follower" ⇒ ∀ s ∈ flushMarkerEntries ∩ memstore[m] : ∀ t ∈ memstore[m] \ markerEntries : t ≥ s`. | Verified |
+| 12 | `FlushDropBoundary` | Every committed flush marker's HFile coverage boundary (`flushDropBound[f]`) is strictly below the flush marker's own seqId. This ensures concurrent in-flight writes (with seqIds between `snapshotMaxSeqId` and `flushOpSeqId`) survive the memstore drop during the snapshot-boundary flush protocol. Formalized as: `∀ f ∈ flushMarkerEntries : flushDropBound[f] < f`. | Verified |
+| 13 | `FollowerFlushMemstoreDrop` | After a follower processes a flush-complete marker with sequence ID S, the follower's memstore contains no non-marker entry at or below `flushDropBound[S]` (the HFile coverage boundary). Entries between `flushDropBound[S]` and S (in-flight writes at flush time) correctly remain. Formalized as: `∀ m ∈ Members : role[m] = "Follower" ⇒ ∀ s ∈ flushMarkerEntries ∩ memstore[m] : ∀ t ∈ memstore[m] \ markerEntries : t > flushDropBound[s]`. | Verified |
 | 14 | `MemberMemstorePrefixEquivalence` | If two members have both applied all committed entries up to the same log index, their memstores contain the same set of sequence IDs; strengthens `FollowerSeqIdConsistency` for promotion correctness | Pending |
 | 15 | `HFilesBeforeFlushMarker` | A flush marker is committed through RAFT only after the corresponding HFiles are durable on HDFS. Formalized as: `∀ s ∈ flushMarkerEntries ∩ committedEntries : s ∈ hdfsHFiles`. | Verified |
-| 16 | `CatchUpDataIntegrity` | Every committed entry is recoverable via RAFT log replay (in a majority of logs) or via HFiles on HDFS (covered by a committed flush marker with durable HFiles). Formalized as: `∀ s ∈ committedEntries : Cardinality({m ∈ Members : s ∈ raftLog[m]}) ≥ Majority ∨ ∃ f ∈ flushMarkerEntries ∩ hdfsHFiles : f ≥ s`. | Verified |
-| 17 | `CatchUpCompleteness` | Once a follower (or promoting member) has applied all committed entries (`ApplicableEntries(m) = {}` and `fApplyBatch[m] = {}`), its memstore is consistent with the committed state: every committed entry is in memstore or covered by an applied flush marker (data is in HFiles on HDFS). Verifies no entries are lost or applied twice during catch-up with concurrent flush. | Verified |
+| 16 | `CatchUpDataIntegrity` | Every committed entry is recoverable via RAFT log replay (in a majority of logs) or via HFiles on HDFS (the entry's seqId is at or below a committed flush marker's HFile coverage boundary). Entries between `flushDropBound[f]` and `f` (in-flight writes at flush time) are not in HFiles and must be in a majority of RAFT logs. Formalized as: `∀ s ∈ committedEntries : Cardinality({m ∈ Members : s ∈ raftLog[m]}) ≥ Majority ∨ ∃ f ∈ flushMarkerEntries ∩ hdfsHFiles : s ≤ flushDropBound[f]`. | Verified |
+| 17 | `CatchUpCompleteness` | Once a follower (or promoting member) has applied all committed entries (`ApplicableEntries(m) = {}` and `fApplyBatch[m] = {}`), its memstore is consistent with the committed state: every committed entry is in memstore or covered by an applied flush marker (the entry's seqId is at or below the marker's HFile coverage boundary `flushDropBound[f]`). Verifies no entries are lost or applied twice during catch-up with concurrent flush. | Verified |
 | 18 | `NoKeyRangeOverlap` | **(Split lifecycle)** No member has both parent and daughter groups active for the same key range. Formalized as: `∀ m ∈ Members : daughterGroupsActive[m] ⇒ splitMarkerSeqId > 0 ∧ (splitMarkerSeqId ∈ memstore[m] ∨ ∃ f ∈ flushMarkerEntries ∩ memstore[m] : f ≥ splitMarkerSeqId)`. The flush-marker disjunct handles the over-approximation artifact where the ungated parent's flush cleans the split marker from memstore; entry ordering guarantees the split marker was applied first. State-loss actions (crash, bootstrap, snapshot) reset `daughterGroupsActive[m]`, so the antecedent is false after state loss. | Verified |
 | 19 | `NoKeyRangeOverlapMerge` | **(Merge lifecycle)** No member has both a parent group and the merged group active for the same key range. Both parents' merge markers must be committed and locally applied before the merged group opens. Formalized as: `∀ m ∈ Members : mergedGroupActive[m] ⇒ (mergeMarkerSeqId_1 > 0 ∧ (mergeMarkerSeqId_1 ∈ memstore_1[m] ∨ ∃ f ∈ flushMarkerEntries_1 ∩ memstore_1[m] : f ≥ mergeMarkerSeqId_1)) ∧ (mergeMarkerSeqId_2 > 0 ∧ (mergeMarkerSeqId_2 ∈ memstore_2[m] ∨ ∃ f ∈ flushMarkerEntries_2 ∩ memstore_2[m] : f ≥ mergeMarkerSeqId_2))`. Same reasoning as `NoKeyRangeOverlap` applied to both parent groups independently. | Verified |
 
@@ -1896,7 +1975,7 @@ LeaseExpiresBeforeElection ==
 
 #### Write Barrier
 
-The write path models the parallel WAL sync + RAFT propose pipeline from `HRegion.doMiniBatchMutate()`. `BeginWrite` atomically assigns a sequence ID via `mvcc.begin()` and claims a WAL ring buffer slot. The guards enforce mutual exclusion with flush and require completed promotion.
+The write path models the parallel WAL sync + RAFT propose pipeline from `HRegion.doMiniBatchMutate()`. `BeginWrite` atomically assigns a sequence ID via `mvcc.begin()` and claims a WAL ring buffer slot. The guard requires completed promotion but does not enforce mutual exclusion with flush: the snapshot-boundary protocol allows writes and flushes to proceed concurrently.
 
 ```tla
 BeginWrite(m) ==
@@ -1977,17 +2056,19 @@ FollowerApplyMarker(m) ==
 
 #### Flush Protocol
 
-The flush protocol models the 14-step primary flush sequence from the design document, collapsed into safety-critical phases. The five actions trace the phase machine: `FlushStart` (steps 1-7), `FlushCommitHFiles` (step 8), `FlushRAFTPropose` (step 9), `FlushRAFTCommit` (step 10), `FlushComplete` (steps 11-14). The flush and write pipelines are mutually exclusive, enforced by the `flushPhase[m] = "Idle"` guard on `BeginWrite` and the `writePhase[m] = "Idle"` guard on `FlushStart`.
+The flush protocol models the 15-step primary flush sequence from the design document, collapsed into safety-critical phases. The five actions trace the phase machine: `FlushStart` (steps 1-8), `FlushCommitHFiles` (step 9), `FlushRAFTPropose` (step 10), `FlushRAFTCommit` (step 11), `FlushComplete` (steps 12-15). The snapshot-boundary protocol allows writes and flushes to run concurrently: `FlushStart` records `snapshotMaxSeqId` and `FlushComplete` drops only entries at or below `snapshotMaxSeqId`, preserving concurrent in-flight writes. `BeginWrite` has no flush-phase guard and `FlushStart` has no write-phase guard.
 
 ```tla
 FlushStart(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
-    /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
-    /\ flushPhase' = [flushPhase EXCEPT ![m] = "FlushStarted"]
-    /\ flushSeqId' = [flushSeqId EXCEPT ![m] = nextSeqId]
+    /\ LET snapBound == IF memstore[m] = {} THEN 0 ELSE SetMax(memstore[m])
+       IN /\ flushPhase' = [flushPhase EXCEPT ![m] = "FlushStarted"]
+          /\ flushSeqId' = [flushSeqId EXCEPT ![m] = nextSeqId]
+          /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = snapBound]
+          /\ flushDropBound' = [flushDropBound EXCEPT ![nextSeqId] = snapBound]
     /\ nextSeqId'  = nextSeqId + 1
     \* ... UNCHANGED omitted ...
 
@@ -2039,29 +2120,30 @@ FlushRAFTCommit(m) ==
 FlushComplete(m) ==
     /\ role[m] = "Leader"
     /\ flushPhase[m] = "RAFTCommitted"
-    /\ memstore' = [memstore EXCEPT ![m] = {s \in @ : s >= flushSeqId[m]}]
+    /\ memstore' = [memstore EXCEPT ![m] = {s \in @ : s > snapshotMaxSeqId[m]}]
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "Idle"]
     /\ flushSeqId' = [flushSeqId EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     \* ... UNCHANGED omitted ...
 ```
 
-The four flush invariants verify the protocol's safety properties. `NoOrphanMemstoreDrop` ensures no member reaches the memstore-drop gate without the flush marker being committed. `FlushWriteExclusion` verifies mutual exclusion. `FollowerFlushMemstoreDrop` verifies that after a follower applies a flush marker, no non-marker entry below it remains. `HFilesBeforeFlushMarker` verifies the phase ordering: HFiles are on HDFS before the flush marker is committed.
+The four flush invariants verify the protocol's safety properties. `NoOrphanMemstoreDrop` ensures no member reaches the memstore-drop gate without the flush marker being committed. `FlushDropBoundary` verifies that every committed flush marker's HFile coverage boundary (`flushDropBound`) is strictly below the marker's seqId, ensuring concurrent in-flight writes survive the memstore drop. `FollowerFlushMemstoreDrop` verifies that after a follower applies a flush marker, no non-marker entry at or below the drop boundary remains. `HFilesBeforeFlushMarker` verifies the phase ordering: HFiles are on HDFS before the flush marker is committed.
 
 ```tla
 NoOrphanMemstoreDrop ==
     \A m \in Members :
         flushPhase[m] = "RAFTCommitted" => flushSeqId[m] \in markerEntries
 
-FlushWriteExclusion ==
-    \A m \in Members :
-        ~(writePhase[m] # "Idle" /\ flushPhase[m] # "Idle")
+FlushDropBoundary ==
+    \A f \in flushMarkerEntries :
+        flushDropBound[f] < f
 
 FollowerFlushMemstoreDrop ==
     \A m \in Members :
         role[m] = "Follower" =>
             \A s \in flushMarkerEntries \cap memstore[m] :
                 \A t \in memstore[m] \ markerEntries :
-                    t >= s
+                    t > flushDropBound[s]
 
 HFilesBeforeFlushMarker ==
     \A s \in flushMarkerEntries : s \in hdfsHFiles
@@ -2314,19 +2396,19 @@ All 14 single-group safety invariants are checked per-group via INSTANCE:
 
 ```tla
 PerGroupSafety ==
-    /\ G1!LeaderUniqueness          /\ G2!LeaderUniqueness
-    /\ G1!LeaseImpliesLeadership    /\ G2!LeaseImpliesLeadership
+    /\ G1!LeaderUniqueness           /\ G2!LeaderUniqueness
+    /\ G1!LeaseImpliesLeadership     /\ G2!LeaseImpliesLeadership
     /\ G1!LeaseExpiresBeforeElection /\ G2!LeaseExpiresBeforeElection
-    /\ G1!CatchUpDataIntegrity      /\ G2!CatchUpDataIntegrity
-    /\ G1!WriteBarrierSafety        /\ G2!WriteBarrierSafety
-    /\ G1!FollowerSeqIdConsistency  /\ G2!FollowerSeqIdConsistency
-    /\ G1!NoOrphanMemstoreDrop      /\ G2!NoOrphanMemstoreDrop
-    /\ G1!FlushWriteExclusion       /\ G2!FlushWriteExclusion
-    /\ G1!FollowerFlushMemstoreDrop /\ G2!FollowerFlushMemstoreDrop
-    /\ G1!HFilesBeforeFlushMarker   /\ G2!HFilesBeforeFlushMarker
-    /\ G1!PromotionReadWriteGuard   /\ G2!PromotionReadWriteGuard
-    /\ G1!PromotionMVCCContinuity   /\ G2!PromotionMVCCContinuity
-    /\ G1!CatchUpCompleteness       /\ G2!CatchUpCompleteness
+    /\ G1!CatchUpDataIntegrity       /\ G2!CatchUpDataIntegrity
+    /\ G1!WriteBarrierSafety         /\ G2!WriteBarrierSafety
+    /\ G1!FollowerSeqIdConsistency   /\ G2!FollowerSeqIdConsistency
+    /\ G1!NoOrphanMemstoreDrop       /\ G2!NoOrphanMemstoreDrop
+    /\ G1!FlushDropBoundary          /\ G2!FlushDropBoundary
+    /\ G1!FollowerFlushMemstoreDrop  /\ G2!FollowerFlushMemstoreDrop
+    /\ G1!HFilesBeforeFlushMarker    /\ G2!HFilesBeforeFlushMarker
+    /\ G1!PromotionReadWriteGuard    /\ G2!PromotionReadWriteGuard
+    /\ G1!PromotionMVCCContinuity    /\ G2!PromotionMVCCContinuity
+    /\ G1!CatchUpCompleteness        /\ G2!CatchUpCompleteness
 ```
 
 #### Region Split Lifecycle

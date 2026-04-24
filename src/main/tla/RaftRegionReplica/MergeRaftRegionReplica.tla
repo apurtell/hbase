@@ -441,7 +441,7 @@ PerGroupSafety ==
     /\ G1!WriteBarrierSafety        /\ G2!WriteBarrierSafety
     /\ G1!FollowerSeqIdConsistency  /\ G2!FollowerSeqIdConsistency
     /\ G1!NoOrphanMemstoreDrop      /\ G2!NoOrphanMemstoreDrop
-    /\ G1!FlushWriteExclusion       /\ G2!FlushWriteExclusion
+    /\ G1!FlushDropBoundary          /\ G2!FlushDropBoundary
     /\ G1!FollowerFlushMemstoreDrop /\ G2!FollowerFlushMemstoreDrop
     /\ G1!HFilesBeforeFlushMarker   /\ G2!HFilesBeforeFlushMarker
     /\ G1!PromotionReadWriteGuard   /\ G2!PromotionReadWriteGuard

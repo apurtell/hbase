@@ -26,7 +26,7 @@ In TLA+, a single step of the system is an action, a predicate over the current 
 
 ## Overview
 
-`RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the flush protocol (HFile commit, RAFT-proposed flush markers), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, and network partitions (including individual link healing and full network recovery).
+`RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the snapshot-boundary flush protocol (concurrent write+flush via `snapshotMaxSeqId` / `flushDropBound`, HFile commit, RAFT-proposed flush markers with HFile coverage boundary), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, and network partitions (including individual link healing and full network recovery).
 
 The base spec exports parameterized building-block operators (`GatedMemberActions(m)`, `GatedMemberDataPathActions(m)`) that collect all single-member normal-operation actions into a single disjunction. Composition modules (`SplitRaftRegionReplica`, `MergeRaftRegionReplica`, `MultiGroupRaftRegionReplica`) invoke these with per-member gating predicates to control when a RAFT group's operations are active on each member, enabling lifecycle transitions (split, merge) to deactivate a group per-member without duplicating action dispatch logic. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
 
@@ -42,7 +42,7 @@ The specification defines 14 safety invariants and 5 liveness properties verifie
 | 6 | `WriteBarrierSafety` | Write path |
 | 7 | `FollowerSeqIdConsistency` | Write path |
 | 8 | `NoOrphanMemstoreDrop` | Flush protocol |
-| 9 | `FlushWriteExclusion` | Flush protocol |
+| 9 | `FlushDropBoundary` | Flush protocol |
 | 10 | `FollowerFlushMemstoreDrop` | Flush protocol |
 | 11 | `HFilesBeforeFlushMarker` | Flush protocol |
 | 12 | `PromotionReadWriteGuard` | Promotion |

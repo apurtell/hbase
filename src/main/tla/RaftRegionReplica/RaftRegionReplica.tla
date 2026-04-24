@@ -47,18 +47,24 @@
  *
  * The flush protocol models the 14-step primary flush sequence from the
  * design document, collapsed into safety-critical phases:
- *   FlushStart       (steps 1-7):  consume flushOpSeqId, block WAL,
- *                     take snapshot, write HFiles to tmp
+ *   FlushStart       (steps 1-7):  consume flushOpSeqId, record
+ *                     snapshotMaxSeqId, take snapshot, write HFiles
  *   FlushCommitHFiles (step 8):    sfc.commit() — HFiles durable on HDFS
  *   FlushRAFTPropose  (step 9):    propose FLUSH_COMPLETE through RAFT
  *   FlushRAFTCommit   (step 10):   majority acknowledge — marker committed
  *   FlushComplete     (steps 11-14): drop memstore, COMMIT_FLUSH, GC log
  *
- * The flush and write pipelines are mutually exclusive on each member:
- * a per-region flushInProgress flag blocks writes for the duration of
- * the flush protocol (steps 1-13), modeled by the flushPhase[m] = "Idle"
- * guard on BeginWrite and the writePhase[m] = "Idle" guard on FlushStart
- * (verified by FlushWriteExclusion).
+ * Snapshot-boundary flush: the write and flush pipelines run concurrently.
+ * At FlushStart, snapshotMaxSeqId captures the highest seqId currently in
+ * the leader's memstore — the true HFile coverage boundary.  Concurrent
+ * in-flight writes receive seqIds above snapshotMaxSeqId (from the
+ * monotonic nextSeqId counter) and are NOT included in the HFile
+ * snapshot.  The memstore drop (FlushComplete) removes entries at or
+ * below snapshotMaxSeqId, preserving concurrent writes.  This
+ * eliminates the flush-induced write pause that mutual exclusion would
+ * cause.  The FlushDropBoundary invariant verifies that the HFile
+ * coverage boundary is always strictly below the flush marker seqId,
+ * ensuring in-flight writes survive the drop.
  *
  * Flush crash recovery is modeled by the existing CrashRestart action
  * firing at each of the 4 non-terminal flush phases (FlushStarted,
@@ -211,12 +217,17 @@
  *
  * Sequence IDs and MVCC state: nextSeqId is a global monotonic counter,
  * writeSeqId tracks the leader's current write seqId, flushSeqId tracks
- * the leader's current flush seqId (flushOpSeqId), committedEntries is
- * the set of RAFT-committed seqIds, markerEntries is the subset of
+ * the leader's current flush seqId (flushOpSeqId), snapshotMaxSeqId
+ * tracks the leader's current flush HFile coverage boundary (the max
+ * seqId in the memstore at FlushStart time), committedEntries is the
+ * set of RAFT-committed seqIds, markerEntries is the subset of
  * committedEntries that are markers (vs mutations), memstore is a
  * per-member set of applied/processed seqIds (including marker seqIds,
- * which represent mvcc.advanceTo points), and fApplyBatch is per-member
- * follower batch apply state (set of mutation seqIds being applied).
+ * which represent mvcc.advanceTo points), fApplyBatch is per-member
+ * follower batch apply state (set of mutation seqIds being applied),
+ * and flushDropBound is a global function mapping flush marker seqIds
+ * to their HFile coverage boundaries (snapshotMaxSeqId recorded at
+ * FlushStart time, persisted for follower marker application).
  * The MVCC writePoint is derived (not tracked as state) via
  * MVCCWritePoint(m), which computes the max of all active seqIds
  * (memstore + in-flight write + in-flight batch apply).  This reduces
@@ -287,10 +298,12 @@
  *   - NoOrphanMemstoreDrop: no member reaches the memstore-drop gate
  *     (RAFTCommitted phase) without the flush marker in markerEntries;
  *     subsumes FlushAtomicity (markerEntries ⊆ committedEntries)
- *   - FlushWriteExclusion: write and flush pipelines are never
- *     simultaneously active on the same member
+ *   - FlushDropBoundary: every committed flush marker's HFile coverage
+ *     boundary (flushDropBound) is strictly below its seqId, ensuring
+ *     concurrent in-flight writes survive the memstore drop
  *   - FollowerFlushMemstoreDrop: after a follower applies a flush
- *     marker, no non-marker entry below it remains in the memstore
+ *     marker, no non-marker entry at or below flushDropBound remains
+ *     in the memstore
  *   - HFilesBeforeFlushMarker: HFiles are on HDFS before the flush
  *     marker is committed through RAFT; subsumes NoFlushDuplication
  *   Promotion protocol:
@@ -373,6 +386,8 @@ VARIABLES
     \* ---- Flush pipeline ----
     flushPhase,         \* flushPhase[m]: flush phase (Idle | FlushStarted | HFilesCommitted | RAFTProposed | RAFTCommitted)
     flushSeqId,         \* flushSeqId[m]: seqId consumed by m's current flush (0 = none)
+    snapshotMaxSeqId,   \* snapshotMaxSeqId[m]: max seqId in the memstore snapshot at FlushStart (0 = none/empty)
+    flushDropBound,     \* flushDropBound[s]: maps flush marker seqId s to its HFile coverage boundary (snapshotMaxSeqId)
     \* ---- Promotion pipeline ----
     promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
     masterConfirmedTerm \* masterConfirmedTerm: highest RAFT term confirmed by master for this group (0 = none)
@@ -382,11 +397,12 @@ vars == <<role, currentTerm, votedFor, votesGranted, raftLog,
           nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
           hdfsHFiles, memstore, fApplyBatch,
           writePhase, walSync, raftCommitted, writeSeqId,
-          flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
+          flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
+          promotionPhase, masterConfirmedTerm>>
 
 writeVars == <<writePhase, walSync, raftCommitted, writeSeqId>>
 
-flushVars == <<flushPhase, flushSeqId>>
+flushVars == <<flushPhase, flushSeqId, snapshotMaxSeqId>>
 
 ----
 (* ---- Type invariant ---- *)
@@ -414,6 +430,8 @@ TypeOK ==
     /\ writeSeqId \in [Members -> 0..MaxSeqId]
     /\ flushPhase \in [Members -> {"Idle", "FlushStarted", "HFilesCommitted", "RAFTProposed", "RAFTCommitted"}]
     /\ flushSeqId \in [Members -> 0..MaxSeqId]
+    /\ snapshotMaxSeqId \in [Members -> 0..MaxSeqId]
+    /\ flushDropBound \in [1..MaxSeqId -> 0..MaxSeqId]
     /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
     /\ masterConfirmedTerm \in 0..MaxTerm
 
@@ -453,17 +471,18 @@ MVCCWritePoint(m) ==
     IN IF active = {} THEN 0 ELSE SetMax(active)
 
 \* Committed entries that follower m can still apply: committed, not
-\* yet in the memstore, and above the flush watermark.  Models the
+\* yet in the memstore, and above the flush drop boundary.  Models the
 \* monotonic lastAppliedIndex invariant of the real RAFT apply
 \* callback combined with RAFT log GC (follower flush-complete step 6),
-\* which removes entries below flushOpSeqId from the local log.
-\* This model uses a never-shrinking global committedEntries set, so
-\* entries dropped from memstore by a flush would re-appear as
-\* "applicable" without the flush-watermark exclusion.
+\* which removes entries at or below snapshotMaxSeqId from the local
+\* log.  The watermark is flushDropBound[f] (the actual HFile coverage
+\* boundary), not the flush marker seqId itself.  Entries between
+\* flushDropBound[f] and f (in-flight writes at flush time) are above
+\* the watermark and remain applicable.
 ApplicableEntries(m) ==
     LET appliedFlushMarkers == flushMarkerEntries \cap memstore[m]
     IN {s \in committedEntries \ memstore[m] :
-            \A f \in appliedFlushMarkers : s >= f}
+            \A f \in appliedFlushMarkers : s > flushDropBound[f]}
 
 ----
 (* ---- Initial state ---- *)
@@ -499,6 +518,8 @@ Init ==
     \* Flush pipeline
     /\ flushPhase      = [m \in Members |-> "Idle"]
     /\ flushSeqId      = [m \in Members |-> 0]
+    /\ snapshotMaxSeqId = [m \in Members |-> 0]
+    /\ flushDropBound  = [s \in 1..MaxSeqId |-> 0]
     \* Promotion pipeline
     /\ promotionPhase  = [m \in Members |-> "None"]
     /\ masterConfirmedTerm = 0
@@ -530,7 +551,8 @@ Timeout(m) ==
     /\ UNCHANGED <<raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* A candidate requests and receives a vote from another member (atomic).
 \* Requires that candidate and voter can communicate (not partitioned).
@@ -593,18 +615,20 @@ RequestVote(candidate, voter) ==
                                   IF steppingDown THEN {} ELSE @]
           /\ memstore'      = [memstore      EXCEPT ![voter] =
                                   IF steppingDown /\ flushPhase[voter] = "RAFTCommitted"
-                                  THEN {s \in @ : s >= flushSeqId[voter]}
+                                  THEN {s \in @ : s > snapshotMaxSeqId[voter]}
                                   ELSE @]
           /\ flushPhase'    = [flushPhase    EXCEPT ![voter] =
                                   IF steppingDown THEN "Idle" ELSE @]
           /\ flushSeqId'    = [flushSeqId    EXCEPT ![voter] =
+                                  IF steppingDown THEN 0 ELSE @]
+          /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![voter] =
                                   IF steppingDown THEN 0 ELSE @]
           /\ promotionPhase' = [promotionPhase EXCEPT ![voter] =
                                   IF steppingDown THEN "None" ELSE @]
     /\ UNCHANGED <<raftLog, clock, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   masterConfirmedTerm>>
+                   flushDropBound, masterConfirmedTerm>>
 
 \* A candidate with a majority of votes becomes leader AND immediately
 \* sends its initial heartbeat round to all reachable followers (atomic).
@@ -670,12 +694,14 @@ BecomeLeader(m) ==
               IF r \in responders THEN 0 ELSE writeSeqId[r]]
         /\ memstore' = [r \in Members |->
               IF r \in responders /\ flushPhase[r] = "RAFTCommitted"
-              THEN {s \in memstore[r] : s >= flushSeqId[r]}
+              THEN {s \in memstore[r] : s > snapshotMaxSeqId[r]}
               ELSE memstore[r]]
         /\ flushPhase' = [r \in Members |->
               IF r \in responders THEN "Idle" ELSE flushPhase[r]]
         /\ flushSeqId' = [r \in Members |->
               IF r \in responders THEN 0 ELSE flushSeqId[r]]
+        /\ snapshotMaxSeqId' = [r \in Members |->
+              IF r \in responders THEN 0 ELSE snapshotMaxSeqId[r]]
         /\ promotionPhase' = [r \in Members |->
               IF r = m THEN "Promoting"
               ELSE IF r \in responders THEN "None"
@@ -683,7 +709,7 @@ BecomeLeader(m) ==
         /\ UNCHANGED <<raftLog, clock, partition,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                       masterConfirmedTerm>>
+                       flushDropBound, masterConfirmedTerm>>
 
 \* ---- RAFT leadership actions ----
 
@@ -738,7 +764,7 @@ Heartbeat(leader) ==
                 ELSE leaseRemaining[m]]
         /\ memstore'      = [m \in Members |->
                 IF m \in responders /\ flushPhase[m] = "RAFTCommitted"
-                THEN {s \in memstore[m] : s >= flushSeqId[m]}
+                THEN {s \in memstore[m] : s > snapshotMaxSeqId[m]}
                 ELSE memstore[m]]
         /\ writePhase'    = [m \in Members |->
                 IF m \in responders THEN "Idle" ELSE writePhase[m]]
@@ -752,12 +778,14 @@ Heartbeat(leader) ==
                 IF m \in responders THEN "Idle" ELSE flushPhase[m]]
         /\ flushSeqId'    = [m \in Members |->
                 IF m \in responders THEN 0 ELSE flushSeqId[m]]
+        /\ snapshotMaxSeqId' = [m \in Members |->
+                IF m \in responders THEN 0 ELSE snapshotMaxSeqId[m]]
         /\ promotionPhase' = [m \in Members |->
                 IF m \in responders THEN "None" ELSE promotionPhase[m]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                       masterConfirmedTerm>>
+                       flushDropBound, masterConfirmedTerm>>
 
 \* A member discovers a higher term and steps down to Follower.
 \* Abstracts receiving any RPC carrying a higher term.
@@ -784,7 +812,7 @@ StepDown(m) ==
     /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
     /\ memstore'        = [memstore        EXCEPT ![m] =
                               IF flushPhase[m] = "RAFTCommitted"
-                              THEN {s \in @ : s >= flushSeqId[m]}
+                              THEN {s \in @ : s > snapshotMaxSeqId[m]}
                               ELSE @]
     /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
     /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
@@ -792,11 +820,12 @@ StepDown(m) ==
     /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
     /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
     /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
     /\ UNCHANGED <<raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   masterConfirmedTerm>>
+                   flushDropBound, masterConfirmedTerm>>
 
 \* A leader whose lease has expired (it could not heartbeat a quorum
 \* within the lease duration) voluntarily steps down to Follower.
@@ -822,26 +851,27 @@ StepDown(m) ==
 LeaderLeaseExpiry(m) ==
     /\ role[m] = "Leader"
     /\ leaseRemaining[m] = 0
-    /\ role'            = [role            EXCEPT ![m] = "Follower"]
-    /\ votesGranted'    = [votesGranted    EXCEPT ![m] = {}]
-    /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'        = [memstore        EXCEPT ![m] =
+    /\ role'             = [role            EXCEPT ![m] = "Follower"]
+    /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
+    /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore'         = [memstore        EXCEPT ![m] =
                               IF flushPhase[m] = "RAFTCommitted"
-                              THEN {s \in @ : s >= flushSeqId[m]}
+                              THEN {s \in @ : s > snapshotMaxSeqId[m]}
                               ELSE @]
-    /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
-    /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
-    /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
-    /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
-    /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
-    /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
-    /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
-    /\ fApplyBatch'     = [fApplyBatch     EXCEPT ![m] = {}]
+    /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
+    /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
+    /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
+    /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
+    /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
+    /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
+    /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock,
                    leaseRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
-                   masterConfirmedTerm>>
+                   flushDropBound, masterConfirmedTerm>>
 
 \* ---- Timing actions ----
 
@@ -886,7 +916,8 @@ ClockTick(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    partition, nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* ---- Crash recovery actions ----
 
@@ -918,19 +949,20 @@ CrashRestartGuard(m) ==
     \/ promotionPhase[m] # "None"
 
 CrashRestartEffect(m) ==
-    /\ role'            = [role            EXCEPT ![m] = "Follower"]
-    /\ votesGranted'    = [votesGranted    EXCEPT ![m] = {}]
-    /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
-    /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'        = [memstore        EXCEPT ![m] = {}]
-    /\ fApplyBatch'     = [fApplyBatch     EXCEPT ![m] = {}]
-    /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
-    /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
-    /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
-    /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
-    /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
-    /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
-    /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ role'             = [role            EXCEPT ![m] = "Follower"]
+    /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
+    /\ leaseRemaining'   = [leaseRemaining  EXCEPT ![m] = 0]
+    /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore'         = [memstore        EXCEPT ![m] = {}]
+    /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
+    /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
+    /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
+    /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
+    /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
+    /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
+    /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
+    /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
 
 CrashRestart(m) ==
     /\ CrashRestartGuard(m)
@@ -938,7 +970,7 @@ CrashRestart(m) ==
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
-                   masterConfirmedTerm>>
+                   flushDropBound, masterConfirmedTerm>>
 
 \* ---- Network partition actions ----
 
@@ -953,7 +985,8 @@ CreatePartition ==
                        clock, leaseRemaining, timerRemaining,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                       writeVars, flushVars, flushDropBound,
+                       promotionPhase, masterConfirmedTerm>>
 
 \* Nondeterministically heal a partition between two members.
 \* Models individual network link recovery.
@@ -965,7 +998,8 @@ HealPartition ==
                        clock, leaseRemaining, timerRemaining,
                        nextSeqId, committedEntries, markerEntries,
                        flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                       writeVars, flushVars, flushDropBound,
+                       promotionPhase, masterConfirmedTerm>>
 
 \* Heal ALL partitions at once — full network recovery.
 \* This action is deterministic (no internal nondeterminism) so
@@ -981,7 +1015,8 @@ HealAllPartitions ==
                    clock, leaseRemaining, timerRemaining,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* ---- Leader write path actions ----
 
@@ -996,12 +1031,16 @@ HealAllPartitions ==
 \* Guard: the leader must have a valid lease (models the isLeader()
 \* check at the start of the write path), no other write in progress
 \* (one in-flight write per member is sufficient for safety verification),
-\* and the global seqId counter has not exceeded MaxSeqId.
+\* and the global seqId counter has not exceeded MaxSeqId.  No flush
+\* exclusion is needed: the snapshot-boundary flush protocol allows
+\* writes to proceed concurrently with the flush pipeline.  In-flight
+\* writes get seqIds above snapshotMaxSeqId and are NOT included in
+\* the HFile snapshot, so the memstore drop (which drops entries <=
+\* snapshotMaxSeqId) never discards data from concurrent writes.
 BeginWrite(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
     /\ writePhase[m] = "Idle"
-    /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
     /\ writePhase'    = [writePhase    EXCEPT ![m] = "Pending"]
     /\ walSync'       = [walSync       EXCEPT ![m] = "Pending"]
@@ -1012,7 +1051,7 @@ BeginWrite(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, flushVars,
-                   promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionPhase, masterConfirmedTerm>>
 
 \* WAL sync to HDFS completes successfully.  Models wal.sync(txid)
 \* returning without error (HRegion.doMiniBatchMutate step 4a).
@@ -1026,7 +1065,7 @@ WALSyncComplete(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionPhase, masterConfirmedTerm>>
 
 \* WAL sync to HDFS fails (HDFS pipeline broken, DataNode failure,
 \* network timeout).  Nondeterministic.  Models wal.sync(txid) throwing
@@ -1041,7 +1080,7 @@ WALSyncFail(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionPhase, masterConfirmedTerm>>
 
 \* RAFT propose succeeds: the entry is committed by majority ack.
 \* Models consensus.propose(stampedWALEdit, seqId) completing
@@ -1080,7 +1119,7 @@ RAFTCommitWrite(m) ==
                    nextSeqId, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch,
                    writePhase, walSync, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionPhase, masterConfirmedTerm>>
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
@@ -1106,7 +1145,7 @@ CompleteWrite(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    walSync, raftCommitted, writeSeqId, flushVars,
-                   promotionPhase, masterConfirmedTerm>>
+                   flushDropBound, promotionPhase, masterConfirmedTerm>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
 \* doMiniBatchMutate (step 9) and resets the write pipeline for the
@@ -1121,7 +1160,8 @@ AckWrite(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   flushVars, promotionPhase, masterConfirmedTerm>>
+                   flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Leader aborts the RegionServer process because WAL sync failed.
 \* This is the mandated response when the WAL is broken: the RS cannot
@@ -1138,23 +1178,24 @@ AckWrite(m) ==
 WALFailureAbort(m) ==
     /\ writePhase[m] = "Pending"
     /\ walSync[m] = "Failed"
-    /\ role'            = [role            EXCEPT ![m] = "Follower"]
-    /\ votesGranted'    = [votesGranted    EXCEPT ![m] = {}]
-    /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
-    /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'        = [memstore        EXCEPT ![m] = {}]
-    /\ fApplyBatch'     = [fApplyBatch     EXCEPT ![m] = {}]
-    /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
-    /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
-    /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
-    /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
-    /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
-    /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
-    /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ role'             = [role            EXCEPT ![m] = "Follower"]
+    /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
+    /\ leaseRemaining'   = [leaseRemaining  EXCEPT ![m] = 0]
+    /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore'         = [memstore        EXCEPT ![m] = {}]
+    /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
+    /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
+    /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
+    /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
+    /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
+    /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
+    /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
+    /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
-                   masterConfirmedTerm>>
+                   flushDropBound, masterConfirmedTerm>>
 
 \* ---- Marker actions ----
 
@@ -1193,7 +1234,8 @@ ProposeMarker(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    clock, leaseRemaining, timerRemaining, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* ---- Flush protocol actions ----
 \*
@@ -1201,34 +1243,55 @@ ProposeMarker(m) ==
 \* the design document.  Steps are collapsed into phases that preserve
 \* the safety-critical boundaries:
 \*
-\*   FlushStart       (steps 1-7):  wal.startCacheFlush, consume
-\*                     flushOpSeqId, write START_FLUSH, take memstore
-\*                     snapshot, sync, write HFiles to tmp dir
+\*   FlushStart       (steps 1-7):  consume flushOpSeqId, record
+\*                     snapshotMaxSeqId (= max seqId in memstore at
+\*                     flush time, the actual HFile coverage boundary),
+\*                     take memstore snapshot, write HFiles to tmp dir
 \*   FlushCommitHFiles (step 8):    sfc.commit() — HFiles durable on HDFS
 \*   FlushRAFTPropose  (step 9):    consensus.propose(FLUSH_COMPLETE)
 \*   FlushRAFTCommit   (step 10):   majority acknowledge
-\*   FlushComplete     (steps 11-14): drop memstore, write COMMIT_FLUSH,
+\*   FlushComplete     (steps 11-14): drop memstore entries at or below
+\*                     snapshotMaxSeqId, write COMMIT_FLUSH,
 \*                     wal.completeCacheFlush, GC RAFT log
 \*
-\* The flush and write pipelines are mutually exclusive on each member:
-\* a per-region flushInProgress flag blocks writes for the duration of
-\* the flush protocol (steps 1-13), modeled by the flushPhase[m] = "Idle"
-\* guard on BeginWrite and the writePhase[m] = "Idle" guard on FlushStart.
+\* The flush and write pipelines run concurrently (snapshot-boundary
+\* protocol).  BeginWrite has no flushPhase guard and FlushStart has
+\* no writePhase guard.  Safety is maintained because the memstore drop
+\* boundary is snapshotMaxSeqId (not flushSeqId): concurrent in-flight
+\* writes have seqIds above snapshotMaxSeqId and survive the drop.
 
 \* Leader initiates a flush: set flushInProgress, consume a flushOpSeqId,
-\* write START_FLUSH marker, take memstore snapshot, sync, and write
-\* HFiles to a tmp directory (not yet durable).
+\* record snapshotMaxSeqId (the actual HFile coverage boundary), write
+\* START_FLUSH marker, take memstore snapshot, sync, and write HFiles
+\* to a tmp directory (not yet durable).
 \*
-\* Guard: the leader must have a valid lease, no write or flush in
-\* progress, and the seqId counter not exhausted.
+\* snapshotMaxSeqId captures the highest seqId currently in the leader's
+\* memstore — this is the true boundary of the data that the HFiles
+\* will contain.  Any concurrent in-flight writes have seqIds assigned
+\* from nextSeqId (which is always > max(memstore)), so they are above
+\* snapshotMaxSeqId and will NOT be included in the HFile snapshot.
+\* The memstore drop (FlushComplete) uses snapshotMaxSeqId (not
+\* flushSeqId) as the boundary, allowing concurrent writes to survive
+\* the flush without data loss.
+\*
+\* flushDropBound[flushSeqId] persists the snapshotMaxSeqId for this
+\* flush marker, making it accessible to followers when they process
+\* the marker via FollowerApplyMarker.
+\*
+\* Guard: the leader must have a valid lease, no flush already in
+\* progress, and the seqId counter not exhausted.  No write exclusion
+\* is needed — the snapshot-boundary protocol allows writes and flushes
+\* to run concurrently.
 FlushStart(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
-    /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
-    /\ flushPhase' = [flushPhase EXCEPT ![m] = "FlushStarted"]
-    /\ flushSeqId' = [flushSeqId EXCEPT ![m] = nextSeqId]
+    /\ LET snapBound == IF memstore[m] = {} THEN 0 ELSE SetMax(memstore[m])
+       IN /\ flushPhase' = [flushPhase EXCEPT ![m] = "FlushStarted"]
+          /\ flushSeqId' = [flushSeqId EXCEPT ![m] = nextSeqId]
+          /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = snapBound]
+          /\ flushDropBound' = [flushDropBound EXCEPT ![nextSeqId] = snapBound]
     /\ nextSeqId'  = nextSeqId + 1
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
@@ -1251,7 +1314,8 @@ FlushCommitHFiles(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, memstore, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Leader proposes the FLUSH_COMPLETE marker through RAFT.  The marker
 \* is proposed but not yet committed; FlushRAFTCommit handles the
@@ -1281,7 +1345,8 @@ FlushRAFTPropose(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Majority acknowledges the FLUSH_COMPLETE marker.  The marker is now
 \* RAFT-committed: its seqId is added to committedEntries and
@@ -1310,31 +1375,32 @@ FlushRAFTCommit(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, hdfsHFiles, fApplyBatch,
-                   writeVars, flushSeqId, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
-\* Flush completion: drop memstore entries at or below flushSeqId,
-\* write COMMIT_FLUSH to WAL, call wal.completeCacheFlush() to unblock
-\* WAL writes, and GC RAFT log entries prior to flushSeqId.  These
-\* steps are atomic from a safety perspective (the critical ordering
-\* constraint — memstore drop after RAFT commit — is already satisfied
-\* by the phase machine).
-\*
-\* The memstore is updated by removing all entries with seqId <
-\* flushSeqId[m] (these are now in HFiles).  The flushSeqId itself
-\* remains in memstore (from the mvcc.advanceTo in FlushRAFTCommit).
+\* Flush completion: drop memstore entries at or below snapshotMaxSeqId
+\* (the actual HFile coverage boundary), write COMMIT_FLUSH to WAL,
+\* call wal.completeCacheFlush() to unblock WAL writes, and GC RAFT
+\* log entries.  The drop boundary is snapshotMaxSeqId[m], NOT
+\* flushSeqId[m]: concurrent in-flight writes that started after
+\* FlushStart have seqIds above snapshotMaxSeqId and must survive
+\* the drop.  The flushSeqId marker itself (from mvcc.advanceTo in
+\* FlushRAFTCommit) is retained because flushSeqId > snapshotMaxSeqId.
 \*
 \* Guard: leader role, flushPhase = RAFTCommitted.
 FlushComplete(m) ==
     /\ role[m] = "Leader"
     /\ flushPhase[m] = "RAFTCommitted"
-    /\ memstore' = [memstore EXCEPT ![m] = {s \in @ : s >= flushSeqId[m]}]
+    /\ memstore' = [memstore EXCEPT ![m] = {s \in @ : s > snapshotMaxSeqId[m]}]
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "Idle"]
     /\ flushSeqId' = [flushSeqId EXCEPT ![m] = 0]
+    /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* ---- Follower batch apply actions ----
 
@@ -1380,7 +1446,8 @@ FollowerBeginBatchApply(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Follower completes applying a batch of committed mutation entries:
 \* stamp cells with the leader's sequence IDs, add all cells to the
@@ -1401,7 +1468,8 @@ FollowerCompleteBatchApply(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Follower applies a committed marker entry.  When the next unapplied
 \* committed entry is a marker (flush-complete, compaction-complete),
@@ -1417,7 +1485,11 @@ FollowerCompleteBatchApply(m) ==
 \* Behavior differs by marker type:
 \*   Compaction marker: add marker seqId to memstore (mvcc.advanceTo).
 \*   Flush marker: guard on HFile accessibility (hdfsHFiles), then
-\*     drop memstore entries below the marker's seqId and add the marker.
+\*     drop memstore entries at or below flushDropBound[marker] (the
+\*     actual HFile coverage boundary, i.e., the snapshotMaxSeqId
+\*     recorded at FlushStart time) and add the marker.  Entries
+\*     between flushDropBound[marker] and the marker seqId (in-flight
+\*     writes at flush time) are above the drop boundary and survive.
 \*     Models the 6-step follower flush-complete handling: complete
 \*     preceding batch -> mvcc.advanceTo -> refresh store files ->
 \*     confirm HFiles accessible -> drop memstore -> GC log.
@@ -1436,13 +1508,14 @@ FollowerApplyMarker(m) ==
                 /\ IF nextEntry \in flushMarkerEntries
                    THEN /\ nextEntry \in hdfsHFiles
                         /\ memstore' = [memstore EXCEPT ![m] =
-                            {s \in @ : s >= nextEntry} \union {nextEntry}]
+                            {s \in @ : s > flushDropBound[nextEntry]} \union {nextEntry}]
                    ELSE /\ memstore' = [memstore EXCEPT ![m] = @ \union {nextEntry}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* ---- Promotion protocol actions ----
 
@@ -1477,7 +1550,7 @@ MasterConfirmPromotion(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars>>
+                   writeVars, flushVars, flushDropBound>>
 
 \* A leader that has received master confirmation completes the
 \* local promotion steps: setReadOnly(false) and acquire WAL
@@ -1505,7 +1578,8 @@ PromotionComplete(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   masterConfirmedTerm>>
 
 \* ---- Orphan entry commitment ----
 
@@ -1551,40 +1625,43 @@ NewLeaderCommitOrphanEntry ==
                     /\ markerEntries' = markerEntries \union {s}
                     /\ flushMarkerEntries' = flushMarkerEntries \union {s}
                     /\ memstore' = [memstore EXCEPT ![leader] =
-                          {e \in @ : e >= s} \union {s}]
+                          {e \in @ : e > flushDropBound[s]} \union {s}]
                ELSE /\ committedEntries' = committedEntries \union {s}
                     /\ memstore' = [memstore EXCEPT ![leader] = @ \union {s}]
                     /\ UNCHANGED <<markerEntries, flushMarkerEntries>>
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                        clock, leaseRemaining, timerRemaining, partition,
                        nextSeqId, hdfsHFiles, fApplyBatch,
-                       writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                       writeVars, flushVars, flushDropBound,
+                       promotionPhase, masterConfirmedTerm>>
 
 \* ---- RAFT log GC and catch-up actions ----
 
-\* A member garbage-collects RAFT log entries below an applied flush
-\* marker.  After a flush-complete marker with seqId S is applied
-\* (S \in memstore[m]), all entries with seqId < S are in HFiles on
-\* HDFS and no longer needed in the RAFT log.  This models the
-\* consensus log segment GC described in the design document: "On
-\* flush-complete for a group, that group's entries before the flush
-\* index are logically marked as GC-eligible."
+\* A member garbage-collects RAFT log entries at or below an applied
+\* flush marker's drop boundary (flushDropBound[S]).  After a
+\* flush-complete marker with seqId S is applied (S \in memstore[m]),
+\* all entries with seqId <= flushDropBound[S] are in HFiles on HDFS
+\* and no longer needed in the RAFT log.  Entries between
+\* flushDropBound[S] and S (in-flight writes at flush time) are NOT
+\* in HFiles and are retained.
 \*
 \* Guard: the member has applied a flush marker, and there are entries
-\* in its log below the marker (something to GC).  Any member can GC
-\* its own log, independent of role.
+\* in its log at or below the drop boundary (something to GC).  Any
+\* member can GC its own log, independent of role.
 \*
-\* Effect: entries below the flush seqId are removed from raftLog[m].
-\* The flush marker seqId itself is retained (it is >= s).
+\* Effect: entries at or below flushDropBound[S] are removed from
+\* raftLog[m].  The flush marker seqId S and any in-flight writes
+\* between flushDropBound[S] and S are retained.
 RaftLogGC(m) ==
     /\ \E s \in flushMarkerEntries \cap memstore[m] :
-        /\ \E e \in raftLog[m] : e < s
-        /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e >= s}]
+        /\ \E e \in raftLog[m] : e <= flushDropBound[s]
+        /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e > flushDropBound[s]}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, memstore, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Leader sends a catch-up reference (CatchUpReference) to a lagging
 \* follower whose needed RAFT log entries have been garbage-collected.
@@ -1628,16 +1705,17 @@ InstallSnapshot(leader, follower) ==
     /\ fApplyBatch[follower] = {}
     /\ \E s \in flushMarkerEntries \cap hdfsHFiles :
         /\ \E needed \in (committedEntries \ memstore[follower]) :
-              needed < s /\ needed \notin raftLog[leader]
+              needed <= flushDropBound[s] /\ needed \notin raftLog[leader]
         /\ memstore' = [memstore EXCEPT ![follower] =
-              {e \in @ : e >= s} \union {s}]
+              {e \in @ : e > flushDropBound[s]} \union {s}]
         /\ raftLog' = [raftLog EXCEPT ![follower] =
-              {e \in @ : e >= s} \union {s}]
+              {e \in @ : e > flushDropBound[s]} \union {s}]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   writeVars, flushVars, promotionPhase, masterConfirmedTerm>>
+                   writeVars, flushVars, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* A new member bootstraps into the RAFT group, replacing a member
 \* whose instance has been terminated (e.g., a new Kubernetes pod with
@@ -1729,26 +1807,27 @@ NewMemberBootstrap(m) ==
         /\ LET uncoveredCommitted == {s \in committedEntries :
                    ~\E f \in flushMarkerEntries : f >= s}
            IN
-            /\ role'            = [role            EXCEPT ![m] = "Follower"]
-            /\ currentTerm'     = [currentTerm     EXCEPT ![m] = currentTerm[leader]]
-            /\ votedFor'        = [votedFor        EXCEPT ![m] = leader]
-            /\ votesGranted'    = [votesGranted    EXCEPT ![m] = {}]
-            /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
-            /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-            /\ raftLog'         = [raftLog         EXCEPT ![m] =
+            /\ role'             = [role            EXCEPT ![m] = "Follower"]
+            /\ currentTerm'      = [currentTerm     EXCEPT ![m] = currentTerm[leader]]
+            /\ votedFor'         = [votedFor        EXCEPT ![m] = leader]
+            /\ votesGranted'     = [votesGranted    EXCEPT ![m] = {}]
+            /\ leaseRemaining'   = [leaseRemaining  EXCEPT ![m] = 0]
+            /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
+            /\ raftLog'          = [raftLog         EXCEPT ![m] =
                   raftLog[leader] \union uncoveredCommitted]
-            /\ memstore'        = [memstore        EXCEPT ![m] = {}]
-            /\ fApplyBatch'     = [fApplyBatch     EXCEPT ![m] = {}]
-            /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
-            /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
-            /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
-            /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
-            /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
-            /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
-            /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
+            /\ memstore'         = [memstore        EXCEPT ![m] = {}]
+            /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
+            /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
+            /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
+            /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
+            /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
+            /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
+            /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
+            /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
+            /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
         /\ UNCHANGED <<clock, partition, nextSeqId, committedEntries,
                        markerEntries, flushMarkerEntries, hdfsHFiles,
-                       masterConfirmedTerm>>
+                       flushDropBound, masterConfirmedTerm>>
 
 ----
 (* ---- Merged actions for data-path domain decomposition ---- *)
@@ -1779,7 +1858,8 @@ AtomicFollowerBatchApply(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writePhase, walSync, raftCommitted, writeSeqId,
-                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
+                   flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 \* Atomic write completion and ack: applies the write to memstore and
 \* resets the write pipeline in a single step.  Merges CompleteWrite +
@@ -1798,7 +1878,8 @@ AtomicCompleteWriteAndAck(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
-                   flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
+                   flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
+                   promotionPhase, masterConfirmedTerm>>
 
 ----
 (* ---- Next-state relation and specification ---- *)
@@ -1972,15 +2053,15 @@ LeaseExpiresBeforeElection ==
 \* Every committed entry is recoverable through at least one path:
 \* either via RAFT log replay (the entry is in a majority of members'
 \* logs) or via HFile access (the entry is covered by a committed
-\* flush marker whose HFiles are durable on HDFS).  This verifies
-\* the design's guarantee that after RAFT log GC, the catch-up-via-
-\* flush path (InstallSnapshot / CatchUpReference) can always
-\* reconstruct the member's state.  Subsumes the weaker
-\* RaftLogConsistency (which did not require HFiles on HDFS).
+\* flush marker whose HFiles are durable on HDFS, meaning the entry's
+\* seqId is at or below the flush marker's HFile coverage boundary
+\* flushDropBound[f]).  Entries between flushDropBound[f] and f
+\* (in-flight writes at flush time) are NOT in HFiles and must be
+\* recoverable via RAFT logs.
 CatchUpDataIntegrity ==
     \A s \in committedEntries :
         \/ Cardinality({m \in Members : s \in raftLog[m]}) >= Majority
-        \/ \E f \in flushMarkerEntries \cap hdfsHFiles : f >= s
+        \/ \E f \in flushMarkerEntries \cap hdfsHFiles : s <= flushDropBound[f]
 
 \* ---- Write path invariants ----
 
@@ -2042,30 +2123,26 @@ NoOrphanMemstoreDrop ==
     \A m \in Members :
         flushPhase[m] = "RAFTCommitted" => flushSeqId[m] \in markerEntries
 
-\* The write pipeline and flush pipeline are never simultaneously active
-\* on the same member.  This models the mutual exclusion enforced by a
-\* per-region flushInProgress flag (set at step 1, cleared at step 13)
-\* on the flush side, and the flushPhase[m] = "Idle" guard on BeginWrite
-\* on the write side.  Without this mutual exclusion, a write could be in-flight
-\* while the flush is between HFile commit and memstore drop, creating a
-\* window where the write's data is both in the memstore and eligible for
-\* drop.
-\*
-\* This is a cross-variable invariant (writePhase x flushPhase).  If the
-\* flushPhase = "Idle" guard were removed from BeginWrite, or the
-\* writePhase = "Idle" guard were removed from FlushStart, TLC would
-\* find a state violating this invariant.
-FlushWriteExclusion ==
-    \A m \in Members :
-        ~(writePhase[m] # "Idle" /\ flushPhase[m] # "Idle")
+\* The HFile coverage boundary (flushDropBound) for every committed flush
+\* marker is strictly less than the flush marker's own seqId.  This is a
+\* structural invariant that captures the fundamental property of the
+\* snapshot-boundary design: flushOpSeqId is consumed AFTER the memstore
+\* snapshot, so the snapshot boundary is always below the marker seqId.
+\* This ensures that in-flight writes (seqIds between snapshotMaxSeqId
+\* and flushSeqId) survive the memstore drop.
+FlushDropBoundary ==
+    \A f \in flushMarkerEntries :
+        flushDropBound[f] < f
 
 \* After a follower has applied a flush marker with seqId S, no non-marker
-\* entry below S remains in the follower's memstore.  This verifies the
-\* 6-step follower flush-complete handling: when a follower processes a
-\* flush-complete marker, it drops all memstore entries below the marker's
-\* seqId (those entries are now in HFiles on HDFS).  Marker entries
-\* (both flush and compaction markers) are excluded from the drop check
-\* because they represent mvcc.advanceTo points, not data entries.
+\* entry at or below flushDropBound[S] remains in the follower's memstore.
+\* The drop boundary is the actual HFile coverage boundary
+\* (snapshotMaxSeqId recorded at FlushStart time), NOT the flush marker
+\* seqId.  Entries between flushDropBound[S] and S (in-flight writes at
+\* flush time) are above the drop boundary and correctly remain in the
+\* memstore.  Marker entries (both flush and compaction markers) are
+\* excluded from the drop check because they represent mvcc.advanceTo
+\* points, not data entries.
 \*
 \* The invariant is scoped to Followers.  Leaders handle their own flush
 \* memstore drop via FlushComplete.  Stepped-down leaders in RAFTCommitted
@@ -2077,7 +2154,7 @@ FollowerFlushMemstoreDrop ==
         role[m] = "Follower" =>
             \A s \in flushMarkerEntries \cap memstore[m] :
                 \A t \in memstore[m] \ markerEntries :
-                    t >= s
+                    t > flushDropBound[s]
 
 \* HFiles are committed to HDFS before any flush marker can be committed
 \* through RAFT.  This is enforced by the phase ordering:
@@ -2166,7 +2243,8 @@ PromotionMVCCContinuity ==
 \* committed entries — ApplicableEntries(m) = {} and no batch in
 \* progress — the member's memstore is consistent with the committed
 \* state: every committed entry is either in memstore or covered by an
-\* applied flush marker (data is in HFiles on HDFS).
+\* applied flush marker (the entry's seqId is at or below the marker's
+\* HFile coverage boundary flushDropBound[f]).
 \*
 \* This invariant verifies catch-up completeness after
 \* NewMemberBootstrap.  The catching-up member starts with an empty
@@ -2175,12 +2253,12 @@ PromotionMVCCContinuity ==
 \* FollowerApplyMarker).  If the leader concurrently flushes during
 \* catch-up, the flush marker arrives as a committed entry; the
 \* catching-up member processes it via FollowerApplyMarker, which
-\* refreshes store files from HDFS and drops memstore entries below the
-\* flush watermark.  After processing, all entries are either in
-\* memstore (above the flush watermark) or materialized in HFiles
-\* (below the flush watermark).  The flush-watermark exclusion in
-\* ApplicableEntries prevents those dropped entries from being
-\* re-applied, ensuring no duplicate application.
+\* refreshes store files from HDFS and drops memstore entries at or
+\* below the flush marker's drop boundary.  After processing, all
+\* entries are either in memstore (above the drop boundary) or
+\* materialized in HFiles (at or below the drop boundary).  The
+\* flush-watermark exclusion in ApplicableEntries prevents those
+\* dropped entries from being re-applied.
 CatchUpCompleteness ==
     \A m \in Members :
         (/\ ApplicableEntries(m) = {}
@@ -2189,7 +2267,7 @@ CatchUpCompleteness ==
         =>
         \A s \in committedEntries :
             \/ s \in memstore[m]
-            \/ \E f \in flushMarkerEntries \cap memstore[m] : f >= s
+            \/ \E f \in flushMarkerEntries \cap memstore[m] : s <= flushDropBound[f]
 
 THEOREM SafetyTHM ==
     Spec => [](/\ LeaderUniqueness
@@ -2199,7 +2277,7 @@ THEOREM SafetyTHM ==
                /\ WriteBarrierSafety
                /\ FollowerSeqIdConsistency
                /\ NoOrphanMemstoreDrop
-               /\ FlushWriteExclusion
+               /\ FlushDropBoundary
                /\ FollowerFlushMemstoreDrop
                /\ HFilesBeforeFlushMarker
                /\ PromotionReadWriteGuard
@@ -2353,10 +2431,10 @@ CatchUpCompletion ==
             ~> (role[m] # "Follower"
                 \/ (ApplicableEntries(m) = {} /\ fApplyBatch[m] = {}))
 
-THEOREM ElectionProgressTHM  == LiveSpecElection => ElectionProgress
-THEOREM WriteCompletionTHM   == LiveSpecWrite    => WriteCompletion
-THEOREM FlushCompletionTHM   == LiveSpecFlush    => FlushCompletion
-THEOREM PromotionCompletionTHM == LiveSpecLocal  => PromotionCompletion
-THEOREM CatchUpCompletionTHM == LiveSpecLocal    => CatchUpCompletion
+THEOREM ElectionProgressTHM    == LiveSpecElection => ElectionProgress
+THEOREM WriteCompletionTHM     == LiveSpecWrite    => WriteCompletion
+THEOREM FlushCompletionTHM     == LiveSpecFlush    => FlushCompletion
+THEOREM PromotionCompletionTHM == LiveSpecLocal    => PromotionCompletion
+THEOREM CatchUpCompletionTHM   == LiveSpecLocal    => CatchUpCompletion
 
 ====
