@@ -28,7 +28,7 @@ In TLA+, a single step of the system is an action, a predicate over the current 
 
 `RaftRegionReplica.tla` is a TLA+ specification modeling RAFT-based region replicas for Apache HBase.  It captures leader election, lease management, clock drift, the write pipeline (WAL sync, RAFT commit, memstore apply), the snapshot-boundary flush protocol (concurrent write+flush via `snapshotMaxSeqId` / `flushDropBound`, HFile commit, RAFT-proposed flush markers with HFile coverage boundary), the promotion protocol with master confirmation (MasterConfirmPromotion action with term-fencing guard), RAFT log garbage collection, shared-storage catch-up, new member bootstrap, crash recovery, and network partitions (including individual link healing and full network recovery).
 
-The base spec exports parameterized building-block operators (`GatedMemberActions(m)`, `GatedMemberDataPathActions(m)`) that collect all single-member normal-operation actions into a single disjunction. Composition modules (`SplitRaftRegionReplica`, `MergeRaftRegionReplica`, `MultiGroupRaftRegionReplica`) invoke these with per-member gating predicates to control when a RAFT group's operations are active on each member, enabling lifecycle transitions (split, merge) to deactivate a group per-member without duplicating action dispatch logic. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
+The base spec exports parameterized building-block operators that collect all single-member normal-operation actions into a single disjunction. Composition modules invoke these with per-member gating predicates to control when a RAFT group's write path and RAFT operations are active on each member, enabling lifecycle transitions (split, merge) to write-close a group per-member without duplicating action dispatch logic. In the real system, the parent's read path remains active after write-closure (frozen-parent read continuation), serving Timeline reads from the frozen, immutable memstore + HFiles until daughter or merged groups are ready. The read path is not modeled because reads do not flow through the consensus layer. Guard + effect factoring of `CrashRestart` and `ClockTick` allows multi-group and lifecycle modules to reuse crash/tick effects across groups without copy-paste.
 
 The specification defines 14 safety invariants and 5 liveness properties verified by TLC:
 
@@ -156,7 +156,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ### Step 6: Split Lifecycle Simulation (30 min, local)
 
-Verify that the region split protocol preserves `NoKeyRangeOverlap` and all 14 parent-group safety invariants.  Uses `SplitRaftRegionReplica.tla`, which gates parent-group actions per-member after the split marker is applied.
+Verify that the region split protocol preserves `NoKeyRangeOverlap` and all 14 parent-group safety invariants.  Uses `SplitRaftRegionReplica.tla`, which gates the parent group's write path and RAFT operations per-member after the split marker is applied (write-closure).  The parent's read path (frozen-parent read continuation) is not modeled because Timeline reads do not flow through the consensus layer; `NoKeyRangeOverlap` constrains write-active groups only.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -166,7 +166,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ### Step 7: Merge Lifecycle Simulation (30 min, local)
 
-Verify that the region merge protocol preserves `NoKeyRangeOverlapMerge` and all 14 per-group safety invariants for both parent groups.  Uses `MergeRaftRegionReplica.tla`, which gates each parent group independently.
+Verify that the region merge protocol preserves `NoKeyRangeOverlapMerge` and all 14 per-group safety invariants for both parent groups.  Uses `MergeRaftRegionReplica.tla`, which gates each parent group's write path and RAFT operations independently after their respective merge markers are applied (write-closure).  As with split, the frozen-parent read continuation is not modeled; `NoKeyRangeOverlapMerge` constrains write-active groups only.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \

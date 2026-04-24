@@ -4,9 +4,17 @@
  *
  * Models two parent RAFT groups (G1, G2) undergoing a region merge:
  * each parent's leader proposes a "region-close / merge" marker through
- * RAFT, members apply both committed markers (closing each parent group
- * locally), and the master opens the merged group on members that have
- * applied both markers.
+ * RAFT, members apply both committed markers (write-closing each parent
+ * group locally), and the master opens the merged group on members that
+ * have applied both markers.
+ *
+ * In the real system, each parent's read path remains active after
+ * write-closure (frozen-parent read continuation): Timeline reads
+ * continue from the frozen, immutable memstore + HFiles until the
+ * merged group is ready, at which point both parents' read paths are
+ * atomically torn down.  The read path is not modeled in TLA+ because
+ * reads do not flow through the consensus layer.  The
+ * NoKeyRangeOverlapMerge invariant constrains write-active groups only.
  *
  * Follows the MultiGroupRaftRegionReplica pattern: two full INSTANCE
  * groups sharing clock, partition, and unified log, with shared-impact
@@ -44,7 +52,7 @@ CONSTANTS
 \* ---- Shared state ----
 VARIABLES clock, partition
 
-\* ---- Group 1 per-group state (22 variables) ----
+\* ---- Group 1 per-group state (24 variables) ----
 VARIABLES
     role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
     leaseRemaining_1, timerRemaining_1,
@@ -52,10 +60,10 @@ VARIABLES
     flushMarkerEntries_1, hdfsHFiles_1,
     memstore_1, fApplyBatch_1,
     writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-    flushPhase_1, flushSeqId_1,
+    flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
     promotionPhase_1, masterConfirmedTerm_1
 
-\* ---- Group 2 per-group state (22 variables) ----
+\* ---- Group 2 per-group state (24 variables) ----
 VARIABLES
     role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
     leaseRemaining_2, timerRemaining_2,
@@ -63,7 +71,7 @@ VARIABLES
     flushMarkerEntries_2, hdfsHFiles_2,
     memstore_2, fApplyBatch_2,
     writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-    flushPhase_2, flushSeqId_2,
+    flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
     promotionPhase_2, masterConfirmedTerm_2
 
 \* ---- Merge lifecycle state ----
@@ -80,7 +88,7 @@ g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
              flushMarkerEntries_1, hdfsHFiles_1,
              memstore_1, fApplyBatch_1,
              writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-             flushPhase_1, flushSeqId_1,
+             flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
              promotionPhase_1, masterConfirmedTerm_1>>
 
 g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
@@ -89,7 +97,7 @@ g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              flushMarkerEntries_2, hdfsHFiles_2,
              memstore_2, fApplyBatch_2,
              writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-             flushPhase_2, flushSeqId_2,
+             flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
              promotionPhase_2, masterConfirmedTerm_2>>
 
 mergeVars == <<mergeMarkerSeqId_1, mergeMarkerSeqId_2, mergedGroupActive>>
@@ -99,6 +107,10 @@ vars == <<clock, partition, g1_vars, g2_vars, mergeVars>>
 ----
 (* ---- Per-member parent gating predicates ---- *)
 
+\* TRUE until member m has applied the merge marker (write-closure).
+\* Once the marker is in memstore, the parent's write path and RAFT
+\* operations are gated on m.  The parent's read path (not modeled)
+\* remains active until the merged group is ready.
 G1ParentActive(m) ==
     mergeMarkerSeqId_1 = 0 \/ mergeMarkerSeqId_1 \notin memstore_1[m]
 
@@ -131,6 +143,8 @@ G1 == INSTANCE RaftRegionReplica WITH
     writeSeqId      <- writeSeqId_1,
     flushPhase      <- flushPhase_1,
     flushSeqId      <- flushSeqId_1,
+    snapshotMaxSeqId <- snapshotMaxSeqId_1,
+    flushDropBound  <- flushDropBound_1,
     promotionPhase  <- promotionPhase_1,
     masterConfirmedTerm <- masterConfirmedTerm_1
 
@@ -157,6 +171,8 @@ G2 == INSTANCE RaftRegionReplica WITH
     writeSeqId      <- writeSeqId_2,
     flushPhase      <- flushPhase_2,
     flushSeqId      <- flushSeqId_2,
+    snapshotMaxSeqId <- snapshotMaxSeqId_2,
+    flushDropBound  <- flushDropBound_2,
     promotionPhase  <- promotionPhase_2,
     masterConfirmedTerm <- masterConfirmedTerm_2
 
@@ -195,13 +211,15 @@ MergeClockTick(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, masterConfirmedTerm_1,
+                   flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
+                   promotionPhase_1, masterConfirmedTerm_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, masterConfirmedTerm_2,
+                   flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
+                   promotionPhase_2, masterConfirmedTerm_2,
                    mergeVars>>
 
 \* Server crash resets volatile state for BOTH groups and the merged
@@ -217,11 +235,11 @@ MergeCrashRestart(m) ==
                    currentTerm_1, votedFor_1, raftLog_1,
                    nextSeqId_1, committedEntries_1, markerEntries_1,
                    flushMarkerEntries_1, hdfsHFiles_1,
-                   masterConfirmedTerm_1,
+                   flushDropBound_1, masterConfirmedTerm_1,
                    currentTerm_2, votedFor_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
-                   masterConfirmedTerm_2,
+                   flushDropBound_2, masterConfirmedTerm_2,
                    mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
 
 \* Network partition — shared across both groups.
@@ -256,14 +274,16 @@ MergeUnifiedLogGC(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    memstore_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, masterConfirmedTerm_1,
+                   flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
+                   promotionPhase_1, masterConfirmedTerm_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2,
                    leaseRemaining_2, timerRemaining_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, masterConfirmedTerm_2,
+                   flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
+                   promotionPhase_2, masterConfirmedTerm_2,
                    mergeVars>>
 
 ----
@@ -300,7 +320,8 @@ ProposeMergeMarker_1(m) ==
                    clock, leaseRemaining_1, timerRemaining_1, partition,
                    flushMarkerEntries_1, hdfsHFiles_1, fApplyBatch_1,
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
-                   flushPhase_1, flushSeqId_1, promotionPhase_1, masterConfirmedTerm_1,
+                   flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
+                   promotionPhase_1, masterConfirmedTerm_1,
                    g2_vars, mergeMarkerSeqId_2, mergedGroupActive>>
 
 \* G2's leader proposes a "region-close / merge" marker through RAFT.
@@ -334,7 +355,8 @@ ProposeMergeMarker_2(m) ==
                    clock, leaseRemaining_2, timerRemaining_2, partition,
                    flushMarkerEntries_2, hdfsHFiles_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
-                   flushPhase_2, flushSeqId_2, promotionPhase_2, masterConfirmedTerm_2,
+                   flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
+                   promotionPhase_2, masterConfirmedTerm_2,
                    g1_vars, mergeMarkerSeqId_1, mergedGroupActive>>
 
 \* Master opens the merged group on member m after BOTH parent groups'
@@ -434,19 +456,19 @@ MergeTypeOK ==
 
 \* All 14 per-group safety invariants for both parent groups.
 PerGroupSafety ==
-    /\ G1!LeaderUniqueness          /\ G2!LeaderUniqueness
-    /\ G1!LeaseImpliesLeadership    /\ G2!LeaseImpliesLeadership
+    /\ G1!LeaderUniqueness           /\ G2!LeaderUniqueness
+    /\ G1!LeaseImpliesLeadership     /\ G2!LeaseImpliesLeadership
     /\ G1!LeaseExpiresBeforeElection /\ G2!LeaseExpiresBeforeElection
-    /\ G1!CatchUpDataIntegrity      /\ G2!CatchUpDataIntegrity
-    /\ G1!WriteBarrierSafety        /\ G2!WriteBarrierSafety
-    /\ G1!FollowerSeqIdConsistency  /\ G2!FollowerSeqIdConsistency
-    /\ G1!NoOrphanMemstoreDrop      /\ G2!NoOrphanMemstoreDrop
+    /\ G1!CatchUpDataIntegrity       /\ G2!CatchUpDataIntegrity
+    /\ G1!WriteBarrierSafety         /\ G2!WriteBarrierSafety
+    /\ G1!FollowerSeqIdConsistency   /\ G2!FollowerSeqIdConsistency
+    /\ G1!NoOrphanMemstoreDrop       /\ G2!NoOrphanMemstoreDrop
     /\ G1!FlushDropBoundary          /\ G2!FlushDropBoundary
-    /\ G1!FollowerFlushMemstoreDrop /\ G2!FollowerFlushMemstoreDrop
-    /\ G1!HFilesBeforeFlushMarker   /\ G2!HFilesBeforeFlushMarker
-    /\ G1!PromotionReadWriteGuard   /\ G2!PromotionReadWriteGuard
-    /\ G1!PromotionMVCCContinuity   /\ G2!PromotionMVCCContinuity
-    /\ G1!CatchUpCompleteness       /\ G2!CatchUpCompleteness
+    /\ G1!FollowerFlushMemstoreDrop  /\ G2!FollowerFlushMemstoreDrop
+    /\ G1!HFilesBeforeFlushMarker    /\ G2!HFilesBeforeFlushMarker
+    /\ G1!PromotionReadWriteGuard    /\ G2!PromotionReadWriteGuard
+    /\ G1!PromotionMVCCContinuity    /\ G2!PromotionMVCCContinuity
+    /\ G1!CatchUpCompleteness        /\ G2!CatchUpCompleteness
 
 \* Core merge safety invariant: no member has both a parent group and
 \* the merged group active for the same key range.

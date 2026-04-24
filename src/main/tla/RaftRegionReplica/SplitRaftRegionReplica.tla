@@ -14,14 +14,21 @@
  * that no member has both parent and daughter groups active for the
  * same key range simultaneously.
  *
- * Per-member gating: the parent group is gated on each member after
- * that member applies the split marker.  ParentGroupActive(m) is
- * TRUE until splitMarkerSeqId is in memstore[m].  ProposeSplitMarker
- * atomically commits the marker and places it in the leader's
- * memstore, so the leader is immediately gated.  Followers remain
- * active until FollowerApplyMarker applies the split marker on each.
- * This matches the real system's regionGroupManager.removeGroup()
- * semantics.
+ * Per-member gating: the parent group's write path and RAFT
+ * operations are gated on each member after that member applies the
+ * split marker (write-closure).  ParentGroupActive(m) is TRUE until
+ * splitMarkerSeqId is in memstore[m].  ProposeSplitMarker atomically
+ * commits the marker and places it in the leader's memstore, so the
+ * leader is immediately write-closed.  Followers remain active until
+ * FollowerApplyMarker applies the split marker on each.
+ *
+ * In the real system, the parent's read path remains active after
+ * write-closure (frozen-parent read continuation): Timeline reads
+ * continue from the frozen, immutable memstore + HFiles until
+ * daughter groups are ready, at which point the read path is
+ * atomically torn down.  The read path is not modeled in TLA+
+ * because reads do not flow through the consensus layer.  The
+ * NoKeyRangeOverlap invariant constrains write-active groups only.
  *
  * Gating is implemented by constructing a gated Next relation using
  * the base spec's building-block operators (GatedMemberActions,
@@ -54,7 +61,8 @@ VARIABLES
     flushMarkerEntries, hdfsHFiles,
     memstore, fApplyBatch,
     writePhase, walSync, raftCommitted, writeSeqId,
-    flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm
+    flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
+    promotionPhase, masterConfirmedTerm
 
 (* ---- Split lifecycle state ---- *)
 VARIABLES
@@ -68,16 +76,18 @@ parentVars == <<role, currentTerm, votedFor, votesGranted, raftLog,
                nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
                hdfsHFiles, memstore, fApplyBatch,
                writePhase, walSync, raftCommitted, writeSeqId,
-               flushPhase, flushSeqId, promotionPhase, masterConfirmedTerm>>
+               flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
+               promotionPhase, masterConfirmedTerm>>
 
 vars == <<parentVars, splitVars>>
 
 ----
 (* ---- Per-member parent gating predicate ---- *)
 
-\* TRUE until member m has applied the split marker.  Once the split
-\* marker is in memstore[m], the parent group is "removed" on m and
-\* no further normal-operation actions fire for that member.
+\* TRUE until member m has applied the split marker (write-closure).
+\* Once the split marker is in memstore[m], the parent group's write
+\* path and RAFT operations are gated on m.  The parent's read path
+\* (not modeled) remains active until daughters are ready.
 ParentGroupActive(m) ==
     splitMarkerSeqId = 0 \/ splitMarkerSeqId \notin memstore[m]
 
@@ -130,8 +140,8 @@ ProposeSplitMarker(m) ==
                    clock, leaseRemaining, timerRemaining, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writePhase, walSync, raftCommitted, writeSeqId,
-                   flushPhase, flushSeqId, promotionPhase,
-                   masterConfirmedTerm,
+                   flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
+                   promotionPhase, masterConfirmedTerm,
                    daughterGroupsActive>>
 
 \* Master opens daughter groups on member m after the split marker

@@ -70,7 +70,7 @@ Appendix B presents the formal TLA+ specification, model checking results, and d
 
 The target deployment spans three AZs within a single AWS region (e.g., us-east-1a, us-east-1b, us-east-1c). These are physically independent datacenters located within a few miles of each other, providing sub-millisecond to low-single-digit-millisecond inter-AZ network latency (well-suited for synchronous RAFT consensus), independent power, cooling, networking, and physical infrastructure per AZ, and the property on offer is resource independence, not distance-based disaster recovery.
 
-The replication factor is 3, with one RAFT member per AZ. Loss of any single AZ means loss of one RAFT member, which is tolerated by a 3-member group (majority = 2). The surviving two members in the remaining AZs continue serving reads and writes without interruption.
+The replication factor is configurable per table via the `REGION_REPLICATION` table descriptor attribute. Any value from 2 to N is valid for RAFT-enabled tables. The reference deployment uses RF=3 (one RAFT member per AZ), which is the recommended default for three-AZ deployments and is used as the running example throughout this document. RF=3 tolerates the loss of any single AZ. The surviving two members form a majority and continue serving reads and writes without interruption. Higher odd values (RF=5, RF=7) increase fault tolerance at the cost of more replication traffic: RF=5 tolerates 2 simultaneous member failures (majority = 3), useful for five-AZ topologies or workloads demanding stronger resilience. Even values are permitted but less efficient. Odd group sizes maximize fault tolerance per replica.
 
 ```
                ┌─────────────────────────────────────────────────────────┐
@@ -684,13 +684,15 @@ Region splits and merges are fundamental HBase operations that must work correct
 
 ### Split
 
-The split is coordinated through the existing `SplitTableRegionProcedure` on the master. The primary proposes a "region-close / split" marker through RAFT, and the master's procedure waits for this marker to be RAFT-committed before proceeding. When each member applies the committed split marker via the consensus apply callback, the callback triggers group removal locally, ensuring that group shutdown is driven by RAFT log ordering rather than by asynchronous master RPCs so that all members close the group at the same logical point (verified by the TLA+ model). The master then creates two new RAFT groups for the daughter regions via the normal region-open path. The daughter regions inherit HFiles from the parent's HDFS directory via reference files, as they do today. No RAFT log state carries over. Daughters start with empty RAFT logs and empty memstores, building state from new writes. If the primary crashes mid-split after the split marker has been committed, the master's procedure framework resumes the split from the last persisted step, opening daughter RAFT groups on surviving members.
+The split is coordinated through the existing `SplitTableRegionProcedure` on the master. The primary proposes a "region-close / split" marker through RAFT, and the master's procedure waits for this marker to be RAFT-committed before proceeding. When each member applies the committed split marker via the consensus apply callback, the callback triggers a two-phase group closure locally. The first phase (write-closure) is immediate: the parent group's write path, flush, compaction, and RAFT operations are gated, and no new mutations or proposals are accepted. The second phase (read-closure) is deferred: the parent's memstore and HFile references remain accessible in a frozen, read-only state so that Timeline reads can continue to be served from the parent's consistent snapshot while the master opens the daughter groups. All RAFT-committed entries up to the marker are applied, and no new writes can modify the memstore. Timeline reads returning this data are strictly no worse than reads that arrived one moment before the marker. Once the daughter groups are opened and ready on a given member, the parent's read path is atomically torn down on that member. This two-phase closure ensures that group shutdown is driven by RAFT log ordering while minimizing the read unavailability window to the duration of the local atomic swap from parent scanners to daughter scanners (verified by the TLA+ model).
+
+The master then creates two new RAFT groups for the daughter regions via the normal region-open path. The daughter regions inherit HFiles from the parent's HDFS directory via reference files, as they do today. No RAFT log state carries over. Daughters start with empty RAFT logs and empty memstores, building state from new writes. If the primary crashes mid-split after the split marker has been committed, the master's procedure framework resumes the split from the last persisted step, opening daughter RAFT groups on surviving members.
 
 ### Merge
 
-Merge is symmetric to split. Both parent RAFT groups receive a "region-close / merge" marker through RAFT, and the master waits for both markers to be RAFT-committed. When each member applies the committed merge markers via the consensus apply callback, the callback triggers group removal for each parent group locally (verified by the TLA+ model). The master then creates a new merged RAFT group via the normal region-open path. The merged region opens with the combined reference files and an empty RAFT log.
+Merge is symmetric to split. Both parent RAFT groups receive a "region-close / merge" marker through RAFT, and the master waits for both markers to be RAFT-committed. When each member applies the committed merge markers via the consensus apply callback, the same two-phase closure applies to each parent group: the write path and RAFT operations are immediately gated (write-closure), but the read path remains active against the frozen memstore and HFiles (read-closure deferred). Timeline reads continue to be served from the frozen parent groups while the master opens the merged RAFT group. Once the merged group is ready on a given member, both parents' read paths are atomically torn down on that member. The master then creates a new merged RAFT group via the normal region-open path. The merged region opens with the combined reference files and an empty RAFT log.
 
-In both split and merge, the parent RAFT group is closed on a majority of members before daughter or merged RAFT groups are opened. This ordering is enforced by the RAFT commit of the close marker preceding the master's region-open step, which avoids any period where both parent and child groups are active for the same key range. If one member is unreachable, the split or merge proceeds with the majority. The unreachable member's stale group is cleaned up when it recovers: it will discover via the RAFT term that it has been superseded, or the master will instruct it to close the stale group upon reconnection. The master's procedure framework handles this cleanup as a deferred step with retries.
+In both split and merge, the parent RAFT group's write path is closed on a majority of members before daughter or merged RAFT groups are opened. This ordering is enforced by the RAFT commit of the close marker preceding the master's region-open step, which avoids any period where both parent and child groups accept writes for the same key range. The parent's read path, however, continues serving Timeline reads from the frozen snapshot until the daughter or merged groups are ready, ensuring near-zero read unavailability during the transition. If one member is unreachable, the split or merge proceeds with the majority. The unreachable member's stale group is cleaned up when it recovers. The master's procedure framework handles this cleanup as a deferred step with retries.
 
 ```mermaid
 sequenceDiagram
@@ -698,12 +700,13 @@ sequenceDiagram
     participant F as Followers
     participant M as Master
 
-    Note over L,M: Region Split
+    Note over L,M: Region Split (two-phase closure)
 
     L->>F: Propose "region-close / split" marker via RAFT
     F-->>L: Majority acknowledge
 
-    Note over L,F: All members apply marker: regionGroupManager.removeGroup, parent group closed at same logical point
+    Note over L,F: Write-closure: write path + RAFT ops gated on each member
+    Note over L,F: Read path remains active (frozen parent serves Timeline reads)
 
     M->>M: SplitTableRegionProcedure proceeds
 
@@ -712,14 +715,15 @@ sequenceDiagram
     M->>F: Open daughter region A via addGroup
     M->>F: Open daughter region B via addGroup
 
+    Note over L,F: Read-closure: parent read path atomically torn down per-member
     Note over L,F: Daughters start with empty RAFT logs, inherit HFiles via reference files
 ```
 
 ### Safety: No Key-Range Overlap
 
-The core safety property for both split and merge is that no member has both a parent group and the daughter or merged group active for the same key range simultaneously. The master opens daughter (or merged) groups on a member only after verifying that the split (or merge) marker has been RAFT-committed and locally applied on that member. This per-member guard is the `RegionGroupManager`'s serialization point. The callback triggers the closing of the parent, and only after this has occurred does the master open daughters on that member (verified by the TLA+ model).
+The core safety property for both split and merge is that no member has both a parent group and the daughter or merged group writing to the same key range simultaneously. The parent's write path is gated immediately on marker application, and the master opens daughter (or merged) groups on a member only after verifying that the split (or merge) marker has been RAFT-committed and locally applied on that member. This per-member guard is the `RegionGroupManager`'s serialization point. The callback triggers write-closure of the parent, and only after this has occurred does the master open daughters on that member (verified by the TLA+ model). The parent's frozen read path, which continues serving Timeline reads during the transition, does not violate this property because it accepts no writes and its data is immutable.
 
-The safety guarantee rests on RAFT entry ordering: `ApplicableEntries` processes entries in monotonically increasing seqId order. A member cannot have applied a later entry without first having applied all earlier entries, including the split/merge marker. This ordering is the foundation for the per-member guard — the marker's presence in the member's applied state proves parent closure.
+The safety guarantee rests on RAFT entry ordering: `ApplicableEntries` processes entries in monotonically increasing seqId order. A member cannot have applied a later entry without first having applied all earlier entries, including the split/merge marker. The marker's presence in the member's applied state proves parent write-closure. The deferred read-closure is a local scheduling decision that does not affect the RAFT log or any member's consensus state.
 
 ### State-Loss Events and Lifecycle Recovery
 
@@ -729,7 +733,7 @@ Three events can clear a member's volatile state, including any applied split/me
 
 2. **New member bootstrap**: A completely new pod joining the group has no state at all. The member must catch up from the leader (via log replay or snapshot), apply the marker, and then the master can open daughters/merged group.
 
-3. **Snapshot installation**: A leader sends a snapshot to a lagging follower, replacing the follower's memstore with the snapshot contents. In the real system this is moot for the split/merge lifecycle. The parent group is removed on marker application, so no further RAFT operations occur on the parent.
+3. **Snapshot installation**: A leader sends a snapshot to a lagging follower, replacing the follower's memstore with the snapshot contents. The parent group's write path and RAFT operations are gated on marker application (write-closure), so no further RAFT operations occur on the parent. The deferred read path, if still active, is torn down as part of the recovery sequence.
 
 In all three cases, the implementation must treat the member's group lifecycle state as lost and require the master to re-verify that the marker applied on the member before re-opening daughter or merged groups. The `RegionGroupManager` must not assume daughters or merged groups survive any of these state-loss events.
 
@@ -1171,11 +1175,104 @@ Since only the primary writes HFiles to HDFS, the primary's ability to flush dep
 
 ## Compatibility
 
-A new Netty port on each RegionServer carries internal RAFT traffic between replicas, but the existing HBase client-server RPCs (mutate, get, scan) are unchanged. Clients use the same protocol and exceptions as before, with no new client-facing exceptions or API changes. RAFT is entirely below the client API surface.
+### Client and Wire Compatibility
 
-RAFT is opt-in per table. Tables must be explicitly enabled with `hbase.raft.enabled = true` and `REGION_REPLICATION = 3` at creation time. Existing tables with async region replicas continue to work under the old model. Mixed clusters (some RegionServers with RAFT support, some without) are not supported; all RegionServers must be upgraded before enabling RAFT on any table.
+A new Netty port on each RegionServer carries internal RAFT traffic between replicas. The existing HBase client-server RPCs are unchanged. The consensus port carries only internal RAFT messages. On a freshly upgraded RegionServer with no RAFT-enabled tables, the port is unused. 
 
-A downgrade path is available. For each RAFT group, the balancer moves the current primary to the RegionServer hosting replica ID 0 by sending a region close to the current primary, which triggers a leadership transfer through the standard promotion protocol, and then opening the region on the target server. Once replica ID 0 has become leader and fully caught up, the master's LeaderChangeHandler has already updated META to record it as primary with the appropriate RAFT term. Only then is REGION_REPLICATION reduced to 1, which closes the other replicas while retaining replica ID 0. Finally, RAFT is disabled and the region reverts to a normal primary with no replicas. The leadership transfer step is essential because the existing AssignmentManager replica-reduction logic closes replicas with the highest replica IDs first, keeping replica ID 0. If the current leader were a different replica ID, closing it without first transferring leadership would lose uncommitted memstore state. During downgrade, the primary-replica-ID and raft-term META columns must be cleaned up. Once RAFT is disabled, these columns are no longer meaningful and should be removed to avoid confusing non-RAFT code paths that assume the primary is always replica ID 0.
+The Protobuf wire format for RAFT messages is versioned within the standard HBase protobuf schema and follows the same forward/backward compatibility rules as other internal RPCs.
+
+No client-side library changes are required.
+
+### Rolling Upgrade
+
+During a rolling upgrade, RegionServers are restarted one at a time with new software that includes the `hbase-consensus` module. Upgraded RegionServers do not start the `ConsensusServer` until they open a region belonging to a table that has `hbase.raft.enabled = true` in its table descriptor. Since no table has this flag set during the rolling upgrade window, no RAFT state machines are instantiated, no consensus port is bound, and no RAFT traffic flows.
+
+### Version Gate
+
+Each RegionServer reports its version string in the `regionServerStartup` and `regionServerReport` RPCs. The master enforces a version gate that prevents RAFT enablement until the upgrade is complete. Before any `ModifyTableProcedure` or `CreateTableProcedure` accepts a table descriptor with `hbase.raft.enabled = true`, it polls `ServerManager.getOnlineServers()` and verifies that every online RegionServer reports a version at or above the minimum RAFT-capable version. If any RegionServer is below the threshold, the procedure rejects the request. The version check is evaluated at procedure submission time within the `MODIFY_TABLE_PREPARE` or `CREATE_TABLE_PRE_OPERATION` state.
+
+If a RegionServer running old software joins the cluster after the procedure has passed the version gate but before the new replicas are assigned, the balancer's assignment constraints prevent RAFT-enabled regions from being placed on that server.
+
+### Enabling RAFT Replicas
+
+Enabling the feature follows the same `alter` command pattern as today's async region replicas, with the addition of the `hbase.raft.enabled` table descriptor attribute:
+
+```
+# Today -- async region replicas (existing behavior, unchanged):
+alter 't1', {REGION_REPLICATION => 3}
+
+# RAFT region replicas:
+alter 't1', {REGION_REPLICATION => 3, METADATA => {'hbase.raft.enabled' => 'true'}}
+```
+
+Or at table creation time:
+
+```
+create 't1', 'cf1', {REGION_REPLICATION => 3, METADATA => {'hbase.raft.enabled' => 'true'}}
+```
+
+The `ModifyTableProcedure` state machine gains additional validation in `MODIFY_TABLE_PREPARE` when `hbase.raft.enabled` transitions from `false` (or absent) to `true`:
+
+1. **Version gate check.** Every online RegionServer must be at the RAFT-capable version, as described above.
+2. **Replication factor check.** `REGION_REPLICATION` must be >= 2. A single-member RAFT group provides no replication benefit. The recommended value is 3 for three-AZ deployments. RF=2 is accepted but the procedure logs a warning that the resulting group has no write fault tolerance (majority = 2, both members must be alive). Odd values are preferred: RF=3 and RF=4 both tolerate one member failure, so RF=4 pays for an extra replica with no additional write fault tolerance. RF=5 tolerates two, etc. 
+3. **Durability check.** The table's durability must not be `ASYNC_WAL`. RAFT-enabled tables require `SYNC_WAL` or `FSYNC_WAL` for the no-data-loss failover guarantee.
+
+If all checks pass, the procedure proceeds through the standard `ModifyTableProcedure` states: persist the updated table descriptor, reopen existing regions, and assign new replicas.
+
+**From no replicas (`REGION_REPLICATION = 1`) to RAFT replicas (`REGION_REPLICATION = N`).** The primary region is reopened with RAFT enabled. On reopen, the RegionServer's `ConsensusServer` creates a new RAFT group with the primary as the sole initial member and leader. N-1 new replicas are then assigned to RegionServers in different failure domains, enforced by the distribute-replicas balancer constraint. Each replica opens, joins the existing RAFT group, and bootstraps from the leader via `AppendEntries` catch-up or `CatchUpReference`, depending on how far behind the new member is. Once all N-1 replicas have joined and caught up, the group is fully operational with N members.
+
+**From async replicas (`REGION_REPLICATION = N`, no RAFT) to RAFT replicas (`REGION_REPLICATION = N`, RAFT).** The existing async replicas are closed first, tearing down the `RegionReplicationSink` pipeline. The primary is then reopened with RAFT enabled, becoming the initial RAFT leader. N-1 new RAFT replicas are assigned and opened, bootstrapping from the leader as above. This transition is briefly disruptive. The table is unavailable for writes during the reopen window, typically ~seconds, and Timeline reads are interrupted while the old replicas are closed and the new RAFT replicas are opening. This is a one-time migration cost.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant M as Master
+    participant SM as ServerManager
+    participant MTP as ModifyTableProcedure
+    participant RS0 as "RS (primary)"
+    participant RS1 as "RS (replica 1)"
+    participant RS2 as "RS (replica 2)"
+
+    Op->>M: alter 't1', REGION_REPLICATION=3, hbase.raft.enabled=true
+    M->>SM: getOnlineServers() -- check all versions
+    SM-->>M: all servers >= minimum RAFT version
+    M->>MTP: submit ModifyTableProcedure
+    Note over MTP: PREPARE: version gate + replication factor + durability checks pass
+    MTP->>MTP: persist updated table descriptor
+    MTP->>RS0: reopen primary with RAFT enabled
+    RS0->>RS0: ConsensusServer creates RAFT group, primary becomes leader
+    MTP->>RS1: assign replica 1
+    RS1->>RS0: join RAFT group, catch up via AppendEntries
+    MTP->>RS2: assign replica 2
+    RS2->>RS0: join RAFT group, catch up via AppendEntries
+    Note over RS0,RS2: RAFT group active with 3 members
+```
+
+The diagram above illustrates the RF=3 case. For other replication factors the same flow applies with N-1 replica assignment steps instead of two.
+
+In both cases the procedure is idempotent. If it fails partway through (e.g., a RegionServer crashes during the reopen phase), the master's procedure framework retries from the last persisted state. Partially-opened RAFT groups are detected on retry: if the primary has already reopened with RAFT but replicas are not yet assigned, the procedure continues from the assignment step.
+
+### Disabling RAFT Replicas and Downgrade
+
+Rollback is the reverse of enablement and follows a strict ordering rule: **schema rollback before software rollback**. The operator must disable RAFT and reduce `REGION_REPLICATION` on every table before downgrading any RegionServer software. This is the dual of the upgrade rule (all software upgraded before RAFT enabled).
+
+**Per-table disable procedure.** For each table with `hbase.raft.enabled = true`:
+
+1. **Transfer leadership to replica ID 0.** For every region in the table, the master (via the balancer or a dedicated `DisableRaftProcedure`) issues a leadership transfer to the member hosted on the RegionServer carrying replica ID 0. The current RAFT leader sends a `TransferLeadership` message, which triggers the standard promotion protocol targeting replica ID 0.
+
+2. **Wait for confirmation.** The master waits for each region's replica ID 0 to become RAFT leader and fully catch up. The `LeaderChangeHandler` processes the `ReportLeaderElection` RPC and updates META to record replica ID 0 as the primary with the appropriate RAFT term.
+
+3. **Alter table to disable RAFT and reduce replicas.** The operator issues:
+   ```
+   alter 't1', {REGION_REPLICATION => 1, METADATA => {'hbase.raft.enabled' => 'false'}}
+   ```
+   The `ModifyTableProcedure` processes this atomically: it closes replicas with the highest replica IDs first (the standard `CloseExcessRegionReplicasProcedure` behavior), then reopens the primary (replica ID 0) without RAFT. Since leadership was transferred to replica ID 0 in step 1, the primary being retained is the current leader with a fully caught-up memstore. No data is lost.
+
+4. **Clean up META columns.** The procedure removes the `primary-replica-ID` and `raft-term` META columns for all regions of the table. These columns are meaningless once RAFT is disabled and would confuse non-RAFT code paths that assume the primary is always replica ID 0.
+
+5. **Table is now a standard single-primary table** with no replicas and no RAFT metadata.
+
+The leadership transfer in step 1 is essential. The existing `AssignmentManager` replica-reduction logic closes replicas with the highest replica IDs first, retaining replica ID 0. If the current RAFT leader were a different replica ID (e.g., replica ID 2 after an AZ failover), closing it without first transferring leadership would lose uncommitted memstore state.
 
 ```mermaid
 flowchart LR
@@ -1186,21 +1283,35 @@ flowchart LR
     E --> F["Normal primary,<br/>no replicas"]
 ```
 
+**Software downgrade.** After all tables have been reverted to non-RAFT operation, the `ConsensusServer` on each RegionServer has zero active RAFT groups and is idle (or was never started). The cluster is now functionally identical to a pre-RAFT deployment, and software can be safely downgraded via the standard rolling restart procedure: restart each RegionServer one at a time with the prior software version.
+
+A downgrade version gate provides additional safety. If any table still has `hbase.raft.enabled = true` in its descriptor, the master logs a warning when a RegionServer running the older (non-RAFT-capable) version reports for duty via `regionServerStartup`. The master accepts the server (to avoid reducing cluster capacity) but refuses to assign any RAFT-enabled regions to it. This prevents a partially-downgraded cluster from placing RAFT-enabled regions on servers that lack the `hbase-consensus` module. The operator is expected to complete the schema rollback (disable RAFT on all tables) before or concurrently with the software rollback.
+
+### Mixed-Version Safety
+
+The design enforces a set of invariants that prevent RAFT from being active while the cluster is in a mixed-version state:
+
+- **RAFT is never active while any RegionServer is below the minimum version.** The version gate in `ModifyTableProcedure` and `CreateTableProcedure` rejects any attempt to set `hbase.raft.enabled = true` unless all online RegionServers are at the RAFT-capable version.
+- **No RAFT traffic flows during rolling upgrade or rolling downgrade.** During upgrade, no table has RAFT enabled yet. During downgrade, all tables must have RAFT disabled before the first server is restarted with old software.
+- **The version gate is enforced at the master**, which is the single serialization point for all schema changes. There is no race between concurrent `alter` commands and server restarts because the version check occurs within the procedure's prepare phase, which holds the table lock.
+- **Old-version servers cannot host RAFT regions.** If an old-version RegionServer joins a cluster that has RAFT-enabled tables (e.g., an operator mistakenly starts a downgraded server before completing schema rollback), the master's balancer excludes it from assignment of RAFT-enabled regions. The table continues operating on the remaining RAFT-capable servers. The master logs a warning identifying the old-version server and the constraint violation.
+- **The only window where RAFT is active** is when all servers are running the RAFT-capable version and at least one table has been explicitly altered to enable it. Entry into and exit from this window are both controlled by explicit operator actions (schema alter) gated by version checks.
+
 ## Availability Impact
 
 This section assesses the availability characteristics of the RAFT-based region replica design relative to the current HBase model, examining each class of failure and operational event.
 
 ### Steady-State Write Availability
 
-Under normal operation a RAFT-enabled region accepts writes whenever the leader holds a valid lease and the promotion-complete flag is set. The parallel write path requires both the HDFS WAL sync and the RAFT majority acknowledgment to succeed before the client is acknowledged. If either path fails, the write is rejected and the client retries. The RAFT majority requirement means that at least two of the three members must be reachable for writes to proceed. A single slow or unreachable follower does not block writes because the leader and one healthy follower suffice for a majority. In practice, this means that the write path tolerates one member being down, partitioned, or slow without any write unavailability. This is a strict improvement over the current model, where the loss of the single primary makes the region entirely unavailable for writes until SCP completes WAL splitting and reassignment.
+Under normal operation a RAFT-enabled region accepts writes whenever the leader holds a valid lease and the promotion-complete flag is set. The parallel write path requires both the HDFS WAL sync and the RAFT majority acknowledgment to succeed before the client is acknowledged. If either path fails, the write is rejected and the client retries. The RAFT majority requirement means that a majority of the N members (floor(N/2)+1) must be reachable for writes to proceed. With RF=3, this is 2 of 3. With RF=5, the group tolerates two simultaneous member failures. With RF=2, majority = 2, so both members must be alive for writes to succeed. There is no write fault tolerance, but the warm follower memstore still provides faster recovery than the current non-replicated model.
 
 ### Steady-State Read Availability
 
-Default-consistency reads continue to be served exclusively by the primary, as they are today. The availability of default reads is therefore identical to write availability. As long as the leader is healthy and promoted, default reads succeed. Timeline-consistency reads are served by any replica, including the leader. Under the current async replication model, replica staleness is unbounded and grows during replication lag. Under RAFT replication, follower memstores are kept current by ordered, majority-committed log entries, so Timeline reads return much fresher data. During normal operation all three members can serve reads, providing three-way read availability. If one member is down, two members still serve Timeline reads. If two members are down the surviving member, if it is the leader, continues serving both default and Timeline reads while RAFT writes are blocked, and if it is a follower, it can serve Timeline reads from its last-applied state but writes and default reads are unavailable until the leader recovers or a new election completes.
+Default-consistency reads continue to be served exclusively by the primary, as they are today. The availability of default reads is therefore identical to write availability. As long as the leader is healthy and promoted, default reads succeed. Timeline-consistency reads are served by any replica, including the leader. Under the current async replication model, replica staleness is unbounded and grows during replication lag. Under RAFT replication, follower memstores are kept current by ordered, majority-committed log entries, so Timeline reads return much fresher data. During normal operation all N members can serve Timeline reads, providing N-way read availability. If one member is down, N-1 members still serve Timeline reads. If enough members fail that fewer than a majority remain, the surviving members that are followers can still serve Timeline reads from their last-applied state, but writes and default reads are unavailable until the leader recovers or a new election completes. With RF=3, this means the sole survivor can serve Timeline reads when two members are down. With RF=2, the sole survivor serves Timeline reads while writes are blocked.
 
 ### Single AZ Failure
 
-The design's primary availability improvement is tolerance of a full AZ outage. When one AZ fails, the surviving two members in the remaining AZs detect the failure via heartbeat timeout (default 1500ms) and elect a new RAFT leader. The promotion protocol then runs in three phases: RAFT-internal log catch-up, master confirmation via ReportLeaderElection, and local state transitions on the promoted replica. The total failover time from AZ failure to the new primary accepting writes is bounded by the heartbeat timeout plus log catch-up time plus one master RPC round-trip, typically sub-second to a few seconds. Throughout this promotion window, the region is unavailable for writes and default-consistency reads, but Timeline reads continue to be served by the surviving replicas whose memstore is warm from RAFT replication.
+The design's primary availability improvement is tolerance of a full AZ outage. When one AZ fails, the surviving N-1 members in the remaining AZs detect the failure via heartbeat timeout (default 1500ms). If a majority survives, the survivors elect a new RAFT leader. The promotion protocol then runs in three phases: RAFT-internal log catch-up, master confirmation via ReportLeaderElection, and local state transitions on the promoted replica. The total failover time from AZ failure to the new primary accepting writes is bounded by the heartbeat timeout plus log catch-up time plus one master RPC round-trip, typically sub-second to a few seconds. Throughout this promotion window, the region is unavailable for writes and default-consistency reads, but Timeline reads continue to be served by the surviving replicas whose memstore is warm from RAFT replication.
 
 This is a qualitative change from the current model. Today, an AZ failure taking down the primary's RegionServer triggers ServerCrashProcedure, which must split the dead server's WAL on HDFS, assign the region to a new RegionServer, and replay recovered edits to rebuild the memstore. This process takes seconds to minutes depending on WAL size and cluster load, and during the entire window the region is unavailable for all operations except Timeline reads on replicas. Under the RAFT model, the promotion bypasses WAL splitting entirely because the promoted replica's memstore is already warm, and SCP's role is reduced to coordination and fallback.
 
@@ -1228,7 +1339,13 @@ The balancer is extended with a cost function that penalizes moving the current 
 
 ### Region Split and Merge
 
-Region splits and merges cause unavailability for the affected regions during the procedure. For splits, the primary proposes a region-close/split marker through RAFT, and the master waits for this marker to be RAFT-committed before opening daughter regions. During the window between the parent group's closure and the daughter groups' readiness, the key range is unavailable. For merges, both parent groups must close before the merged group opens. These unavailability windows are similar in duration to the current model's split and merge procedures because the RAFT commit of the close marker adds only a few milliseconds to the existing procedure latency. The safety property that no member has both a parent group and a daughter group active for the same key range simultaneously is enforced by RAFT log ordering, which is a stronger guarantee than the current model's asynchronous coordination.
+Region splits and merges cause write unavailability for the affected regions during the procedure. The key range cannot accept mutations between the parent group's write-closure and the daughter or merged group becoming ready. The RAFT commit of the close marker adds only a few milliseconds to the existing procedure latency, so the write unavailability window is comparable to the current model's split and merge procedures.
+
+Read availability is substantially improved relative to the current model. When a member applies the split or merge marker, only the write path and RAFT operations are immediately gated (write-closure). The parent's memstore and HFile references remain accessible in a frozen, read-only state, and the member continues serving Timeline reads from this consistent snapshot. Once the daughter or merged groups are opened and ready on a given member, the parent's read path is atomically torn down and reads transition to the new groups. This atomic swap is a local operation, so the read unavailability window is reduced to a sub-millisecond local pointer swap, effectively near-zero.
+
+The safety property that no member has both a parent group and a daughter group writing to the same key range simultaneously is enforced by RAFT log ordering. The frozen parent accepts no writes. Memory held by the frozen parent's memstore is released when the read path is torn down, bounding the additional memory lifetime to the master procedure's region-open latency, typically hundreds of milliseconds to a few seconds.
+
+For merges, both parent groups enter the frozen read-only state independently when their respective merge markers are applied, and both continue serving Timeline reads for their respective key ranges until the merged group is ready. The merged group assumes responsibility for the combined key range, and both parents' read paths are atomically torn down.
 
 ### HDFS Degradation
 
@@ -1238,13 +1355,19 @@ However, the promoted replica's initial ability to serve as primary after failov
 
 ### New Member Bootstrap and Replication Factor Recovery
 
-After a failure, the surviving two members continue operating at a reduced replication factor of two. The cluster remains available for reads and writes, but a second member failure before the replication factor is restored would leave only one surviving member, which cannot form a RAFT majority. The master schedules a replacement replica as part of SCP's post-promotion cleanup. The new member loads shared HFiles from HDFS and catches up via RAFT log replay or the shared-storage catch-up path. During bootstrap, the new member is not eligible for voting or promotion, so the cluster operates with a two-member quorum until bootstrap completes. The time to restore the full replication factor depends on the region's data size (for HFile loading) and the write rate (for RAFT log catch-up), typically seconds to minutes. Until the third member is fully caught up, the system can not tolerate additional member failures for that region without losing write availability.
+After a failure, the surviving N-1 members continue operating at a reduced replication factor. With RF=3, the surviving two members form a majority and the cluster remains available for reads and writes, but a second member failure before the replication factor is restored would leave only one surviving member, which cannot form a RAFT majority. The master schedules a replacement replica as part of SCP's post-promotion cleanup. The new member loads shared HFiles from HDFS and catches up via RAFT log replay or the shared-storage catch-up path. During bootstrap, the new member is not eligible for voting or promotion, so the cluster operates with a reduced quorum until bootstrap completes. The time to restore the full replication factor depends on the region's data size and the write rate, typically seconds to minutes. Until the replacement member is fully caught up, the group's fault tolerance remains reduced by one member.
 
 ### Availability Summary
 
 The net effect of the RAFT-based design on availability is strongly positive.
 
-The dominant improvement is the elimination of WAL splitting from the failover path, which reduces region unavailability after a primary failure from seconds-to-minutes to sub-second-to-seconds. Write availability during single AZ failures is maintained after a brief promotion gap, whereas the current model provides no write availability until SCP completes. Read availability is improved by keeping replica memstores current through ordered RAFT replication rather than best-effort async replication, making Timeline reads useful during and after failover rather than increasingly stale. A new source of per-region unavailability is the promotion gap, on the order of hundreds of milliseconds in the common case. This is a modest cost relative to the large gains in failover speed and write availability under failure.
+The dominant improvement is the elimination of WAL splitting from the failover path, which reduces region unavailability after a primary failure from seconds-to-minutes to sub-second-to-seconds.
+
+Write availability during single AZ failures is maintained after a brief promotion gap, whereas the current model provides no write availability until SCP completes.
+
+Read availability is improved by keeping replica memstores current through ordered RAFT replication rather than best-effort async replication, making Timeline reads useful during and after failover rather than increasingly stale.
+
+Region splits and merges maintain near-zero read unavailability because the parent's read path remains active against a frozen, immutable snapshot while the master opens daughter or merged groups, and transitions to the new groups via a sub-millisecond local atomic swap.
 
 ## Performance and Scalability
 
