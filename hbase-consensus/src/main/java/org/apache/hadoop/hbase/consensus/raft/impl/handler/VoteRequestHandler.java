@@ -134,7 +134,13 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
     }
     LOGGER.info("{} Granted vote for {}", localEndpointStr(), request);
     state.grantVote(candidateTerm, candidate);
-    node.leaderHeartbeatReceived();
+    // Defer our own pre-vote pass so the candidate we just voted for has a
+    // chance to win, but do NOT touch lastLeaderHeartbeatTimestamp. A vote
+    // grant is not a leader heartbeat, and refreshing it would make
+    // (Pre)VoteRequestHandler reject any other higher-term candidate that
+    // arrives before the timer elapses, which deadlocks elections when
+    // the original candidate fails to gather a quorum.
+    node.electionTimerReset();
     node.send(candidate, responseBuilder.setTerm(candidateTerm).setGranted(true).build());
   }
 }

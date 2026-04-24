@@ -921,6 +921,7 @@
     <log4j2.version>2.25.4</log4j2.version>
     <mockito.version>4.11.0</mockito.version>
     <byte-buddy.version>1.15.11</byte-buddy.version>
+    <jctools.version>4.0.5</jctools.version>
     <!--
       Version of protobuf that hbase uses internally (we shade our pb) Must match what is out
       in hbase-thirdparty include.
@@ -1705,6 +1706,11 @@
         <artifactId>awaitility</artifactId>
         <version>${awaitility.version}</version>
         <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.jctools</groupId>
+        <artifactId>jctools-core</artifactId>
+        <version>${jctools.version}</version>
       </dependency>
       <dependency>
         <groupId>org.hamcrest</groupId>

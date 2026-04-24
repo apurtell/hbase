@@ -56,7 +56,7 @@ public class HeartbeatTask extends RaftNodeStatusAwareTask {
             localEndpointStr());
           resetLeaderAndTryTriggerPreVote(false);
         }
-      } else if (node.isLeaderHeartbeatTimeoutElapsed() && state.preCandidateState() == null) {
+      } else if (node.isElectionTimerElapsed() && state.preCandidateState() == null) {
         LOGGER.warn("{} Current leader {}'s heartbeats are timed-out.", localEndpointStr(),
           leader.getId());
         resetLeaderAndTryTriggerPreVote(true);

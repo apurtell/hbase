@@ -67,10 +67,15 @@ public class VoteRequestHandlerTimerResetTest extends BaseTest {
       .setGroupId(follower.getGroupId()).setSender(leader.getLocalEndpoint()).setTerm(candidateTerm)
       .setLastLogTerm(last.getTerm()).setLastLogIndex(last.getIndex()).setSticky(false).build();
     follower.handle(request);
-    // handle() is asynchronous; wait until the grant has been processed and the timer reset
+    // handle() is asynchronous. Wait until the grant has been processed and the
+    // election timer reset. The leader-heartbeat timer must remain elapsed
+    // (a vote grant is not a real heartbeat), but the local
+    // election-timer-reset timestamp must have been refreshed so HeartbeatTask
+    // does not preempt the candidate.
     eventually(() -> {
       assertThat(follower.getTerm().getTerm()).isGreaterThanOrEqualTo(candidateTerm);
-      assertThat(follower.isLeaderHeartbeatTimeoutElapsed()).isFalse();
+      assertThat(follower.isElectionTimerElapsed()).isFalse();
     });
+    assertThat(follower.isLeaderHeartbeatTimeoutElapsed()).isTrue();
   }
 }

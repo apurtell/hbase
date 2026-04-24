@@ -172,6 +172,13 @@ public final class RaftNodeImpl implements RaftNode {
   private final List<RaftNodeLifecycleAware> lifecycleAwareComponents = new ArrayList<>();
   private final List<RaftNodeLifecycleAware> startedLifecycleAwareComponents = new ArrayList<>();
   private long lastLeaderHeartbeatTimestamp;
+  // Updated whenever the local follower has a reason to defer starting its own
+  // election: a real leader heartbeat (AppendEntries/InstallSnapshot) or a vote
+  // grant. Kept distinct from {@link #lastLeaderHeartbeatTimestamp} so that
+  // sticky-leader checks in (Pre)VoteRequestHandler continue to reflect lease
+  // safety (only true leader heartbeats refresh the lease), while the
+  // HeartbeatTask still avoids preempting a candidate it just voted for.
+  private long lastElectionTimerResetTimestamp;
   private volatile RaftNodeStatus status = INITIAL;
   private int takeSnapshotCount;
   private int installSnapshotCount;
@@ -916,10 +923,25 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   /**
-   * Updates the last leader heartbeat timestamp to now
+   * Updates the last leader heartbeat timestamp to now. Also defers the local election timer (a
+   * real leader heartbeat must suppress the local pre-vote pass too).
    */
   public void leaderHeartbeatReceived() {
-    lastLeaderHeartbeatTimestamp = Math.max(lastLeaderHeartbeatTimestamp, clock.millis());
+    long now = clock.millis();
+    lastLeaderHeartbeatTimestamp = Math.max(lastLeaderHeartbeatTimestamp, now);
+    lastElectionTimerResetTimestamp = Math.max(lastElectionTimerResetTimestamp, now);
+  }
+
+  /**
+   * Defers the local election timer without claiming a fresh leader heartbeat. Called by
+   * {@link org.apache.hadoop.hbase.consensus.raft.impl.handler.VoteRequestHandler} after granting a
+   * vote so that the {@link org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask} does
+   * not immediately preempt the candidate we just voted for. Crucially this does NOT refresh
+   * {@link #lastLeaderHeartbeatTimestamp}: a vote grant is not a leader heartbeat, so sticky-leader
+   * checks in (Pre)VoteRequestHandler still correctly reflect whether a real leader is alive.
+   */
+  public void electionTimerReset() {
+    lastElectionTimerResetTimestamp = Math.max(lastElectionTimerResetTimestamp, clock.millis());
   }
 
   /**
@@ -1654,6 +1676,16 @@ public final class RaftNodeImpl implements RaftNode {
   @Override
   public boolean isLeaderHeartbeatTimeoutElapsed() {
     return isLeaderHeartbeatTimeoutElapsed(lastLeaderHeartbeatTimestamp, clock.millis());
+  }
+
+  /**
+   * @return whether the local election timer has elapsed. The election timer is deferred by either
+   *         a real leader heartbeat or by granting a vote, so this returning {@code false} means
+   *         the local {@link org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask} must
+   *         NOT start a new pre-vote pass yet.
+   */
+  public boolean isElectionTimerElapsed() {
+    return isLeaderHeartbeatTimeoutElapsed(lastElectionTimerResetTimestamp, clock.millis());
   }
 
   private boolean isLeaderHeartbeatTimeoutElapsed(long timestamp) {
