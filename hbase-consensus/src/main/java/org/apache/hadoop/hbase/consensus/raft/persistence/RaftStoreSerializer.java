@@ -1,0 +1,57 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.hadoop.hbase.consensus.raft.persistence;
+
+import edu.umd.cs.findbugs.annotations.NonNull;
+import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
+import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
+import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
+import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
+import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
+
+/**
+ * Similarly to the {@link org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory}, users of
+ * the RaftStore implementations must provide methods for converting a few of their types into
+ * binary data for persistence. This logic is expected to be relatively straightforward for the
+ * implementer, since similar logic will exist within the
+ * {@link org.apache.hadoop.hbase.consensus.raft.transport.Transport}. It should be noted that
+ * serialization performed here may need to be deserialized for an indefinite period and so
+ * evolution of any relevant types should be considered by the implementer.
+ */
+public interface RaftStoreSerializer {
+  Serializer<RaftGroupMembersView> raftGroupMembersViewSerializer();
+
+  Serializer<RaftEndpoint> raftEndpointSerializer();
+
+  Serializer<LogEntry> logEntrySerializer();
+
+  Serializer<SnapshotChunk> snapshotChunkSerializer();
+
+  Serializer<RaftEndpointPersistentState> raftEndpointPersistentStateSerializer();
+
+  Serializer<RaftTermPersistentState> raftTermPersistentState();
+
+  interface Serializer<T> {
+    @NonNull
+    byte[] serialize(@NonNull T element);
+
+    @NonNull
+    T deserialize(@NonNull byte[] element);
+  }
+}

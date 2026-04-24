@@ -1,0 +1,78 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.hadoop.hbase.consensus.raft.executor;
+
+import edu.umd.cs.findbugs.annotations.NonNull;
+import java.util.concurrent.TimeUnit;
+import org.apache.hadoop.hbase.consensus.raft.RaftNode;
+import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+
+/**
+ * The abstraction used by {@link RaftNode} to execute the Raft consensus algorithm with the Actor
+ * model. You can read about the Actor Model at the following link:
+ * https://en.wikipedia.org/wiki/Actor_model
+ * <p>
+ * A Raft node runs by submitting tasks to its Raft node executor. All tasks submitted by a Raft
+ * node must be executed serially, with maintaining the happens-before relationship, so that the
+ * Raft consensus algorithm and the user-provided state machine logic could be executed without
+ * synchronization.
+ * <p>
+ * A default implementation, {@link DefaultRaftNodeExecutor} is provided and should be suitable for
+ * most of the use-cases.
+ * <p>
+ * A {@link RaftNodeExecutor} implementation can implement {@link RaftNodeLifecycleAware} to perform
+ * initialization and clean up work during {@link RaftNode} startup and termination. However, there
+ * is one subtle point about the order of method calls. {@link RaftNode} calls
+ * {@link RaftNodeExecutor#execute(Runnable)} before
+ * {@link RaftNodeLifecycleAware#onRaftNodeStart()} to submit the start task.
+ * @see RaftNode
+ * @see DefaultRaftNodeExecutor
+ * @see RaftNodeLifecycleAware
+ */
+public interface RaftNodeExecutor {
+  /**
+   * Executes the given task on the underlying platform.
+   * <p>
+   * Please note that all tasks of a single Raft node must be executed in a single-threaded manner
+   * and the happens-before relationship must be maintained between given tasks of the Raft node.
+   * <p>
+   * The underlying platform is free to execute the given task immediately if it fits to the defined
+   * guarantees. the task to be executed.
+   */
+  void execute(@NonNull Runnable task);
+
+  /**
+   * Submits the given task for execution.
+   * <p>
+   * If the caller is already on the thread that runs the Raft node, the given task cannot be
+   * executed immediately and it must be put into the internal task queue for execution in future.
+   * the task object to be executed later.
+   */
+  void submit(@NonNull Runnable task);
+
+  /**
+   * Schedules the task on the underlying platform to be executed after the given delay.
+   * <p>
+   * Please note that even though the scheduling can be offloaded to another thread, the given task
+   * must be executed in a single-threaded manner and the happens-before relationship must be
+   * maintained between given tasks of the Raft node. the task to be executed in future the time
+   * from now to delay execution the time unit of the delay
+   */
+  void schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit);
+}
