@@ -17,7 +17,7 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.impl.task;
 
-import static java.util.concurrent.TimeUnit.SECONDS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus.ACTIVE;
 import static org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus.isTerminal;
 
@@ -117,7 +117,7 @@ public class TransferLeadershipTask implements Runnable {
     int tryCount = leadershipTransferState.incrementTryCount();
     RaftConfig config = node.getConfig();
     if (
-      config.getLeaderHeartbeatTimeoutSecs() <= tryCount * config.getLeaderHeartbeatPeriodSecs()
+      config.getLeaderHeartbeatTimeoutMillis() <= tryCount * config.getLeaderHeartbeatPeriodMillis()
     ) {
       String msg = node.localEndpointStr() + " leadership transfer to " + targetEndpoint.getId()
         + " timed out!";
@@ -152,7 +152,7 @@ public class TransferLeadershipTask implements Runnable {
   private void scheduleRetry(RaftState state) {
     try {
       node.getExecutor().schedule(() -> transferLeadership(state),
-        node.getConfig().getLeaderHeartbeatPeriodSecs(), SECONDS);
+        node.getConfig().getLeaderHeartbeatPeriodMillis(), MILLISECONDS);
     } catch (Throwable t) {
       LOGGER.error(node.localEndpointStr() + " failed to schedule retry of leadership transfer to "
         + targetEndpoint.getId(), t);

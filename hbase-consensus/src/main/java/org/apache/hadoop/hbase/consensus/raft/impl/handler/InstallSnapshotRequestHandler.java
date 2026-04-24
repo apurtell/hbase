@@ -18,7 +18,7 @@
 package org.apache.hadoop.hbase.consensus.raft.impl.handler;
 
 import static java.util.Objects.requireNonNull;
-import static java.util.concurrent.TimeUnit.SECONDS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.stream.Collectors.toList;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.FOLLOWER;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEARNER;
@@ -82,6 +82,7 @@ public class InstallSnapshotRequestHandler extends AbstractMessageHandler<Instal
   @SuppressWarnings({ "checkstyle:npathcomplexity", "checkstyle:cyclomaticcomplexity" })
   protected void handle(@NonNull InstallSnapshotRequest request) {
     requireNonNull(request);
+    // getCatchUpReference() is reserved for catch-up-by-reference; chunked path ignores it.
     RaftEndpoint sender = request.getSender();
     // Reply false if term < currentTerm (§5.1)
     if (request.getTerm() < state.term()) {
@@ -265,7 +266,7 @@ public class InstallSnapshotRequestHandler extends AbstractMessageHandler<Instal
         node.getExecutor()
           .schedule(() -> handleUnresponsiveEndpoint(state.term(), target,
             request.getSnapshotIndex(), e.getValue()),
-            node.getConfig().getLeaderHeartbeatPeriodSecs(), SECONDS);
+            node.getConfig().getLeaderHeartbeatPeriodMillis(), MILLISECONDS);
       }
     }
   }
@@ -308,7 +309,7 @@ public class InstallSnapshotRequestHandler extends AbstractMessageHandler<Instal
       node.send(target, response);
       node.getExecutor().schedule(
         () -> handleUnresponsiveEndpoint(term, target, snapshotIndex, e.getValue()),
-        node.getConfig().getLeaderHeartbeatPeriodSecs(), SECONDS);
+        node.getConfig().getLeaderHeartbeatPeriodMillis(), MILLISECONDS);
     }
   }
 }

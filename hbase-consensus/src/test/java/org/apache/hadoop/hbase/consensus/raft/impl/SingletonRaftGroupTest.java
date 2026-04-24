@@ -78,8 +78,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_singletonRaftGroupIsStarted_then_leaderIsElected() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.start(1, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     assertThat(leader).isNotNull();
@@ -102,7 +102,8 @@ public class SingletonRaftGroupTest extends BaseTest {
     Optional<Long> quorumTimestamp = reports.get(2).getQuorumHeartbeatTimestamp();
     assertThat(quorumTimestamp.get()).isGreaterThan(0).isLessThan(Long.MAX_VALUE);
     allTheTime(() -> assertThat(leader.getLeaderEndpoint()).isEqualTo(leader.getLocalEndpoint()),
-      2 * config.getLeaderHeartbeatTimeoutSecs());
+      2 * java.util.concurrent.TimeUnit.MILLISECONDS
+        .toSeconds(config.getLeaderHeartbeatTimeoutMillis()));
   }
 
   @Test
@@ -707,8 +708,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void
     when_nodeRestartsAfterSingletonRaftGroupExpandedWithLearner_then_newLeaderIsElected() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY)
       .enableNewTermOperation().setConfig(config).build();
     group.start();
@@ -745,8 +746,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void
     when_nodeRestartsAfterSingletonRaftGroupExpandedWithFollower_then_newLeaderIsElected() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY)
       .enableNewTermOperation().setConfig(config).build();
     group.start();
@@ -782,8 +783,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_nodeRestartsAfterSingletonRaftGroupExpanded_then_newLeaderIsElected() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY)
       .enableNewTermOperation().setConfig(config).build();
     group.start();
@@ -847,8 +848,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_leaderLeaves2NodeRaftGroup_then_singletonRaftGroupCommitsNewLogEntry() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(2).enableNewTermOperation().setConfig(config).build();
     group.start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -883,8 +884,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_memberRemovalIsNotCommitted_then_singletonFollowerCompletesMembershipChange() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(2).enableNewTermOperation().setConfig(config).build();
     group.start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -928,8 +929,8 @@ public class SingletonRaftGroupTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_singleVotingRaftNodeIsRunning_then_cannotRemoveEndpoint() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(3).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(1).enableNewTermOperation().setConfig(config).build();
     group.start();
     RaftNode leader = group.waitUntilLeaderElected();

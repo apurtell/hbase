@@ -33,13 +33,18 @@ public final class RaftConfig implements Serializable {
    */
   public static final long DEFAULT_LEADER_ELECTION_TIMEOUT_MILLIS = 1000;
   /**
-   * The default value for {@link #leaderHeartbeatTimeoutSecs}
+   * The default value for {@link #leaderHeartbeatTimeoutMillis} (10 seconds).
    */
-  public static final long DEFAULT_LEADER_HEARTBEAT_TIMEOUT_SECS = 10;
+  public static final long DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MILLIS = 10_000;
   /**
-   * The default value for {@link #leaderHeartbeatPeriodSecs}.
+   * The default value for {@link #leaderHeartbeatPeriodMillis} (2 seconds).
    */
-  public static final long DEFAULT_LEADER_HEARTBEAT_PERIOD_SECS = 2;
+  public static final long DEFAULT_LEADER_HEARTBEAT_PERIOD_MILLIS = 2000;
+  /**
+   * Default upper bound on clock skew between nodes (milliseconds), used to derive the leader lease
+   * duration {@code leaderHeartbeatTimeoutMillis - 2 * maxClockDriftMillis}.
+   */
+  public static final long DEFAULT_MAX_CLOCK_DRIFT_MILLIS = 200;
   /**
    * The default value for {@link #maxPendingLogEntryCount}.
    */
@@ -71,10 +76,10 @@ public final class RaftConfig implements Serializable {
    */
   private final long leaderElectionTimeoutMillis;
   /**
-   * Duration in seconds for a follower to decide on failure of the current leader and start a new
-   * leader election round. If this duration is too short, a leader could be considered as failed
-   * unnecessarily in case of a small hiccup. If it is too long, it takes longer to detect an actual
-   * failure.
+   * Duration in milliseconds for a follower to decide on failure of the current leader and start a
+   * new leader election round. If this duration is too short, a leader could be considered as
+   * failed unnecessarily in case of a small hiccup. If it is too long, it takes longer to detect an
+   * actual failure.
    * <p>
    * Even though there is a single "election timeout" parameter in the Raft paper for both
    * timing-out a leader election round and detecting failure of the leader, MicroRaft uses two
@@ -83,14 +88,19 @@ public final class RaftConfig implements Serializable {
    * You can set {@link #leaderElectionTimeoutMillis} and this field to the same duration to align
    * with the "election timeout" definition in the Raft paper.
    */
-  private final long leaderHeartbeatTimeoutSecs;
+  private final long leaderHeartbeatTimeoutMillis;
   /**
-   * Duration in seconds for a Raft leader node to send periodic heartbeat requests to its followers
-   * in order to denote its liveliness. Periodic heartbeat requests are actually append entries
-   * requests and can contain log entries. A periodic heartbeat request is not sent to a follower if
-   * an append entries request has been sent to that follower recently.
+   * Upper bound on clock skew between nodes (milliseconds). Used with
+   * {@link #leaderHeartbeatTimeoutMillis} to derive {@link #getLeaderLeaseDurationMillis()}.
    */
-  private final long leaderHeartbeatPeriodSecs;
+  private final long maxClockDriftMillis;
+  /**
+   * Duration in milliseconds for a Raft leader node to send periodic heartbeat requests to its
+   * followers in order to denote its liveliness. Periodic heartbeat requests are actually append
+   * entries requests and can contain log entries. A periodic heartbeat request is not sent to a
+   * follower if an append entries request has been sent to that follower recently.
+   */
+  private final long leaderHeartbeatPeriodMillis;
   /**
    * Maximum number of pending log entries in the leader's Raft log before temporarily rejecting new
    * requests of clients. This configuration enables a back pressure mechanism to prevent OOME when
@@ -131,22 +141,16 @@ public final class RaftConfig implements Serializable {
   private final int raftNodeReportPublishPeriodSecs;
 
   /**
-   * Creates a config object duration of leader election rounds in milliseconds duration in seconds
-   * for a Raft leader node to send periodic heartbeat requests to its followers in order to denote
-   * its liveliness duration in seconds for a follower to decide on failure of the current leader
-   * and start a new leader election round maximum number of Raft log entries that can be sent as a
-   * batch in a single append entries request number of new commits to initiate a new snapshot after
-   * the last snapshot taken maximum number of pending log entries in the leader's Raft log before
-   * temporarily rejecting new requests of clients enable / disable parallel snapshot transfer from
-   * followers how frequently a Raft node publishes a report of its internal Raft state
+   * Creates a config object with the given parameters.
    */
-  public RaftConfig(long leaderElectionTimeoutMillis, long leaderHeartbeatPeriodSecs,
-    long leaderHeartbeatTimeoutSecs, int appendEntriesRequestBatchSize,
+  public RaftConfig(long leaderElectionTimeoutMillis, long leaderHeartbeatPeriodMillis,
+    long leaderHeartbeatTimeoutMillis, long maxClockDriftMillis, int appendEntriesRequestBatchSize,
     int commitCountToTakeSnapshot, int maxPendingLogEntryCount,
     boolean transferSnapshotsFromFollowersEnabled, int raftNodeReportPublishPeriodSecs) {
     this.leaderElectionTimeoutMillis = leaderElectionTimeoutMillis;
-    this.leaderHeartbeatPeriodSecs = leaderHeartbeatPeriodSecs;
-    this.leaderHeartbeatTimeoutSecs = leaderHeartbeatTimeoutSecs;
+    this.leaderHeartbeatPeriodMillis = leaderHeartbeatPeriodMillis;
+    this.leaderHeartbeatTimeoutMillis = leaderHeartbeatTimeoutMillis;
+    this.maxClockDriftMillis = maxClockDriftMillis;
     this.appendEntriesRequestBatchSize = appendEntriesRequestBatchSize;
     this.commitCountToTakeSnapshot = commitCountToTakeSnapshot;
     this.maxPendingLogEntryCount = maxPendingLogEntryCount;
@@ -177,19 +181,36 @@ public final class RaftConfig implements Serializable {
   }
 
   /**
-   * @return leader heartbeat timeout seconds
-   * @see #leaderHeartbeatTimeoutSecs
+   * @return leader heartbeat timeout in milliseconds
+   * @see #leaderHeartbeatTimeoutMillis
    */
-  public long getLeaderHeartbeatTimeoutSecs() {
-    return leaderHeartbeatTimeoutSecs;
+  public long getLeaderHeartbeatTimeoutMillis() {
+    return leaderHeartbeatTimeoutMillis;
   }
 
   /**
-   * @return the leader election heartbeat period in seconds
-   * @see #leaderHeartbeatPeriodSecs
+   * @return upper bound on clock skew between nodes (milliseconds)
+   * @see #maxClockDriftMillis
    */
-  public long getLeaderHeartbeatPeriodSecs() {
-    return leaderHeartbeatPeriodSecs;
+  public long getMaxClockDriftMillis() {
+    return maxClockDriftMillis;
+  }
+
+  /**
+   * Leader lease duration used for clock-drift-compensated leader stickiness:
+   * {@code leaderHeartbeatTimeoutMillis - 2 * maxClockDriftMillis}. Builder enforces strict
+   * inequality {@code leaderHeartbeatTimeoutMillis > 2 * maxClockDriftMillis}.
+   */
+  public long getLeaderLeaseDurationMillis() {
+    return leaderHeartbeatTimeoutMillis - 2 * maxClockDriftMillis;
+  }
+
+  /**
+   * @return the leader heartbeat period in milliseconds
+   * @see #leaderHeartbeatPeriodMillis
+   */
+  public long getLeaderHeartbeatPeriodMillis() {
+    return leaderHeartbeatPeriodMillis;
   }
 
   /**
@@ -235,10 +256,10 @@ public final class RaftConfig implements Serializable {
   @Override
   public String toString() {
     return "RaftConfig{" + "leaderElectionTimeoutMillis=" + leaderElectionTimeoutMillis
-      + ", leaderHeartbeatTimeoutSecs=" + leaderHeartbeatTimeoutSecs
-      + ", leaderHeartbeatPeriodSecs=" + leaderHeartbeatPeriodSecs + ", maxPendingLogEntryCount="
-      + maxPendingLogEntryCount + ", appendEntriesRequestBatchSize=" + appendEntriesRequestBatchSize
-      + ", commitCountToTakeSnapshot=" + commitCountToTakeSnapshot
+      + ", leaderHeartbeatTimeoutMillis=" + leaderHeartbeatTimeoutMillis + ", maxClockDriftMillis="
+      + maxClockDriftMillis + ", leaderHeartbeatPeriodMillis=" + leaderHeartbeatPeriodMillis
+      + ", maxPendingLogEntryCount=" + maxPendingLogEntryCount + ", appendEntriesRequestBatchSize="
+      + appendEntriesRequestBatchSize + ", commitCountToTakeSnapshot=" + commitCountToTakeSnapshot
       + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
       + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs + '}';
   }
@@ -248,8 +269,9 @@ public final class RaftConfig implements Serializable {
    */
   public static final class RaftConfigBuilder {
     private long leaderElectionTimeoutMillis = DEFAULT_LEADER_ELECTION_TIMEOUT_MILLIS;
-    private long leaderHeartbeatPeriodSecs = DEFAULT_LEADER_HEARTBEAT_PERIOD_SECS;
-    private long leaderHeartbeatTimeoutSecs = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_SECS;
+    private long leaderHeartbeatPeriodMillis = DEFAULT_LEADER_HEARTBEAT_PERIOD_MILLIS;
+    private long leaderHeartbeatTimeoutMillis = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MILLIS;
+    private long maxClockDriftMillis = DEFAULT_MAX_CLOCK_DRIFT_MILLIS;
     private int appendEntriesRequestBatchSize = DEFAULT_APPEND_ENTRIES_REQUEST_BATCH_SIZE;
     private int commitCountToTakeSnapshot = DEFAULT_COMMIT_COUNT_TO_TAKE_SNAPSHOT;
     private int maxPendingLogEntryCount = DEFAULT_MAX_PENDING_LOG_ENTRY_COUNT;
@@ -273,24 +295,39 @@ public final class RaftConfig implements Serializable {
     }
 
     /**
-     * the leader heartbeat timeout in seconds value to set
+     * the leader heartbeat timeout in milliseconds value to set
      * @return the builder object for fluent calls
-     * @see RaftConfig#leaderHeartbeatTimeoutSecs
+     * @see RaftConfig#leaderHeartbeatTimeoutMillis
      */
-    public RaftConfigBuilder setLeaderHeartbeatTimeoutSecs(long leaderHeartbeatTimeoutSecs) {
-      checkPositive(leaderHeartbeatTimeoutSecs, "leader heartbeat timeout secs must be positive!");
-      this.leaderHeartbeatTimeoutSecs = leaderHeartbeatTimeoutSecs;
+    public RaftConfigBuilder setLeaderHeartbeatTimeoutMillis(long leaderHeartbeatTimeoutMillis) {
+      checkPositive(leaderHeartbeatTimeoutMillis,
+        "leader heartbeat timeout millis must be positive!");
+      this.leaderHeartbeatTimeoutMillis = leaderHeartbeatTimeoutMillis;
       return this;
     }
 
     /**
-     * the leader heartbeat period in seconds value to set
+     * Upper bound on clock skew between nodes (milliseconds). Must satisfy
+     * {@code leaderHeartbeatTimeoutMillis > 2 * maxClockDriftMillis}.
      * @return the builder object for fluent calls
-     * @see RaftConfig#leaderHeartbeatPeriodSecs
      */
-    public RaftConfigBuilder setLeaderHeartbeatPeriodSecs(long leaderHeartbeatPeriodSecs) {
-      checkPositive(leaderHeartbeatPeriodSecs, "leader heartbeat period secs must be positive!");
-      this.leaderHeartbeatPeriodSecs = leaderHeartbeatPeriodSecs;
+    public RaftConfigBuilder setMaxClockDriftMillis(long maxClockDriftMillis) {
+      if (maxClockDriftMillis < 0) {
+        throw new IllegalArgumentException("max clock drift millis must be non-negative!");
+      }
+      this.maxClockDriftMillis = maxClockDriftMillis;
+      return this;
+    }
+
+    /**
+     * the leader heartbeat period in milliseconds value to set
+     * @return the builder object for fluent calls
+     * @see RaftConfig#leaderHeartbeatPeriodMillis
+     */
+    public RaftConfigBuilder setLeaderHeartbeatPeriodMillis(long leaderHeartbeatPeriodMillis) {
+      checkPositive(leaderHeartbeatPeriodMillis,
+        "leader heartbeat period millis must be positive!");
+      this.leaderHeartbeatPeriodMillis = leaderHeartbeatPeriodMillis;
       return this;
     }
 
@@ -358,28 +395,34 @@ public final class RaftConfig implements Serializable {
      * @return the RaftConfig object.
      */
     public RaftConfig build() {
-      if (leaderHeartbeatTimeoutSecs < leaderHeartbeatPeriodSecs) {
+      if (leaderHeartbeatTimeoutMillis < leaderHeartbeatPeriodMillis) {
         throw new IllegalArgumentException(
-          "leader heartbeat timeout secs: " + leaderHeartbeatTimeoutSecs
-            + " cannot be smaller than leader heartbeat timeout period secs: "
-            + leaderHeartbeatPeriodSecs);
+          "leader heartbeat timeout millis: " + leaderHeartbeatTimeoutMillis
+            + " cannot be smaller than leader heartbeat period millis: "
+            + leaderHeartbeatPeriodMillis);
       }
-      return new RaftConfig(leaderElectionTimeoutMillis, leaderHeartbeatPeriodSecs,
-        leaderHeartbeatTimeoutSecs, appendEntriesRequestBatchSize, commitCountToTakeSnapshot,
-        maxPendingLogEntryCount, transferSnapshotsFromFollowersEnabled,
+      if (leaderHeartbeatTimeoutMillis <= 2 * maxClockDriftMillis) {
+        throw new IllegalArgumentException(
+          "leader heartbeat timeout millis must be strictly greater than 2 * maxClockDriftMillis: "
+            + "timeout=" + leaderHeartbeatTimeoutMillis + ", maxClockDriftMillis="
+            + maxClockDriftMillis);
+      }
+      return new RaftConfig(leaderElectionTimeoutMillis, leaderHeartbeatPeriodMillis,
+        leaderHeartbeatTimeoutMillis, maxClockDriftMillis, appendEntriesRequestBatchSize,
+        commitCountToTakeSnapshot, maxPendingLogEntryCount, transferSnapshotsFromFollowersEnabled,
         raftNodeReportPublishPeriodSecs);
     }
 
     @Override
     public String toString() {
       return "RaftConfigBuilder{" + "leaderElectionTimeoutMillis=" + leaderElectionTimeoutMillis
-        + ", leaderHeartbeatPeriodSecs=" + leaderHeartbeatPeriodSecs
-        + ", leaderHeartbeatTimeoutSecs=" + leaderHeartbeatTimeoutSecs
-        + ", appendEntriesRequestBatchSize=" + appendEntriesRequestBatchSize
-        + ", commitCountToTakeSnapshot=" + commitCountToTakeSnapshot + ", maxPendingLogEntryCount="
-        + maxPendingLogEntryCount + ", transferSnapshotsFromFollowersEnabled="
-        + transferSnapshotsFromFollowersEnabled + ", raftNodeReportPublishPeriodSecs="
-        + raftNodeReportPublishPeriodSecs + '}';
+        + ", leaderHeartbeatPeriodMillis=" + leaderHeartbeatPeriodMillis
+        + ", leaderHeartbeatTimeoutMillis=" + leaderHeartbeatTimeoutMillis
+        + ", maxClockDriftMillis=" + maxClockDriftMillis + ", appendEntriesRequestBatchSize="
+        + appendEntriesRequestBatchSize + ", commitCountToTakeSnapshot=" + commitCountToTakeSnapshot
+        + ", maxPendingLogEntryCount=" + maxPendingLogEntryCount
+        + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
+        + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs + '}';
     }
   }
 }

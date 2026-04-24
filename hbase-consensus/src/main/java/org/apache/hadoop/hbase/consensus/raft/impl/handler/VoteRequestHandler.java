@@ -134,6 +134,7 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
     }
     LOGGER.info("{} Granted vote for {}", localEndpointStr(), request);
     state.grantVote(candidateTerm, candidate);
+    node.leaderHeartbeatReceived();
     node.send(candidate, responseBuilder.setTerm(candidateTerm).setGranted(true).build());
   }
 }

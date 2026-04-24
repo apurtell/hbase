@@ -36,13 +36,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
-/*
-   TO RUN THIS TEST ON YOUR MACHINE:
-   $ gh repo clone MicroRaft/MicroRaft
-   $ cd MicroRaft && ./mvnw clean test -Dtest=org.apache.hadoop.hbase.consensus.raft.faulttolerance.RaftLeaderFailureTest -DfailIfNoTests=false -Ptutorial
-   YOU CAN SEE THIS CLASS AT:
-   https://github.com/MicroRaft/MicroRaft/blob/master/microraft/src/test/java/io/microraft/faulttolerance/RaftLeaderFailureTest.java
- */
 @Tag(SmallTests.TAG)
 public class RaftLeaderFailureTest extends BaseTest {
   private LocalRaftGroup group;
@@ -56,8 +49,7 @@ public class RaftLeaderFailureTest extends BaseTest {
 
   @Test
   public void testRaftLeaderFailure() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatTimeoutSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config).start();
     RaftNode leader = group.waitUntilLeaderElected();
     // the leader can replicate log entries to the followers, but it won't
@@ -94,5 +86,14 @@ public class RaftLeaderFailureTest extends BaseTest {
         Optional.empty(), Optional.empty()).join();
     // it turns out that our operation is committed twice
     assertThat(queryResult.getResult()).hasSize(2);
+  }
+
+  @Test
+  public void defaultRaftConfigLeaderLeaseStrictlyInsideHeartbeatTimeout() {
+    RaftConfig c = RaftConfig.DEFAULT_RAFT_CONFIG;
+    assertThat(c.getLeaderLeaseDurationMillis()).isLessThan(c.getLeaderHeartbeatTimeoutMillis());
+    assertThat(c.getLeaderHeartbeatTimeoutMillis()).isGreaterThan(2 * c.getMaxClockDriftMillis());
+    assertThat(c.getLeaderLeaseDurationMillis() + 2 * c.getMaxClockDriftMillis())
+      .isEqualTo(c.getLeaderHeartbeatTimeoutMillis());
   }
 }

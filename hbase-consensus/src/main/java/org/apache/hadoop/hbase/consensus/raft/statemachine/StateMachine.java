@@ -107,6 +107,15 @@ public interface StateMachine {
   void installSnapshot(long commitIndex, @NonNull List<Object> snapshotChunks);
 
   /**
+   * Installs catch-up state by reference (metadata only).
+   * @param commitIndex snapshot / catch-up commit index
+   * @param reference   opaque catch-up metadata (e.g. HFile paths placeholder)
+   */
+  default void installSnapshotReference(long commitIndex, @NonNull CatchUpReference reference) {
+    throw new UnsupportedOperationException("installSnapshotReference is not wired yet");
+  }
+
+  /**
    * Returns the operation to be appended after a new leader is elected in a new term.
    * <p>
    * See <a href= "https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J"> <i>Bug

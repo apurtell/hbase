@@ -41,11 +41,17 @@ public final class LeaderState {
   private boolean requestBackoffResetTaskScheduled;
   private boolean flushTaskSubmitted;
   private long flushedLogIndex;
+  /**
+   * Wall-clock time (ms) until which this leader considers its lease valid for leader-stickiness /
+   * step-down. Refreshed from replication quorum ack timestamps.
+   */
+  private long leaseExpiryMillis;
 
   LeaderState(Collection<RaftEndpoint> remoteMembers, long lastLogIndex, long currentTimeMillis) {
     remoteMembers.forEach(follower -> followerStates.put(follower,
       new FollowerState(0L, lastLogIndex + 1, currentTimeMillis)));
     flushedLogIndex = lastLogIndex;
+    leaseExpiryMillis = 0L;
   }
 
   /**
@@ -142,6 +148,18 @@ public final class LeaderState {
 
   public long flushedLogIndex() {
     return flushedLogIndex;
+  }
+
+  public long leaseExpiryMillis() {
+    return leaseExpiryMillis;
+  }
+
+  public void leaseExpiryMillis(long expiry) {
+    if (expiry < this.leaseExpiryMillis) {
+      throw new IllegalStateException(
+        "lease expiry must be monotonic: new=" + expiry + ", existing=" + this.leaseExpiryMillis);
+    }
+    this.leaseExpiryMillis = expiry;
   }
 
   /**

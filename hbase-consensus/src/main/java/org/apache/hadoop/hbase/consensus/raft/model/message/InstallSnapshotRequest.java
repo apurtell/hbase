@@ -23,6 +23,7 @@ import java.util.Collection;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
+import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
 
 /**
  * Raft message for the InstallSnapshot RPC.
@@ -55,6 +56,12 @@ public interface InstallSnapshotRequest extends RaftMessage {
   long getQuerySequenceNumber();
 
   long getFlowControlSequenceNumber();
+
+  /**
+   * Optional catch-up-by-reference metadata. Ignored by the current chunked install path.
+   */
+  @Nullable
+  CatchUpReference getCatchUpReference();
 
   /**
    * The builder interface for {@link InstallSnapshotRequest}.
@@ -97,5 +104,8 @@ public interface InstallSnapshotRequest extends RaftMessage {
 
     @NonNull
     InstallSnapshotRequestBuilder setFlowControlSequenceNumber(long flowControlSequenceNumber);
+
+    @NonNull
+    InstallSnapshotRequestBuilder setCatchUpReference(@Nullable CatchUpReference catchUpReference);
   }
 }

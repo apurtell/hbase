@@ -527,9 +527,9 @@ public class MembershipChangeTest extends BaseTest {
   public void
     when_leaderFailsBeforeCommittingPromotion_then_followersElectNewLeaderViaGettingVoteFromLearner() {
     int initialMemberCount = 3;
-    group = LocalRaftGroup.newBuilder(initialMemberCount).enableNewTermOperation()
-      .setConfig(RaftConfig.newBuilder().setLeaderHeartbeatTimeoutSecs(3)
-        .setLeaderHeartbeatPeriodSecs(1).build())
+    group = LocalRaftGroup
+      .newBuilder(initialMemberCount).enableNewTermOperation().setConfig(RaftConfig.newBuilder()
+        .setLeaderHeartbeatTimeoutMillis(3000).setLeaderHeartbeatPeriodMillis(1000).build())
       .start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -727,7 +727,7 @@ public class MembershipChangeTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_leaderLeaves_then_itCannotVoteForCommitOfMemberChange() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -907,7 +907,7 @@ public class MembershipChangeTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_followerAppendsMultipleMembershipChangesAtOnce_then_itCommitsThemCorrectly() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000).build();
     group = LocalRaftGroup.start(5, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());

@@ -191,7 +191,7 @@ public final class RaftNodeImpl implements RaftNode {
     this.raftNodeReportListener = requireNonNull(raftNodeReportListener);
     this.config = requireNonNull(config);
     this.localEndpointStr = localEndpoint.getId() + "<" + groupId + ">";
-    this.leaderHeartbeatTimeoutMillis = SECONDS.toMillis(config.getLeaderHeartbeatTimeoutSecs());
+    this.leaderHeartbeatTimeoutMillis = config.getLeaderHeartbeatTimeoutMillis();
     this.commitCountToTakeSnapshot = config.getCommitCountToTakeSnapshot();
     this.appendEntriesRequestBatchSize = config.getAppendEntriesRequestBatchSize();
     this.maxPendingLogEntryCount = config.getMaxPendingLogEntryCount();
@@ -223,7 +223,7 @@ public final class RaftNodeImpl implements RaftNode {
     this.localEndpointStr =
       restoredState.getLocalEndpointPersistentState().getLocalEndpoint().getId() + "<" + groupId
         + ">";
-    this.leaderHeartbeatTimeoutMillis = SECONDS.toMillis(config.getLeaderHeartbeatTimeoutSecs());
+    this.leaderHeartbeatTimeoutMillis = config.getLeaderHeartbeatTimeoutMillis();
     this.commitCountToTakeSnapshot = config.getCommitCountToTakeSnapshot();
     this.appendEntriesRequestBatchSize = config.getAppendEntriesRequestBatchSize();
     this.maxPendingLogEntryCount = config.getMaxPendingLogEntryCount();
@@ -248,13 +248,16 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   private int getMaxBackoffRounds(RaftConfig config) {
-    long durationSecs;
-    if (config.getLeaderHeartbeatPeriodSecs() == 1 && config.getLeaderHeartbeatTimeoutSecs() > 1) {
-      durationSecs = 2;
+    long durationMillis;
+    if (
+      config.getLeaderHeartbeatPeriodMillis() == SECONDS.toMillis(1)
+        && config.getLeaderHeartbeatTimeoutMillis() > SECONDS.toMillis(1)
+    ) {
+      durationMillis = SECONDS.toMillis(2);
     } else {
-      durationSecs = config.getLeaderHeartbeatPeriodSecs();
+      durationMillis = config.getLeaderHeartbeatPeriodMillis();
     }
-    return (int) (SECONDS.toMillis(durationSecs) / LEADER_BACKOFF_RESET_TASK_PERIOD_MILLIS);
+    return (int) (durationMillis / LEADER_BACKOFF_RESET_TASK_PERIOD_MILLIS);
   }
 
   /**
@@ -541,7 +544,8 @@ public final class RaftNodeImpl implements RaftNode {
       leaderFlushTask = new FlushTask(this);
     }
     leaderBackoffResetTask = new LeaderBackoffResetTask(this);
-    executor.schedule(new HeartbeatTask(this), config.getLeaderHeartbeatPeriodSecs(), SECONDS);
+    executor.schedule(new HeartbeatTask(this), config.getLeaderHeartbeatPeriodMillis(),
+      MILLISECONDS);
     executor.schedule(new RaftStateSummaryPublishTask(this),
       config.getRaftNodeReportPublishPeriodSecs(), SECONDS);
   }
@@ -934,6 +938,7 @@ public final class RaftNodeImpl implements RaftNode {
       return;
     }
     LOGGER.debug("{} is taking snapshot at index: {}", localEndpointStr, snapshotIndex);
+    // TODO: swap chunked install-snapshot for CatchUpReference
     List<Object> chunkObjects = new ArrayList<>();
     try {
       stateMachine.takeSnapshot(snapshotIndex, chunkObjects::add);
@@ -1146,6 +1151,10 @@ public final class RaftNodeImpl implements RaftNode {
    */
   public void toLeader() {
     state.toLeader(clock.millis());
+    LeaderState ls = state.leaderState();
+    long now = clock.millis();
+    long quorumTs = ls.quorumResponseTimestamp(state.logReplicationQuorumSize(), now);
+    ls.leaseExpiryMillis(quorumTs + config.getLeaderLeaseDurationMillis());
     appendNewTermEntry();
     broadcastAppendEntriesRequest();
     publishRaftNodeReport(RaftNodeReportReason.ROLE_CHANGE);
@@ -1605,6 +1614,44 @@ public final class RaftNodeImpl implements RaftNode {
     }
   }
 
+  @Override
+  public boolean isLeaderWithValidLease(long nowMillis) {
+    return state.role() == LEADER && state.leaderState() != null
+      && state.leaderState().leaseExpiryMillis() > nowMillis;
+  }
+
+  /**
+   * If this node is leader and its leader lease has expired, steps down to follower (same term).
+   * Before checking expiry, recomputes the lease from the current quorum response timestamps (this
+   * is what allows singleton leaders to keep their lease and a multi-member leader to pick up
+   * follower acks observed since the last AppendEntriesSuccessResponseHandler invocation).
+   * @return true if the node stepped down due to lease expiry
+   */
+  @Override
+  public boolean demoteToFollowerIfLeaseExpired() {
+    if (state.role() != LEADER) {
+      return false;
+    }
+    LeaderState leaderState = state.leaderState();
+    if (leaderState == null) {
+      return false;
+    }
+    long now = clock.millis();
+    long quorumTs = leaderState.quorumResponseTimestamp(state.logReplicationQuorumSize(), now);
+    long candidateExpiry = quorumTs + config.getLeaderLeaseDurationMillis();
+    if (candidateExpiry > leaderState.leaseExpiryMillis()) {
+      leaderState.leaseExpiryMillis(candidateExpiry);
+    }
+    if (leaderState.leaseExpiryMillis() <= now) {
+      LOGGER.warn("{} Demoting to {} since leader lease expired (leaseExpiryMillis={} now={}).",
+        localEndpointStr, FOLLOWER, leaderState.leaseExpiryMillis(), now);
+      toFollower(state.term());
+      return true;
+    }
+    return false;
+  }
+
+  @Override
   public boolean isLeaderHeartbeatTimeoutElapsed() {
     return isLeaderHeartbeatTimeoutElapsed(lastLeaderHeartbeatTimestamp, clock.millis());
   }
@@ -1620,6 +1667,7 @@ public final class RaftNodeImpl implements RaftNode {
   private void initRestoredState() {
     SnapshotEntry snapshotEntry = state.log().snapshotEntry();
     if (isNonInitial(snapshotEntry)) {
+      // TODO: swap chunked install-snapshot for CatchUpReference
       List<Object> chunkOperations = ((List<SnapshotChunk>) snapshotEntry.getOperation()).stream()
         .map(SnapshotChunk::getOperation).collect(toList());
       stateMachine.installSnapshot(snapshotEntry.getIndex(), chunkOperations);

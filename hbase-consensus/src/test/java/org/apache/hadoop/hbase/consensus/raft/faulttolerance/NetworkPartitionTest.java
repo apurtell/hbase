@@ -58,8 +58,8 @@ public class NetworkPartitionTest extends BaseTest {
 
   @Test
   public void testNetworkPartition() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config).start();
     RaftNode firstLeader = group.waitUntilLeaderElected();
     List<RaftNode> followers = group.getNodesExcept(firstLeader.getLocalEndpoint());

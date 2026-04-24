@@ -528,8 +528,8 @@ public class SnapshotTest extends BaseTest {
   public void when_isolatedLeaderAppendsEntries_then_itInvalidatesTheirFeaturesUponInstallSnapshot()
     throws Exception {
     int entryCount = 50;
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).setCommitCountToTakeSnapshot(entryCount).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(5000).setCommitCountToTakeSnapshot(entryCount).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -832,8 +832,8 @@ public class SnapshotTest extends BaseTest {
   private void when_leaderFailsDuringSnapshotTransfer_then_followerTransfersSnapshotFromNewLeader(
     boolean transferSnapshotFromFollowersEnabled) {
     int entryCount = 50;
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).setCommitCountToTakeSnapshot(entryCount)
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(5000).setCommitCountToTakeSnapshot(entryCount)
       .setTransferSnapshotsFromFollowersEnabled(transferSnapshotFromFollowersEnabled).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -905,7 +905,7 @@ public class SnapshotTest extends BaseTest {
   public void when_leaderCrashesDuringSnapshotTransfer_then_newLeaderSendsItsSnapshottedMembers() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount)
-      .setLeaderHeartbeatPeriodSecs(1).setLeaderHeartbeatTimeoutSecs(5).build();
+      .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.start(5, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -966,7 +966,7 @@ public class SnapshotTest extends BaseTest {
     when_promotionCommitFallsIntoSnapshot_then_promotedMemberTurnsIntoVotingMemberByInstallingSnapshot() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount)
-      .setLeaderHeartbeatPeriodSecs(1).setLeaderHeartbeatTimeoutSecs(5).build();
+      .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().setConfig(config).build();
     group.start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();

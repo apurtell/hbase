@@ -57,12 +57,14 @@ public class AppendEntriesSuccessResponseHandler
 
   @Override
   protected void handleResponse(@NonNull AppendEntriesSuccessResponse response) {
+    if (response.getTerm() > state.term()) {
+      LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
+        response.getTerm(), state.term(), response);
+      node.toFollower(response.getTerm());
+      return;
+    }
     if (state.role() != LEADER) {
       LOGGER.warn("{} Ignored {}. We are not LEADER anymore.", localEndpointStr(), response);
-      return;
-    } else if (response.getTerm() > state.term()) {
-      LOGGER.warn("{} Ignored invalid response {} for current term: {}", localEndpointStr(),
-        response, state.term());
       return;
     }
     LOGGER.debug("{} received {}.", localEndpointStr(), response);
@@ -74,6 +76,23 @@ public class AppendEntriesSuccessResponseHandler
       node.tryRunQueries();
     }
     checkIfQueryAckNeeded(response);
+    refreshLeaderLeaseIfVotingSender(response);
+  }
+
+  private void refreshLeaderLeaseIfVotingSender(AppendEntriesSuccessResponse response) {
+    if (state.role() != LEADER) {
+      return;
+    }
+    if (!state.isVotingMember(response.getSender())) {
+      return;
+    }
+    LeaderState leaderState = state.leaderState();
+    if (leaderState == null) {
+      return;
+    }
+    long now = node.getClock().millis();
+    long quorumTs = leaderState.quorumResponseTimestamp(state.logReplicationQuorumSize(), now);
+    leaderState.leaseExpiryMillis(quorumTs + node.getConfig().getLeaderLeaseDurationMillis());
   }
 
   private boolean updateFollowerIndices(AppendEntriesSuccessResponse response) {

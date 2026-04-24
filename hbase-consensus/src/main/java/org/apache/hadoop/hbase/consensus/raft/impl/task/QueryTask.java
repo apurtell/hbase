@@ -88,16 +88,20 @@ public final class QueryTask implements Runnable {
   }
 
   private void queryWithLeaderLease() {
-    if (raftNode.demoteToFollowerIfQuorumHeartbeatTimeoutElapsed()) {
+    if (state.role() != LEADER) {
       future.fail(raftNode.newNotLeaderException());
-    } else {
-      long commitIndex = state.commitIndex();
-      if (commitIndex < minCommitIndex) {
-        future.fail(raftNode.newLaggingCommitIndexException(minCommitIndex));
-        return;
-      }
-      queryWithEventualConsistency();
+      return;
     }
+    if (raftNode.demoteToFollowerIfLeaseExpired()) {
+      future.fail(raftNode.newNotLeaderException());
+      return;
+    }
+    long commitIndex = state.commitIndex();
+    if (commitIndex < minCommitIndex) {
+      future.fail(raftNode.newLaggingCommitIndexException(minCommitIndex));
+      return;
+    }
+    queryWithEventualConsistency();
   }
 
   private void queryWithEventualConsistency() {

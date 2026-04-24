@@ -17,10 +17,6 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.impl.handler;
 
-import static org.apache.hadoop.hbase.consensus.raft.RaftRole.FOLLOWER;
-import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEADER;
-import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEARNER;
-
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.FollowerState;
@@ -65,17 +61,10 @@ public class InstallSnapshotResponseHandler
   protected void handleResponse(@NonNull InstallSnapshotResponse response) {
     LOGGER.debug("{} received {}.", localEndpointStr(), response);
     if (response.getTerm() > state.term()) {
-      if (state.role() == LEADER) {
-        LOGGER.warn("{} Ignored invalid response {} for current term: {}", localEndpointStr(),
-          response, state.term());
-        return;
-      } else if (state.role() != FOLLOWER && state.role() != LEARNER) {
-        // If the request term is greater than the local term,
-        // update the local term and convert to follower (§5.1)
-        LOGGER.info("{} Moving to new term: {} from current term: {} and sender: {}",
-          localEndpointStr(), response.getTerm(), state.term(), response.getSender().getId());
-        node.toFollower(response.getTerm());
-      }
+      LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
+        response.getTerm(), state.term(), response);
+      node.toFollower(response.getTerm());
+      return;
     }
     node.tryAckQuery(response.getQuerySequenceNumber(), response.getSender());
     LeaderState leaderState = state.leaderState();
@@ -91,6 +80,7 @@ public class InstallSnapshotResponseHandler
         return;
       }
     }
+    // TODO: swap chunked install-snapshot for CatchUpReference
     node.sendSnapshotChunk(response.getSender(), response.getSnapshotIndex(),
       response.getRequestedSnapshotChunkIndex());
   }

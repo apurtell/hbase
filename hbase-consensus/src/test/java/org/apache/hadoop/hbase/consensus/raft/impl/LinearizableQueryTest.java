@@ -265,8 +265,8 @@ public class LinearizableQueryTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_leaderDemotesToFollowerWhileThereIsOngoingQuery_then_queryFails() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(5000).build();
     startGroup(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     group.splitMembers(leader.getLocalEndpoint());
@@ -287,8 +287,8 @@ public class LinearizableQueryTest extends BaseTest {
     when_followersInstallSnapshot_then_queryIsExecutedOnLeaderWithInstallSnapshotResponse() {
     RaftConfig config = RaftConfig.newBuilder()
       .setLeaderElectionTimeoutMillis(TEST_RAFT_CONFIG.getLeaderElectionTimeoutMillis())
-      .setLeaderHeartbeatPeriodSecs(TEST_RAFT_CONFIG.getLeaderHeartbeatPeriodSecs())
-      .setLeaderHeartbeatTimeoutSecs(TEST_RAFT_CONFIG.getLeaderHeartbeatTimeoutSecs())
+      .setLeaderHeartbeatPeriodMillis(TEST_RAFT_CONFIG.getLeaderHeartbeatPeriodMillis())
+      .setLeaderHeartbeatTimeoutMillis(TEST_RAFT_CONFIG.getLeaderHeartbeatTimeoutMillis())
       .setCommitCountToTakeSnapshot(100).build();
     startGroup(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -346,8 +346,8 @@ public class LinearizableQueryTest extends BaseTest {
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_leaderLeavesRaftGroupWhileThereIsOngoingQuery_then_queryFails() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
+      .setLeaderHeartbeatTimeoutMillis(5000).build();
     startGroup(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     for (RaftNodeImpl follower : group.<RaftNodeImpl> getNodesExcept(leader.getLocalEndpoint())) {

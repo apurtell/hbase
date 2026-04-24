@@ -43,8 +43,8 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 
 public final class RaftTestUtils {
   public static final RaftConfig TEST_RAFT_CONFIG =
-    RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(2000).setLeaderHeartbeatPeriodSecs(1)
-      .setLeaderHeartbeatTimeoutSecs(5).build();
+    RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(2000)
+      .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(5000).build();
 
   private RaftTestUtils() {
   }

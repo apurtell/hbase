@@ -645,7 +645,7 @@ public class RaftTest extends BaseTest {
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void when_leaderStaysInMinorityDuringSplit_then_itCannotCommitNewEntries() {
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(100)
-      .setLeaderHeartbeatPeriodSecs(1).setLeaderHeartbeatTimeoutSecs(5).build();
+      .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("val1")).join();

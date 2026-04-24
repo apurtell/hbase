@@ -127,8 +127,8 @@ public class LeadershipTransferTest extends BaseTest {
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
   public void
     when_leadershipTransferTriggeredDuringMembershipChange_then_leadershipTransferFails() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodSecs(30)
-      .setLeaderHeartbeatTimeoutSecs(30).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(30_000)
+      .setLeaderHeartbeatTimeoutMillis(30_000).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("val")).join();

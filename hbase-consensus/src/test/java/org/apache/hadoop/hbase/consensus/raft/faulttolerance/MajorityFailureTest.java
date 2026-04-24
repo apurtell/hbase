@@ -63,8 +63,8 @@ public class MajorityFailureTest {
 
   @Test
   public void testMajorityFailure() {
-    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatTimeoutSecs(5)
-      .setLeaderHeartbeatPeriodSecs(1).build();
+    RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatTimeoutMillis(5000)
+      .setLeaderHeartbeatPeriodMillis(1000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config)
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNode leader = group.waitUntilLeaderElected();

@@ -172,6 +172,24 @@ public interface RaftNode {
   RaftGroupMembers getEffectiveMembers();
 
   /**
+   * Returns true if this node is the Raft leader and its clock-drift-compensated lease is valid at
+   * {@code nowMillis}.
+   */
+  boolean isLeaderWithValidLease(long nowMillis);
+
+  /**
+   * Returns true if the follower has not received a leader heartbeat (or vote grant resetting the
+   * election timer) within {@link RaftConfig#getLeaderHeartbeatTimeoutMillis()}.
+   */
+  boolean isLeaderHeartbeatTimeoutElapsed();
+
+  /**
+   * If this node is leader and its lease has expired, steps down to follower in the current term.
+   * @return true if the node stepped down
+   */
+  boolean demoteToFollowerIfLeaseExpired();
+
+  /**
    * Triggers this Raft node to start executing the Raft consensus algorithm.
    * <p>
    * The returned future is completed with {@link IllegalStateException} if this Raft node has
@@ -370,7 +388,7 @@ public interface RaftNode {
    * {@link RaftNodeStatus#ACTIVE}, {@link IllegalArgumentException} if the given endpoint is not a
    * voting member in the committed Raft group member list, and {@link TimeoutException} if the
    * leadership transfer process has timed out w.r.t
-   * {@link RaftConfig#getLeaderHeartbeatTimeoutSecs()}. the Raft endpoint to which the leadership
+   * {@link RaftConfig#getLeaderHeartbeatTimeoutMillis()}. the Raft endpoint to which the leadership
    * will be transferred
    * @return the future to be completed when the leadership transfer is done, or with the execution
    *         if the leader transfer could not be done.

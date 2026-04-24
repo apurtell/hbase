@@ -17,7 +17,7 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.impl.task;
 
-import static java.util.concurrent.TimeUnit.SECONDS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.FOLLOWER;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEARNER;
 
@@ -41,7 +41,7 @@ public class HeartbeatTask extends RaftNodeStatusAwareTask {
   protected void doRun() {
     try {
       if (state.leaderState() != null) {
-        if (!node.demoteToFollowerIfQuorumHeartbeatTimeoutElapsed()) {
+        if (!node.demoteToFollowerIfLeaseExpired()) {
           node.broadcastAppendEntriesRequest();
           // TODO(basri) append no-op if snapshotIndex > 0 && snapshotIndex ==
           // lastLogIndex
@@ -68,7 +68,8 @@ public class HeartbeatTask extends RaftNodeStatusAwareTask {
         resetLeaderAndTryTriggerPreVote(true);
       }
     } finally {
-      node.getExecutor().schedule(this, node.getConfig().getLeaderHeartbeatPeriodSecs(), SECONDS);
+      node.getExecutor().schedule(this, node.getConfig().getLeaderHeartbeatPeriodMillis(),
+        MILLISECONDS);
     }
   }
 

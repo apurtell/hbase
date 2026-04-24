@@ -53,19 +53,21 @@ public class VoteResponseHandler extends AbstractResponseHandler<VoteResponse> {
 
   @Override
   protected void handleResponse(@NonNull VoteResponse response) {
-    if (state.role() != CANDIDATE) {
-      LOGGER.debug("{} Ignored {}. We are not CANDIDATE anymore.", localEndpointStr(), response);
-      return;
-    } else if (response.getTerm() > state.term()) {
+    if (response.getTerm() > state.term()) {
       // If the response term is greater than the local term, update the local term
-      // and convert to follower (§5.1)
+      // and convert to follower (§5.1), even if we already became leader in a lower term.
       LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
         response.getTerm(), state.term(), response);
       node.toFollower(response.getTerm());
       return;
-    } else if (response.getTerm() < state.term()) {
+    }
+    if (response.getTerm() < state.term()) {
       LOGGER.warn("{} Stale {} is received, current term: {}", localEndpointStr(), response,
         state.term());
+      return;
+    }
+    if (state.role() != CANDIDATE) {
+      LOGGER.debug("{} Ignored {}. We are not CANDIDATE anymore.", localEndpointStr(), response);
       return;
     }
     CandidateState candidateState = state.candidateState();
