@@ -28,28 +28,28 @@ import org.junit.jupiter.api.Test;
 @Tag(SmallTests.TAG)
 public class Long2ObjectHashMapTest extends BaseTest {
   @Test
-  public void constructor_whenNegativeInitialCapacityProvided_throwsIllegalArgumentException() {
+  public void rejectsNegativeCapacity() {
     assertThatThrownBy(() -> new Long2ObjectHashMap<>(-1, Long2ObjectHashMap.DEFAULT_LOAD_FACTOR))
       .isInstanceOf(IllegalArgumentException.class)
       .hasMessage("Initial capacity cannot be negative: -1");
   }
 
   @Test
-  public void constructor_whenZeroLoadFactorProvided_throwsIllegalArgumentException() {
+  public void rejectsZeroLoadFactor() {
     assertThatThrownBy(() -> new Long2ObjectHashMap<>(8, 0.0d))
       .isInstanceOf(IllegalArgumentException.class)
       .hasMessage("Load factor must be > 0 and < 1: 0.0");
   }
 
   @Test
-  public void constructor_whenOneLoadFactorProvided_throwsIllegalArgumentException() {
+  public void rejectsUnitLoadFactor() {
     assertThatThrownBy(() -> new Long2ObjectHashMap<>(8, 1.0d))
       .isInstanceOf(IllegalArgumentException.class)
       .hasMessage("Load factor must be > 0 and < 1: 1.0");
   }
 
   @Test
-  public void constructor_whenValidArgumentsProvided_createsMap() {
+  public void createsMap() {
     Long2ObjectHashMap<String> map = new Long2ObjectHashMap<>(8, 0.6d);
     map.put(1L, "value");
     assertThat(map.get(1L)).isEqualTo("value");

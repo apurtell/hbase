@@ -82,7 +82,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void testTermAndVoteArePersisted() {
+  public void termAndVotePersisted() {
     group = LocalRaftGroup.newBuilder(3).setConfig(TEST_RAFT_CONFIG)
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -123,7 +123,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void testCommittedEntriesArePersisted() {
+  public void committedEntriesPersisted() {
     group =
       LocalRaftGroup.newBuilder(3).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -145,7 +145,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void testUncommittedEntriesArePersisted() {
+  public void uncommittedEntriesPersisted() {
     group =
       LocalRaftGroup.newBuilder(3).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -173,7 +173,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void testSnapshotIsPersisted() {
+  public void snapshotPersisted() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config =
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(commitCountToTakeSnapshot).build();
@@ -197,7 +197,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderAppendEntriesInMinoritySplit_then_itTruncatesEntriesOnStore() {
+  public void minorityAppendsTruncated() {
     group = LocalRaftGroup.newBuilder(3).setConfig(TEST_RAFT_CONFIG)
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -243,7 +243,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderIsRestarted_then_itBecomesFollowerAndRestoresItsRaftState() {
+  public void leaderRestartsAsFollower() {
     group = LocalRaftGroup.newBuilder(3).setConfig(TEST_RAFT_CONFIG).enableNewTermOperation()
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -278,7 +278,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderIsRestarted_then_itRestoresItsRaftStateAndBecomesLeader() {
+  public void leaderRestartsAsLeader() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation()
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -319,7 +319,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsRestarted_then_itRestoresItsRaftState() {
+  public void followerRestoresState() {
     group =
       LocalRaftGroup.newBuilder(3).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -356,7 +356,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsRestarted_then_itRestoresItsRaftState() {
+  public void learnerRestoresState() {
     group = LocalRaftGroup.newBuilder(3, 2).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY)
       .start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -402,7 +402,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderIsRestarted_then_itBecomesFollowerAndRestoresItsRaftStateWithSnapshot() {
+  public void leaderRestartsAsFollowerWithSnapshot() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config = RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(2000)
       .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(5000)
@@ -441,7 +441,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsRestarted_then_itRestoresItsRaftStateWithSnapshot() {
+  public void followerRestoresStateWithSnapshot() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config =
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(commitCountToTakeSnapshot).build();
@@ -484,7 +484,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsRestarted_then_itRestoresItsRaftStateWithSnapshot() {
+  public void learnerRestoresStateWithSnapshot() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config =
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(commitCountToTakeSnapshot).build();
@@ -535,7 +535,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderIsRestarted_then_itRestoresItsRaftStateWithSnapshotAndBecomesLeader() {
+  public void leaderRestartsAsLeaderWithSnapshot() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config =
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(commitCountToTakeSnapshot).build();
@@ -573,7 +573,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderIsRestarted_then_itBecomesLeaderAndAppliesPreviouslyCommittedMemberList() {
+  public void leaderRestartAppliesMembers() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation()
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -604,7 +604,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsRestarted_then_itAppliesPreviouslyCommittedMemberList() {
+  public void followerRestartAppliesMembers() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(30_000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config).enableNewTermOperation()
@@ -633,7 +633,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsRestarted_then_itAppliesItsPromotion() {
+  public void learnerRestartAppliesPromotion() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(30_000).build();
     group = LocalRaftGroup.newBuilder(3, 2).setConfig(config).enableNewTermOperation()
@@ -705,7 +705,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsRestarted_then_itAppliesPreviouslyCommittedMemberListViaSnapshot() {
+  public void followerRestartAppliesMembersViaSnapshot() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config =
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(commitCountToTakeSnapshot)
@@ -739,7 +739,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsRestarted_then_itAppliesItsPromotionViaSnapshot() {
+  public void learnerRestartAppliesPromotionViaSnapshot() {
     int commitCountToTakeSnapshot = 50;
     RaftConfig config =
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(commitCountToTakeSnapshot)
@@ -778,7 +778,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsRestarted_then_itRestartsAsNonVotingMember() {
+  public void learnerRestartsNonVoting() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation()
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -795,7 +795,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_promotedMemberIsRestarted_then_itRestartsAsVotingMember() {
+  public void promotedMemberRestartsVoting() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation()
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -815,7 +815,7 @@ public class PersistenceTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_promotingMemberIsRestarted_then_itRestartsAsVotingMember() {
+  public void promotingMemberRestartsVoting() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation()
       .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();

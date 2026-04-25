@@ -75,7 +75,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_linearizableQueryIsIssuedWithoutCommitIndex_then_itReadsLastState() {
+  public void readWithoutCommitIndex() {
     startGroup(5, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
@@ -100,7 +100,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_linearizableQueryIsIssuedWithCommitIndex_then_itReadsLastState() {
+  public void readWithCommitIndex() {
     startGroup(5, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
@@ -125,7 +125,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_linearizableQueryIsIssuedWithFurtherCommitIndex_then_itFails() {
+  public void furtherCommitIndexFails() {
     startGroup(5, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
@@ -141,7 +141,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_newCommitIsDoneWhileThereIsWaitingQuery_then_queryRunsAfterNewCommit() {
+  public void waitingQueryRunsAfterCommit() {
     startGroup(5, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
@@ -192,7 +192,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_newCommitsAreDoneWhileThereAreMultipleQueries_then_allQueriesRunAfterCommits() {
+  public void multipleQueriesRunAfterCommits() {
     startGroup(5, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
@@ -222,7 +222,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_linearizableQueryIsIssuedToFollower_then_queryFails() {
+  public void followerQueryFails() {
     startGroup(5, TEST_RAFT_CONFIG);
     RaftNode leader = group.waitUntilLeaderElected();
     try {
@@ -236,7 +236,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_multipleQueryLimitIsReachedBeforeHeartbeatAcks_then_noNewQueryIsAccepted() {
+  public void exceedQueryLimitRejected() {
     RaftConfig config = RaftConfig.newBuilder().setMaxPendingLogEntryCount(1).build();
     startGroup(5, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -264,7 +264,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderDemotesToFollowerWhileThereIsOngoingQuery_then_queryFails() {
+  public void demotionFailsQuery() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(5000).build();
     startGroup(3, config);
@@ -345,7 +345,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderLeavesRaftGroupWhileThereIsOngoingQuery_then_queryFails() {
+  public void leaderLeaveFailsQuery() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(5000).build();
     startGroup(3, config);
@@ -415,7 +415,7 @@ public class LinearizableQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerPresentInRaftGroup_then_queryQuorumIgnoresLearner() {
+  public void learnerNotInQueryQuorum() {
     startGroup(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();

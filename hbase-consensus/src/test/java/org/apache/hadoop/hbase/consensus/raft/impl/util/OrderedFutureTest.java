@@ -36,13 +36,12 @@ public class OrderedFutureTest extends BaseTest {
   private final OrderedFuture<Object> future = new OrderedFuture<>();
 
   @Test
-  public void testFutureCannotBeCancelled() {
+  public void cannotCancel() {
     assertThrows(UnsupportedOperationException.class, () -> future.cancel(false));
   }
 
   @Test
-  public void testFutureCanCompleteAfterGetTimeout()
-    throws InterruptedException, ExecutionException {
+  public void completeAfterGetTimeout() throws InterruptedException, ExecutionException {
     try {
       future.get(1, TimeUnit.SECONDS);
       fail(".get() cannot succeed on uncompleted future");
@@ -53,13 +52,13 @@ public class OrderedFutureTest extends BaseTest {
   }
 
   @Test
-  public void testFutureCanBeCompletedExceptionallyWithPublicAPI() {
+  public void publicCompleteExceptionallyForbidden() {
     assertThrows(UnsupportedOperationException.class,
       () -> future.completeExceptionally(new NullPointerException()));
   }
 
   @Test
-  public void testFutureCanBeCompletedExceptionallyWithInternalAPI() {
+  public void internalFail() {
     future.fail(new NullPointerException());
     assertThat(future).isCompletedExceptionally();
     try {
@@ -71,7 +70,7 @@ public class OrderedFutureTest extends BaseTest {
   }
 
   @Test
-  public void testFutureCannotBeCompletedWithPublicAPI() {
+  public void publicCompleteForbidden() {
     assertThrows(UnsupportedOperationException.class, () -> future.complete(new Ordered<Object>() {
       @Override
       public long getCommitIndex() {
@@ -86,17 +85,18 @@ public class OrderedFutureTest extends BaseTest {
   }
 
   @Test
-  public void testCompleteWithNullInternally() throws ExecutionException, InterruptedException {
+  public void completeNullInternal() throws ExecutionException, InterruptedException {
     long commitIndex = 1;
     future.completeNull(commitIndex);
     assertThat(future).isCompleted();
     Ordered<Object> ordered = future.get();
-    assertThat(ordered.getCommitIndex()).isEqualTo(commitIndex);
     assertThat(ordered).isNotNull();
+    assertThat(ordered.getCommitIndex()).isEqualTo(commitIndex);
+    assertThat(ordered.getResult()).isNull();
   }
 
   @Test
-  public void testCompleteWithValueInternally() throws ExecutionException, InterruptedException {
+  public void completeValueInternal() throws ExecutionException, InterruptedException {
     long commitIndex = 1;
     Object result = new Object();
     future.complete(commitIndex, result);

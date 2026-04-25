@@ -74,7 +74,7 @@ public class MultiGroupExecutorRaftIntegrationTest extends BaseTest {
 
   @Test
   @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void twoGroupsOnOneExecutorReplicateAndFailIndependently() throws Exception {
+  public void twoGroupsReplicateAndFailIndependently() throws Exception {
     mge = new MultiGroupExecutor();
     Group x = startGroup("group-x", 3);
     Group y = startGroup("group-y", 3);

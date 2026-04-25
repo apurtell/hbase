@@ -51,7 +51,7 @@ public class GroupExecutorFairnessTest extends BaseTest {
 
   @Test
   @Timeout(value = 60, unit = TimeUnit.SECONDS)
-  public void drainCapYieldsWorkerToOtherGroups() throws Exception {
+  public void drainCapYields() throws Exception {
     final int drainCap = 4;
     mge = new MultiGroupExecutor(1, drainCap, 256);
     final RaftNodeExecutor fat = mge.executorFor("fat");

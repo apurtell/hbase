@@ -49,7 +49,7 @@ public class GroupExecutorLostWakeupTest extends BaseTest {
 
   @Test
   @Timeout(value = 180, unit = TimeUnit.SECONDS)
-  public void noLostWakeupUnderHeavyContention() throws Exception {
+  public void noLostWakeup() throws Exception {
     final int iterations = 5;
     final int producers = 16;
     final int perProducer = 50_000;

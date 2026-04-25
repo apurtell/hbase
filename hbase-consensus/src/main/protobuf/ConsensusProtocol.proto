@@ -1,0 +1,221 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+syntax = "proto2";
+package hbase.consensus.pb;
+option java_package = "org.apache.hadoop.hbase.consensus.protobuf.generated";
+option java_outer_classname = "ConsensusProtos";
+option java_generate_equals_and_hash = true;
+option optimize_for = SPEED;
+
+// Opaque endpoint id; carries the bytes of the producer's RaftEndpoint.getId().
+message RaftEndpointPB {
+  optional bytes id = 1;
+}
+
+// One Raft log entry. op_payload may optionally be compressed; when compressed,
+// op_payload_compression carries the ordinal of the Compression.Algorithm enum used
+// by the producer so the receiver can resolve the codec on demand without sharing
+// configuration with the sender. Absent (or NONE's ordinal) means the payload is
+// uncompressed.
+message LogEntryPB {
+  optional int64 index = 1;
+  optional int32 term = 2;
+  optional int32 op_type = 3;       // OperationCodec discriminator
+  optional int32 op_payload_compression = 4;
+  optional bytes op_payload = 5;
+}
+
+message RaftGroupMembersViewPB {
+  optional int64 log_index = 1;
+  repeated RaftEndpointPB members = 2;
+  repeated RaftEndpointPB voting_members = 3;
+}
+
+message SnapshotChunkPB {
+  optional int64 index = 1;
+  optional int32 term = 2;
+  optional int32 chunk_index = 3;
+  optional int32 chunk_count = 4;
+  optional RaftGroupMembersViewPB members_view = 5;
+  optional bytes payload = 6;
+}
+
+message CatchUpReferencePB {
+  optional int64 flush_op_seq_id = 1;
+  optional int64 snapshot_max_seq_id = 2;
+  optional bytes metadata = 3;
+}
+
+// Wire form of an UpdateRaftGroupMembersOp. Carried as the LogEntryPB.op_payload
+// when the consensus core replicates a membership change.
+message UpdateRaftGroupMembersOpPB {
+  enum ChangeMode {
+    ADD_LEARNER                = 1;
+    ADD_OR_PROMOTE_TO_FOLLOWER = 2;
+    REMOVE_MEMBER              = 3;
+  }
+  repeated RaftEndpointPB members = 1;
+  repeated RaftEndpointPB voting_members = 2;
+  optional RaftEndpointPB endpoint = 3;
+  optional ChangeMode mode = 4;
+}
+
+// Per-group payloads (envelope-bundled below)
+message GroupAppendEntriesPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int32 prev_log_term = 4;
+  optional int64 prev_log_index = 5;
+  optional int64 commit_index = 6;
+  repeated LogEntryPB entries = 7;
+  optional int64 query_seq = 8;
+  optional int64 flow_control_seq = 9;
+}
+
+// Dataless heartbeat for one group.
+message GroupHeartbeatPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int64 commit_index = 4;
+  optional int64 query_seq = 5;
+  optional int64 flow_control_seq = 6;
+}
+
+message GroupAppendSuccessPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int64 last_log_index = 4;
+  optional int64 query_seq = 5;
+  optional int64 flow_control_seq = 6;
+}
+
+message GroupAppendFailurePB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int64 expected_next_index = 4;
+  optional int64 query_seq = 5;
+  optional int64 flow_control_seq = 6;
+}
+
+message InstallSnapshotRequestPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional bool sender_leader = 4;
+  optional int32 snapshot_term = 5;
+  optional int64 snapshot_index = 6;
+  optional int32 total_snapshot_chunk_count = 7;
+  optional SnapshotChunkPB snapshot_chunk = 8;
+  repeated RaftEndpointPB snapshotted_members = 9;
+  optional RaftGroupMembersViewPB group_members_view = 10;
+  optional int64 query_seq = 11;
+  optional int64 flow_control_seq = 12;
+  optional CatchUpReferencePB catch_up_reference = 13;
+}
+
+message InstallSnapshotResponsePB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int64 snapshot_index = 4;
+  optional int32 requested_snapshot_chunk_index = 5;
+  optional int64 query_seq = 6;
+  optional int64 flow_control_seq = 7;
+}
+
+message VoteRequestPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int32 last_log_term = 4;
+  optional int64 last_log_index = 5;
+  optional bool sticky = 6;
+}
+
+message VoteResponsePB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional bool granted = 4;
+}
+
+message PreVoteRequestPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int32 last_log_term = 4;
+  optional int64 last_log_index = 5;
+}
+
+message PreVoteResponsePB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional bool granted = 4;
+}
+
+message TriggerLeaderElectionPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int32 last_log_term = 4;
+  optional int64 last_log_index = 5;
+}
+
+// Coalescing batches; one envelope can carry many groups' append/heartbeat
+// messages bound for the same peer.
+message BatchAppendEntriesPB {
+  repeated GroupAppendEntriesPB groups = 1;
+}
+
+message HeartbeatBatchPB {
+  repeated GroupHeartbeatPB groups = 1;
+}
+
+// Top-level frame; one per outbound flush window per peer.
+message ConsensusFrame {
+  enum Kind {
+    BATCH_APPEND            = 1;
+    HEARTBEAT_BATCH         = 2;
+    APPEND_SUCCESS          = 3;
+    APPEND_FAILURE          = 4;
+    INSTALL_SNAPSHOT        = 5;
+    INSTALL_SNAPSHOT_RESP   = 6;
+    VOTE_REQUEST            = 7;
+    VOTE_RESPONSE           = 8;
+    PRE_VOTE_REQUEST        = 9;
+    PRE_VOTE_RESPONSE       = 10;
+    TRIGGER_LEADER_ELECTION = 11;
+  }
+  optional Kind kind = 1;
+  optional BatchAppendEntriesPB      batch_append      = 2;
+  optional HeartbeatBatchPB          heartbeat_batch   = 3;
+  optional GroupAppendSuccessPB      append_success    = 4;
+  optional GroupAppendFailurePB      append_failure    = 5;
+  optional InstallSnapshotRequestPB  install_request   = 6;
+  optional InstallSnapshotResponsePB install_response  = 7;
+  optional VoteRequestPB             vote_request      = 8;
+  optional VoteResponsePB            vote_response     = 9;
+  optional PreVoteRequestPB          pre_vote_request  = 10;
+  optional PreVoteResponsePB         pre_vote_response = 11;
+  optional TriggerLeaderElectionPB   trigger_election  = 12;
+}

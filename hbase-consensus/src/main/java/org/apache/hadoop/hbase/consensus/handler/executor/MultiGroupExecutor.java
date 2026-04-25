@@ -31,21 +31,21 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
+ * Multi-group executor.
+ * <p>
  * Owns a shared {@link ScheduledThreadPoolExecutor} and hands out one {@link RaftNodeExecutor} per
- * Raft group id. {@link GroupExecutor} instances are created on demand and removed when their
- * {@link org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware#onRaftNodeTerminate()}
- * runs.
+ * Raft group id. {@link GroupExecutor} instances are created on demand.
  */
+@InterfaceAudience.Private
 public final class MultiGroupExecutor {
 
-  /** Default {@link org.jctools.queues.MpscUnboundedArrayQueue} chunk size. */
   public static final int DEFAULT_MAILBOX_CHUNK_SIZE = 256;
 
-  /** Default max runnable executions per drain pass before yielding back to the pool. */
   public static final int DEFAULT_DRAIN_BATCH_CAP = 64;
 
   private static final Logger LOG = LoggerFactory.getLogger(MultiGroupExecutor.class);
@@ -65,6 +65,7 @@ public final class MultiGroupExecutor {
   }
 
   /**
+   * Constructor.
    * @param poolSize         shared scheduler worker count (must be at least 1)
    * @param drainBatchCap    max tasks to run per drain pass per group before re-queueing
    * @param mailboxChunkSize JCTools MPSC unbounded queue chunk size
@@ -102,10 +103,6 @@ public final class MultiGroupExecutor {
     return mailboxChunkSize;
   }
 
-  /**
-   * Best-effort drain submit; returns {@code true} on success or {@code false} if the underlying
-   * pool has been shut down (callers must treat shutdown as terminal).
-   */
   boolean submitDrain(@NonNull Runnable drain) {
     requireNonNull(drain);
     try {
@@ -120,9 +117,6 @@ public final class MultiGroupExecutor {
     }
   }
 
-  /**
-   * Best-effort schedule; returns {@code null} if the underlying pool has been shut down.
-   */
   @Nullable
   ScheduledFuture<?> schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit unit) {
     requireNonNull(task);
@@ -140,11 +134,6 @@ public final class MultiGroupExecutor {
 
   void unregister(@NonNull Object groupId) {
     registry.remove(requireNonNull(groupId));
-  }
-
-  /** Visible for tests. */
-  ScheduledThreadPoolExecutor pool() {
-    return pool;
   }
 
   /**
@@ -202,5 +191,10 @@ public final class MultiGroupExecutor {
       Thread.currentThread().interrupt();
       pool.shutdownNow();
     }
+  }
+
+  /** Visible for tests. */
+  ScheduledThreadPoolExecutor pool() {
+    return pool;
   }
 }

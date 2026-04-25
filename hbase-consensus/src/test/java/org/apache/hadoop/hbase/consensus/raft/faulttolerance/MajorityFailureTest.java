@@ -62,7 +62,7 @@ public class MajorityFailureTest {
   }
 
   @Test
-  public void testMajorityFailure() {
+  public void majorityFailure() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatTimeoutMillis(5000)
       .setLeaderHeartbeatPeriodMillis(1000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config)

@@ -57,7 +57,7 @@ public class NetworkPartitionTest extends BaseTest {
   }
 
   @Test
-  public void testNetworkPartition() {
+  public void networkPartition() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config).start();

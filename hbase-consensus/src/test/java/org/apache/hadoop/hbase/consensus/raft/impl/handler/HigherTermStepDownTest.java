@@ -51,7 +51,7 @@ public class HigherTermStepDownTest extends BaseTest {
 
   @Test
   @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void appendEntriesSuccessResponseHigherTermDemotesLeader() {
+  public void appendSuccessHigherTermStepsDown() {
     group = LocalRaftGroup.newBuilder(3).setConfig(RaftTestUtils.TEST_RAFT_CONFIG)
       .enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -69,7 +69,7 @@ public class HigherTermStepDownTest extends BaseTest {
 
   @Test
   @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void installSnapshotResponseHigherTermDemotesLeader() {
+  public void installSnapshotHigherTermStepsDown() {
     group = LocalRaftGroup.newBuilder(3).setConfig(RaftTestUtils.TEST_RAFT_CONFIG)
       .enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -88,7 +88,7 @@ public class HigherTermStepDownTest extends BaseTest {
 
   @Test
   @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void voteResponseHigherTermDemotesLeader() {
+  public void voteResponseHigherTermStepsDown() {
     group = LocalRaftGroup.newBuilder(3).setConfig(RaftTestUtils.TEST_RAFT_CONFIG)
       .enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();

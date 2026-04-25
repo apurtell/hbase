@@ -55,7 +55,7 @@ public class RestoreCrashedRaftNodeTest {
   }
 
   @Test
-  public void testRestoreCrashedRaftNode() {
+  public void restoreCrashedNode() {
     group =
       LocalRaftGroup.newBuilder(3).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
     RaftNode leader = group.waitUntilLeaderElected();

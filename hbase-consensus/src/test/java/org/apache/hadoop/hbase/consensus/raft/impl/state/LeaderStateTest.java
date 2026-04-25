@@ -47,7 +47,7 @@ public class LeaderStateTest {
   }
 
   @Test
-  public void test_initialState() {
+  public void initialState() {
     for (RaftEndpoint endpoint : remoteEndpoints) {
       FollowerState followerState = state.getFollowerState(endpoint);
       assertThat(followerState.matchIndex()).isEqualTo(0);
@@ -61,7 +61,7 @@ public class LeaderStateTest {
   }
 
   @Test
-  public void test_nextIndex() {
+  public void nextIndex() {
     Map<RaftEndpoint, Integer> indices = new HashMap<>();
     for (RaftEndpoint endpoint : remoteEndpoints) {
       int index = 1 + random.nextInt(100);
@@ -75,7 +75,7 @@ public class LeaderStateTest {
   }
 
   @Test
-  public void test_matchIndex() {
+  public void matchIndex() {
     Map<RaftEndpoint, Long> indices = new HashMap<>();
     for (RaftEndpoint endpoint : remoteEndpoints) {
       long index = 1 + random.nextInt(100);
@@ -95,7 +95,7 @@ public class LeaderStateTest {
   }
 
   @Test
-  public void test_matchIndex_nonVotingMembers() {
+  public void matchIndexNonVoting() {
     int logIndex = 10;
     for (RaftEndpoint endpoint : remoteEndpoints) {
       state.getFollowerState(endpoint).matchIndex(++logIndex);

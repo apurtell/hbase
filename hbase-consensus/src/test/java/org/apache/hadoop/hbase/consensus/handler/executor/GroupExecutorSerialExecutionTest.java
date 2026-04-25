@@ -47,7 +47,7 @@ public class GroupExecutorSerialExecutionTest extends BaseTest {
 
   @Test
   @Timeout(value = 60, unit = TimeUnit.SECONDS)
-  public void perProducerOrderIsPreservedAndTasksDoNotOverlap() throws Exception {
+  public void serialPerProducer() throws Exception {
     final int producers = 8;
     final int perProducer = 10_000;
     mge = new MultiGroupExecutor(8, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 256);

@@ -41,14 +41,14 @@ public class FirewallTest extends BaseTest {
   private final Firewall firewall = new Firewall();
 
   @Test
-  public void when_messageIsDroppedForEndpoint_then_messageIsNotSentToThatEndpoint() {
+  public void dropMessageType() {
     RaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropMessagesTo(endpoint, AppendEntriesRequest.class);
     assertThat(firewall.shouldDropMessage(endpoint, mock(AppendEntriesRequest.class))).isTrue();
   }
 
   @Test
-  public void when_messageIsDroppedForEndpoint_then_messageIsSentToOtherEndpoint() {
+  public void dropDoesNotAffectOtherEndpoint() {
     RaftEndpoint endpoint1 = LocalRaftEndpoint.newEndpoint();
     RaftEndpoint endpoint2 = LocalRaftEndpoint.newEndpoint();
     firewall.dropMessagesTo(endpoint1, AppendEntriesRequest.class);
@@ -56,14 +56,14 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void when_messageIsDroppedForEndpoint_then_otherMessageTypeIsSentToThatEndpoint() {
+  public void dropDoesNotAffectOtherMessageType() {
     RaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropMessagesTo(endpoint, VoteRequest.class);
     assertThat(firewall.shouldDropMessage(endpoint, mock(AppendEntriesRequest.class))).isFalse();
   }
 
   @Test
-  public void when_allMessagesAreDroppedForEndpoint_then_noMessageIsSentToThatEndpoint() {
+  public void dropAllMessages() {
     RaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropAllMessagesTo(endpoint);
     assertThat(firewall.shouldDropMessage(endpoint, mock(AppendEntriesRequest.class))).isTrue();
@@ -82,7 +82,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void when_allMessagesAreDroppedForEndpoint_then_messagesAreSentToOtherEndpoint() {
+  public void dropAllDoesNotAffectOtherEndpoint() {
     RaftEndpoint endpoint1 = LocalRaftEndpoint.newEndpoint();
     RaftEndpoint endpoint2 = LocalRaftEndpoint.newEndpoint();
     firewall.dropAllMessagesTo(endpoint1);
@@ -103,7 +103,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void when_messageIsDroppedForAllEndpoints_then_messageIsNotSentToAnyEndpoint() {
+  public void dropMessageTypeForAllEndpoints() {
     firewall.dropMessagesToAll(AppendEntriesRequest.class);
     assertThat(
       firewall.shouldDropMessage(LocalRaftEndpoint.newEndpoint(), mock(AppendEntriesRequest.class)))
@@ -114,7 +114,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void when_messageIsDroppedForAllEndpoints_then_otherMessageTypeIsSentToEndpoints() {
+  public void dropForAllDoesNotAffectOtherType() {
     firewall.dropMessagesToAll(AppendEntriesRequest.class);
     assertThat(firewall.shouldDropMessage(LocalRaftEndpoint.newEndpoint(), mock(VoteRequest.class)))
       .isFalse();
@@ -123,8 +123,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void
-    when_messageTypeIsDroppedToEndpoint_then_allMessageTypesCanBeDroppedForThatEndpoint() {
+  public void dropAllOverridesSpecific() {
     LocalRaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropMessagesTo(endpoint, AppendEntriesRequest.class);
     firewall.dropAllMessagesTo(endpoint);
@@ -133,7 +132,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void when_messageTypeIsAllowedForEndpoint_then_messageCanBeSent() {
+  public void allowReversesDrop() {
     LocalRaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropMessagesTo(endpoint, AppendEntriesRequest.class);
     firewall.allowMessagesTo(endpoint, AppendEntriesRequest.class);
@@ -141,7 +140,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void when_allMessageTypesDroppedForEndpoint_then_allMessageTypesCanBeAllowedForEndpoint() {
+  public void allowAllReversesDropAll() {
     LocalRaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropAllMessagesTo(endpoint);
     firewall.allowAllMessagesTo(endpoint);
@@ -149,8 +148,7 @@ public class FirewallTest extends BaseTest {
   }
 
   @Test
-  public void
-    when_multipleMessageTypesDroppedForEndpoint_then_allMessageTypesCanBeAllowedForEndpoint() {
+  public void allowAllReversesMultipleDrops() {
     LocalRaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     firewall.dropMessagesTo(endpoint, AppendEntriesRequest.class);
     firewall.dropMessagesTo(endpoint, VoteRequest.class);

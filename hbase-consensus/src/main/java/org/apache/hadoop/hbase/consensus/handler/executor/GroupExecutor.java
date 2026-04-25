@@ -33,18 +33,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.jctools.queues.MpscUnboundedArrayQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Per-group actor: MPSC mailbox, single serialized {@link #drain()} critical section (required for
- * JCTools MPSC single-consumer semantics), and scheduled work that trampolines through
- * {@link #execute(Runnable)}.
- * <p>
- * Only the drain critical section ever calls {@link MpscUnboundedArrayQueue#relaxedPoll()};
- * producers go through {@link MpscUnboundedArrayQueue#offer(Object)}.
+ * Per-group actor.
  */
+@InterfaceAudience.Private
 final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
 
   private static final Logger LOG = LoggerFactory.getLogger(GroupExecutor.class);
@@ -64,6 +61,7 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   private final AtomicBoolean terminated = new AtomicBoolean(false);
   private final AtomicBoolean unregisterDone = new AtomicBoolean(false);
   private final Runnable drainRunnable = this::drain;
+
   /**
    * Private drain monitor. The JCTools MPSC queue requires single-consumer semantics for
    * {@code relaxedPoll()} / {@code peek()}, so all mailbox reads happen under this monitor. The
@@ -85,31 +83,6 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
     this.parent = requireNonNull(parent);
     this.groupId = requireNonNull(groupId);
     this.mailbox = new MpscUnboundedArrayQueue<>(mailboxChunkSize);
-  }
-
-  /** Visible for tests. */
-  int executedTaskCount() {
-    return executedTaskCount.get();
-  }
-
-  /** Visible for tests. */
-  int droppedTaskCount() {
-    return droppedTaskCount.get();
-  }
-
-  /** Visible for tests. */
-  int pendingMailboxSize() {
-    return mailbox.size();
-  }
-
-  /** Visible for tests. */
-  Object groupId() {
-    return groupId;
-  }
-
-  /** Visible for tests. */
-  boolean isTerminated() {
-    return terminated.get();
   }
 
   @Override
@@ -247,8 +220,8 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
       }
 
       // Lost-wakeup-safe handoff plus cap-driven yield: clear the flag, then if mailbox is
-      // non-empty (or a producer raced after our last poll) re-submit a fresh drain runnable
-      // so the pool's FIFO queue interleaves with other groups.
+      // non-empty and re-submit a fresh drain runnable so the pool's FIFO queue interleaves
+      // with other groups.
       scheduled.set(false);
       boolean hasMore = mailbox.peek() != null;
       if ((hasMore || terminated.get()) && scheduled.compareAndSet(false, true)) {
@@ -317,5 +290,30 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
       throws InterruptedException, ExecutionException, TimeoutException {
       throw new UnsupportedOperationException();
     }
+  }
+
+  /** Visible for tests. */
+  int executedTaskCount() {
+    return executedTaskCount.get();
+  }
+
+  /** Visible for tests. */
+  int droppedTaskCount() {
+    return droppedTaskCount.get();
+  }
+
+  /** Visible for tests. */
+  int pendingMailboxSize() {
+    return mailbox.size();
+  }
+
+  /** Visible for tests. */
+  Object groupId() {
+    return groupId;
+  }
+
+  /** Visible for tests. */
+  boolean isTerminated() {
+    return terminated.get();
   }
 }

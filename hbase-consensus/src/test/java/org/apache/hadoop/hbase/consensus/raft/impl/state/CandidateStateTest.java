@@ -38,14 +38,14 @@ public class CandidateStateTest {
   }
 
   @Test
-  public void test_initialState() {
+  public void initialState() {
     assertThat(state.majority()).isEqualTo(majority);
     assertThat(state.voteCount()).isEqualTo(0);
     assertThat(state.isMajorityGranted()).isFalse();
   }
 
   @Test
-  public void test_grantVote_withoutMajority() {
+  public void grantVoteNoMajority() {
     RaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
     assertThat(state.grantVote(endpoint)).isTrue();
     assertThat(state.grantVote(endpoint)).isFalse();
@@ -54,7 +54,7 @@ public class CandidateStateTest {
   }
 
   @Test
-  public void test_grantVote_withMajority() {
+  public void grantVoteMajority() {
     for (int i = 0; i < majority; i++) {
       RaftEndpoint endpoint = LocalRaftEndpoint.newEndpoint();
       assertThat(state.grantVote(endpoint)).isTrue();

@@ -48,14 +48,14 @@ public class LeaderLeaseTest extends BaseTest {
   }
 
   @Test
-  public void raftConfigBuilderRejectsNonStrictLeaseVsDrift() {
+  public void rejectInvalidLeaseConfig() {
     assertThatThrownBy(() -> RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(400).setMaxClockDriftMillis(200).build())
       .isInstanceOf(IllegalArgumentException.class);
   }
 
   @Test
-  public void leaderStateLeaseExpiryIsMonotonic() {
+  public void leaseExpiryMonotonic() {
     LeaderState ls = new LeaderState(Collections.emptyList(), 0, 0L);
     ls.leaseExpiryMillis(10L);
     assertThatThrownBy(() -> ls.leaseExpiryMillis(5L)).isInstanceOf(IllegalStateException.class);
@@ -63,7 +63,7 @@ public class LeaderLeaseTest extends BaseTest {
 
   @Test
   @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void leaderStepsDownWhenLeaseExpiresWithoutQuorumAcks() {
+  public void leaseExpiryStepsDown() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(5000)
       .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(3000)
       .setMaxClockDriftMillis(100).build();

@@ -82,7 +82,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_newNodeJoinsAsFollower_then_itAppendsMissingEntries() {
+  public void newFollowerCatchesUp() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -139,7 +139,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_newNodeJoinsAsLearner_then_itAppendsMissingEntries() {
+  public void newLearnerCatchesUp() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -196,7 +196,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereIsSingleLearner_then_followerIsAdded() {
+  public void addFollowerWithLearner() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -266,7 +266,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereIsSingleLearner_then_secondLearnerIsAdded() {
+  public void addSecondLearner() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -336,7 +336,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereAreTwoLearners_then_followerIsAdded() {
+  public void addFollowerWithTwoLearners() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -404,7 +404,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereAreTwoLearners_then_thirdLearnerCannotBeAdded() {
+  public void rejectThirdLearner() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -427,7 +427,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsPromoted_then_majorityIsUpdated() {
+  public void promoteLearnerUpdatesMajority() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -450,7 +450,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsPromoted_then_newLearnerCanBeAdded() {
+  public void promoteLearnerAllowsAdd() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -478,7 +478,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_secondLearnerIsPromoted_then_majorityDoesNotChange() {
+  public void secondPromoteKeepsMajority() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -510,7 +510,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsPromoted_then_promotionFails() {
+  public void promoteFollowerFails() {
     int initialMemberCount = 3;
     group = LocalRaftGroup.start(initialMemberCount);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -574,7 +574,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_initialMemberIsRemoved_then_itCannotBeAddedAgain() {
+  public void removedMemberCannotRejoin() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl leavingFollower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -594,7 +594,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerLeaves_then_itIsRemovedFromTheGroupMembers() {
+  public void followerLeaves() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -617,7 +617,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_newNodeJoinsAfterAnotherNodeLeaves_then_itAppendsMissingEntries() {
+  public void newNodeAfterRemovalCatchesUp() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("val")).join();
@@ -706,7 +706,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderLeaves_then_itIsRemovedFromTheGroupMembers() {
+  public void leaderLeaves() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("val")).join();
@@ -726,7 +726,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderLeaves_then_itCannotVoteForCommitOfMemberChange() {
+  public void leavingLeaderCannotVote() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -740,7 +740,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderLeaves_then_followersElectNewLeader() {
+  public void leaderLeavesElectsNew() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -765,7 +765,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_membershipChangeRequestIsMadeWithInvalidType_then_membershipChangeFails() {
+  public void invalidTypeFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("val")).join();
@@ -778,7 +778,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_nonExistingEndpointIsRemoved_then_membershipChangeFails() {
+  public void removeUnknownFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl leavingFollower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -797,7 +797,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_existingEndpointIsAdded_then_membershipChangeFails() {
+  public void addExistingFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("val")).join();
@@ -811,7 +811,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereIsNoCommitInTheCurrentTerm_then_cannotMakeMemberChange() {
+  public void noTermCommitBlocksChange() {
     // https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -825,7 +825,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_appendNopEntryOnLeaderElection_then_canMakeMemberChangeAfterNopEntryCommitted() {
+  public void nopAllowsChangeAfterCommit() {
     // https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -844,7 +844,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_newJoiningNodeFirstReceivesSnapshot_then_itInstallsSnapshot() {
+  public void joiningInstallsSnapshot() {
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(5).build();
     group = LocalRaftGroup.start(3, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -870,7 +870,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderFailsWhileLeavingRaftGroup_othersCommitTheMembershipChange() {
+  public void leaderFailDuringLeaveCommits() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -906,7 +906,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerAppendsMultipleMembershipChangesAtOnce_then_itCommitsThemCorrectly() {
+  public void multipleAppendsCommitInOrder() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000).build();
     group = LocalRaftGroup.start(5, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -972,7 +972,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderIsSteppingDown_then_itDoesNotAcceptNewAppends() {
+  public void steppingDownRejectsAppends() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.getNodesExcept(leader.getLocalEndpoint());
@@ -995,7 +995,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_replicatedMembershipChangeIsReverted_then_itCanBeCommittedOnSecondReplicate() {
+  public void revertedChangeRetryCommits() {
     group =
       LocalRaftGroup.newBuilder(3).setConfig(TEST_RAFT_CONFIG).enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -1082,7 +1082,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereIsSingleVotingMember_then_learnerCanBeRemoved() {
+  public void singleVoterRemovesLearner() {
     group =
       LocalRaftGroup.newBuilder(2, 1).setConfig(TEST_RAFT_CONFIG).enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -1097,7 +1097,7 @@ public class MembershipChangeTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereIsSingleVotingMember_then_votingMemberCannotBeRemoved() {
+  public void singleVoterCannotRemoveSelf() {
     group =
       LocalRaftGroup.newBuilder(2, 1).setConfig(TEST_RAFT_CONFIG).enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();

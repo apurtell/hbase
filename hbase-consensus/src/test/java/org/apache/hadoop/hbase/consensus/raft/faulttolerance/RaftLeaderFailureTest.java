@@ -48,7 +48,7 @@ public class RaftLeaderFailureTest extends BaseTest {
   }
 
   @Test
-  public void testRaftLeaderFailure() {
+  public void leaderFailure() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatTimeoutMillis(5000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config).start();
     RaftNode leader = group.waitUntilLeaderElected();
@@ -89,7 +89,7 @@ public class RaftLeaderFailureTest extends BaseTest {
   }
 
   @Test
-  public void defaultRaftConfigLeaderLeaseStrictlyInsideHeartbeatTimeout() {
+  public void defaultLeaseInsideTimeout() {
     RaftConfig c = RaftConfig.DEFAULT_RAFT_CONFIG;
     assertThat(c.getLeaderLeaseDurationMillis()).isLessThan(c.getLeaderHeartbeatTimeoutMillis());
     assertThat(c.getLeaderHeartbeatTimeoutMillis()).isGreaterThan(2 * c.getMaxClockDriftMillis());

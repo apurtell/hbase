@@ -77,7 +77,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStarted_then_leaderIsElected() {
+  public void leaderElected() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.start(1, config);
@@ -108,7 +108,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStarted_then_logEntryIsCommitted() {
+  public void commitOneEntry() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal = "val";
@@ -122,7 +122,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStarted_then_multipleLogEntriesAreCommitted() {
+  public void commitMultipleEntries() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<Entry<CompletableFuture<Ordered<Object>>, String>> futures = new ArrayList<>();
@@ -141,7 +141,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonClusterIsStartedWithRaftStore_then_logEntryIsCommitted() {
+  public void commitOneEntryWithStore() {
     group =
       LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).build();
     group.start();
@@ -154,7 +154,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStartedWithRaftStore_then_multipleLogEntriesAreCommitted() {
+  public void commitMultipleEntriesWithStore() {
     group =
       LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).build();
     group.start();
@@ -175,7 +175,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsAddedToSingletonRaftGroup_then_quorumDoesNotChange() {
+  public void addLearnerKeepsQuorum() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal = "val";
@@ -197,7 +197,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsAddedToSingletonRaftGroup_then_quorumIsUpdated() {
+  public void addFollowerUpdatesQuorum() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal = "val";
@@ -219,7 +219,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsPromotedAfterAddedToSingletonRaftGroup_then_quorumIsUpdated() {
+  public void promoteLearnerUpdatesQuorum() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal = "val";
@@ -244,7 +244,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsAddedToSingletonRaftGroupWithRaftStore_then_quorumDoesNotChange() {
+  public void addLearnerKeepsQuorumWithStore() {
     group =
       LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).build();
     group.start();
@@ -268,7 +268,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsAddedToSingletonRaftGroupWithRaftStore_then_quorumIsUpdated() {
+  public void addFollowerUpdatesQuorumWithStore() {
     group =
       LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).build();
     group.start();
@@ -320,7 +320,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsAddedToSingletonRaftGroup_then_newLogEntryIsCommitted() {
+  public void addLearnerCommitsEntry() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal1 = "val1";
@@ -346,7 +346,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsAddedToSingletonRaftGroup_then_newLogEntryIsCommitted() {
+  public void addFollowerCommitsEntry() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal1 = "val1";
@@ -372,7 +372,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsPromotedAfterAddedToSingletonRaftGroup_then_newLogEntryIsCommitted() {
+  public void promoteLearnerCommitsEntry() {
     group = LocalRaftGroup.start(1);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal1 = "val1";
@@ -401,7 +401,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_learnerIsAddedToSingletonRaftGroupWithRaftStore_then_newLogEntryIsCommitted() {
+  public void addLearnerCommitsEntryWithStore() {
     group =
       LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).build();
     group.start();
@@ -429,7 +429,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerIsAddedToSingletonRaftGroupWithRaftStore_then_newLogEntryIsCommitted() {
+  public void addFollowerCommitsEntryWithStore() {
     group =
       LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).build();
     group.start();
@@ -633,7 +633,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStarted_then_linearizableQueryIsExecuted() {
+  public void linearizableQuery() {
     group = LocalRaftGroup.start(1);
     group.start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -647,7 +647,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStarted_then_leaderLeaseQueryIsExecuted() {
+  public void leaderLeaseQuery() {
     group = LocalRaftGroup.start(1);
     group.start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -661,7 +661,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsStarted_then_eventuallyConsistentQueryIsExecuted() {
+  public void eventualQuery() {
     group = LocalRaftGroup.start(1);
     group.start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
@@ -675,7 +675,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupRestarted_then_leaderIsElected() {
+  public void restartElectsLeader() {
     group = LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY)
       .enableNewTermOperation().build();
     group.start();
@@ -782,7 +782,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_nodeRestartsAfterSingletonRaftGroupExpanded_then_newLeaderIsElected() {
+  public void restartAfterExpandElectsLeader() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(1).setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY)
@@ -822,7 +822,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerLeaves2NodeRaftGroup_then_singletonRaftGroupCommitsNewLogEntry() {
+  public void followerLeavesCommits() {
     LocalRaftGroup group = LocalRaftGroup.start(2);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNode follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -847,7 +847,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderLeaves2NodeRaftGroup_then_singletonRaftGroupCommitsNewLogEntry() {
+  public void leaderLeavesCommits() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(2).enableNewTermOperation().setConfig(config).build();
@@ -883,7 +883,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_memberRemovalIsNotCommitted_then_singletonFollowerCompletesMembershipChange() {
+  public void uncommittedRemovalCompletes() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(2).enableNewTermOperation().setConfig(config).build();
@@ -915,7 +915,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singletonRaftGroupIsRunning_then_cannotRemoveEndpoint() {
+  public void singletonRejectsRemove() {
     group = LocalRaftGroup.start(1);
     RaftNode leader = group.waitUntilLeaderElected();
     try {
@@ -928,7 +928,7 @@ public class SingletonRaftGroupTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_singleVotingRaftNodeIsRunning_then_cannotRemoveEndpoint() {
+  public void singleVotingRejectsRemove() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(3000).build();
     group = LocalRaftGroup.newBuilder(1).enableNewTermOperation().setConfig(config).build();

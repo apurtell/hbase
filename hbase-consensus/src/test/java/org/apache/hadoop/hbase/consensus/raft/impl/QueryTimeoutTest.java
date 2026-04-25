@@ -61,8 +61,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void
-    when_followerQueriedWithFutureCommitIndex_then_queryExecutedWhenCommitIndexAdvances() {
+  public void followerFutureIndexExecutesOnAdvance() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -79,8 +78,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void
-    when_multipleQueriesScheduledToFollowerdWithFutureCommitIndex_then_queriesExecutedWhenCommitIndexAdvances() {
+  public void multipleFollowerQueriesAdvance() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -104,8 +102,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void
-    when_multipleQueriesScheduledToFollowerdWithFutureCommitIndex_then_queriesExecutedWhenCommitIndexAdvancesViaInstalledSnapshot() {
+  public void multipleFollowerQueriesAdvanceViaSnapshot() {
     int logSize = 10;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(logSize).build();
     group = LocalRaftGroup.start(3, config);
@@ -131,7 +128,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerQueriedWithPastCommitIndex_then_queryExecutedImmediately() {
+  public void followerPastIndexImmediate() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -147,8 +144,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void
-    when_followerQueriedWithFutureCommitIndex_then_queryTimesOutIfCommitIndexDoesNotAdvance() {
+  public void followerFutureIndexTimesOut() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -166,8 +162,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void
-    when_followerQueriedWithFutureCommitIndexAndNegativeTimeout_then_queryFailsImmediately() {
+  public void followerFutureIndexNegativeTimeoutFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -183,7 +178,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderQueriedWithLeaderLeaseAndFutureCommitIndex_then_queryFailsImmediately() {
+  public void leaderLeaseFutureIndexFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
@@ -198,7 +193,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderQueriedWithLinearizableAndFutureCommitIndex_then_queryFailsImmediately() {
+  public void leaderLinearizableFutureIndexFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
@@ -229,7 +224,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerQueriedWithFutureCommitIndex_then_queryFailsOnTerminate() {
+  public void followerFutureIndexFailsOnTerminate() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -249,7 +244,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderQueriedWithFutureCommitIndex_then_queryFailsWhenLeaderLeavesRaftGroup() {
+  public void leaderFutureIndexFailsOnLeave() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
@@ -267,7 +262,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerWaitsForPastCommitIndex_then_barrierCompletesImmediately() {
+  public void followerBarrierPastImmediate() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -283,7 +278,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerWaitsForCurrentCommitIndex_then_barrierCompletesImmediately() {
+  public void followerBarrierCurrentImmediate() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -298,7 +293,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followerWaitsForFutureCommitIndex_then_barrierFailsWithTimeout() {
+  public void followerBarrierFutureTimesOut() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -315,7 +310,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderWaitsForPastCommitIndex_then_barrierCompletesImmediately() {
+  public void leaderBarrierPastImmediate() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex1 = leader.replicate(applyValue("value1")).join().getCommitIndex();
@@ -327,7 +322,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderWaitsForCurrentCommitIndex_then_barrierCompletesImmediately() {
+  public void leaderBarrierCurrentImmediate() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value1")).join().getCommitIndex();
@@ -338,7 +333,7 @@ public class QueryTimeoutTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderWaitsForFutureCommitIndex_then_barrierFailsWithTimeout() {
+  public void leaderBarrierFutureTimesOut() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value1")).join().getCommitIndex();

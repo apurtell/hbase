@@ -46,7 +46,7 @@ public class GroupExecutorScheduleTest extends BaseTest {
 
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
-  public void scheduledTaskFiresAfterDelayAndDoesNotOverlapInlineTasks() throws Exception {
+  public void scheduledTaskFiresWithoutOverlap() throws Exception {
     mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
     RaftNodeExecutor exec = mge.executorFor("g");
 
@@ -92,7 +92,7 @@ public class GroupExecutorScheduleTest extends BaseTest {
 
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
-  public void terminateCancelsPendingScheduledTask() throws Exception {
+  public void terminateCancelsScheduled() throws Exception {
     mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
     GroupExecutor exec = (GroupExecutor) mge.executorFor("g");
     final long delayMillis = 200;

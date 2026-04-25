@@ -49,7 +49,7 @@ public class VoteRequestHandlerTimerResetTest extends BaseTest {
 
   @Test
   @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void grantingVoteResetsFollowerElectionTimer() {
+  public void grantedVoteResetsTimer() {
     RaftConfig config = RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(10_000)
       .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(2000).build();
     group = LocalRaftGroup.newBuilder(3).setConfig(config).enableNewTermOperation().start();

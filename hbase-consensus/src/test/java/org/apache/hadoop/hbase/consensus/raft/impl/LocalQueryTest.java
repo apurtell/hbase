@@ -58,7 +58,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLeader_withoutAnyCommit_then_returnDefaultValue() {
+  public void leaderEmptyDefault() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     Ordered<Object> o =
@@ -69,7 +69,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLeaderWithCommitIndex_withoutAnyCommit_then_fail() {
+  public void leaderEmptyCommitIndexFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     try {
@@ -83,7 +83,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromFollower_withoutAnyCommit_then_returnDefaultValue() {
+  public void followerEmptyDefault() {
     group = LocalRaftGroup.start(3);
     RaftNode leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -95,7 +95,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromFollowerWithCommitIndex_withoutAnyCommit_then_returnDefaultValue() {
+  public void followerEmptyCommitIndexDefault() {
     group = LocalRaftGroup.start(3);
     RaftNode leader = group.waitUntilLeaderElected();
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -110,7 +110,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLeaderWithoutCommitIndex_onStableRaftGroup_then_readLatestValue() {
+  public void leaderReadsLatest() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     int count = 3;
@@ -126,7 +126,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLeaderWithCommitIndex_onStableRaftGroup_then_readLatestValue() {
+  public void leaderCommitIndexReadsLatest() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     int count = 3;
@@ -142,7 +142,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLeaderWithFurtherCommitIndex_onStableRaftGroup_then_fail() {
+  public void leaderFurtherCommitIndexFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     int count = 3;
@@ -161,7 +161,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromFollower_withLeaderLeasePolicy_then_fail() {
+  public void followerLeaseQueryFails() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value")).join();
@@ -176,7 +176,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromFollowerWithoutCommitIndex_onStableRaftGroup_then_readLatestValue() {
+  public void followerReadsLatest() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     int count = 3;
@@ -198,7 +198,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromFollowerWithCommitIndex_onStableRaftGroup_then_readLatestValue() {
+  public void followerCommitIndexReadsLatest() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     int count = 3;
@@ -221,7 +221,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromSlowFollower_then_readStaleValue() {
+  public void slowFollowerReadsStale() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl slowFollower = group.getAnyNodeExcept(leader.getLocalEndpoint());
@@ -240,7 +240,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromSlowFollower_then_eventuallyReadLatestValue() {
+  public void slowFollowerEventuallyLatest() {
     group = LocalRaftGroup.start(3);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
@@ -261,7 +261,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromSplitLeaderWithAnyLocal_then_readStaleValue() {
+  public void splitLeaderReadsStale() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     Object firstValue = "value1";
@@ -319,7 +319,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromSplitLeader_then_eventuallyReadLatestValue() {
+  public void splitLeaderEventuallyLatest() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     Object firstValue = "value1";
@@ -351,7 +351,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLearner_then_readLatestValue() {
+  public void learnerReadsLatest() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     Object value = "value";
@@ -367,7 +367,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLearnerWithStaleCommitIndex_then_readStaleValue() {
+  public void learnerStaleCommitIndexReadsStale() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     Object value1 = "value1";
@@ -389,7 +389,7 @@ public class LocalQueryTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_queryFromLearnerWithInvalidCommitIndex_then_queryFails() {
+  public void learnerInvalidCommitIndexFails() {
     group = LocalRaftGroup.start(3, TEST_RAFT_CONFIG);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     Object value = "value";

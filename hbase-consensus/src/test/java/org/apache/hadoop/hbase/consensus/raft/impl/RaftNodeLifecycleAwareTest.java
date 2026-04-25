@@ -95,7 +95,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testExecutorStart() {
+  public void executorStart() {
     raftNode.start().join();
     assertThat(executor.startCall).isGreaterThan(0);
     assertThat(executor.executeCall).isGreaterThan(0);
@@ -103,7 +103,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testExecutorTerminate() {
+  public void executorTerminate() {
     raftNode.start().join();
     raftNode.terminate().join();
     assertThat(executor.startCall).isGreaterThan(0);
@@ -114,7 +114,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testTransportStart() {
+  public void transportStart() {
     raftNode.start().join();
     assertThat(transport.startCall).isGreaterThan(0);
     assertThat(transport.sendCall).isGreaterThan(0);
@@ -122,7 +122,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testTransportTerminate() {
+  public void transportTerminate() {
     raftNode.start().join();
     raftNode.terminate().join();
     assertThat(transport.startCall).isGreaterThan(0);
@@ -134,13 +134,13 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testStateMachineStart() {
+  public void stateMachineStart() {
     raftNode.start().join();
     assertThat(stateMachine.startCall).isGreaterThan(0);
   }
 
   @Test
-  public void testStateMachineTerminate() {
+  public void stateMachineTerminate() {
     raftNode.start().join();
     raftNode.terminate().join();
     assertThat(stateMachine.startCall).isGreaterThan(0);
@@ -149,7 +149,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testModelFactoryStart() {
+  public void modelFactoryStart() {
     raftNode.start().join();
     assertThat(modelFactory.startCall).isGreaterThan(0);
     assertThat(modelFactory.createCall).isGreaterThan(0);
@@ -157,7 +157,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testModelFactoryTerminate() {
+  public void modelFactoryTerminate() {
     raftNode.start().join();
     raftNode.terminate().join();
     assertThat(modelFactory.startCall).isGreaterThan(0);
@@ -169,7 +169,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testReportListenerStart() {
+  public void reportListenerStart() {
     raftNode.start().join();
     assertThat(reportListener.startCall).isGreaterThan(0);
     assertThat(reportListener.acceptCall).isGreaterThan(0);
@@ -177,7 +177,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testReportListenerTerminate() {
+  public void reportListenerTerminate() {
     raftNode.start().join();
     raftNode.terminate().join();
     assertThat(reportListener.startCall).isGreaterThan(0);
@@ -189,7 +189,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testStoreStart() {
+  public void storeStart() {
     raftNode.start().join();
     assertThat(store.startCall).isGreaterThan(0);
     assertThat(store.persistCall).isGreaterThan(0);
@@ -197,7 +197,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testStoreTerminate() {
+  public void storeTerminate() {
     raftNode.start().join();
     raftNode.terminate().join();
     assertThat(store.startCall).isGreaterThan(0);
@@ -209,7 +209,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testTerminateCalledForAllComponentsWhenStartFails() {
+  public void terminateAllOnStartFailure() {
     stateMachine.failOnStart = true;
     try {
       raftNode.start().join();
@@ -236,7 +236,7 @@ public class RaftNodeLifecycleAwareTest extends BaseTest {
   }
 
   @Test
-  public void testTerminateCalledForAllComponentsWhenStartAndTerminateFails() {
+  public void terminateAllOnStartAndTerminateFailure() {
     stateMachine.failOnStart = true;
     stateMachine.failOnTerminate = true;
     try {

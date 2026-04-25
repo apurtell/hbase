@@ -82,7 +82,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_commitLogAdvances_then_snapshotIsTaken() {
+  public void snapshotOnAdvance() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount).build();
     group = LocalRaftGroup.start(3, config);
@@ -105,7 +105,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotIsTaken_then_nextEntryIsCommitted() {
+  public void commitAfterSnapshot() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount).build();
     group = LocalRaftGroup.start(3, config);
@@ -135,13 +135,13 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followersMatchIndexIsUnknown_then_itInstallsSnapshotFromLeaderOnly() {
+  public void installSnapshotFromLeader() {
     when_followersMatchIndexIsUnknown_then_itInstallsSnapshot(false);
   }
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_followersMatchIndexIsUnknown_then_itInstallsSnapshotFromLeaderAndFollowers() {
+  public void installSnapshotFromLeaderAndFollowers() {
     when_followersMatchIndexIsUnknown_then_itInstallsSnapshot(true);
   }
 
@@ -295,7 +295,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderMissesResponse_then_itAdvancesMatchIndexWithNextResponse_leaderOnly() {
+  public void advanceMatchIndexAfterMissedResponse() {
     when_leaderMissesInstallSnapshotResponse_then_itAdvancesMatchIndexWithNextInstallSnapshotResponse(
       false);
   }
@@ -525,8 +525,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_isolatedLeaderAppendsEntries_then_itInvalidatesTheirFeaturesUponInstallSnapshot()
-    throws Exception {
+  public void isolatedLeaderInvalidatesAppendsOnInstall() throws Exception {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setLeaderHeartbeatPeriodMillis(1000)
       .setLeaderHeartbeatTimeoutMillis(5000).setCommitCountToTakeSnapshot(entryCount).build();
@@ -646,7 +645,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void testMembershipChangeBlocksSnapshotBug() {
+  public void membershipBlocksSnapshot() {
     // The comments below show how the code behaves before the mentioned bug is
     // fixed.
     int commitCountToTakeSnapshot = 50;
@@ -865,7 +864,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_thereAreCrashedFollowers_then_theyAreSkippedDuringSnapshotTransfer() {
+  public void crashedFollowersSkipped() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount).build();
     group = LocalRaftGroup.start(3, config);
@@ -902,7 +901,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_leaderCrashesDuringSnapshotTransfer_then_newLeaderSendsItsSnapshottedMembers() {
+  public void newLeaderResendsSnapshot() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount)
       .setLeaderHeartbeatPeriodMillis(1000).setLeaderHeartbeatTimeoutMillis(5000).build();
@@ -989,7 +988,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotTriggeredViaNotStartedSingletonNode_then_snapshotCannotBeTaken() {
+  public void notStartedSingletonNoSnapshot() {
     group = LocalRaftGroup.newBuilder(1).build();
     RaftNodeImpl node = group.getNodes().get(0);
     try {
@@ -1026,7 +1025,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotTriggeredViaNotStartedNode_then_snapshotCannotBeTaken() {
+  public void notStartedNodeNoSnapshot() {
     group = LocalRaftGroup.newBuilder(2).build();
     RaftNodeImpl node = group.getNodes().get(0);
     try {
@@ -1053,7 +1052,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotTriggeredViaLeaderWhenFirstEntryCommitted_then_snapshotCanBeTaken() {
+  public void leaderTriggerOnFirstCommit() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().start();
     RaftNodeImpl node = group.waitUntilLeaderElected();
     eventually(() -> {
@@ -1065,7 +1064,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotTriggeredViaLeaderMultipleTimesAtSameIndex_then_singleSnapshotIsTaken() {
+  public void leaderRepeatedTriggerSingleSnapshot() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().start();
     RaftNodeImpl node = group.waitUntilLeaderElected();
     eventually(() -> {
@@ -1097,7 +1096,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotTriggeredViaFollowerWhenFirstEntryCommitted_then_snapshotCanBeTaken() {
+  public void followerTriggerOnFirstCommit() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().start();
     group.waitUntilLeaderElected();
     RaftNodeImpl node = group.getAnyNodeExcept(group.getLeaderEndpoint());
@@ -1110,7 +1109,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_snapshotTriggeredViaLearnerWhenFirstEntryCommitted_then_snapshotCanBeTaken() {
+  public void learnerTriggerOnFirstCommit() {
     group = LocalRaftGroup.newBuilder(3).enableNewTermOperation().start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     RaftNodeImpl newNode = group.createNewNode();
@@ -1125,7 +1124,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_manualSnapshotIsTakenViaLeader_then_leaderCanTakeAutomaticSnapshot() {
+  public void leaderManualThenAuto() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount)
       .setMaxPendingLogEntryCount(entryCount / 10).build();
@@ -1149,7 +1148,7 @@ public class SnapshotTest extends BaseTest {
 
   @Test
   @Timeout(value = 300, unit = TimeUnit.SECONDS)
-  public void when_manualSnapshotIsTakenViaFollower_then_followerCanTakeAutomaticSnapshot() {
+  public void followerManualThenAuto() {
     int entryCount = 50;
     RaftConfig config = RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount)
       .setMaxPendingLogEntryCount(entryCount / 10).build();

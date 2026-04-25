@@ -47,7 +47,7 @@ public class GroupExecutorLifecycleTest extends BaseTest {
 
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
-  public void terminateDiscardsPendingMailboxAndCancelsScheduledTask() throws Exception {
+  public void terminateClearsMailbox() throws Exception {
     mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
     GroupExecutor a = (GroupExecutor) mge.executorFor("group-a");
     final AtomicInteger ran = new AtomicInteger();
@@ -94,7 +94,7 @@ public class GroupExecutorLifecycleTest extends BaseTest {
 
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
-  public void terminatingOneGroupDoesNotShutDownTheSharedPool() throws Exception {
+  public void terminateKeepsPoolAlive() throws Exception {
     mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
     GroupExecutor a = (GroupExecutor) mge.executorFor("group-a");
     GroupExecutor b = (GroupExecutor) mge.executorFor("group-b");
@@ -111,7 +111,7 @@ public class GroupExecutorLifecycleTest extends BaseTest {
 
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
-  public void closeShutsPoolDownAndExecutorForThrows() throws Exception {
+  public void closeShutsDownPool() throws Exception {
     mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
     RaftNodeExecutor a = mge.executorFor("a");
     final CountDownLatch ran = new CountDownLatch(1);

@@ -29,7 +29,7 @@ public class FollowerStateTest {
   private final FollowerState followerState = new FollowerState(0, 1, TIME);
 
   @Test
-  public void testFirstBackoffRound() {
+  public void firstBackoff() {
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
     assertThat(flowControlSeqNum).isGreaterThan(0);
     assertThat(followerState.flowControlSequenceNumber()).isEqualTo(flowControlSeqNum);
@@ -37,7 +37,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testValidResponseReceivedOnFirstBackoff() {
+  public void validResponseFirstBackoff() {
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
     boolean success = followerState.responseReceived(flowControlSeqNum, TIME);
     assertThat(success).isTrue();
@@ -46,7 +46,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testInvalidResponseReceivedOnFirstBackoff() {
+  public void invalidResponseFirstBackoff() {
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
     boolean success = followerState.responseReceived(flowControlSeqNum + 1, TIME);
     assertThat(success).isFalse();
@@ -55,7 +55,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testCompletedFirstBackoff() {
+  public void completeFirstBackoff() {
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
     boolean backoffCompleted = followerState.completeBackoffRound();
     assertThat(backoffCompleted).isTrue();
@@ -64,7 +64,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testFirstResponseReceivedAfterBackoffIsSetForSecondRequest() {
+  public void staleResponseAfterRetry() {
     long flowControlSeqNum1 = followerState.setRequestBackoff(1, 2);
     followerState.completeBackoffRound();
     long flowControlSeqNum2 = followerState.setRequestBackoff(1, 2);
@@ -76,7 +76,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testSecondBackoffRound() {
+  public void secondBackoff() {
     followerState.setRequestBackoff(1, 2);
     followerState.completeBackoffRound();
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
@@ -86,7 +86,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testValidResponseReceivedOnSecondBackoff() {
+  public void validResponseSecondBackoff() {
     followerState.setRequestBackoff(1, 2);
     followerState.completeBackoffRound();
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
@@ -97,7 +97,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testInvalidResponseReceivedOnSecondBackoff() {
+  public void invalidResponseSecondBackoff() {
     followerState.setRequestBackoff(1, 2);
     followerState.completeBackoffRound();
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
@@ -108,7 +108,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testCompletedSecondBackoff() {
+  public void completeSecondBackoff() {
     followerState.setRequestBackoff(1, 2);
     followerState.completeBackoffRound();
     long flowControlSeqNum = followerState.setRequestBackoff(1, 2);
@@ -123,19 +123,7 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testFirstResponseReceivedAfterSecondBackoffIsSetForSecondRequest() {
-    long flowControlSeqNum1 = followerState.setRequestBackoff(1, 2);
-    followerState.completeBackoffRound();
-    long flowControlSeqNum2 = followerState.setRequestBackoff(1, 2);
-    assertThat(flowControlSeqNum2).isGreaterThan(flowControlSeqNum1);
-    boolean success = followerState.responseReceived(flowControlSeqNum1, TIME);
-    assertThat(success).isFalse();
-    assertThat(followerState.flowControlSequenceNumber()).isEqualTo(flowControlSeqNum2);
-    assertThat(followerState.backoffRound()).isEqualTo(2);
-  }
-
-  @Test
-  public void testMaxBackoff() {
+  public void maxBackoff() {
     long flowControlSeqNum1 = followerState.setRequestBackoff(1, 4);
     followerState.completeBackoffRound();
     long flowControlSeqNum2 = followerState.setRequestBackoff(1, 4);
@@ -155,12 +143,14 @@ public class FollowerStateTest {
   }
 
   @Test
-  public void testNoBackoffOverflow() {
+  public void noBackoffOverflow() {
     for (int i = 0; i < 64; i++) {
       followerState.setRequestBackoff(1, 64);
       while (followerState.isRequestBackoffSet()) {
         followerState.completeBackoffRound();
       }
     }
+    assertThat(followerState.backoffRound()).isEqualTo(0);
+    assertThat(followerState.isRequestBackoffSet()).isFalse();
   }
 }

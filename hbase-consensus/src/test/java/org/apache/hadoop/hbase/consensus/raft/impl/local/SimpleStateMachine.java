@@ -192,11 +192,15 @@ public class SimpleStateMachine
     return new LinkedHashMap<>();
   }
 
-  private static class Apply {
-    private Object val;
+  static class Apply {
+    private final Object val;
 
     Apply(Object val) {
       this.val = val;
+    }
+
+    Object getVal() {
+      return val;
     }
 
     @Override
@@ -205,21 +209,21 @@ public class SimpleStateMachine
     }
   }
 
-  private static class QueryLast {
+  static class QueryLast {
     @Override
     public String toString() {
       return "Query{}";
     }
   }
 
-  private static class QueryAll {
+  static class QueryAll {
     @Override
     public String toString() {
       return "QueryAll{}";
     }
   }
 
-  private static final class NewTermOp {
+  static final class NewTermOp {
     @Override
     public String toString() {
       return "NewTermOp{}";

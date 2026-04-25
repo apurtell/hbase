@@ -60,7 +60,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void test_initialState() {
+  public void initialState() {
     assertThat(state.memberCount()).isEqualTo(initialEndpoints.size());
     assertThat(state.members()).isEqualTo(initialEndpoints);
     Collection<RaftEndpoint> remoteMembers = new HashSet<>(initialEndpoints);
@@ -81,20 +81,20 @@ public class RaftStateTest {
   }
 
   @Test
-  public void test_leader() {
+  public void leader() {
     state.leader(localEndpoint);
     assertThat(state.leader()).isEqualTo(localEndpoint);
   }
 
   @Test
-  public void test_commitIndex() {
+  public void commitIndex() {
     int ix = 123;
     state.commitIndex(ix);
     assertThat(state.commitIndex()).isEqualTo(ix);
   }
 
   @Test
-  public void test_lastApplied() {
+  public void lastApplied() {
     int last = 123;
     state.lastApplied(last);
     assertThat(state.lastApplied()).isEqualTo(last);
@@ -110,7 +110,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void toFollower_fromCandidate() {
+  public void candidateToFollower() {
     state.toCandidate();
     int term = 23;
     state.toFollower(term);
@@ -122,7 +122,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void toFollower_fromLeader() {
+  public void leaderToFollower() {
     state.toLeader(TIME);
     int term = 23;
     state.toFollower(term);
@@ -134,7 +134,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void toCandidate_fromFollower() {
+  public void followerToCandidate() {
     int term = 23;
     state.toFollower(term);
     state.toCandidate();
@@ -150,7 +150,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void toLeader_fromCandidate() {
+  public void candidateToLeader() {
     state.toCandidate();
     int term = state.term();
     RaftLog log = state.log();
@@ -185,7 +185,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void testQuorumSizesOfOddSizedCluster() {
+  public void quorumSizesOdd() {
     int memberCount = 7;
     initialEndpoints = new HashSet<>();
     initialEndpoints.add(localEndpoint);
@@ -202,7 +202,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void testQuorumSizesOfEvenSizedCluster() {
+  public void quorumSizesEven() {
     int memberCount = 8;
     initialEndpoints = new HashSet<>();
     initialEndpoints.add(localEndpoint);
@@ -219,7 +219,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void test_initialStateOfJoinedMember() {
+  public void joinedMemberInitialState() {
     localEndpoint = newEndpoint();
     state =
       RaftState.create("default", localEndpoint, groupMembers, 100, new DefaultRaftModelFactory());
@@ -245,7 +245,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void test_promotionToVotingMember() {
+  public void promoteToVoting() {
     localEndpoint = newEndpoint();
     state =
       RaftState.create("default", localEndpoint, groupMembers, 100, new DefaultRaftModelFactory());
@@ -258,7 +258,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void test_revertVotingMemberPromotion() {
+  public void revertPromotion() {
     localEndpoint = newEndpoint();
     state =
       RaftState.create("default", localEndpoint, groupMembers, 100, new DefaultRaftModelFactory());
@@ -270,7 +270,7 @@ public class RaftStateTest {
   }
 
   @Test
-  public void test_revertVotingMemberPromotionFailsWhileCandidate() {
+  public void revertPromotionWhileCandidate() {
     localEndpoint = newEndpoint();
     state =
       RaftState.create("default", localEndpoint, groupMembers, 100, new DefaultRaftModelFactory());
