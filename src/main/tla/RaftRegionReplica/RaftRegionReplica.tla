@@ -95,7 +95,7 @@
  * atomically (rather than aborted).  The flush marker is irrevocably
  * committed through RAFT; aborting would leave the member's memstore
  * inconsistent.  This is modeled in StepDown, BecomeLeader,
- * Heartbeat, and RequestVote.  The FollowerFlushMemstoreDrop
+ * LeaderHeartbeat, and RequestVote.  The FollowerFlushMemstoreDrop
  * invariant verifies that after any follower has applied a flush
  * marker, no non-marker entry below it remains in the memstore.
  *
@@ -209,8 +209,9 @@
  * Entries committed after promotion (e.g., orphan flush markers
  * committed by NewLeaderCommitOrphanEntry when a partition heals)
  * are atomically applied to the leader's memstore within the same
- * action, mirroring MicroRaft's single-threaded AdvanceCommitIndex
- * + runOperation() callback.  The PromotionMVCCContinuity
+ * action, mirroring the consensus core's single-threaded
+ * AdvanceCommitIndexTask + runOperation() callback (one
+ * RaftNodeExecutor per group).  The PromotionMVCCContinuity
  * invariant verifies that no committed entry is unapplied outside
  * the leader's active write pipeline, ensuring no MVCC sequence
  * gaps after promotion.
@@ -235,20 +236,77 @@
  * compromising the invariant: in all reachable states, the derivation
  * matches the value that explicit tracking would produce.
  *
- * Implementation grounding:  This spec models MicroRaft's election
- * protocol with clock-drift-compensated lease extension.  Actions that
- * reflect existing MicroRaft code (as of the hbase-consensus baseline):
- * Timeout, RequestVote, BecomeLeader, StepDown, LeaderLeaseExpiry,
- * CrashRestart.  Actions
- * that represent planned modifications to MicroRaft: the
- * LeaderLeaseDuration / MaxClockDrift timing parameters, and the
- * lease countdown logic in BecomeLeader and Heartbeat (MicroRaft
- * currently uses responseTimestamp comparison without a lease expiry
- * field; the modification adds an explicit leaseExpiry field refreshed
- * on quorum ack).  Timers and leases use relative countdown
+ * Implementation grounding:  This spec models hbase-consensus's
+ * election protocol with clock-drift-compensated lease extension.
+ * Each spec action maps onto a code path in the consensus core
+ * (the consensus core is the single-threaded actor in
+ * hbase-consensus/src/main/java/org/apache/hadoop/hbase/consensus
+ * derived from the MicroRaft baseline; one RaftNodeExecutor per
+ * group serializes all state mutations).  The lease itself is
+ * represented in the implementation by the explicit
+ * LeaderState.leaseExpiryMillis field, refreshed monotonically on
+ * each ack from a voting follower (LeaderHeartbeatAckHandler and
+ * AppendEntriesSuccessResponseHandler) and re-evaluated on every
+ * heartbeat tick by RaftNodeImpl.demoteToFollowerIfLeaseExpired,
+ * which steps the leader down to Follower if leaseExpiryMillis <= now.
+ * The spec collapses this absolute-deadline representation to a
+ * relative countdown (leaseRemaining as ticks remaining), which
+ * collapses functionally equivalent states that differ only in
+ * absolute clock position; the LeaderHeartbeat action atomically
+ * refreshes the leader's lease as part of the same heartbeat round
+ * that resets responder election timers.
+ *
+ * Timers and leases in the spec use relative countdown
  * representation (ticks remaining) rather than absolute deadlines,
  * collapsing functionally equivalent states that differ only in
  * absolute clock position.
+ *
+ * Implementation features intentionally abstracted (not modeled):
+ *
+ *   - The wire-level distinction between LeaderHeartbeat (lightweight,
+ *     steady-state liveness) and AppendEntriesRequest (log replication,
+ *     snapshot trigger, matchIndex discovery, membership-op preparation).
+ *     The spec has a single atomic LeaderHeartbeat action that captures
+ *     both the liveness effect on followers (election-timer reset) and
+ *     the leader's lease refresh; the implementation splits this round
+ *     on the wire into a LeaderHeartbeat broadcast plus per-follower
+ *     LeaderHeartbeatAck responses (see SweepingHeartbeatScheduler),
+ *     but the round must be modeled atomically because the lease-safety
+ *     argument requires the lease refresh and the quorum of follower
+ *     election-timer resets to be causally bound by the same round-trip.
+ *     Log replication is abstracted into atomic raftLog updates inside
+ *     RAFTCommitWrite / FlushRAFTPropose / ProposeMarker.
+ *
+ *   - The lastVerifiedLogIndex clamp on commit-index advancement from
+ *     heartbeats (LeaderHeartbeatHandler / AppendEntriesRequestHandler
+ *     and LeaderState.lastVerifiedLogIndex).  The spec's atomic
+ *     RAFTCommitWrite makes a per-follower verified watermark
+ *     unnecessary at this abstraction level.
+ *
+ *   - Linearizable queries (QueryState, querySequenceNumber, the
+ *     fail-pending + bump-QSN-on-leader-self-removal handling).  Reads
+ *     do not flow through the consensus layer in the spec (see README).
+ *
+ *   - REMOVE_MEMBER / ADD_LEARNER / ADD_OR_PROMOTE_TO_FOLLOWER
+ *     UpdateRaftGroupMembersOp entries as replicated log entries,
+ *     including leader self-removal that drives the node into
+ *     RaftNodeStatus.TERMINATED.  Membership in the spec is the static
+ *     CONSTANT Members set.
+ *
+ *   - LEARNER role / non-voting members.  The spec's role variable
+ *     ranges over {Follower, Candidate, Leader}.
+ *
+ *   - PreVote as a distinct round.  The spec subsumes PreVote into
+ *     the leader-stickiness guard on RequestVote (described in that
+ *     action's comment).
+ *
+ *   - Chunked InstallSnapshot transfer (SnapshotChunkCollector).
+ *     The spec models the design-target shared-storage CatchUpReference
+ *     path as a single atomic action.  Both paths are observationally
+ *     equivalent at this abstraction level: the follower's log is
+ *     truncated to the snapshot index and the data is recoverable
+ *     (HFiles on HDFS in the design-target path; replayed chunks plus
+ *     locally-flushed HFiles in the chunked path).
  *
  * Write path actions model the leader's HRegion.doMiniBatchMutate()
  * pipeline for RAFT-enabled regions: BeginWrite (doWALAppend, step 3),
@@ -266,16 +324,17 @@
  * the next unapplied entry is a marker, advancing writePoint and
  * readPoint past the marker's seqId).
  *
- * Spec constant to MicroRaft RaftConfig mapping:
+ * Spec constant to RaftConfig mapping:
  *
- *   Spec constant        MicroRaft RaftConfig parameter
+ *   Spec constant        RaftConfig parameter
  *   -------------------- -----------------------------------------
- *   ElectionTimeoutMin   leaderHeartbeatTimeoutSecs (follower
+ *   ElectionTimeoutMin   leaderHeartbeatTimeoutMillis (follower
  *                        failure detection, the timing-critical
  *                        parameter for lease safety)
- *   LeaderLeaseDuration  leaderLeaseDuration =
- *                        leaderHeartbeatTimeoutMs - 2*maxClockDrift
- *   MaxClockDrift        maxClockDrift
+ *   LeaderLeaseDuration  leaderLeaseDurationMillis =
+ *                          leaderHeartbeatTimeoutMillis
+ *                          - 2 * maxClockDriftMillis
+ *   MaxClockDrift        maxClockDriftMillis
  *
  * Vote durability is a hard requirement, not configurable;
  * hbase-consensus always uses a durable RaftStore.
@@ -325,8 +384,10 @@
  * model ensures the lease and all followers' election timers are set in
  * the same logical instant as the role transition, which is the
  * prerequisite for the timing analysis that relates LeaderLeaseDuration
- * to ElectionTimeoutMin.  The separate Heartbeat action models subsequent
- * periodic heartbeats for lease renewal.
+ * to ElectionTimeoutMin.  The LeaderHeartbeat action models subsequent
+ * periodic heartbeats and lease renewal as a single atomic round (see
+ * the LeaderHeartbeat action header for why the broadcast and lease
+ * refresh must be modeled atomically).
  *
  * With network partitions, unreachable followers are excluded from the
  * responder set, naturally modeling partial heartbeat rounds where a
@@ -589,11 +650,15 @@ Init ==
 \* A follower or candidate whose election timer has expired starts an
 \* election: increment term, become Candidate, vote for self.
 \*
-\* MicroRaft implementation: models PreVoteTimeoutTask /
-\* LeaderElectionTimeoutTask triggering toCandidate() in RaftNodeImpl.
-\* MicroRaft first runs a pre-vote phase (not modeled separately here;
-\* the pre-vote is subsumed by the leader-stickiness guard on
-\* RequestVote, which prevents voting before the election timer fires).
+\* Implementation: models LeaderElectionTimeoutTask triggering
+\* toCandidate() in RaftNodeImpl (see also broadcastVoteRequest()).
+\* The consensus core retains a PreVote round; this spec subsumes
+\* pre-vote into the leader-stickiness guard on RequestVote, which
+\* prevents voting before the election timer fires.  At this
+\* abstraction level the pre-vote round only ever delays the term bump
+\* — it does not change which candidate eventually wins, and the
+\* leader-stickiness guard already prevents the disruptive-candidate
+\* scenario PreVote was added to mitigate.
 Timeout(m) ==
     /\ role[m] \in {"Follower", "Candidate"}
     /\ currentTerm[m] < MaxTerm
@@ -621,26 +686,29 @@ Timeout(m) ==
 \* expires before any follower can participate in a new election,
 \* even by voting (not just by starting its own election).
 \*
-\* The voter's election timer is NOT reset on vote grant.  Standard RAFT
-\* resets the election timer on vote grant, but MicroRaft
-\* does not: VoteRequestHandler calls state.grantVote() and sends the
-\* response without calling leaderHeartbeatReceived().  The hbase-consensus
-\* fork patches VoteRequestHandler to reset the timer (see design doc),
-\* but this spec models the conservative case (no reset) to verify that
-\* safety holds even without the reset.  The BecomeLeader action's atomic
-\* initial heartbeat resets all reachable followers' timers immediately
-\* upon election, so the practical gap is one atomic step.
+\* The voter's election timer is NOT reset on vote grant in this spec.
+\* The implementation does reset it: VoteRequestHandler.handle() calls
+\* node.electionTimerReset() on a successful grant (deferring the
+\* voter's own election timer), but explicitly does NOT call
+\* node.leaderHeartbeatReceived() — leader-stickiness still uses the
+\* unmodified leader-heartbeat-received timestamp, so a recently
+\* heartbeated follower will not grant the vote in the first place.
+\* The spec models the conservative no-reset case purely as a safety
+\* stress test: showing safety holds even when the voter's election
+\* timer is not deferred bounds any race the deferral could mask.
+\* The BecomeLeader action's atomic initial heartbeat resets all
+\* reachable followers' timers immediately upon election, so the
+\* practical gap between vote grant and timer reset is one atomic step.
 \*
 \* If the voter is a Leader in a lower term (possible when two leaders
 \* coexist in different terms due to partitions), the voter steps down
 \* and its write pipeline is reset (any in-flight write is abandoned).
 \*
-\* MicroRaft implementation: models VoteRequestHandler.handle().
-\* The timerRemaining[voter] = 0 guard models leader stickiness
-\* (!node.isLeaderHeartbeatTimeoutElapsed() at
-\* VoteRequestHandler line 92).  The vote-granting logic models
-\* state.grantVote() which calls persistAndFlushTerm() before
-\* returning, ensuring vote durability before the response is sent.
+\* Implementation: models VoteRequestHandler.handle().  The
+\* timerRemaining[voter] = 0 guard models the leader-stickiness check
+\* (!node.isLeaderHeartbeatTimeoutElapsed()).  The vote-granting logic
+\* models state.grantVote(), which calls persistAndFlushTerm() before
+\* returning so that votedFor is durable before the response is sent.
 RequestVote(candidate, voter) ==
     /\ role[candidate] = "Candidate"
     /\ candidate # voter
@@ -700,11 +768,19 @@ RequestVote(candidate, voter) ==
 \* Responders that were leaders in a lower term (possible during
 \* partition-heal scenarios) have their write pipelines reset.
 \*
-\* MicroRaft implementation: models VoteResponseHandler triggering
-\* toLeader(), which atomically calls appendNewTermEntry() +
-\* broadcastAppendEntriesRequest().  The atomic initial heartbeat is
-\* justified by MicroRaft's single-threaded actor model: no work can
-\* interleave between the election win and the first heartbeat.
+\* Implementation: models VoteResponseHandler triggering
+\* RaftNodeImpl.toLeader(), whose synchronous body initializes
+\* leaseExpiryMillis = quorumResponseTimestamp(quorumSize, now)
+\*                     + leaderLeaseDurationMillis
+\* (using the freshly-recorded grant timestamps as the initial
+\* responseTimestamp values), appends a no-op new-term entry via
+\* appendNewTermEntry(), and broadcasts the initial AppendEntries
+\* round.  The atomic initial heartbeat is justified by the consensus
+\* core's single-threaded actor model (one RaftNodeExecutor per group):
+\* no other work can interleave between the election win and the first
+\* heartbeat.  The atomic-with-initial-heartbeat model in this spec
+\* remains faithful for safety because the lease is set synchronously
+\* in toLeader() before any other action can observe the new role.
 BecomeLeader(m) ==
     /\ role[m] = "Candidate"
     /\ Cardinality(votesGranted[m]) >= Majority
@@ -759,28 +835,56 @@ BecomeLeader(m) ==
 
 \* ---- RAFT leadership actions ----
 
-\* Leader sends a heartbeat round to all responding followers (atomic).
-\* Each responding follower resets its election timer.  The leader's
-\* lease is refreshed and all non-leader leases are cleared.
-\* Only followers whose term is <= the leader's term AND who are
-\* reachable (not partitioned from the leader) respond;
-\* a follower in a higher term or behind a partition would not respond.
+\* Leader runs one heartbeat round: broadcasts a heartbeat to all
+\* responding followers (each resets its election timer) AND refreshes
+\* its own lease atomically.  Non-leader leases on responders are
+\* cleared.  Only followers whose term is <= the leader's term AND who
+\* are reachable (not partitioned from the leader) respond; a follower
+\* in a higher term or behind a partition would not respond.
+\*
+\* The action is modeled atomically even though the implementation
+\* splits the round on the wire into two distinct messages
+\* (LeaderHeartbeat broadcast + LeaderHeartbeatAck per-follower
+\* response, see SweepingHeartbeatScheduler).  The split is an
+\* implementation optimization (smaller, independent messages, finer
+\* scheduling); at the spec abstraction level the round must be atomic
+\* because the lease-safety argument requires the leader's lease
+\* refresh and the quorum of follower election-timer resets to be
+\* causally bound by the same round-trip.  The implementation
+\* maintains this causality via the request-response correlation: an
+\* ack only arrives at the leader because a heartbeat broadcast was
+\* delivered to the follower, which called node.leaderHeartbeatReceived()
+\* to reset its election timer before replying.  Modeling the broadcast
+\* and the lease refresh as independent TLA+ actions broke this causal
+\* link and admitted a counterexample to LeaseExpiresBeforeElection
+\* in which the leader's lease was refreshed without any follower's
+\* election timer being reset by this leader; TLC found a state with
+\* two valid leases simultaneously (different terms, partitioned
+\* leaders, both reachable to the same swing voter).
 \*
 \* Guard: if any reachable member has a higher term, the heartbeat
 \* round discovers this via the rejection response, and the leader
-\* steps down instead of refreshing its lease.  StepDown handles
-\* the actual transition; this guard prevents the stale heartbeat.
+\* steps down instead of broadcasting.  StepDown handles the actual
+\* transition; this guard prevents the stale heartbeat.
 \*
 \* Responders that were leaders in a lower term (possible during
 \* partition-heal scenarios) have their write pipelines reset.
 \*
-\* MicroRaft implementation: models periodic heartbeats via HeartbeatTask.
-\* The lease refresh (leaseRemaining' = LeaderLeaseDuration) represents
-\* the planned modification: MicroRaft currently uses responseTimestamp
-\* comparison without a lease expiry; the modification adds an explicit
-\* leaseExpiry field in LeaderState, refreshed when
-\* AppendEntriesSuccessResponseHandler counts a quorum of acks.
-Heartbeat(leader) ==
+\* Implementation: models RaftNodeImpl.broadcastLeaderHeartbeat() called
+\* from runHeartbeatTick (HeartbeatScheduler -> SweepingHeartbeatScheduler
+\* or DefaultHeartbeatScheduler), composed with the cumulative effect of
+\* LeaderHeartbeatAckHandler (per-follower) updating
+\* FollowerState.responseTimestamp on each ack and recomputing
+\* leaseExpiryMillis = quorumResponseTimestamp(quorumSize, now) +
+\* leaderLeaseDurationMillis once a voting-member quorum has acked.
+\* On the wire the broadcast is a LeaderHeartbeat message processed by
+\* LeaderHeartbeatHandler on the follower; the handler resets the
+\* election timer (leaderHeartbeatReceived()) and sends back a
+\* LeaderHeartbeatAck.  AppendEntriesRequest is no longer used as a
+\* steady-state liveness signal; it is reserved for log replication
+\* catch-up, snapshot trigger, matchIndex discovery, and membership-op
+\* preparation (sendCatchupAppendsIfNeeded).
+LeaderHeartbeat(leader) ==
     /\ role[leader] = "Leader"
     /\ QuorumReachable(leader)
     /\ LET responders == Responders(leader)
@@ -830,13 +934,22 @@ Heartbeat(leader) ==
 \* Requires that the member can observe the other's term (not partitioned).
 \* Any in-flight write is abandoned (write pipeline reset).
 \*
-\* MicroRaft implementation: models toFollower(higherTerm) triggered by
-\* AppendEntriesFailureResponseHandler, VoteResponseHandler, or
-\* AppendEntriesRequestHandler on observing a higher term.  Planned fix:
-\* also trigger from AppendEntriesSuccessResponseHandler and
-\* InstallSnapshotResponseHandler, both of which currently ignore
-\* higher-term responses when the node is LEADER (log a warning but
-\* do not call toFollower()).
+\* Implementation: models RaftNodeImpl.toFollower(higherTerm).  In the
+\* current code, every handler that observes a strictly higher term in
+\* an inbound message or response calls toFollower(higherTerm) before
+\* doing any other work:
+\*   - VoteRequestHandler
+\*   - VoteResponseHandler
+\*   - AppendEntriesRequestHandler
+\*   - AppendEntriesSuccessResponseHandler
+\*   - AppendEntriesFailureResponseHandler
+\*   - InstallSnapshotRequestHandler
+\*   - InstallSnapshotResponseHandler
+\*   - LeaderHeartbeatHandler
+\*   - LeaderHeartbeatAckHandler
+\* The spec abstracts the "discover via any RPC" behavior into a single
+\* atomic action guarded by reachability of some other member with a
+\* higher term.
 StepDown(m) ==
     /\ \E other \in Members :
         /\ other # m
@@ -861,27 +974,33 @@ StepDown(m) ==
                    globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
 
-\* A leader whose lease has expired (it could not heartbeat a quorum
-\* within the lease duration) voluntarily steps down to Follower.
-\* This models MicroRaft's quorum health check: HeartbeatTask
-\* periodically calls checkQuorumHeartbeat(), and if the leader has
-\* not received AppendEntriesSuccessResponse from a majority within
-\* leaderHeartbeatTimeoutSecs, it calls toFollower(currentTerm).
+\* A leader whose lease has expired (it could not refresh leaseExpiryMillis
+\* via a quorum of follower acks within the lease duration) voluntarily
+\* steps down to Follower.
 \*
 \* Unlike StepDown (which requires discovering a higher term from a
 \* reachable member), LeaderLeaseExpiry fires when the leader simply
 \* cannot refresh its lease — e.g., it is fully partitioned from the
-\* quorum, or responders are slow.  The term is not bumped (MicroRaft's
-\* toFollower preserves the current term when no higher term is
-\* discovered), and votedFor is preserved (already voted in this term).
+\* quorum, or responders are slow.  The term is not bumped
+\* (toFollower(currentTerm) preserves the current term when no higher
+\* term is discovered), and votedFor is preserved (already voted in
+\* this term).
 \*
 \* State cleanup (write/flush/promotion reset, memstore
 \* flush-in-RAFTCommitted handling) is identical to StepDown: any
 \* in-flight write or flush is abandoned, and the promotion phase is
 \* reset.
 \*
-\* MicroRaft implementation: models the quorum liveness check in
-\* HeartbeatTask.run() -> checkQuorumHeartbeat() -> toFollower(currentTerm).
+\* Implementation: models RaftNodeImpl.demoteToFollowerIfLeaseExpired,
+\* which is called from RaftNodeImpl.runHeartbeatTick on every
+\* heartbeat tick.  It recomputes leaseExpiryMillis from the freshest
+\* quorum response timestamps via
+\*   leaseExpiryMillis = quorumResponseTimestamp(quorumSize, now)
+\*                       + leaderLeaseDurationMillis,
+\* updates leaderState.leaseExpiryMillis monotonically, and calls
+\* toFollower(state.term()) when leaseExpiryMillis <= now.  (The
+\* legacy demoteToFollowerIfQuorumHeartbeatTimeoutElapsed helper still
+\* exists but is no longer invoked from the heartbeat hot path.)
 LeaderLeaseExpiry(m) ==
     /\ role[m] = "Leader"
     /\ leaseRemaining[m] = 0
@@ -961,11 +1080,13 @@ ClockTick(m) ==
 \* post-crash state, so crashing it is a no-op.  Pruning this
 \* eliminates redundant transitions without changing reachability.
 \*
-\* MicroRaft implementation: models crash-recovery via RaftState.restore()
-\* from RestoredRaftState.  currentTerm is always preserved (UNCHANGED) —
-\* MicroRaft does NOT increment term on restart.  votedFor is preserved
-\* by the durable RaftStore (e.g., RaftSqliteStore with SYNCHRONOUS =
-\* EXTRA).
+\* Implementation: models crash-recovery via RaftState.restore() from
+\* RestoredRaftState.  currentTerm is preserved (UNCHANGED) — the
+\* consensus core does NOT increment term on restart.  votedFor is
+\* preserved by the durable RaftStore.  Volatile in-memory state — role, votes
+\* received, leaseExpiryMillis (LeaderState), in-flight write/flush
+\* pipeline state, memstore — is rebuilt from log replay rather than
+\* persisted, matching the spec's reset of those variables.
 CrashRestartGuard(m) ==
     \/ role[m] # "Follower"
     \/ memstore[m] # {}
@@ -1264,14 +1385,44 @@ ProposeMarker(m) ==
 \* the marker via FollowerApplyMarker.
 \*
 \* Guard: the leader must have a valid lease, no flush already in
-\* progress, and the seqId counter not exhausted.  No write exclusion
-\* is needed — the snapshot-boundary protocol allows writes and flushes
-\* to run concurrently.
+\* progress, and the seqId counter not exhausted.  Additionally, the
+\* leader's apply queue must be drained
+\* (`ApplicableEntries(m) = {}`) AND no write may be in-flight on the
+\* leader (`writePhase[m] = "Idle"`).  These two conditions ensure
+\* the captured `snapshotMaxSeqId` faithfully reflects every entry
+\* the leader is responsible for: every committed entry has been
+\* applied to memstore, and there is no in-flight write with a
+\* writeSeqId below the upcoming marker's seqId that could later
+\* land in the memstore with a seqId at or below
+\* `flushDropBound[flushSeqId]`.  This mirrors the implementation:
+\* HRegion's flush prepares a non-blocking write barrier
+\* (`mvcc.advanceTo` + completion wait) so that all writes whose
+\* seqId is below the chosen flush seqId have applied to the
+\* memstore before the snapshot is taken; the consensus core's
+\* single-threaded `RaftNodeExecutor` then processes any newly
+\* committed entries in seqId order before the next operation.  New
+\* writes that begin after `FlushStart` are assigned `nextSeqId`
+\* values strictly greater than the marker's seqId, so they
+\* naturally land above `snapshotMaxSeqId` and survive the drop;
+\* this is the snapshot-boundary protocol's notion of
+\* "concurrent in-flight writes survive the flush" — it admits
+\* writes started during the flush, not writes started before it
+\* with lower seqIds that have not yet applied.  Without these two
+\* preconditions the spec admits two distinct counterexamples to
+\* `FollowerFlushMemstoreDrop`: (a) `FlushStart` captures a
+\* snapshot from a memstore missing a raft-committed but
+\* not-yet-applied write (advertising HFile coverage of a seqId
+\* that was never written to the HFile); (b) `FlushStart` runs
+\* while a not-yet-RAFT-committed write holds a lower writeSeqId,
+\* which later commits and applies into the memstore at a seqId at
+\* or below `flushDropBound[flushSeqId]`.
 FlushStart(m) ==
     /\ IsLeader(m)
     /\ promotionPhase[m] = "Complete"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
+    /\ ApplicableEntries(m) = {}
+    /\ writePhase[m] = "Idle"
     /\ LET snapBound == IF memstore[m] = {} THEN 0 ELSE SetMax(memstore[m])
        IN /\ flushPhase' = [flushPhase EXCEPT ![m] = "FlushStarted"]
           /\ flushSeqId' = [flushSeqId EXCEPT ![m] = nextSeqId]
@@ -1515,9 +1666,11 @@ MasterConfirmPromotion(m) ==
 \* and PromotionComplete.  The lease guard prevents a stale leader
 \* whose lease has expired from completing promotion.
 \*
-\* MicroRaft implementation: promotion steps run on the actor thread
-\* and check isLeader() before proceeding.  In hbase-consensus,
-\* isLeader() includes the lease validity check (leaseRemaining > 0).
+\* Implementation: promotion steps run on the actor thread and check
+\* RaftNodeImpl.isLeaderWithValidLease(now) before proceeding.  That
+\* accessor returns true iff role == LEADER, leaderState != null, and
+\* leaderState.leaseExpiryMillis > now — exactly the spec's
+\* role[m] = "Leader" /\ LeaseValid(m) conjunction.
 PromotionComplete(m) ==
     /\ role[m] = "Leader"
     /\ LeaseValid(m)
@@ -1546,9 +1699,10 @@ PromotionComplete(m) ==
 \* atomically commits).
 \*
 \* The leader atomically applies the committed entry to its own
-\* memstore, mirroring MicroRaft's single-threaded actor model where
-\* AdvanceCommitIndex and the runOperation() apply callback execute
-\* on the same thread with no interleaving.  For flush markers, the
+\* memstore, mirroring the consensus core's single-threaded actor
+\* model (one RaftNodeExecutor per group): AdvanceCommitIndexTask and
+\* the runOperation() apply callback execute on the same thread with
+\* no interleaving.  For flush markers, the
 \* leader applies via mvcc.advanceTo(s) and drops memstore entries
 \* below s (the data is now in HFiles on HDFS).  For mutations, the
 \* leader applies via memstore.add.  In the current model, mutations
@@ -1560,9 +1714,10 @@ PromotionComplete(m) ==
 \* (the new leader drives log advancement), the entry must be in a
 \* majority of logs, and must not already be committed.  The IsLeader
 \* guard ensures that a stale leader with expired lease cannot advance
-\* its commit index — in MicroRaft, AdvanceCommitIndex is driven by
-\* AppendEntries responses, which a stale leader does not receive
-\* (followers in a higher term reject its requests).
+\* its commit index — in the consensus core, commit-index advancement
+\* is driven by AppendEntries / LeaderHeartbeatAck responses, which a
+\* stale leader does not receive (followers in a higher term reject
+\* its requests).
 NewLeaderCommitOrphanEntry ==
     \E s \in 1..MaxSeqId :
         /\ s \notin committedEntries
@@ -1646,12 +1801,11 @@ RaftLogGC(m) ==
 \* remain in memstore/raftLog if already present and can be applied
 \* via normal FollowerBeginBatchApply / FollowerApplyMarker.
 \*
-\* MicroRaft implementation: replaces InstallSnapshotRequestHandler /
-\* SnapshotChunkCollector.  sendAppendEntriesRequest() detects that
-\* the follower's nextIndex is behind the leader's first available
-\* log entry and sends a CatchUpReference instead.  The follower's
-\* StateMachine.installSnapshot() receives HFile path metadata and
-\* triggers the HDFS-based catch-up path.
+\* Implementation: this action models the design-target shared-storage
+\* state-transfer path. The follower's log is truncated to the snapshot
+\* index, and the data that was below the snapshot is recoverable — via
+\* HFiles on HDFS in the design-target path, via replayed chunks plus
+\* locally-flushed HFiles in the chunked path.
 InstallSnapshot(leader, follower) ==
     /\ role[leader] = "Leader"
     /\ follower # leader
@@ -1726,23 +1880,38 @@ InstallSnapshot(leader, follower) ==
 \* no-op).
 \*
 \* The raftLog is set to the leader's raftLog unioned with all
-\* committed entries not covered by a flush marker.  In the real
-\* system, RAFT's leader completeness property guarantees the leader
-\* has all committed entries in its log (enforced by the log
-\* up-to-date check in RequestVote, which this model omits for
+\* committed entries not covered by a strictly-later flush marker.
+\* In the real system, RAFT's leader completeness property guarantees
+\* the leader has all committed entries in its log (enforced by the
+\* log up-to-date check in RequestVote, which this model omits for
 \* simplicity).  The union compensates for the omission: committed
 \* entries that must be in a majority of raftLogs (those without a
 \* covering flush marker) are included regardless of whether the
-\* model's leader happens to have them.  Entries covered by a flush
-\* marker are in HFiles on HDFS and need not be in any raftLog.
+\* model's leader happens to have them.  Entries strictly below a
+\* flush marker (data covered by HFiles on HDFS) need not be in any
+\* raftLog; the flush marker entry itself, however, is at a seqId
+\* strictly greater than its own flushDropBound (the marker is the
+\* control entry, not part of the snapshot data) and therefore must
+\* be preserved in the bootstrapping member's raftLog so that
+\* CatchUpDataIntegrity remains satisfied for the marker — using a
+\* strict inequality (`f > s`) prevents a marker from being treated
+\* as "covered by itself" and silently dropped by bootstrap, which
+\* TLC found could leave a marker in only a minority of raftLogs
+\* after a stale-log new leader (model abstraction omitting the log
+\* up-to-date check) bootstrapped a follower against its empty log.
 \*
-\* MicroRaft implementation: replaces the standard InstallSnapshot
-\* chunk transfer.  sendAppendEntriesRequest() detects that the
+\* Implementation: this action abstracts both production catch-up paths
+\* into one atomic step.  sendAppendEntriesRequest() detects that the
 \* follower's nextIndex is 0 (or behind the leader's first available
-\* log entry) and sends either AppendEntries with the full log tail
-\* or a CatchUpReference containing HFile paths and the flush seqId.
-\* The follower's StateMachine.installSnapshot() receives HFile path
-\* metadata and triggers the HDFS-based catch-up path.
+\* log entry) and either delivers the log tail via AppendEntries
+\* (sendCatchupAppendsIfNeeded) or transitions to chunked
+\* InstallSnapshot via SnapshotChunkCollector +
+\* InstallSnapshotRequestHandler (StateMachine.installSnapshot
+\* receives the chunk).  The design-target shared-storage path
+\* (CatchUpReference + StateMachine.installSnapshotReference) is
+\* defined in protobuf and handler scaffolding but is not populated
+\* or invoked in production today; both paths are observationally
+\* equivalent at this spec's abstraction level.
 NewMemberBootstrap(m) ==
     \E leader \in Members :
         /\ role[leader] = "Leader"
@@ -1759,7 +1928,7 @@ NewMemberBootstrap(m) ==
            \/ flushPhase[m] # "Idle"
            \/ promotionPhase[m] # "None"
         /\ LET uncoveredCommitted == {s \in committedEntries :
-                   ~\E f \in flushMarkerEntries : f >= s}
+                   ~\E f \in flushMarkerEntries : f > s}
            IN
             /\ role'             = [role            EXCEPT ![m] = "Follower"]
             /\ currentTerm'      = [currentTerm     EXCEPT ![m] = currentTerm[leader]]
@@ -1851,7 +2020,7 @@ AtomicCompleteWriteAndAck(m) ==
 ElectionAndLeadershipActions(m) ==
     \/ Timeout(m)
     \/ BecomeLeader(m)
-    \/ Heartbeat(m)
+    \/ LeaderHeartbeat(m)
     \/ StepDown(m)
     \/ LeaderLeaseExpiry(m)
 
@@ -2155,8 +2324,9 @@ PromotionReadWriteGuard ==
 \*     ApplicableEntries(m) = {} (all committed entries applied,
 \*     with valid lease, before promotion finishes)
 \*   - NewLeaderCommitOrphanEntry atomically applying committed entries
-\*     to the leader's memstore (mirroring MicroRaft's single-threaded
-\*     AdvanceCommitIndex + runOperation() callback)
+\*     to the leader's memstore (mirroring the consensus core's
+\*     single-threaded AdvanceCommitIndexTask + runOperation() callback,
+\*     with one RaftNodeExecutor per group)
 \*   - BeginWrite assigning writeSeqId from the monotonic nextSeqId
 \*     counter, which is always > max(committedEntries)
 PromotionMVCCContinuity ==

@@ -32,6 +32,15 @@ The base spec exports parameterized building-block operators that collect all si
 
 Dual-group compositions (`MultiGroupRaftRegionReplica.tla` and `MergeRaftRegionReplica.tla`) share common infrastructure via `DualGroupBase.tla`, which provides per-group variable declarations, INSTANCE blocks, variable tuples, and the `PerGroupSafety` invariant. Single-group MC configurations share common constants via `MCRaftRegionReplica_base.tla`.
 
+The specification intentionally abstracts several features of `hbase-consensus` that do not change the safety / liveness story at this level. These are documented in detail in the spec header (`RaftRegionReplica.tla`, "Implementation features intentionally abstracted") and listed here for orientation:
+- The wire-level distinction between `LeaderHeartbeat` (lightweight, steady-state liveness) and `AppendEntriesRequest` (log replication, snapshot trigger, `matchIndex` discovery, membership-op preparation): the spec has a single atomic `LeaderHeartbeat` action that simultaneously resets responder election timers and refreshes the leader's lease. The implementation splits the round across two wire messages (`LeaderHeartbeat` broadcast + per-follower `LeaderHeartbeatAck`) for performance, but at this abstraction level the round must be modeled atomically because the `LeaseExpiresBeforeElection` argument requires the lease refresh and follower timer-resets to be causally bound by the same round-trip. Log replication is folded into the atomic `RAFTCommitWrite` / `FlushRAFTPropose` / `ProposeMarker` actions.
+- The `lastVerifiedLogIndex` clamp on commit-index advancement from heartbeats — unnecessary at this abstraction level because `RAFTCommitWrite` is atomic.
+- Linearizable queries (`QueryState`, `querySequenceNumber`, the fail-pending-and-bump-QSN-on-leader-self-removal handling). Reads do not flow through the consensus layer in the spec.
+- `REMOVE_MEMBER` / `ADD_LEARNER` / `ADD_OR_PROMOTE_TO_FOLLOWER` `UpdateRaftGroupMembersOp` entries as replicated log entries, including leader self-removal that drives the node into `RaftNodeStatus.TERMINATED`. Membership in the spec is the static `CONSTANT Members` set.
+- `LEARNER` role / non-voting members. The spec's `role` ranges over `{Follower, Candidate, Leader}`.
+- `PreVote` as a distinct round; subsumed in the leader-stickiness guard on `RequestVote`.
+- Chunked `InstallSnapshot` transfer (`SnapshotChunkCollector`). The spec models the design-target shared-storage `CatchUpReference` path; both paths are observationally equivalent here (follower log truncated to snapshot index + data recoverable via HDFS HFiles or replayed chunks).
+
 The specification defines 14 safety invariants and 5 liveness properties verified by TLC:
 
 | # | Invariant | Category |
@@ -104,7 +113,7 @@ This domain retains full data-path depth (MaxSeqId = 3) while collapsing the tim
 
 #### Election Domain (`MCRaftRegionReplica_election`)
 
-This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeoutMin = 4, MaxClock = 4) while reducing the data-path dimension to MaxSeqId = 1, allowing at most one write or flush per trace.  No actions are merged or removed; the original unmodified `Next` relation with all 31 actions is used.
+This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeoutMin = 4, MaxClock = 4) while reducing the data-path dimension to MaxSeqId = 1, allowing at most one write or flush per trace.
 
 ### Multi-Group (`MCRaftRegionReplica_multigroup`)
 

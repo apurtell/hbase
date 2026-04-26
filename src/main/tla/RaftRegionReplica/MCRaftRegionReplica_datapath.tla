@@ -38,7 +38,8 @@
  * 1. FollowerBatchApply (merges FollowerBeginBatchApply +
  *    FollowerCompleteBatchApply):  The intermediate state (fApplyBatch
  *    non-empty between begin and complete) represents a within-callback
- *    state on MicroRaft's single-threaded actor.  A JVM crash
+ *    state on the consensus core's single-threaded actor (one
+ *    RaftNodeExecutor per group).  A JVM crash
  *    mid-callback produces the same post-crash state as crash-before-
  *    callback (CrashRestart resets both memstore and fApplyBatch to {}).
  *    The merged action computes the batch and applies it to memstore
