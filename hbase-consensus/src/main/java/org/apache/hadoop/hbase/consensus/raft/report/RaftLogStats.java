@@ -20,9 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.report;
 import java.util.Map;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 
-/**
- * Contains statistics about a Raft node's Raft log.
- */
+/** Contains statistics about a Raft node's Raft log. */
 public interface RaftLogStats {
   /**
    * Returns index of the highest log entry known to be committed.

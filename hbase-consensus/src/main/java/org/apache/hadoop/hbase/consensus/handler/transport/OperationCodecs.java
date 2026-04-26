@@ -22,9 +22,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
 
-/**
- * Static helpers for composing {@link OperationCodec}s.
- */
+/** Static helpers for composing {@link OperationCodec}s. */
 @InterfaceAudience.Private
 public final class OperationCodecs {
   private OperationCodecs() {

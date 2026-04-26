@@ -26,9 +26,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
 
-/**
- * Used when a Raft node works transiently (its state is not persisted).
- */
+/** Used when a Raft node works transiently (its state is not persisted). */
 public class NopRaftStore implements RaftStore {
   @Override
   public void persistAndFlushLocalEndpoint(

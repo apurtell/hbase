@@ -58,17 +58,10 @@ public final class RaftLog {
    * Important: Log entry indices start from 1, not 0.
    */
   private final ArrayRingbuffer<LogEntry> log;
-  /**
-   * Used for reflecting log changes to persistent storage.
-   */
   private final RaftStore store;
-  /**
-   * Latest snapshot entry
-   */
+  /** Latest snapshot entry */
   private SnapshotEntry snapshot = new DefaultSnapshotEntryOrBuilder().build();
-  /**
-   * Indicates if there is a change after the last {@link #flush()} call.
-   */
+  /** Indicates if there is a change after the last {@link #flush()} call. */
   private boolean dirty;
 
   private RaftLog(int capacity, RaftStore store) {
@@ -197,7 +190,6 @@ public final class RaftLog {
   }
 
   /**
-   * Returns snapshot entry index.
    */
   public long snapshotIndex() {
     return snapshot.getIndex();
@@ -395,9 +387,6 @@ public final class RaftLog {
     }
   }
 
-  /**
-   * Returns snapshot entry.
-   */
   public SnapshotEntry snapshotEntry() {
     return snapshot;
   }

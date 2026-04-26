@@ -42,9 +42,7 @@ public interface SnapshotEntry extends BaseLogEntry {
   @NonNull
   RaftGroupMembersView getGroupMembersView();
 
-  /**
-   * The builder interface for {@link SnapshotEntry}.
-   */
+  /** The builder interface for {@link SnapshotEntry}. */
   interface SnapshotEntryBuilder {
     @NonNull
     SnapshotEntryBuilder setIndex(long index);

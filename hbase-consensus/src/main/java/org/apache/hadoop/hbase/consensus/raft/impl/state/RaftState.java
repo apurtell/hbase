@@ -57,32 +57,20 @@ import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * State maintained by each Raft node.
- */
+/** State maintained by each Raft node. **/
 @SuppressWarnings({ "checkstyle:methodcount" })
 public final class RaftState {
   private static final Logger LOGGER = LoggerFactory.getLogger(RaftState.class);
-  /**
-   * Unique ID of the Raft group that this Raft node belongs to
-   */
+  /** Unique ID of the Raft group that this Raft node belongs to. */
   private final Object groupId;
-  /**
-   * Endpoint of this Raft node
-   */
+  /** Endpoint of this Raft node. */
   private final RaftEndpoint localEndpoint;
-  /**
-   * Initial members of the Raft group
-   * <p>
-   * [PERSISTENT]
-   */
+  /** Initial members of the Raft group. */
   private final RaftGroupMembersState initialGroupMembers;
-  /**
-   * Used for reflecting persistent-state changes to persistent storage.
-   */
+  /** Used for reflecting persistent-state changes to persistent storage. */
   private final RaftStore store;
   /**
-   * Raft log entries; each log entry contains command for state machine, and the term when entry
+   * Raft log entries. Each log entry contains command for state machine, and the term when entry
    * was received by Raft group leader. First log index is 1.
    */
   private final RaftLog log;
@@ -98,18 +86,14 @@ public final class RaftState {
    * not advance enough before the timeout, a query's result future is completed with an exception.
    */
   private final NavigableMap<Long, Set<QueryContainer>> scheduledQueries = new TreeMap<>();
-  /**
-   * Latest committed group members of the Raft group.
-   */
+  /** Latest committed group members of the Raft group. */
   private volatile RaftGroupMembersState committedGroupMembers;
   /**
    * Latest applied group members of the Raft group. This member may not be committed yet and can be
    * reverted. (initially equal to {@link #committedGroupMembers})
    */
   private volatile RaftGroupMembersState effectiveGroupMembers;
-  /**
-   * Role of this Raft node.
-   */
+  /** Role of this Raft node. */
   private volatile RaftRole role;
   /**
    * Latest term this Raft node has seen along with the latest known Raft leader endpoint (or null
@@ -169,9 +153,7 @@ public final class RaftState {
    * when {@link #toLeader(long)} or {@link #toFollower(int)} is called.
    */
   private CandidateState candidateState;
-  /**
-   * State maintained by the Raft group leader during leadership transfer.
-   */
+  /** State maintained by the Raft group leader during leadership transfer. */
   private LeadershipTransferState leadershipTransferState;
   /**
    * State maintained by followers to keep received snapshot chunks during snapshot installation.
@@ -252,114 +234,84 @@ public final class RaftState {
     return new RaftState(groupId, restoredState, logCapacity, store, modelFactory);
   }
 
-  /**
-   * Returns the unique ID of the Raft group that this Raft node belongs to.
-   */
+  /** Returns the unique ID of the Raft group that this Raft node belongs to. */
   public Object groupId() {
     return groupId;
   }
 
-  /**
-   * Returns the endpoint of this Raft node.
-   */
+  /** Returns the endpoint of this Raft node. */
   public RaftEndpoint localEndpoint() {
     return localEndpoint;
   }
 
-  /**
-   * Returns the initial members of the Raft group.
-   */
+  /** Returns the initial members of the Raft group. */
   public RaftGroupMembersState initialMembers() {
     return initialGroupMembers;
   }
 
-  /**
-   * Returns all members in the effective group members.
-   */
+  /** Returns all members in the effective group members. */
   public Collection<RaftEndpoint> members() {
     return effectiveGroupMembers.getMembers();
   }
 
-  /**
-   * Returns all voting members in the effective group members.
-   */
+  /** Returns all voting members in the effective group members. */
   public Collection<RaftEndpoint> votingMembers() {
     return effectiveGroupMembers.getVotingMembers();
   }
 
-  /**
-   * Returns remote members in the effective group members.
-   */
+  /** Returns remote members in the effective group members. */
   public Collection<RaftEndpoint> remoteMembers() {
     return effectiveGroupMembers.remoteMembers();
   }
 
-  /**
-   * Returns remote voting members in the effective group members.
-   */
+  /** Returns remote voting members in the effective group members. */
   public Collection<RaftEndpoint> remoteVotingMembers() {
     return effectiveGroupMembers.remoteVotingMembers();
   }
 
-  /**
-   * Returns number of members in the effective group members.
-   */
+  /** Returns number of members in the effective group members. */
   public int memberCount() {
     return effectiveGroupMembers.memberCount();
   }
 
-  /**
-   * Returns number of voting members in the effective group members.
-   */
+  /** Returns number of voting members in the effective group members. */
   public int votingMemberCount() {
     return effectiveGroupMembers.votingMemberCount();
   }
 
-  /**
-   * Returns the committed group members.
-   */
+  /** Returns the committed group members. */
   public RaftGroupMembersState committedGroupMembers() {
     return committedGroupMembers;
   }
 
-  /**
-   * Returns the effective group members.
-   */
+  /** Returns the effective group members. */
   public RaftGroupMembersState effectiveGroupMembers() {
     return effectiveGroupMembers;
   }
 
-  /**
-   * Returns role of this Raft node.
-   */
+  /** Returns role of this Raft node. */
   public RaftRole role() {
     return role;
   }
 
-  /**
-   * Returns the latest term information this Raft node has seen.
-   */
+  /** Returns the latest term information this Raft node has seen. */
   public RaftTermState termState() {
     return termState;
   }
 
-  /**
-   * Returns endpoint of the known leader in the current term.
-   */
+  /** Returns endpoint of the known leader in the current term. */
   public RaftEndpoint leader() {
     return termState.getLeaderEndpoint();
   }
 
-  /**
-   * Returns index of the highest log entry known to be committed.
-   */
+  /** Returns index of the highest log entry known to be committed. */
   public long commitIndex() {
     return commitIndex;
   }
 
   /**
-   * Updates the commit index. Maintains the invariant {@code lastVerifiedLogIndex >= commitIndex}:
-   * callers on a follower are expected to have already advanced {@code lastVerifiedLogIndex} (via
+   * Updates the commit index. Maintains the invariant {@code lastVerifiedLogIndex >= commitIndex}
+   * Callers on a follower are expected to have already advanced {@code lastVerifiedLogIndex} (via
    * {@code lastVerifiedLogIndex(long)}) before raising the commit index past it; on the leader
    * (where {@code tryAdvanceCommitIndex} drives commit advance directly)
    * {@code lastVerifiedLogIndex} is auto-bumped here since the leader's own log is the source of
@@ -376,8 +328,7 @@ public final class RaftState {
 
   /**
    * Returns the highest local log index proven to match the current leader's log. Used by
-   * {@code LeaderHeartbeatHandler} to bound commit-index advancement from a leader heartbeat (which
-   * carries no per-entry consistency check).
+   * {@code LeaderHeartbeatHandler} to bound commit-index advancement from a leader heartbeat.
    */
   public long lastVerifiedLogIndex() {
     return lastVerifiedLogIndex;
@@ -394,39 +345,29 @@ public final class RaftState {
     lastVerifiedLogIndex = index;
   }
 
-  /**
-   * Returns index of the highest log entry applied to state machine
-   */
+  /** Returns index of the highest log entry applied to state machine */
   public long lastApplied() {
     return lastApplied;
   }
 
-  /**
-   * Updates the last applied index
-   */
+  /** Updates the last applied index */
   public void lastApplied(long index) {
     assert index >= lastApplied
       : "new last applied: " + index + " is smaller than current last applied: " + lastApplied;
     lastApplied = index;
   }
 
-  /**
-   * Returns the Raft log.
-   */
+  /** Returns the Raft log. */
   public RaftLog log() {
     return log;
   }
 
-  /**
-   * Returns the leader state.
-   */
+  /** Returns the leader state. */
   public LeaderState leaderState() {
     return leaderState;
   }
 
-  /**
-   * Returns the candidate state.
-   */
+  /** Returns the candidate state. */
   public CandidateState candidateState() {
     return candidateState;
   }
@@ -447,7 +388,7 @@ public final class RaftState {
 
   /**
    * Switches this Raft node to follower role. Clears leader and (pre)candidate states, updates the
-   * term. current term
+   * term.
    */
   public void toFollower(int term) {
     int oldTerm = termState.getTerm();
@@ -487,23 +428,17 @@ public final class RaftState {
     }
   }
 
-  /**
-   * Returns the latest term this Raft node has seen.
-   */
+  /** Returns the latest term this Raft node has seen. */
   public int term() {
     return termState.getTerm();
   }
 
-  /**
-   * Returns the endpoint this Raft note voted for in the current term.
-   */
+  /** Returns the endpoint this Raft note voted for in the current term. */
   public RaftEndpoint votedEndpoint() {
     return termState.getVotedEndpoint();
   }
 
-  /**
-   * Completes the current leadership transfer process with the given result and resets it.
-   */
+  /** Completes the current leadership transfer process with the given result and resets it. */
   public void completeLeadershipTransfer(Object result) {
     if (leadershipTransferState == null) {
       return;
@@ -553,19 +488,15 @@ public final class RaftState {
     }
   }
 
-  /**
-   * Returns the quorum size for a candidate to win leader election.
-   */
+  /** Returns the quorum size for a candidate to win leader election. */
   public int leaderElectionQuorumSize() {
     return effectiveGroupMembers.getMajorityQuorumSize();
   }
 
-  /**
-   * Returns the quorum size for committing a log entry.
-   */
+  /** Returns the quorum size for committing a log entry. */
   public int logReplicationQuorumSize() {
     /*
-     * We use the improved majority quorums technique of FPaxos here. In a cluster of size N * 2, we
+     * We use the improved majority quorums technique of FPaxos here. In a cluster of size N * 2 we
      * can commit log entries after collecting acks from N nodes. Since leader elections are done
      * with majority quorums (N + 1), we still guarantee that a new leader will always have all
      * committed log entries. Here, we treat the 2-node group as a special case and use the normal
@@ -579,9 +510,7 @@ public final class RaftState {
       || quorumSize == 2 ? quorumSize : quorumSize - 1;
   }
 
-  /**
-   * Persist a vote for the endpoint in current term during leader election.
-   */
+  /** Persist a vote for the endpoint in current term during leader election. */
   public void grantVote(int term, RaftEndpoint member) {
     RaftTermState newTermState = termState.grantVote(term, member);
     persistTerm(newTermState);
@@ -601,9 +530,7 @@ public final class RaftState {
       log.lastLogOrSnapshotIndex(), currentTimeMillis);
   }
 
-  /**
-   * Updates the known leader to the given endpoint.
-   */
+  /** Updates the known leader to the given endpoint. */
   public void leader(RaftEndpoint endpoint) {
     termState = termState.withLeader(endpoint);
   }
@@ -631,9 +558,7 @@ public final class RaftState {
     preCandidateState.grantVote(localEndpoint);
   }
 
-  /**
-   * Returns the pre-candidate state.
-   */
+  /** Returns the pre-candidate state. */
   public CandidateState preCandidateState() {
     return preCandidateState;
   }
@@ -767,9 +692,7 @@ public final class RaftState {
     return false;
   }
 
-  /**
-   * Returns the current leadership transfer process.
-   */
+  /** Returns the current leadership transfer process. */
   public LeadershipTransferState leadershipTransferState() {
     return leadershipTransferState;
   }
@@ -878,10 +801,7 @@ public final class RaftState {
     scheduledQueries.computeIfAbsent(minCommitIndex, (v) -> new LinkedHashSet<>(1)).add(query);
   }
 
-  /**
-   * Completes futures of the all queries waiting to be executed at a future commit index. the error
-   * to complete the futures of the queries waiting to be executed.
-   */
+  /** Completes futures of the all queries waiting to be executed at a future commit index. */
   public void invalidateScheduledQueries() {
     if (scheduledQueries.isEmpty()) {
       return;
@@ -901,8 +821,7 @@ public final class RaftState {
 
   /**
    * Tries to remove the given query at the given minimum commit index and returns true if
-   * successful. The given query might have been already executed, in which case returns false. the
-   * minimum commit index to execute the given query the query to be executed
+   * successful. The given query might have been already executed, in which case returns false.
    * @return true if successfully removed the given query, false otherwise
    */
   public boolean removeScheduledQuery(long minCommitIndex, QueryContainer query) {

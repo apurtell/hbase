@@ -30,8 +30,8 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 /**
  * The default implementation of {@link RaftNodeExecutor}.
  * <p>
- * Internally uses a single-threaded {@link ScheduledExecutorService} to execute tasks submitted and
- * scheduled by {@link RaftNode}.
+ * Uses a single-threaded {@link ScheduledExecutorService} to execute tasks submitted and scheduled
+ * by {@link RaftNode}.
  * @see RaftNode
  * @see RaftNodeExecutor
  */

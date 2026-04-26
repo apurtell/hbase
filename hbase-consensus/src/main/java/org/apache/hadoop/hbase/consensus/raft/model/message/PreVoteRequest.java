@@ -31,9 +31,7 @@ public interface PreVoteRequest extends RaftMessage {
 
   long getLastLogIndex();
 
-  /**
-   * The builder interface for {@link PreVoteRequest}.
-   */
+  /** The builder interface for {@link PreVoteRequest}. */
   interface PreVoteRequestBuilder extends RaftMessageBuilder<PreVoteRequest> {
     @NonNull
     PreVoteRequestBuilder setGroupId(@NonNull Object groupId);

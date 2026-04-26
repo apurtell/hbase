@@ -25,8 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 
 /**
  * The abstraction used by {@link RaftNode} to execute the Raft consensus algorithm with the Actor
- * model. You can read about the Actor Model at the following link:
- * https://en.wikipedia.org/wiki/Actor_model
+ * model.
  * <p>
  * A Raft node runs by submitting tasks to its Raft node executor. All tasks submitted by a Raft
  * node must be executed serially, with maintaining the happens-before relationship, so that the
@@ -34,7 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
  * synchronization.
  * <p>
  * A default implementation, {@link DefaultRaftNodeExecutor} is provided and should be suitable for
- * most of the use-cases.
+ * most use cases.
  * <p>
  * A {@link RaftNodeExecutor} implementation can implement {@link RaftNodeLifecycleAware} to perform
  * initialization and clean up work during {@link RaftNode} startup and termination. However, there
@@ -53,7 +52,7 @@ public interface RaftNodeExecutor {
    * and the happens-before relationship must be maintained between given tasks of the Raft node.
    * <p>
    * The underlying platform is free to execute the given task immediately if it fits to the defined
-   * guarantees. the task to be executed.
+   * guarantees.
    */
   void execute(@NonNull Runnable task);
 
@@ -69,10 +68,9 @@ public interface RaftNodeExecutor {
   /**
    * Schedules the task on the underlying platform to be executed after the given delay.
    * <p>
-   * Please note that even though the scheduling can be offloaded to another thread, the given task
-   * must be executed in a single-threaded manner and the happens-before relationship must be
-   * maintained between given tasks of the Raft node. the task to be executed in future the time
-   * from now to delay execution the time unit of the delay
+   * Note that even though the scheduling can be offloaded to another thread, the given task must be
+   * executed in a single-threaded manner and the happens-before relationship must be maintained
+   * between given tasks of the Raft node.
    */
   void schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit);
 }

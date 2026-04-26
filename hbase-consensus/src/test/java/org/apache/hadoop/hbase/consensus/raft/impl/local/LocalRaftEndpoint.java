@@ -55,11 +55,10 @@ public final class LocalRaftEndpoint implements RaftEndpoint {
     if (this == o) {
       return true;
     }
-    if (o == null || getClass() != o.getClass()) {
+    if (!(o instanceof RaftEndpoint)) {
       return false;
     }
-    LocalRaftEndpoint that = (LocalRaftEndpoint) o;
-    return id.equals(that.id);
+    return id.equals(String.valueOf(((RaftEndpoint) o).getId()));
   }
 
   @Override

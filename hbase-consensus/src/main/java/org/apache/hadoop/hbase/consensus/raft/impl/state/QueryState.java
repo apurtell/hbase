@@ -41,13 +41,9 @@ import org.slf4j.LoggerFactory;
 public final class QueryState {
   private static final Logger LOGGER = LoggerFactory.getLogger(QueryState.class);
 
-  /**
-   * Queries waiting to be executed.
-   */
+  /** Queries waiting to be executed. */
   private final List<QueryContainer> queries = new ArrayList<>();
-  /**
-   * The set of followers acknowledged the leader in the current query round.
-   */
+  /** The set of followers acknowledged the leader in the current query round. */
   private final Set<RaftEndpoint> acks = new HashSet<>();
   /**
    * The minimum log index required to be committed and applied on the leader to execute the
@@ -111,16 +107,12 @@ public final class QueryState {
     return added;
   }
 
-  /**
-   * Returns {@code true} if the given follower is removed from the ack list.
-   */
+  /** Returns {@code true} if the given follower is removed from the ack list. */
   public boolean removeAck(RaftEndpoint follower) {
     return acks.remove(follower);
   }
 
-  /**
-   * Returns the index of the heartbeat round to execute the currently waiting queries.
-   */
+  /** Returns the index of the heartbeat round to execute the currently waiting queries. */
   public long querySequenceNumber() {
     return querySequenceNumber;
   }
@@ -159,17 +151,13 @@ public final class QueryState {
     return ok;
   }
 
-  /**
-   * Returns the number of collected acks for the current query round.
-   */
+  /** Returns the number of collected acks for the current query round. */
   private int ackCount() {
     // +1 is for the leader itself.
     return acks.size() + 1;
   }
 
-  /**
-   * Returns {@code true} if more acks are needed to complete the given quorum size.
-   */
+  /** Returns {@code true} if more acks are needed to complete the given quorum size. */
   public boolean isAckNeeded(RaftEndpoint follower, int quorumSize) {
     boolean needed = queryCount() > 0 && !acks.contains(follower) && ackCount() < quorumSize;
     LOGGER.trace(
@@ -180,23 +168,17 @@ public final class QueryState {
     return needed;
   }
 
-  /**
-   * Returns the number of queries waiting for execution.
-   */
+  /** Returns the number of queries waiting for execution. */
   public int queryCount() {
     return queries.size();
   }
 
-  /**
-   * Returns the queries waiting to be executed.
-   */
+  /** Returns the queries waiting to be executed. */
   public Collection<QueryContainer> queries() {
     return queries;
   }
 
-  /**
-   * Fails the pending query futures with the given throwable.
-   */
+  /** Fails the pending query futures with the given throwable. */
   public void fail(Throwable t) {
     LOGGER.trace("TRACE> QueryState.fail queries={} acks={} qsn={} cause={}", queries.size(), acks,
       querySequenceNumber, t.getClass().getSimpleName(), t);
@@ -206,9 +188,7 @@ public final class QueryState {
     reset();
   }
 
-  /**
-   * Resets the collection of waiting queries and acks.
-   */
+  /** Resets the collection of waiting queries and acks. */
   public void reset() {
     LOGGER.trace("TRACE> QueryState.reset queries={} acks={} qsn={}", queries.size(), acks,
       querySequenceNumber);

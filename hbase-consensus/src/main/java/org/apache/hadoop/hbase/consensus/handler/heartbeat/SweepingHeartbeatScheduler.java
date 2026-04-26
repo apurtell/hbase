@@ -41,11 +41,11 @@ import org.slf4j.LoggerFactory;
  * {@link RaftNodeImpl} from a single {@link ScheduledThreadPoolExecutor}.
  * <p>
  * On each tick the sweeper enqueues {@link RaftNodeImpl#runHeartbeatTick()} on each registered
- * node's own {@link RaftNodeExecutor} (preserving the per-group serial-execution contract). The
+ * node's own {@link RaftNodeExecutor}, preserving the per-group serial execution contract. The
  * outbound {@code LeaderHeartbeat}s produced by all groups in that flush window therefore reach the
  * per-peer mailboxes of the {@code CoalescingTransport} together, so the wire sees a single
  * {@code HEARTBEAT_BATCH} {@code ConsensusFrame} per peer per tick regardless of the number of
- * registered Raft groups.
+ * registered groups.
  */
 @InterfaceAudience.Private
 public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, AutoCloseable {
@@ -107,8 +107,7 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
 
   /**
    * Registers the given node so its {@link RaftNodeImpl#runHeartbeatTick()} is enqueued on every
-   * sweep tick. Same {@code (groupId, node)} pair is a no-op; a different node for the same groupId
-   * throws {@link IllegalArgumentException}. Throws {@link IllegalStateException} after
+   * sweep tick. throws {@link IllegalArgumentException}. Throws {@link IllegalStateException} after
    * {@link #close()}.
    */
   @Override
@@ -125,7 +124,6 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
     }
   }
 
-  /** Idempotent: returns silently if the group isn't registered. */
   @Override
   public void unregister(@NonNull RaftNodeImpl node) {
     requireNonNull(node);
@@ -136,7 +134,6 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
     registry.remove(groupId, node);
   }
 
-  /** Idempotent: arms the periodic tick at {@link #intervalMs} cadence. */
   public void start() {
     synchronized (lifecycleLock) {
       if (closed) {
@@ -151,7 +148,6 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
     }
   }
 
-  /** Idempotent: cancels the periodic tick. Does NOT clear the registry. */
   public void stop() {
     synchronized (lifecycleLock) {
       if (!started) {
@@ -166,7 +162,6 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
     }
   }
 
-  /** {@link #stop()} + shuts down the timer thread pool. Idempotent. */
   @Override
   public void close() {
     synchronized (lifecycleLock) {

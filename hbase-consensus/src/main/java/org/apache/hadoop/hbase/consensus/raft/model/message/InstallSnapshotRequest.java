@@ -57,15 +57,11 @@ public interface InstallSnapshotRequest extends RaftMessage {
 
   long getFlowControlSequenceNumber();
 
-  /**
-   * Optional catch-up-by-reference metadata. Ignored by the current chunked install path.
-   */
+  /** Optional catch-up-by-reference metadata. Ignored by the current chunked install path. */
   @Nullable
   CatchUpReference getCatchUpReference();
 
-  /**
-   * The builder interface for {@link InstallSnapshotRequest}.
-   */
+  /** The builder interface for {@link InstallSnapshotRequest}. */
   interface InstallSnapshotRequestBuilder extends RaftMessageBuilder<InstallSnapshotRequest> {
     @NonNull
     InstallSnapshotRequestBuilder setGroupId(@NonNull Object groupId);

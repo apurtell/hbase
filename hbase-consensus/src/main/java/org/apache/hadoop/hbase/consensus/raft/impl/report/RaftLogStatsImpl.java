@@ -25,9 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftLogStats;
 
-/**
- * Contains statistics about a Raft node's local Raft log.
- */
+/** Contains statistics about a Raft node's local Raft log. */
 public final class RaftLogStatsImpl implements RaftLogStats {
   private final long commitIndex;
   private final int lastLogOrSnapshotTerm;

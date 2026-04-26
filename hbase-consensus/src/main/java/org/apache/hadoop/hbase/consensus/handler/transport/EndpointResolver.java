@@ -25,7 +25,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 /**
  * Resolves a {@link RaftEndpoint} to the {@link InetSocketAddress} of the peer node hosting it.
  * <p>
- * Implementations must be safe for concurrent calls.
+ * Implementations must be thread safe.
  */
 @InterfaceAudience.Private
 @FunctionalInterface

@@ -28,9 +28,11 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
- * Default {@link InboundDispatcher}: a thread-safe {@code Object -> RaftNode} registry keyed on
- * {@link RaftNode#getGroupId()}. {@link CoalescingTransport} owns one of these and exposes
- * {@link #discoverNode(RaftNode)} / {@link #undiscoverNode(RaftNode)} on its public surface.
+ * Default {@link InboundDispatcher}.
+ * <p>
+ * A thread-safe {@code Object -> RaftNode} registry keyed on {@link RaftNode#getGroupId()}.
+ * {@link CoalescingTransport} owns one of these and exposes {@link #discoverNode(RaftNode)} /
+ * {@link #undiscoverNode(RaftNode)} on its public surface.
  */
 @InterfaceAudience.Private
 public final class RegistryDispatcher implements InboundDispatcher {

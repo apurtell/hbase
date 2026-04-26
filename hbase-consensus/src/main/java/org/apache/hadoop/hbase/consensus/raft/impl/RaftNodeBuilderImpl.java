@@ -46,9 +46,7 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 
-/**
- * Builder for {@link RaftNode}.
- */
+/** Builder for {@link RaftNode}. */
 public class RaftNodeBuilderImpl implements RaftNodeBuilder {
   private Object groupId;
   private RaftEndpoint localEndpoint;

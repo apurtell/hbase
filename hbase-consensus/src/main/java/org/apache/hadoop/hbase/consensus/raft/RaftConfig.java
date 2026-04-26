@@ -17,7 +17,6 @@
  */
 package org.apache.hadoop.hbase.consensus.raft;
 
-import java.io.Serializable;
 import org.apache.hadoop.hbase.consensus.raft.exception.CannotReplicateException;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 
@@ -27,47 +26,29 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
  * RaftConfig is an immutable configuration class. You can use a RaftConfigBuilder to build a
  * RaftConfig object.
  */
-public final class RaftConfig implements Serializable {
-  /**
-   * The default value for {@link #leaderElectionTimeoutMillis}.
-   */
+public final class RaftConfig {
+  /** The default value for {@link #leaderElectionTimeoutMillis}. */
   public static final long DEFAULT_LEADER_ELECTION_TIMEOUT_MILLIS = 1000;
-  /**
-   * The default value for {@link #leaderHeartbeatTimeoutMillis} (10 seconds).
-   */
+  /** The default value for {@link #leaderHeartbeatTimeoutMillis} (10 seconds). */
   public static final long DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MILLIS = 10_000;
-  /**
-   * The default value for {@link #leaderHeartbeatPeriodMillis} (2 seconds).
-   */
+  /** The default value for {@link #leaderHeartbeatPeriodMillis} (2 seconds). */
   public static final long DEFAULT_LEADER_HEARTBEAT_PERIOD_MILLIS = 2000;
   /**
-   * Default upper bound on clock skew between nodes (milliseconds), used to derive the leader lease
+   * Default upper bound on clock skew between nodes (milliseconds), used to derive the leade lease
    * duration {@code leaderHeartbeatTimeoutMillis - 2 * maxClockDriftMillis}.
    */
   public static final long DEFAULT_MAX_CLOCK_DRIFT_MILLIS = 200;
-  /**
-   * The default value for {@link #maxPendingLogEntryCount}.
-   */
+  /** The default value for {@link #maxPendingLogEntryCount}. */
   public static final int DEFAULT_MAX_PENDING_LOG_ENTRY_COUNT = 5000;
-  /**
-   * The default value for {@link #appendEntriesRequestBatchSize}.
-   */
+  /** The default value for {@link #appendEntriesRequestBatchSize}. */
   public static final int DEFAULT_APPEND_ENTRIES_REQUEST_BATCH_SIZE = 1000;
-  /**
-   * The default value for {@link #commitCountToTakeSnapshot}.
-   */
+  /** The default value for {@link #commitCountToTakeSnapshot}. */
   public static final int DEFAULT_COMMIT_COUNT_TO_TAKE_SNAPSHOT = 50000;
-  /**
-   * The default value for {@link #transferSnapshotsFromFollowersEnabled}
-   */
+  /** The default value for {@link #transferSnapshotsFromFollowersEnabled}. */
   public static final boolean DEFAULT_TRANSFER_SNAPSHOTS_FROM_FOLLOWERS_ENABLED = true;
-  /**
-   * The default value for {@link #raftNodeReportPublishPeriodSecs}.
-   */
+  /** The default value for {@link #raftNodeReportPublishPeriodSecs}. */
   public static final int DEFAULT_RAFT_NODE_REPORT_PUBLISH_PERIOD_SECS = 10;
-  /**
-   * The config object with default configuration.
-   */
+  /** The config object with default configuration. */
   public static final RaftConfig DEFAULT_RAFT_CONFIG = new RaftConfigBuilder().build();
   /**
    * Duration of leader election rounds in milliseconds. If a candidate cannot win majority votes
@@ -140,9 +121,7 @@ public final class RaftConfig implements Serializable {
    */
   private final int raftNodeReportPublishPeriodSecs;
 
-  /**
-   * Creates a config object with the given parameters.
-   */
+  /** Creates a config object with the given parameters. */
   public RaftConfig(long leaderElectionTimeoutMillis, long leaderHeartbeatPeriodMillis,
     long leaderHeartbeatTimeoutMillis, long maxClockDriftMillis, int appendEntriesRequestBatchSize,
     int commitCountToTakeSnapshot, int maxPendingLogEntryCount,
@@ -264,9 +243,7 @@ public final class RaftConfig implements Serializable {
       + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs + '}';
   }
 
-  /**
-   * Builder for Raft config
-   */
+  /** Builder for Raft config. */
   public static final class RaftConfigBuilder {
     private long leaderElectionTimeoutMillis = DEFAULT_LEADER_ELECTION_TIMEOUT_MILLIS;
     private long leaderHeartbeatPeriodMillis = DEFAULT_LEADER_HEARTBEAT_PERIOD_MILLIS;

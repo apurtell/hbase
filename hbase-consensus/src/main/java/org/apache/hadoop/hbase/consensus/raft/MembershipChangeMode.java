@@ -35,8 +35,6 @@ public enum MembershipChangeMode {
    * group is re-calculated based on the new number of voting members.
    */
   ADD_OR_PROMOTE_TO_FOLLOWER,
-  /**
-   * Denotes that a Raft endpoint will be removed from the Raft group.
-   */
+  /** Denotes that a Raft endpoint will be removed from the Raft group. */
   REMOVE_MEMBER
 }

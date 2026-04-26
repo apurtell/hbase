@@ -34,11 +34,10 @@ import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
 /**
  * Pluggable per-entry payload compression for {@code LogEntryPB.op_payload}.
  * <p>
- * The configured algorithm only governs the <em>outbound</em> path: messages produced by this node
- * stamp {@code LogEntryPB.op_payload_compression} with the algorithm's enum ordinal. The
- * <em>inbound</em> path resolves the algorithm from that wire field via
- * {@link #algorithmFromOrdinal(int)}, so a receiver can decode entries compressed with any
- * algorithm regardless of how it itself is configured.
+ * The configured algorithm only governs the >outbound path. Messages produced by this node stamp
+ * {@code LogEntryPB.op_payload_compression} with the algorithm's enum ordinal. The inbound path
+ * resolves the algorithm from that wire field via {@link #algorithmFromOrdinal(int)}, so a receiver
+ * can decode entries compressed with any algorithm regardless of how it itself is configured.
  * <p>
  * Construction-time setup, performed once when {@link CoalescingTransport} is built:
  * <ol>
@@ -58,7 +57,7 @@ public final class PayloadCompressor {
   /**
    * Cached snapshot of {@link Compression.Algorithm#values()} so {@link #algorithmFromOrdinal(int)}
    * doesn't allocate a fresh array per call. {@code Compression.Algorithm}'s ordinals are part of
-   * the public contract (the enum's javadoc forbids reordering), so this snapshot is safe to hold.
+   * the public contract, so this snapshot is safe to hold.
    */
   private static final Compression.Algorithm[] ALGORITHMS = Compression.Algorithm.values();
 

@@ -59,7 +59,6 @@ public interface Transport {
    * {@link RaftMessage} objects are designed idempotently. Therefore, if a {@link RaftMessage}
    * object is not sent to the given endpoint, it implies that the source Raft node will not receive
    * a {@link RaftMessage} as response, hence it will re-send the failed {@link RaftMessage} again.
-   * the target endpoint to send the Raft message the Raft message object to be sent
    */
   void send(@NonNull RaftEndpoint target, @NonNull RaftMessage message);
 
@@ -70,8 +69,7 @@ public interface Transport {
    * This method is not required to return a precise information. For instance, the Transport
    * implementation does not need to ping the given endpoint to check if it is reachable when this
    * method is called. Instead, the local Raft node could use a local information, such as recency
-   * of a message sent by or having a TCP connection to the given Raft endpoint. the Raft endpoint
-   * to check reachability
+   * of a message sent by or having a TCP connection to the given Raft endpoint
    * @return true if given endpoint is reachable, false otherwise
    */
   boolean isReachable(@NonNull RaftEndpoint endpoint);

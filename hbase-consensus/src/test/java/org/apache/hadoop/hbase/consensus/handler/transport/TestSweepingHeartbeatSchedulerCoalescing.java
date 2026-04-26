@@ -117,7 +117,8 @@ public class TestSweepingHeartbeatSchedulerCoalescing extends TestBase {
     LocalRaftEndpoint peerEp = LocalRaftEndpoint.newEndpoint();
     Configuration conf = HBaseConfiguration.create();
     conf.setBoolean(TransportConfig.KEY_NATIVE_TRANSPORT, false);
-    // Big batch window so the N enqueues from N "groups" collide on the same flush tick.
+    // BATCH_MS only governs the periodic backstop flush tick (and connect cadence for the
+    // warmup)
     conf.setLong(TransportConfig.KEY_BATCH_MS, 250L);
     conf.setInt(TransportConfig.KEY_IO_THREADS, 1);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
@@ -134,26 +135,40 @@ public class TestSweepingHeartbeatSchedulerCoalescing extends TestBase {
     sender.start();
 
     DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
-    // First, dispatch a single heartbeat to establish the connection (an empty mailbox plus a
-    // long batch window means nothing flushes until something is enqueued AND the connection
-    // is up).
+    // Warmup: dispatch a single heartbeat to bring up the outbound connection. With an empty
+    // mailbox the periodic tick is what triggers the initial connect attempt.
     LeaderHeartbeat warmup = factory.createLeaderHeartbeatBuilder().setGroupId("warmup")
       .setSender(senderEp).setTerm(1).setCommitIndex(0L).build();
     sender.send(peerEp, warmup);
     await().atMost(5, TimeUnit.SECONDS).until(() -> heartbeatBatchFrameCount.get() >= 1);
+    // Wait until the OutboundChannel's underlying Netty channel exists and is active so we can
+    // grab its event loop for the deterministic burst below.
+    await().atMost(5, TimeUnit.SECONDS).until(() -> {
+      OutboundChannel out = sender.peerChannelOrNull(peerEp);
+      return out != null && out.currentChannel() != null && out.currentChannel().isActive();
+    });
     // Reset counters; the rest of the test measures ONLY the steady-state batch.
     heartbeatBatchFrameCount.set(0);
     totalGroupsAcrossFrames.set(0);
     otherFrameCount.set(0);
 
-    // Enqueue N heartbeats from N distinct group ids back-to-back. With BATCH_MS=250 these
-    // should land on the same flush tick and emerge as a single HEARTBEAT_BATCH frame on the
-    // wire whose groups list size == N.
-    for (int g = 0; g < N_GROUPS; g++) {
-      LeaderHeartbeat hb = factory.createLeaderHeartbeatBuilder().setGroupId("g-" + g)
-        .setSender(senderEp).setTerm(1).setCommitIndex(0L).build();
-      sender.send(peerEp, hb);
-    }
+    // Deterministic coalescing. Enqueue all N heartbeats from inside a single task running on
+    // the outbound channel's event loop. The first enqueue CAS-flips OutboundChannel.draining
+    // and submits a drain task via Channel#eventLoop().execute(...). Because we're already on
+    // the event loop, that drain task is deferred until our enqueue task returns. The other
+    // N-1 enqueues observe draining==true and skip submission entirely. When the event loop
+    // finally runs the deferred drain it polls all N pending messages from the MPSC mailbox in
+    // one pass and emits a single HEARTBEAT_BATCH frame whose groups list size == N. No timing
+    // assumptions and no flush-window guesswork.
+    OutboundChannel outbound = sender.peerChannelOrNull(peerEp);
+    Channel outboundCh = outbound.currentChannel();
+    outboundCh.eventLoop().submit(() -> {
+      for (int g = 0; g < N_GROUPS; g++) {
+        LeaderHeartbeat hb = factory.createLeaderHeartbeatBuilder().setGroupId("g-" + g)
+          .setSender(senderEp).setTerm(1).setCommitIndex(0L).build();
+        sender.send(peerEp, hb);
+      }
+    }).sync();
 
     await().atMost(5, TimeUnit.SECONDS).until(() -> totalGroupsAcrossFrames.get() >= N_GROUPS);
 

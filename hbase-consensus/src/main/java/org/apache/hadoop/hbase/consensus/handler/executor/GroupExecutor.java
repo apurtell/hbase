@@ -48,8 +48,8 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
 
   /**
    * Sentinel installed in a schedule trampoline's reference cell when the trampoline runs before
-   * the producer has stored the {@link ScheduledFuture} returned from the underlying pool. Lets us
-   * coordinate the "track-the-future for cancellation" handshake without holding a lock.
+   * the producer has stored the {@link ScheduledFuture} returned from the underlyin pool.
+   * Coordinates the handshake without holding a lock.
    */
   private static final ScheduledFuture<?> TRAMPOLINE_SENTINEL = new SentinelFuture();
 
@@ -63,13 +63,8 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   private final Runnable drainRunnable = this::drain;
 
   /**
-   * Private drain monitor. The JCTools MPSC queue requires single-consumer semantics for
-   * {@code relaxedPoll()} / {@code peek()}, so all mailbox reads happen under this monitor. The
-   * {@link #scheduled} flag prevents two drains from being in flight in the pool simultaneously,
-   * but a producer can win the CAS in the small window between {@code scheduled=false} and the
-   * drain method actually returning, and the resubmitted drain may then start running on a
-   * different worker thread before the first one fully exits. The monitor closes that window
-   * cheaply without compromising lock-free producer behavior.
+   * The JCTools MPSC queue requires single-consumer semantics for {@code relaxedPoll()} /
+   * {@code peek()}, so all mailbox reads happen under this lock.
    */
   private final Object drainLock = new Object();
 
@@ -121,8 +116,6 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
       return;
     }
     if (delay <= 0L) {
-      // Avoid the trampoline + future-tracking overhead when the caller does
-      // not actually need a delay; semantically equivalent to execute().
       execute(task);
       return;
     }
@@ -150,9 +143,8 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
     }
     if (ref.compareAndSet(null, f)) {
       scheduledFutures.add(f);
-      // Termination may have raced with our add; ensure the future is
-      // canceled if the terminate path has already snapshotted/cleared the
-      // set.
+      // Termination may have raced with our add. Ensure the future is canceled if the
+      // terminate path has already snapshotted/cleared the future from the set.
       if (terminated.get() && scheduledFutures.remove(f)) {
         f.cancel(false);
       }
@@ -177,11 +169,10 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   }
 
   /**
-   * Single-threaded drain pass per invocation; ensures {@link #mailbox} is polled by at most one
-   * thread at a time (JCTools MPSC requirement). Runs at most
-   * {@link MultiGroupExecutor#drainBatchCap} tasks then yields back to the parent pool by
-   * re-submitting itself if work remains. The yield is what bounds any one group's share of a
-   * worker thread.
+   * Single-threaded drain pass per invocation. Ensures {@link #mailbox} is polled by at most one
+   * thread at a time. Runs at most {@link MultiGroupExecutor#drainBatchCap} tasks then yields back
+   * to the parent pool by re-submitting itself if work remains. The yield is what bounds any one
+   * group's share of a worker thread.
    */
   private void drain() {
     synchronized (drainLock) {
@@ -219,9 +210,7 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
         return;
       }
 
-      // Lost-wakeup-safe handoff plus cap-driven yield: clear the flag, then if mailbox is
-      // non-empty and re-submit a fresh drain runnable so the pool's FIFO queue interleaves
-      // with other groups.
+      // Lost-wakeup-safe handoff plus cap-driven yield.
       scheduled.set(false);
       boolean hasMore = mailbox.peek() != null;
       if ((hasMore || terminated.get()) && scheduled.compareAndSet(false, true)) {

@@ -22,9 +22,7 @@ import static java.util.Objects.requireNonNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Arrays;
 
-/**
- * Lightweight catch-up metadata for state transfer by reference.
- */
+/** Lightweight catch-up metadata for state transfer by reference. */
 public final class CatchUpReference {
   private final long flushOpSeqId;
   private final long snapshotMaxSeqId;

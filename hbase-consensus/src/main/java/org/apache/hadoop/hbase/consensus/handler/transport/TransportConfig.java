@@ -26,9 +26,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 /**
  * Transport-side configuration parsed from a Hadoop {@link Configuration}.
  * <p>
- * All keys are namespaced under {@code hbase.consensus.*}. Defaults are chosen so the transport is
- * usable out-of-the-box for tests; production deployments are expected to override the port and
- * possibly the watermarks based on operator policy.
+ * All keys are namespaced under {@code hbase.consensus.*}.
  * <p>
  * Key-naming convention follows the rest of HBase ({@code XYZ_KEY} string + {@code DEFAULT_XYZ}
  * sibling, both {@code public static final}); see {@code NettyEventLoopGroupConfig} and
@@ -103,7 +101,7 @@ public final class TransportConfig {
 
   /**
    * {@link org.apache.hbase.thirdparty.io.netty.buffer.ByteBufAllocator} selector. Accepted values
-   * are {@value #ALLOCATOR_POOLED}, {@value #ALLOCATOR_UNPOOLED} and {@value #ALLOCATOR_HEAP}; any
+   * are {@value #ALLOCATOR_POOLED}, {@value #ALLOCATOR_UNPOOLED} and {@value #ALLOCATOR_HEAP}. Any
    * other value is treated as a fully-qualified class name and instantiated reflectively, matching
    * the semantics of {@code hbase.netty.rpcserver.allocator}.
    */
@@ -127,7 +125,6 @@ public final class TransportConfig {
   private final boolean nativeTransport;
   private final String allocator;
 
-  /** Builds a transport config from the given Hadoop {@link Configuration}. */
   public TransportConfig(@NonNull Configuration conf) {
     this.port = conf.getInt(KEY_PORT, DEFAULT_PORT);
     this.batchMs = conf.getLong(KEY_BATCH_MS, DEFAULT_BATCH_MS);

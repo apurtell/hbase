@@ -19,12 +19,11 @@ package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import org.apache.hadoop.hbase.consensus.handler.store.RaftModelPbCodecs;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
@@ -45,7 +44,6 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectio
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
-import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
@@ -53,51 +51,40 @@ import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
 /**
  * Bidirectional conversion between RAFT interfaces and {@code ConsensusProtos.*PB}.
  * <p>
- * The injected {@link PayloadCompressor} drives the outbound entry-payload compression path (its
- * configured algorithm is stamped onto each {@code LogEntryPB.op_payload_compression}). The inbound
- * side ignores the configured algorithm and resolves a codec on demand from the wire ordinal via
- * {@link PayloadCompressor#algorithmFromOrdinal(int)} and
- * {@link PayloadCompressor#decompress(ByteString, org.apache.hadoop.hbase.io.compress.Compression.Algorithm)},
- * so peers do not need to share a compression configuration.
+ * The injected {@link PayloadCompressor} drives the outbound entry-payload compression path. The
+ * inbound side ignores the configured algorithm and resolves a codec on demand from the wire
+ * ordinal via {@link PayloadCompressor#algorithmFromOrdinal(int)} and
+ * {@link PayloadCompressor#decompress(ByteString, org.apache.hadoop.hbase.io.compress.Compression.Algorithm)}.
  */
 @InterfaceAudience.Private
 final class ProtoConverter {
 
   private final DefaultRaftModelFactory factory;
-  private final OperationCodec operationCodec;
-  private final PayloadCompressor compressor;
+  private final RaftModelPbCodecs modelCodecs;
 
   ProtoConverter(@NonNull DefaultRaftModelFactory factory, @NonNull OperationCodec operationCodec,
     @NonNull PayloadCompressor compressor) {
     this.factory = factory;
-    this.operationCodec = operationCodec;
-    this.compressor = compressor;
+    this.modelCodecs = new RaftModelPbCodecs(factory, operationCodec, compressor);
   }
 
   /**
-   * Inbound proto-message field-presence helper. Every field in {@code ConsensusProtocol.proto} is
-   * declared {@code optional} for forward compatibility (so individual fields can be deprecated
-   * without a wire break — see the schema's preamble); the semantic invariants — "an
-   * {@code AppendEntries} carries a group id", "a {@code ConsensusFrame} carries a kind", etc. —
-   * are enforced here, called from each {@code from*PB} converter (and from {@link InboundHandler}
-   * for the top-level frame). Failures throw {@link MalformedMessageException}; the inbound
-   * dispatcher catches that and logs + drops the offending message rather than tearing down the
-   * channel.
+   * Inbound proto-message field-presence helper. Delegates to {@link RaftModelPbCodecs} so the
+   * shared persistence-model converters and the wire-only converters here apply the same policy.
+   * The {@link IllegalArgumentException} the helper throws is wrapped in a
+   * {@link MalformedMessageException} for the wire path so the inbound dispatcher can log + drop
+   * the offending message rather than tearing down the channel.
    */
   static void requireField(boolean present, String pbType, String fieldName) {
-    if (!present) {
-      throw new MalformedMessageException(
-        pbType + " is missing required field '" + fieldName + "'");
+    try {
+      RaftModelPbCodecs.requireField(present, pbType, fieldName);
+    } catch (IllegalArgumentException e) {
+      throw new MalformedMessageException(e.getMessage());
     }
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Endpoints
-  // ---------------------------------------------------------------------------------------------
-
   static ConsensusProtos.RaftEndpointPB toEndpointPB(RaftEndpoint endpoint) {
-    return ConsensusProtos.RaftEndpointPB.newBuilder().setId(WireRaftEndpoint.toBytes(endpoint))
-      .build();
+    return RaftModelPbCodecs.toEndpointPB(endpoint);
   }
 
   static RaftEndpoint fromEndpointPB(ConsensusProtos.RaftEndpointPB pb) {
@@ -124,143 +111,58 @@ final class ProtoConverter {
     return ByteString.copyFromUtf8(String.valueOf(groupId));
   }
 
-  /**
-   * Decodes the on-wire group id back to the local representation. Local Raft nodes typically use a
-   * {@code String} group id (see {@code LocalRaftEndpoint} / {@code SimpleStateMachine}); the
-   * registry dispatcher keys on whatever object the producer of
-   * {@link org.apache.hadoop.hbase.consensus.raft.RaftNode#getGroupId()} returned, so we decode to
-   * a {@code String} and rely on {@link String#equals(Object)}.
-   */
+  /** Decodes the on-wire group id back to the local representation. */
   static Object bytesToGroupId(ByteString bytes) {
     return new String(bytes.toByteArray(), StandardCharsets.UTF_8);
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Log entries
-  // ---------------------------------------------------------------------------------------------
-
   ConsensusProtos.LogEntryPB toLogEntryPB(LogEntry entry) {
-    Object op = entry.getOperation();
-    int typeId = operationCodec.typeId(op);
-    ByteString payload = operationCodec.encode(op);
-    Compression.Algorithm alg = compressor.algorithm();
-    try {
-      payload = compressor.compress(payload);
-    } catch (IOException e) {
-      throw new UncheckedIOException(
-        "Failed to compress LogEntry payload at index " + entry.getIndex(), e);
-    }
-    ConsensusProtos.LogEntryPB.Builder builder = ConsensusProtos.LogEntryPB.newBuilder()
-      .setIndex(entry.getIndex()).setTerm(entry.getTerm()).setOpType(typeId).setOpPayload(payload);
-    // Only stamp the ordinal when we actually compressed; absence means NONE on the wire.
-    if (alg != Compression.Algorithm.NONE) {
-      builder.setOpPayloadCompression(alg.ordinal());
-    }
-    return builder.build();
+    return modelCodecs.toLogEntryPB(entry);
   }
 
   LogEntry fromLogEntryPB(ConsensusProtos.LogEntryPB pb) {
-    requireField(pb.hasIndex(), "LogEntryPB", "index");
-    requireField(pb.hasTerm(), "LogEntryPB", "term");
-    requireField(pb.hasOpType(), "LogEntryPB", "op_type");
-    requireField(pb.hasOpPayload(), "LogEntryPB", "op_payload");
-    ByteString payload = pb.getOpPayload();
-    Compression.Algorithm alg = pb.hasOpPayloadCompression()
-      ? PayloadCompressor.algorithmFromOrdinal(pb.getOpPayloadCompression())
-      : Compression.Algorithm.NONE;
     try {
-      payload = PayloadCompressor.decompress(payload, alg);
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to decompress LogEntry payload at index "
-        + pb.getIndex() + " (algorithm=" + alg + ")", e);
+      return modelCodecs.fromLogEntryPB(pb);
+    } catch (IllegalArgumentException e) {
+      throw new MalformedMessageException(e.getMessage());
     }
-    Object op = operationCodec.decode(pb.getOpType(), payload);
-    return factory.createLogEntryBuilder().setIndex(pb.getIndex()).setTerm(pb.getTerm())
-      .setOperation(op).build();
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Group members view
-  // ---------------------------------------------------------------------------------------------
-
   static ConsensusProtos.RaftGroupMembersViewPB toMembersViewPB(RaftGroupMembersView view) {
-    ConsensusProtos.RaftGroupMembersViewPB.Builder builder =
-      ConsensusProtos.RaftGroupMembersViewPB.newBuilder().setLogIndex(view.getLogIndex());
-    for (RaftEndpoint m : view.getMembers()) {
-      builder.addMembers(toEndpointPB(m));
-    }
-    for (RaftEndpoint m : view.getVotingMembers()) {
-      builder.addVotingMembers(toEndpointPB(m));
-    }
-    return builder.build();
+    return RaftModelPbCodecs.toMembersViewPB(view);
   }
 
   RaftGroupMembersView fromMembersViewPB(ConsensusProtos.RaftGroupMembersViewPB pb) {
-    requireField(pb.hasLogIndex(), "RaftGroupMembersViewPB", "log_index");
-    List<RaftEndpoint> members = new ArrayList<>(pb.getMembersCount());
-    for (ConsensusProtos.RaftEndpointPB ep : pb.getMembersList()) {
-      members.add(fromEndpointPB(ep));
+    try {
+      return modelCodecs.fromMembersViewPB(pb);
+    } catch (IllegalArgumentException e) {
+      throw new MalformedMessageException(e.getMessage());
     }
-    List<RaftEndpoint> voters = new ArrayList<>(pb.getVotingMembersCount());
-    for (ConsensusProtos.RaftEndpointPB ep : pb.getVotingMembersList()) {
-      voters.add(fromEndpointPB(ep));
-    }
-    return factory.createRaftGroupMembersViewBuilder().setLogIndex(pb.getLogIndex())
-      .setMembers(members).setVotingMembers(voters).build();
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Snapshot chunk
-  // ---------------------------------------------------------------------------------------------
-
   ConsensusProtos.SnapshotChunkPB toSnapshotChunkPB(SnapshotChunk chunk) {
-    Object op = chunk.getOperation();
-    ByteString payload;
-    if (op instanceof byte[]) {
-      payload = ByteString.copyFrom((byte[]) op);
-    } else {
-      payload = operationCodec.encode(op);
-    }
-    return ConsensusProtos.SnapshotChunkPB.newBuilder().setIndex(chunk.getIndex())
-      .setTerm(chunk.getTerm()).setChunkIndex(chunk.getSnapshotChunkIndex())
-      .setChunkCount(chunk.getSnapshotChunkCount())
-      .setMembersView(toMembersViewPB(chunk.getGroupMembersView())).setPayload(payload).build();
+    return modelCodecs.toSnapshotChunkPB(chunk);
   }
 
   SnapshotChunk fromSnapshotChunkPB(ConsensusProtos.SnapshotChunkPB pb) {
-    requireField(pb.hasIndex(), "SnapshotChunkPB", "index");
-    requireField(pb.hasTerm(), "SnapshotChunkPB", "term");
-    requireField(pb.hasChunkIndex(), "SnapshotChunkPB", "chunk_index");
-    requireField(pb.hasChunkCount(), "SnapshotChunkPB", "chunk_count");
-    requireField(pb.hasMembersView(), "SnapshotChunkPB", "members_view");
-    requireField(pb.hasPayload(), "SnapshotChunkPB", "payload");
-    return factory.createSnapshotChunkBuilder().setIndex(pb.getIndex()).setTerm(pb.getTerm())
-      .setSnapshotChunkIndex(pb.getChunkIndex()).setSnapshotChunkCount(pb.getChunkCount())
-      .setGroupMembersView(fromMembersViewPB(pb.getMembersView()))
-      .setOperation(pb.getPayload().toByteArray()).build();
+    try {
+      return modelCodecs.fromSnapshotChunkPB(pb);
+    } catch (IllegalArgumentException e) {
+      throw new MalformedMessageException(e.getMessage());
+    }
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // CatchUpReference
-  // ---------------------------------------------------------------------------------------------
-
   static ConsensusProtos.CatchUpReferencePB toCatchUpPB(CatchUpReference ref) {
-    return ConsensusProtos.CatchUpReferencePB.newBuilder().setFlushOpSeqId(ref.getFlushOpSeqId())
-      .setSnapshotMaxSeqId(ref.getSnapshotMaxSeqId())
-      .setMetadata(ByteString.copyFrom(ref.getMetadata())).build();
+    return RaftModelPbCodecs.toCatchUpPB(ref);
   }
 
   static CatchUpReference fromCatchUpPB(ConsensusProtos.CatchUpReferencePB pb) {
-    requireField(pb.hasFlushOpSeqId(), "CatchUpReferencePB", "flush_op_seq_id");
-    requireField(pb.hasSnapshotMaxSeqId(), "CatchUpReferencePB", "snapshot_max_seq_id");
-    requireField(pb.hasMetadata(), "CatchUpReferencePB", "metadata");
-    return new CatchUpReference(pb.getFlushOpSeqId(), pb.getSnapshotMaxSeqId(),
-      pb.getMetadata().toByteArray());
+    try {
+      return RaftModelPbCodecs.fromCatchUpPB(pb);
+    } catch (IllegalArgumentException e) {
+      throw new MalformedMessageException(e.getMessage());
+    }
   }
-
-  // ---------------------------------------------------------------------------------------------
-  // AppendEntries
-  // ---------------------------------------------------------------------------------------------
 
   ConsensusProtos.GroupAppendEntriesPB toGroupAppendPB(AppendEntriesRequest req) {
     ConsensusProtos.GroupAppendEntriesPB.Builder builder =
@@ -296,10 +198,6 @@ final class ProtoConverter {
       .build();
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // LeaderHeartbeat / LeaderHeartbeatAck — lightweight, log-free liveness signaling.
-  // ---------------------------------------------------------------------------------------------
-
   ConsensusProtos.GroupHeartbeatPB toGroupHeartbeatPB(LeaderHeartbeat hb) {
     return ConsensusProtos.GroupHeartbeatPB.newBuilder().setGroupId(groupIdToBytes(hb.getGroupId()))
       .setSender(toEndpointPB(hb.getSender())).setTerm(hb.getTerm())
@@ -333,10 +231,6 @@ final class ProtoConverter {
       .setLastVerifiedLogIndex(pb.hasLastVerifiedLogIndex() ? pb.getLastVerifiedLogIndex() : 0L)
       .build();
   }
-
-  // ---------------------------------------------------------------------------------------------
-  // Append responses
-  // ---------------------------------------------------------------------------------------------
 
   ConsensusProtos.GroupAppendSuccessPB toAppendSuccessPB(AppendEntriesSuccessResponse resp) {
     return ConsensusProtos.GroupAppendSuccessPB.newBuilder()
@@ -381,10 +275,6 @@ final class ProtoConverter {
       .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
       .build();
   }
-
-  // ---------------------------------------------------------------------------------------------
-  // Vote / PreVote / TriggerElection
-  // ---------------------------------------------------------------------------------------------
 
   ConsensusProtos.VoteRequestPB toVoteRequestPB(VoteRequest req) {
     return ConsensusProtos.VoteRequestPB.newBuilder().setGroupId(groupIdToBytes(req.getGroupId()))
@@ -475,10 +365,6 @@ final class ProtoConverter {
       .setLastLogIndex(pb.getLastLogIndex()).build();
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // InstallSnapshot
-  // ---------------------------------------------------------------------------------------------
-
   ConsensusProtos.InstallSnapshotRequestPB toInstallSnapshotPB(InstallSnapshotRequest req) {
     ConsensusProtos.InstallSnapshotRequestPB.Builder builder =
       ConsensusProtos.InstallSnapshotRequestPB.newBuilder()
@@ -562,10 +448,6 @@ final class ProtoConverter {
       .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
       .build();
   }
-
-  // ---------------------------------------------------------------------------------------------
-  // Single-frame top-level wrap
-  // ---------------------------------------------------------------------------------------------
 
   ConsensusProtos.ConsensusFrame toFrame(@NonNull RaftMessage message) {
     ConsensusProtos.ConsensusFrame.Builder builder = ConsensusProtos.ConsensusFrame.newBuilder();

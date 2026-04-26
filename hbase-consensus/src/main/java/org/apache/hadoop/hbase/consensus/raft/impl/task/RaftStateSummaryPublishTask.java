@@ -23,9 +23,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport.RaftNodeReportReason;
 
-/**
- * Publishes a {@link RaftNodeReport} for the current state of the Raft node
- */
+/** Publishes a {@link RaftNodeReport} for the current state of the Raft node. */
 public class RaftStateSummaryPublishTask extends RaftNodeStatusAwareTask {
   public RaftStateSummaryPublishTask(RaftNodeImpl node) {
     super(node);

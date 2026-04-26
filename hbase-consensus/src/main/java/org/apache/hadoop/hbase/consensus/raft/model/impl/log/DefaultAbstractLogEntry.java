@@ -20,9 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.impl.log;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
 
-/**
- * Base class for Raft log entry implementations.
- */
+/** Base class for Raft log entry implementations. */
 public class DefaultAbstractLogEntry implements BaseLogEntry {
   int term;
   long index;

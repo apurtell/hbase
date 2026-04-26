@@ -20,8 +20,8 @@ package org.apache.hadoop.hbase.consensus.handler.transport;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
- * Thrown by {@link ProtoConverter#requireField(boolean, String, String)} (and other inbound
- * validators) when an inbound proto message is missing a load-bearing field. The
+ * Thrown by {@link ProtoConverter#requireField(boolean, String, String)} and other inbound
+ * validators when an inbound proto message is missing a load-bearing field. The
  * {@link InboundHandler} catches it and logs+drops the offending message.
  */
 @InterfaceAudience.Private

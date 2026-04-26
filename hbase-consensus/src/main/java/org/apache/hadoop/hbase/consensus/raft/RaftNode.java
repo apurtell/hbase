@@ -354,8 +354,7 @@ public interface RaftNode {
    * <p>
    * The returned future can be completed with {@link NotLeaderException},
    * {@link CannotReplicateException} or {@link IndeterminateStateException}. Please see individual
-   * exception classes for more information. the endpoint to add to or remove from the Raft group
-   * the type of the membership change the expected members commit index
+   * exception classes for more information.
    * @return the future to be completed with the new member list of the Raft group if the membership
    *         change is successful, or the exception if the membership change failed
    * @see #replicate(Object)
@@ -390,10 +389,9 @@ public interface RaftNode {
    * {@link RaftNodeStatus#ACTIVE}, {@link IllegalArgumentException} if the given endpoint is not a
    * voting member in the committed Raft group member list, and {@link TimeoutException} if the
    * leadership transfer process has timed out w.r.t
-   * {@link RaftConfig#getLeaderHeartbeatTimeoutMillis()}. the Raft endpoint to which the leadership
-   * will be transferred
+   * {@link RaftConfig#getLeaderHeartbeatTimeoutMillis()}.
    * @return the future to be completed when the leadership transfer is done, or with the execution
-   *         if the leader transfer could not be done.
+   *         result if the leader transfer could not be done.
    * @see CannotReplicateException
    * @see NotLeaderException
    */
@@ -417,9 +415,7 @@ public interface RaftNode {
   @NonNull
   CompletableFuture<Ordered<RaftNodeReport>> takeSnapshot();
 
-  /**
-   * The builder interface for configuring and creating Raft node instances.
-   */
+  /** The builder interface for configuring and creating Raft node instances. */
   interface RaftNodeBuilder {
     /**
      * Sets the unique ID of the Raft group that this Raft node belongs to. the group id to create
@@ -434,7 +430,7 @@ public interface RaftNode {
      * <p>
      * This method must be used along with one of the {@link #setInitialGroupMembers(Collection)}
      * overloads when either a new Raft group is bootstrapping for the first time or a new Raft node
-     * is being added to a running Raft group. the Raft endpoint to create the Raft node with
+     * is being added to a running Raft group.
      * @return the builder object for fluent calls
      */
     @NonNull
@@ -450,8 +446,7 @@ public interface RaftNode {
      * <p>
      * This method must be called along with {@link #setLocalEndpoint(RaftEndpoint)} when either a
      * new Raft group is bootstrapping for the first time or a new Raft node is being added to a
-     * running Raft group. the initial group members of the Raft group which the Raft node belongs
-     * to
+     * running Raft group.
      * @return the builder object for fluent calls
      */
     @NonNull
@@ -468,8 +463,7 @@ public interface RaftNode {
      * <p>
      * This method must be called along with {@link #setLocalEndpoint(RaftEndpoint)} when either a
      * new Raft group is bootstrapping for the first time or a new Raft node is being added to a
-     * running Raft group. the initial group members of the Raft group which the Raft node belongs
-     * to the list of voting members in the initial Raft group member list
+     * running Raft group.
      * @return the builder object for fluent calls
      */
     @NonNull
@@ -485,8 +479,7 @@ public interface RaftNode {
      * it has not crashed.
      * <p>
      * {@link #setLocalEndpoint(RaftEndpoint)} and {@link #setInitialGroupMembers(Collection)} must
-     * not be called when a {@link RestoredRaftState} object is provided via this method. the
-     * restored Raft state which will be used while creating the Raft node
+     * not be called when a {@link RestoredRaftState} object is provided via this method.
      * @return the builder object for fluent calls
      * @see RestoredRaftState
      */
@@ -496,8 +489,7 @@ public interface RaftNode {
     /**
      * Sets the Raft config.
      * <p>
-     * If not set, {@link RaftConfig#DEFAULT_RAFT_CONFIG} is used. the config object to create the
-     * Raft node with
+     * If not set, {@link RaftConfig#DEFAULT_RAFT_CONFIG} is used.
      * @return the builder object for fluent calls
      * @see RaftConfig
      */
@@ -507,8 +499,7 @@ public interface RaftNode {
     /**
      * Sets the Raft node executor object to be used for running submitted and scheduled tasks.
      * <p>
-     * If not set, {@link DefaultRaftNodeExecutor} is used. the Raft node executor object to be used
-     * for running submitted and scheduled tasks
+     * If not set, {@link DefaultRaftNodeExecutor} is used.
      * @return the builder object for fluent calls
      * @see RaftNodeExecutor
      * @see DefaultRaftNodeExecutor
@@ -517,8 +508,7 @@ public interface RaftNode {
     RaftNodeBuilder setExecutor(@NonNull RaftNodeExecutor executor);
 
     /**
-     * Sets the transport object to be used for communicating with other Raft nodes. the transport
-     * object to be used for communicating with other Raft nodes
+     * Sets the transport object to be used for communicating with other Raft nodes.
      * @return the builder object for fluent calls
      * @see Transport
      */
@@ -527,7 +517,6 @@ public interface RaftNode {
 
     /**
      * Sets the state machine object to be used for execution of queries and committed operations.
-     * the state machine object which will be used for execution of queries and committed operations
      * @return the builder object for fluent calls
      * @see StateMachine
      */
@@ -538,8 +527,7 @@ public interface RaftNode {
      * Sets the Raft state object to be used for persisting internal Raft state to stable storage.
      * <p>
      * If not set, {@link NopRaftStore} is used which keeps the internal Raft state in memory and
-     * disables crash-recover scenarios. the Raft state object to be used for persisting internal
-     * Raft state to stable storage.
+     * disables crash-recover scenarios.
      * @return the builder object for fluent calls
      * @see RaftStore
      */
@@ -549,8 +537,7 @@ public interface RaftNode {
     /**
      * Sets the Raft model factory object to be used for creating Raft model objects.
      * <p>
-     * If not set, {@link DefaultRaftModelFactory} is used. the factory object to be used for
-     * creating Raft model objects
+     * If not set, {@link DefaultRaftModelFactory} is used.
      * @return the builder object for fluent calls
      * @see RaftModelFactory
      * @see DefaultRaftModelFactory
@@ -560,23 +547,20 @@ public interface RaftNode {
 
     /**
      * Sets the Raft node report listener object to be completed about events related to the
-     * execution of the Raft consensus algorithm. the Raft node report listener object to be
-     * completed about events related to the execution of the Raft consensus algorithm
+     * execution of the Raft consensus algorithm.
      * @return the builder object for fluent calls
      * @see RaftNodeReportListener
      */
     RaftNodeBuilder setRaftNodeReportListener(@NonNull RaftNodeReportListener listener);
 
     /**
-     * Sets the Random instance used in parts of the Raft algorithm. the Random instance to be used
-     * by this RaftNode.
+     * Sets the Random instance used in parts of the Raft algorithm.
      * @return the builder object for fluent calls
      */
     RaftNodeBuilder setRandom(Random random);
 
     /**
-     * Sets the Clock instance used by parts of the Raft algorithm. the Clock instance to be used by
-     * this RaftNode.
+     * Sets the Clock instance used by parts of the Raft algorithm.
      * @return the builder object for fluent calls
      */
     RaftNodeBuilder setClock(Clock clock);

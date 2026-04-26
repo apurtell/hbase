@@ -42,18 +42,12 @@ public class MismatchingRaftGroupMembersCommitIndexException extends RaftExcepti
     this.members = members;
   }
 
-  /**
-   * Returns the commit index of the current Raft group members.
-   * @return the commit index of the current Raft group members.
-   */
+  /** Returns the commit index of the current Raft group members. */
   public long getCommitIndex() {
     return commitIndex;
   }
 
-  /**
-   * Returns the current Raft group members knwon by the Raft node
-   * @return the current Raft group members knwon by the Raft node
-   */
+  /** Returns the current Raft group members knwon by the Raft node. */
   public Collection<RaftEndpoint> getMembers() {
     return members;
   }

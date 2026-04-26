@@ -19,23 +19,19 @@ package org.apache.hadoop.hbase.consensus.raft.exception;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 
-/**
- * Base exception class for Raft-related exceptions.
- */
+/** ase exception class for Raft-related exceptions. */
 public class RaftException extends RuntimeException {
   private static final long serialVersionUID = 3165333502175586105L;
   private final RaftEndpoint leader;
 
-  /**
-   * Creates an instance of this exception reason of this exception to be thrown
-   */
+  /** Creates an instance of this exception reason of this exception to be thrown . */
   public RaftException(Throwable cause) {
     super(cause);
     this.leader = null;
   }
 
   /**
-   * Creates an instance of this exception Raft endpoint of the leader known by the local Raft node
+   * Creates an instance of this exception Raft endpoint of the leader known by the local Raft node.
    */
   public RaftException(RaftEndpoint leader) {
     this.leader = leader;
@@ -43,7 +39,7 @@ public class RaftException extends RuntimeException {
 
   /**
    * Creates an instance of this exception exception message Raft endpoint of the leader known by
-   * the local Raft node
+   * the local Raft node.
    */
   public RaftException(String message, RaftEndpoint leader) {
     super(message);
@@ -52,7 +48,7 @@ public class RaftException extends RuntimeException {
 
   /**
    * Creates an instance of this exception exception message Raft endpoint of the leader known by
-   * the local Raft node reason of this exception to be thrown
+   * the local Raft node reason of this exception to be thrown.
    */
   public RaftException(String message, RaftEndpoint leader, Throwable cause) {
     super(message, cause);
@@ -63,7 +59,7 @@ public class RaftException extends RuntimeException {
    * Returns the leader endpoint of the related Raft group, if available and known by the Raft node
    * by the time this exception is thrown.
    * @return the leader endpoint of the related Raft group, if available and known by the Raft node
-   *         by the time this exception is thrown
+   *         by the time this exception is thrown.
    */
   public RaftEndpoint getLeader() {
     return leader;

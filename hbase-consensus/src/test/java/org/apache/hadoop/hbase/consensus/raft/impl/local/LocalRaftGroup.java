@@ -23,6 +23,8 @@ import static org.apache.hadoop.hbase.consensus.raft.RaftConfig.DEFAULT_RAFT_CON
 import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.eventually;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.File;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -33,6 +35,13 @@ import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import org.apache.hadoop.hbase.consensus.handler.store.DefaultLogStoreSerializer;
+import org.apache.hadoop.hbase.consensus.handler.store.LogStoreConfig;
+import org.apache.hadoop.hbase.consensus.handler.store.LogStoreSerializer;
+import org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore;
+import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodec;
+import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodecs;
+import org.apache.hadoop.hbase.consensus.handler.transport.PayloadCompressor;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
@@ -41,6 +50,7 @@ import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecu
 import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftTermState;
+import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
@@ -51,13 +61,12 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
 import org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils;
+import org.apache.hadoop.hbase.io.compress.Compression;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * This class is used for running a Raft group with local Raft nodes. It provides methods to access
- * specific Raft nodes, a set of functionalities over them, such as terminations, creating network
- * partitions, dropping or altering network messages.
+ * This class is used for running a Raft group with local Raft node.
  * @see LocalRaftEndpoint
  * @see SimpleStateMachine
  * @see Firewall
@@ -67,6 +76,7 @@ public final class LocalRaftGroup {
     RaftStore> IN_MEMORY_RAFT_STATE_STORE_FACTORY = (endpoint, config) -> {
       return new InMemoryRaftStore();
     };
+
   private static final Logger LOGGER = LoggerFactory.getLogger(LocalRaftGroup.class);
   private final RaftConfig config;
   private final boolean newTermEntryEnabled;
@@ -75,6 +85,37 @@ public final class LocalRaftGroup {
   private final BiFunction<RaftEndpoint, RaftConfig, RaftStore> raftStoreFactory;
   private final HeartbeatScheduler heartbeatScheduler;
   private final Function<RaftEndpoint, HeartbeatScheduler> heartbeatSchedulerFactory;
+
+  /**
+   * Builds a {@link BiFunction} factory that creates a fresh disk-backed
+   * {@link org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore} per Raft endpoint
+   * under {@code rootDir/<endpointId>}. The returned {@link RaftStore} is the
+   * {@code "default"}-group adapter; the caller owns the underlying parent stores listed in
+   * {@code stores} and must {@link UnifiedRaftStore#close()} them on test teardown.
+   */
+  public static BiFunction<RaftEndpoint, RaftConfig, RaftStore> unifiedRaftStateStoreFactory(
+    java.io.File rootDir,
+    java.util.List<org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore> stores) {
+    return (endpoint, config) -> {
+      try {
+        java.io.File subdir = new java.io.File(rootDir, String.valueOf(endpoint.getId()));
+        if (!subdir.exists() && !subdir.mkdirs()) {
+          throw new java.io.IOException("Failed to create " + subdir);
+        }
+        LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 50L, 64);
+        OperationCodec codec = OperationCodecs.composite(OperationCodecs.defaultCodecs(),
+          new SimpleStateMachineOpCodec());
+        LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),
+          codec, new PayloadCompressor(Compression.Algorithm.NONE));
+        UnifiedRaftStore parent = new UnifiedRaftStore(cfg, serializer);
+        parent.load();
+        stores.add(parent);
+        return parent.newGroupStore("default".getBytes());
+      } catch (java.io.IOException ioe) {
+        throw new java.io.UncheckedIOException(ioe);
+      }
+    };
+  }
 
   private LocalRaftGroup(int groupSize, int votingMemberCount, RaftConfig config,
     boolean newTermEntryEnabled, BiFunction<RaftEndpoint, RaftConfig, RaftStore> raftStoreFactory,
@@ -247,6 +288,60 @@ public final class LocalRaftGroup {
   }
 
   /**
+   * Restores a Raft node by re-opening its on-disk
+   * {@link org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore} under
+   * {@code rootDir/<endpointId>}, calling {@code load()}, and rebuilding the node from whatever
+   * state survived. Used by corruption / fault-tolerance fixtures: if {@code load()} returns a
+   * {@link RestoredRaftState} for the {@code "default"} group the node is restored from it; if no
+   * state survives (e.g. the directory is empty or all segments were deleted) the node is recreated
+   * fresh against the original {@code initialMembers} so the leader can drive
+   * {@code InstallSnapshot} catchup. The freshly opened parent store is appended to {@code stores}
+   * so the test can {@code close()} it on teardown.
+   */
+  public RaftNodeImpl restoreNodeFromUnifiedStore(RaftEndpoint endpoint, File rootDir,
+    List<UnifiedRaftStore> stores) throws java.io.IOException {
+    boolean running =
+      nodeContexts.values().stream().filter(ctx -> ctx.getLocalEndpoint().equals(endpoint))
+        .anyMatch(RaftNodeContext::isExecutorRunning);
+    if (running) {
+      throw new IllegalStateException(endpoint + " is already running!");
+    }
+    File subdir = new File(rootDir, String.valueOf(endpoint.getId()));
+    if (!subdir.exists() && !subdir.mkdirs()) {
+      throw new java.io.IOException("Failed to create " + subdir);
+    }
+    LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 50L, 64);
+    OperationCodec codec =
+      OperationCodecs.composite(OperationCodecs.defaultCodecs(), new SimpleStateMachineOpCodec());
+    LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),
+      codec, new PayloadCompressor(Compression.Algorithm.NONE));
+    UnifiedRaftStore parent = new UnifiedRaftStore(cfg, serializer);
+    Map<ByteBuffer, RestoredRaftState> states = parent.load();
+    stores.add(parent);
+    RaftStore store = parent.newGroupStore("default".getBytes());
+    RestoredRaftState restored = states.get(ByteBuffer.wrap("default".getBytes()));
+    LocalTransport transport = new LocalTransport(endpoint);
+    SimpleStateMachine stateMachine = new SimpleStateMachine(newTermEntryEnabled);
+    RaftNodeImpl node;
+    if (restored != null) {
+      node = (RaftNodeImpl) RaftNode.newBuilder().setGroupId("default").setRestoredState(restored)
+        .setConfig(config).setTransport(transport).setStateMachine(stateMachine).setStore(store)
+        .build();
+    } else {
+      java.util.List<RaftEndpoint> votingMembers =
+        initialMembers.subList(0, Math.min(initialMembers.size(), initialMembers.size()));
+      node = (RaftNodeImpl) RaftNode.newBuilder().setGroupId("default").setLocalEndpoint(endpoint)
+        .setInitialGroupMembers(initialMembers, votingMembers).setConfig(config)
+        .setTransport(transport).setStateMachine(stateMachine).setStore(store).build();
+    }
+    nodeContexts.put(endpoint, new RaftNodeContext((DefaultRaftNodeExecutor) node.getExecutor(),
+      transport, stateMachine, node));
+    node.start();
+    initDiscovery();
+    return node;
+  }
+
+  /**
    * Returns all Raft nodes currently running in this local Raft group.
    * @return all Raft nodes currently running in this local Raft group
    */
@@ -270,11 +365,7 @@ public final class LocalRaftGroup {
     return (List<T>) nodes;
   }
 
-  /**
-   * Returns the currently running Raft node of the given Raft endpoint. the Raft endpoint to return
-   * its Raft node
-   * @return the currently running Raft node of the given Raft endpoint
-   */
+  /** Returns the currently running Raft node of the given Raft endpoint. */
   public <T extends RaftNode> T getNode(RaftEndpoint endpoint) {
     requireNonNull(endpoint);
     return (T) nodeContexts.get(endpoint).node;
@@ -312,11 +403,7 @@ public final class LocalRaftGroup {
     return leaderEndpoint;
   }
 
-  /**
-   * Returns the state machine object for the given Raft endpoint. the Raft endpoint to get the
-   * state machine object
-   * @return the state machine object for the given Raft endpoint
-   */
+  /** Returns the state machine object for the given Raft endpoint. */
   public SimpleStateMachine getStateMachine(RaftEndpoint endpoint) {
     requireNonNull(endpoint);
     return nodeContexts.get(endpoint).stateMachine;
@@ -370,7 +457,7 @@ public final class LocalRaftGroup {
    * Returns a random Raft node other than the given Raft endpoint.
    * <p>
    * If no running Raft node is found for given Raft endpoint, then this method fails with
-   * {@link NullPointerException}. the endpoint to not to choose for the returned Raft node
+   * {@link NullPointerException}.
    * @return a random Raft node other than the given Raft endpoint if no running Raft node is found
    *         for given Raft endpoint
    */
@@ -411,7 +498,7 @@ public final class LocalRaftGroup {
 
   /**
    * Creates an artificial load on the given Raft node by sleeping its thread for the given
-   * duration. the endpoint of the Raft node to slow down the sleep duration in seconds
+   * duration.
    */
   public void slowDownNode(RaftEndpoint endpoint, int seconds) {
     nodeContexts.get(endpoint).executor.submit(() -> {
@@ -429,8 +516,7 @@ public final class LocalRaftGroup {
    * between the given endpoints and the other Raft nodes will be blocked completely.
    * <p>
    * This method fails with {@link NullPointerException} if no Raft node is found for any of the
-   * given endpoints list. the list of Raft endpoints to split from the rest of the Raft group if no
-   * Raft node is found for any of the given endpoints list
+   * given endpoints list.
    */
   public void splitMembers(RaftEndpoint... endpoints) {
     splitMembers(Arrays.asList(endpoints));
@@ -441,8 +527,7 @@ public final class LocalRaftGroup {
    * between the given endpoints and the other Raft nodes will be blocked completely.
    * <p>
    * This method fails with {@link NullPointerException} if no Raft node is found for any of the
-   * given endpoints list. the list of Raft endpoints to split from the rest of the Raft group if no
-   * Raft node is found for any of the given endpoints list
+   * given endpoints list.
    */
   public void splitMembers(List<RaftEndpoint> endpoints) {
     for (RaftEndpoint endpoint : endpoints) {
@@ -460,8 +545,10 @@ public final class LocalRaftGroup {
   }
 
   /**
-   * Returns a random set of Raft nodes. the number of Raft nodes to return denotes whether if the
-   * leader Raft node can be returned or not
+   * Returns a random set of Raft nodes.
+   * <p>
+   * The number of Raft nodes to return denotes whether if the leader Raft node can be returned or
+   * not.
    * @return the randomly selected Raft node set
    */
   public List<RaftEndpoint> getRandomNodes(int nodeCount, boolean includeLeader) {
@@ -496,9 +583,7 @@ public final class LocalRaftGroup {
    * message type.
    * <p>
    * After this call, Raft messages of the given type sent from the given source Raft endpoint to
-   * the given target Raft endpoint are silently dropped. the source Raft endpoint to drop Raft
-   * messages of the given type the target Raft endpoint to drop Raft messages of the given type the
-   * type of the Raft messages to be dropped
+   * the given target Raft endpoint are silently dropped.
    */
   public <T extends RaftMessage> void dropMessagesTo(RaftEndpoint source, RaftEndpoint target,
     Class<T> messageType) {
@@ -507,8 +592,7 @@ public final class LocalRaftGroup {
 
   /**
    * Deletes the one-way drop-message rule for the given source and target Raft endpoints and the
-   * Raft message type. the source Raft endpoint to remove the drop-message rule the target Raft
-   * endpoint to remove the drop-message rule the type of the Raft messages
+   * Raft message type.
    */
   public <T extends RaftMessage> void allowMessagesTo(RaftEndpoint source, RaftEndpoint target,
     Class<T> messageType) {
@@ -522,8 +606,7 @@ public final class LocalRaftGroup {
    * endpoint are silently dropped.
    * <p>
    * If there were drop-message rules from the source Raft endpoint to the target Raft endpoint,
-   * they are replaced with a drop-all-messages rule. the source Raft endpoint to drop all Raft
-   * messages the target Raft endpoint to drop all Raft messages
+   * they are replaced with a drop-all-messages rule.
    */
   public void dropAllMessagesTo(RaftEndpoint source, RaftEndpoint target) {
     getFirewall(source).dropAllMessagesTo(target);
@@ -531,7 +614,7 @@ public final class LocalRaftGroup {
 
   /**
    * Deletes all one-way drop-message and drop-all-messages rules created for the source Raft
-   * endpoint and the target Raft endpoint. the source Raft endpoint the target Raft endpoint
+   * endpoint and the target Raft endpoint.
    */
   public void allowAllMessagesTo(RaftEndpoint source, RaftEndpoint target) {
     getFirewall(source).allowAllMessagesTo(target);
@@ -539,7 +622,7 @@ public final class LocalRaftGroup {
 
   /**
    * Adds a one-way drop-message rule for the given Raft message type from the source Raft endpoint
-   * to all other Raft endpoints. the type of the Raft messages to be dropped
+   * to all other Raft endpoints.
    */
   public <T extends RaftMessage> void dropMessagesToAll(RaftEndpoint source, Class<T> messageType) {
     getFirewall(source).dropMessagesToAll(messageType);
@@ -547,7 +630,7 @@ public final class LocalRaftGroup {
 
   /**
    * Deletes the one-way drop-all-messages rule for the given Raft message type from the source Raft
-   * endpoint to any other Raft endpoint. the type of the Raft message to delete the rule
+   * endpoint to any other Raft endpoint.
    */
   public <T extends RaftMessage> void allowMessagesToAll(RaftEndpoint source,
     Class<T> messageType) {
@@ -557,14 +640,6 @@ public final class LocalRaftGroup {
   /**
    * Drops both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the source to
    * the target Raft endpoint.
-   * <p>
-   * Phase&nbsp;4 of the consensus design split the leader's keep-alive traffic into two distinct
-   * messages: {@link AppendEntriesRequest} (used only to replicate log entries) and
-   * {@link LeaderHeartbeat} (used solely as a leader-liveness signal). Tests written against the
-   * pre-Phase-4 protocol that simulated a one-way leader-to-follower partition by dropping only
-   * {@link AppendEntriesRequest} no longer suffice, because the follower would still observe
-   * heartbeats and never become election-eligible. This helper drops both message types together,
-   * preserving the original semantic of "the follower hears nothing from this leader".
    */
   public void dropAppendsAndHeartbeatsTo(RaftEndpoint source, RaftEndpoint target) {
     getFirewall(source).dropMessagesTo(target, AppendEntriesRequest.class);
@@ -601,9 +676,7 @@ public final class LocalRaftGroup {
     getFirewall(source).allowMessagesToAll(LeaderHeartbeat.class);
   }
 
-  /**
-   * Resets all drop rules from the source Raft endpoint.
-   */
+  /** Resets all drop rules from the source Raft endpoint. */
   public void resetAllRulesFrom(RaftEndpoint source) {
     getFirewall(source).resetAllRules();
   }
@@ -616,9 +689,7 @@ public final class LocalRaftGroup {
    * instead of returning null.
    * <p>
    * Only a single alter rule can be created in the source Raft endpoint for a given target Raft
-   * endpoint and a new alter rule overwrites the previous one. the source Raft endpoint to apply
-   * the alter function the target Raft endpoint to apply the alter function the alter function to
-   * apply to Raft messages
+   * endpoint and a new alter rule overwrites the previous one.
    */
   public void alterMessagesTo(RaftEndpoint source, RaftEndpoint target,
     Function<RaftMessage, RaftMessage> function) {
@@ -626,9 +697,7 @@ public final class LocalRaftGroup {
   }
 
   /**
-   * Deletes the alter-message rule from the source Raft endpoint to the target Raft endpoint. the
-   * source Raft endpoint to delete the alter function the target Raft endpoint to delete the alter
-   * function
+   * Deletes the alter-message rule from the source Raft endpoint to the target Raft endpoint.
    */
   void removeAlterMessageRuleTo(RaftEndpoint source, RaftEndpoint target) {
     getFirewall(source).removeAlterMessageFunctionTo(target);
@@ -640,8 +709,7 @@ public final class LocalRaftGroup {
    * as unreachable.
    * <p>
    * This method fails with {@link NullPointerException} if there is no running Raft node with the
-   * given endpoint. the Raft endpoint to terminate its Raft node if there is no running Raft node
-   * with the given endpoint
+   * given endpoint.
    */
   public void terminateNode(RaftEndpoint endpoint) {
     RaftNodeContext ctx = nodeContexts.get(requireNonNull(endpoint));
@@ -652,9 +720,7 @@ public final class LocalRaftGroup {
     nodeContexts.remove(endpoint);
   }
 
-  /**
-   * Builder for creating and starting Raft groups
-   */
+  /** Builder for creating and starting Raft groups. */
   public static final class LocalRaftGroupBuilder {
     private final int groupSize;
     private final int votingMemberCount;
@@ -686,7 +752,7 @@ public final class LocalRaftGroup {
     }
 
     /**
-     * Sets the RaftConfig object to create Raft nodes. the RaftConfig object to create Raft nodes
+     * Sets the RaftConfig object to create Raft nodes.
      * @return the builder object for fluent calls
      */
     public LocalRaftGroupBuilder setConfig(RaftConfig config) {
@@ -705,8 +771,7 @@ public final class LocalRaftGroup {
     }
 
     /**
-     * Sets the factory object for creating Raft state stores. the factory object for creating Raft
-     * state stores
+     * Sets the factory object for creating Raft state stores.
      * @return the builder object for fluent calls
      */
     public LocalRaftGroupBuilder

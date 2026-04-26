@@ -30,9 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView.RaftGroupMembersViewBuilder;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftGroupMembers;
 
-/**
- * Contains member list of a Raft group.
- **/
+/** Contains member list of a Raft group. **/
 public final class RaftGroupMembersState implements RaftGroupMembers {
   private final long index;
   private final Collection<RaftEndpoint> members;
@@ -65,9 +63,7 @@ public final class RaftGroupMembersState implements RaftGroupMembers {
     this.remoteVotingMembers = unmodifiableSet(remoteVotingMembers);
   }
 
-  /**
-   * Returns index in the Raft log into which this member list is appended.
-   */
+  /** Returns index in the Raft log into which this member list is appended. */
   @Override
   public long getLogIndex() {
     return index;
@@ -97,23 +93,17 @@ public final class RaftGroupMembersState implements RaftGroupMembers {
     return new ArrayList<>(votingMembers);
   }
 
-  /**
-   * Returns the number of members in the Raft group.
-   */
+  /** Returns the number of members in the Raft group. */
   public int memberCount() {
     return members.size();
   }
 
-  /**
-   * Returns the number of voting members in the Raft group.
-   */
+  /** Returns the number of voting members in the Raft group. */
   public int votingMemberCount() {
     return votingMembers.size();
   }
 
-  /**
-   * Returns the members in the Raft group, excluding the local endpoint.
-   */
+  /** Returns the members in the Raft group, excluding the local endpoint. */
   public Collection<RaftEndpoint> remoteMembers() {
     return remoteMembers;
   }
@@ -125,24 +115,18 @@ public final class RaftGroupMembersState implements RaftGroupMembers {
     return remoteVotingMembers;
   }
 
-  /**
-   * Returns the majority number of the Raft group member list.
-   */
+  /** Returns the majority number of the Raft group member list. */
   @Override
   public int getMajorityQuorumSize() {
     return majority;
   }
 
-  /**
-   * Returns true if the given endpoint is a member of the Raft group, false otherwise.
-   */
+  /** Returns true if the given endpoint is a member of the Raft group, false otherwise. */
   public boolean isKnownMember(RaftEndpoint endpoint) {
     return members.contains(endpoint);
   }
 
-  /**
-   * Returns true if the given endpoint is a voting member of the Raft group, false otherwise.
-   */
+  /** Returns true if the given endpoint is a voting member of the Raft group, false otherwise. */
   public boolean isVotingMember(RaftEndpoint endpoint) {
     return votingMembers.contains(endpoint);
   }

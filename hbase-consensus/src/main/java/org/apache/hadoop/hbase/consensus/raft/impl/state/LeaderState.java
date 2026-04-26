@@ -29,9 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * @see FollowerState
  */
 public final class LeaderState {
-  /**
-   * A {@link FollowerState} object will be maintained for each follower.
-   */
+  /** A {@link FollowerState} object will be maintained for each follower. */
   private final Map<RaftEndpoint, FollowerState> followerStates = new HashMap<>();
   /**
    * Contains inflight queries that are waiting to be executed without appending entries to the Raft
@@ -42,7 +40,7 @@ public final class LeaderState {
   private boolean flushTaskSubmitted;
   private long flushedLogIndex;
   /**
-   * Wall-clock time (ms) until which this leader considers its lease valid for leader-stickiness /
+   * Wall-clock time (ms) until which this leader considers its lease valid for leader stickiness /
    * step-down. Refreshed from replication quorum ack timestamps.
    */
   private long leaseExpiryMillis;
@@ -56,17 +54,14 @@ public final class LeaderState {
 
   /**
    * Add a new follower with the leader's {@code lastLogIndex}. Follower's {@code nextIndex} will be
-   * set to {@code lastLogIndex
-   * + 1} and {@code matchIndex} to 0.
+   * set to {@code lastLogIndex + 1} and {@code matchIndex} to 0.
    */
   public void add(RaftEndpoint follower, long lastLogIndex, long currentTimeMillis) {
     assert !followerStates.containsKey(follower) : "Already known follower " + follower;
     followerStates.put(follower, new FollowerState(0L, lastLogIndex + 1, currentTimeMillis));
   }
 
-  /**
-   * Removes a follower from leader maintained state.
-   */
+  /** Removes a follower from leader maintained state. */
   public void remove(RaftEndpoint follower) {
     FollowerState removed = followerStates.remove(follower);
     queryState.removeAck(follower);
@@ -75,7 +70,7 @@ public final class LeaderState {
 
   /**
    * Returns an array of match indices for all followers. Additionally an empty slot is added at the
-   * end of indices array for leader itself.
+   * last index of the array for leader itself.
    */
   public long[] matchIndices(Collection<RaftEndpoint> remoteVotingMembers) {
     // Leader index is put to the last index of the array while calculating
@@ -88,9 +83,7 @@ public final class LeaderState {
     return indices;
   }
 
-  /**
-   * Returns a non-null follower state object for the given follower.
-   */
+  /** Returns a non-null follower state object for the given follower. */
   public FollowerState getFollowerState(RaftEndpoint follower) {
     FollowerState followerState = followerStates.get(follower);
     assert followerState != null : "Unknown follower " + follower;
@@ -101,16 +94,12 @@ public final class LeaderState {
     return followerStates.get(follower);
   }
 
-  /**
-   * Returns all follower state objects.
-   */
+  /** Returns all follower state objects. */
   public Map<RaftEndpoint, FollowerState> getFollowerStates() {
     return followerStates;
   }
 
-  /**
-   * Returns the state object that contains inflight queries.
-   */
+  /** Returns the state object that contains inflight queries. */
   public QueryState queryState() {
     return queryState;
   }
@@ -174,17 +163,14 @@ public final class LeaderState {
       maxFollowerTimestamp = Math.max(maxFollowerTimestamp, followerTimestamp);
       timestamps[i++] = followerTimestamp;
     }
-    // this is for the local RaftNode. all timestmaps are local,
-    // hence local RaftNode's timestamp cannot be smaller than
+    // All timestamps are local, hence local RaftNode's timestamp cannot be smaller than
     // any of the follower timestamps.
     timestamps[i] = Math.max(maxFollowerTimestamp, localNodeTimestamp);
     Arrays.sort(timestamps);
     return timestamps[timestamps.length - quorumSize];
   }
 
-  /**
-   * Returns response timestamps of all followers.
-   */
+  /** Returns response timestamps of all followers. */
   public Map<RaftEndpoint, Long> responseTimestamps() {
     return followerStates.entrySet().stream()
       .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().responseTimestamp()));

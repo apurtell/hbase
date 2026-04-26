@@ -38,14 +38,10 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * @see LeaderHeartbeat
  */
 public interface LeaderHeartbeatAck extends RaftMessage {
-  /**
-   * The follower's {@code lastVerifiedLogIndex} at the time the ack was sent.
-   */
+  /** The follower's {@code lastVerifiedLogIndex} at the time the ack was sent. */
   long getLastVerifiedLogIndex();
 
-  /**
-   * The builder interface for {@link LeaderHeartbeatAck}.
-   */
+  /** The builder interface for {@link LeaderHeartbeatAck}. */
   interface LeaderHeartbeatAckBuilder extends RaftMessageBuilder<LeaderHeartbeatAck> {
     @NonNull
     LeaderHeartbeatAckBuilder setGroupId(@NonNull Object groupId);

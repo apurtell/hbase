@@ -27,22 +27,23 @@ import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
  * {@link org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry} for transport.
  * <p>
  * Each codec is identified by an {@code int} discriminator stored in the {@code LogEntryPB.op_type}
- * field on the wire. Reserved discriminators:
+ * field on the wire.
+ * <p>
+ * Reserved discriminators:
  * <ul>
  * <li>{@code 0} — reserved (do not use)</li>
- * <li>{@code 1} — {@link UpdateRaftGroupMembersOpCodec} (built-in, group membership op)</li>
- * <li>{@code 2} — {@link IdentityByteCodec} (built-in default user codec; identity over
- * {@code byte[]})</li>
+ * <li>{@code 1} — {@link UpdateRaftGroupMembersOpCodec} (group membership op)</li>
+ * <li>{@code 2} — {@link IdentityByteCodec} (identity over {@code byte[]})</li>
  * <li>{@code 3..1023} — reserved for future built-in codecs</li>
  * <li>{@code 1024..} — caller-defined operation types</li>
  * </ul>
  * <p>
- * Implementations should be stateless and thread-safe. The same codec instance is shared by every
+ * Implementations must be stateless and thread-safe. The same codec instance is shared by every
  * outbound and inbound thread of a {@link CoalescingTransport}.
  */
 @InterfaceAudience.Private
 public interface OperationCodec {
-  /** First discriminator id available to callers. Lower ids are reserved for built-in codecs. */
+  /** First discriminator id available to callers. */
   int FIRST_USER_TYPE_ID = 1024;
 
   /**

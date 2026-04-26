@@ -37,8 +37,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Appends the given operation to the log of the given leader Raft node and replicates the new entry
- * to the followers.
+ * Appends the given operation to the log of the given leader Raft node and replicates the new log
+ * entry to the followers.
  * <p>
  * Scheduled by {@link RaftNode#replicate(Object)}, or {@link MembershipChangeTask} for membership
  * changes.

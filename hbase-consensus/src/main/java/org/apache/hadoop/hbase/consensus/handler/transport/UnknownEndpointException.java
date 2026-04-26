@@ -22,9 +22,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Thrown by {@link EndpointResolver#resolve(RaftEndpoint)} when no address is registered for the
- * given endpoint. {@link CoalescingTransport#send} catches this and silently drops the message (the
- * {@link org.apache.hadoop.hbase.consensus.raft.transport.Transport} contract is best-effort and
- * the producing Raft node will retry).
+ * given endpoint. {@link CoalescingTransport#send} catches this and silently drops the message.
  */
 @InterfaceAudience.Private
 public class UnknownEndpointException extends Exception {

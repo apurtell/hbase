@@ -154,6 +154,7 @@ public final class RaftNodeImpl implements RaftNode {
   private static final int LEADER_ELECTION_TIMEOUT_NOISE_MILLIS = 100;
   private static final long LEADER_BACKOFF_RESET_TASK_PERIOD_MILLIS = 250;
   private static final int MIN_BACKOFF_ROUNDS = 4;
+
   private final Object groupId;
   private final RaftState state;
   private final RaftConfig config;
@@ -279,7 +280,7 @@ public final class RaftNodeImpl implements RaftNode {
    * Returns true if a new operation is allowed to be replicated. This method must be invoked only
    * when the local Raft node is the Raft group leader.
    * <p>
-   * Replication is not allowed, when;
+   * Replication is not allowed when:
    * <ul>
    * <li>The local Raft log has no more empty slots for pending entries.</li>
    * <li>The given operation is a {@link RaftGroupOp} and there's an ongoing membership change in
@@ -287,7 +288,7 @@ public final class RaftNodeImpl implements RaftNode {
    * <li>The operation is a membership change and there's no committed entry in the current term
    * yet.</li>
    * </ul>
-   * the operation to check for replication
+   * @param operation the operation to check for replication
    * @return true if the given operation can be replicated, false otherwise
    * @see RaftNodeStatus
    * @see RaftGroupOp
@@ -346,8 +347,7 @@ public final class RaftNodeImpl implements RaftNode {
     if (lastCommittedEntry.getTerm() != state.term()) {
       return false;
     }
-    // We can execute multiple queries at one-shot without appending to the Raft
-    // log,
+    // We can execute multiple queries at one-shot without appending to the Raft log,
     // and we use the maxPendingLogEntryCount configuration parameter to upper-bound
     // the number of queries that are collected until the heartbeat round is done.
     QueryState queryState = state.leaderState().queryState();
@@ -451,7 +451,7 @@ public final class RaftNodeImpl implements RaftNode {
 
   /**
    * Updates status of the Raft node with the given status. the new status to set on the local Raft
-   * node
+   * node.
    */
   public void setStatus(RaftNodeStatus newStatus) {
     if (isTerminal(status)) {
@@ -843,8 +843,7 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   /**
-   * Schedules a task to reset append entries request backoff periods, if not scheduled already. the
-   * leader state to check and set the backoff task scheduling state.
+   * Schedules a task to reset append entries request backoff periods, if not scheduled already.
    */
   public void scheduleLeaderRequestBackoffResetTask(LeaderState leaderState) {
     if (!leaderState.isRequestBackoffResetTaskScheduled()) {
@@ -963,7 +962,7 @@ public final class RaftNodeImpl implements RaftNode {
    * {@link org.apache.hadoop.hbase.consensus.raft.impl.handler.VoteRequestHandler} after granting a
    * vote so that the {@link org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask} does
    * not immediately preempt the candidate we just voted for. Crucially this does NOT refresh
-   * {@link #lastLeaderHeartbeatTimestamp}: a vote grant is not a leader heartbeat, so sticky-leader
+   * {@link #lastLeaderHeartbeatTimestamp}: a vote grant is not a leader heartbeat, so sticky leader
    * checks in (Pre)VoteRequestHandler still correctly reflect whether a real leader is alive.
    */
   public void electionTimerReset() {
@@ -1128,15 +1127,15 @@ public final class RaftNodeImpl implements RaftNode {
   public void updateGroupMembers(long logIndex, Collection<RaftEndpoint> members,
     Collection<RaftEndpoint> votingMembers) {
     state.updateGroupMembers(logIndex, members, votingMembers, clock.millis());
-    // If we are the leader and this membership change excludes us from the voting set (typically a
-    // self-targeted REMOVE_MEMBER), our tenure as a quorum participant is over. Any in-flight
-    // linearizable query that has been dispatched but not yet completed cannot be safely satisfied
-    // by acks issued under the previous query sequence number: those acks reflect a quorum
-    // computation that included this leader as an implicit ack, but the effective voting set has
-    // just shrunk underneath us. To prevent a query from completing successfully on a stale
-    // quorum, we (1) fail any pending queries immediately with NotLeaderException, and
-    // (2) advance the query sequence number so that any subsequent acks for the old sequence
-    // number are explicitly treated as stale by QueryState.tryAck.
+    // If we are the leader and this membership change excludes us from the voting set
+    // (typically a self-targeted REMOVE_MEMBER), our tenure as a quorum participant is over.
+    // Any in-flight linearizable query that has been dispatched but not yet completed cannot be
+    // safely satisfied by acks issued under the previous query sequence number: those acks
+    // reflect a quorum computation that included this leader as an implicit ack, but the
+    // effective voting set has just shrunk underneath us. To prevent a query from completing
+    // successfully on a stale quorum, we (1) fail any pending queries immediately with
+    // NotLeaderException, and (2) advance the query sequence number so that any subsequent acks
+    // for the old sequence number are explicitly treated as stale by QueryState.tryAck.
     LeaderState leaderState = state.leaderState();
     if (leaderState != null && !votingMembers.contains(getLocalEndpoint())) {
       QueryState queryState = leaderState.queryState();
@@ -1164,7 +1163,7 @@ public final class RaftNodeImpl implements RaftNode {
 
   /**
    * Publishes a new Raft node report for the given reason the underlying reason that triggers this
-   * RaftNodeReport publish
+   * RaftNodeReport publish.
    * @see RaftNodeReport
    */
   public void publishRaftNodeReport(RaftNodeReportReason reason) {
@@ -1201,9 +1200,7 @@ public final class RaftNodeImpl implements RaftNode {
     }
   }
 
-  /**
-   * Updates the known leader endpoint. the discovered leader endpoint
-   */
+  /** Updates the known leader endpoint. the discovered leader endpoint. */
   public void leader(RaftEndpoint member) {
     state.leader(member);
     publishRaftNodeReport(RaftNodeReportReason.ROLE_CHANGE);
@@ -1291,7 +1288,7 @@ public final class RaftNodeImpl implements RaftNode {
    * Sends one lightweight {@link LeaderHeartbeat} to each remote member of the Raft group.
    * <p>
    * Heartbeats only carry {@code (groupId, sender, term, commitIndex)} and do not touch the log on
-   * the receiving side; followers update their commit index (clamped by the local
+   * the receiving side. Followers update their commit index (clamped by the local
    * {@code lastLogOrSnapshotIndex}) and reply with a {@link LeaderHeartbeatAck}. Match-index
    * discovery, log catch-up, and snapshot triggering are handled separately by
    * {@link #sendCatchupAppendsIfNeeded()}.
@@ -1308,9 +1305,9 @@ public final class RaftNodeImpl implements RaftNode {
   /**
    * Fires {@link #sendAppendEntriesRequest(RaftEndpoint)} only for those followers whose state
    * indicates they need it, that is: their {@code matchIndex} is behind the leader's
-   * {@code lastLogOrSnapshotIndex} (lagging follower or new follower with {@code matchIndex == 0}),
-   * or their {@code nextIndex} is at or below the leader's snapshot index (snapshot trigger). All
-   * other followers are kept in sync via the cheaper {@link #broadcastLeaderHeartbeat()} path.
+   * {@code lastLogOrSnapshotIndex}, or their {@code nextIndex} is at or below the leader's snapshot
+   * index (snapshot trigger). All other followers are kept in sync via the cheaper
+   * {@link #broadcastLeaderHeartbeat()} path.
    * <p>
    * Followers with active request-backoff (waiting on a previous AE response) are skipped here;
    * they are followed up by {@code AppendEntriesSuccessResponseHandler.trySendAppendRequest} on
@@ -1371,9 +1368,8 @@ public final class RaftNodeImpl implements RaftNode {
    * If the given follower's nextIndex is behind the latest snapshot index, then an
    * {@link InstallSnapshotRequest} is sent.
    * <p>
-   * If the leader doesn't know the given follower's matchIndex (i.e., its {@code matchIndex == 0}),
-   * then an empty append entries request is sent to save bandwidth until the leader discovers the
-   * real matchIndex of the follower. the Raft endpoint to send the request
+   * If the leader doesn't know the given follower's matchIndex then an empty append entries request
+   * is sent to save bandwidth until the leader discovers the real matchIndex of the follower.
    */
   @SuppressWarnings({ "checkstyle:npathcomplexity", "checkstyle:cyclomaticcomplexity",
     "checkstyle:methodlength", })
@@ -1453,8 +1449,7 @@ public final class RaftNodeImpl implements RaftNode {
         // the leader can send AppendEntries with no entries (like heartbeats) to save
         // bandwidth.
         // We still need to enable append request backoff here because we do not want to
-        // bombard
-        // the follower before we learn its match index.
+        // bombard the follower before we learn its match index.
         entries = emptyList();
       } else if (nextIndex <= lastLogIndex) {
         // Then, once the matchIndex immediately precedes the nextIndex,
@@ -1547,8 +1542,7 @@ public final class RaftNodeImpl implements RaftNode {
   /**
    * Returns true if the leader flush task is submitted either by the current call or a previous
    * call of this method. Returns false if the leader flush task is not submitted, because this Raft
-   * node is created with {@link NopRaftStore}. the leader state to set the flush task scheduling
-   * state
+   * node is created with {@link NopRaftStore}
    * @return true if the leader flush task is submitted either by the current call or a previous
    *         call of this method
    */
@@ -1578,8 +1572,7 @@ public final class RaftNodeImpl implements RaftNode {
    * Switches this Raft node to the candidate role for the next term and starts a new leader
    * election round. Regular leader elections are sticky, meaning that leader stickiness will be
    * considered by other Raft nodes when they receive vote requests. A non-sticky leader election
-   * occurs when the current Raft group leader tries to transfer leadership to another member. the
-   * parameter to pass on to the vote requests which are going to be sent to the followers.
+   * occurs when the current Raft group leader tries to transfer leadership to another member.
    */
   public void toCandidate(boolean sticky) {
     state.toCandidate();
@@ -1662,9 +1655,7 @@ public final class RaftNodeImpl implements RaftNode {
 
   public boolean tryAdvanceCommitIndex() {
     // If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥
-    // N, and log[N].term ==
-    // currentTerm:
-    // set commitIndex = N (§5.3, §5.4)
+    // N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4)
     long quorumMatchIndex = findQuorumMatchIndex();
     long commitIndex = state.commitIndex();
     LOGGER.trace("TRACE> {} tryAdvanceCommitIndex enter quorumMatchIndex={} commitIndex={} term={}",
@@ -1735,10 +1726,7 @@ public final class RaftNodeImpl implements RaftNode {
     }
   }
 
-  /**
-   * Returns a short string that represents identity of the local Raft endpoint.
-   * @return a short string that represents identity of the local Raft endpoint
-   */
+  /** Returns a short string that represents identity of the local Raft endpoint. */
   public String localEndpointStr() {
     return localEndpointStr;
   }
@@ -1787,10 +1775,7 @@ public final class RaftNodeImpl implements RaftNode {
    * Executes the given query operation and sets execution result to the future if the current
    * commit index is greater than or equal to the given commit index.
    * <p>
-   * Please note that the given operation must not make any mutation on the state machine. the query
-   * object to be executed the minimum commit index that the local Raft node must satisfy the future
-   * object to notify with the result if the current commit index is smaller than the given commit
-   * index
+   * Please note that the given operation must not make any mutation on the state machine.
    */
   public void runOrScheduleQuery(QueryContainer query, long minCommitIndex,
     Optional<Duration> timeout) {

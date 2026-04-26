@@ -28,10 +28,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
  * responsibility to assign unique ids to different Raft endpoints.
  */
 public interface RaftEndpoint {
-  /**
-   * Returns the unique identifier of the Raft endpoint.
-   * @return the unique identifier of the Raft endpoint
-   */
+  /** Returns the unique identifier of the Raft endpoint. */
   @NonNull
   Object getId();
 }

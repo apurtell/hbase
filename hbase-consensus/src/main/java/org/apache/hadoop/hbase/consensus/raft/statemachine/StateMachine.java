@@ -120,9 +120,6 @@ public interface StateMachine {
 
   /**
    * Returns the operation to be appended after a new leader is elected in a new term.
-   * <p>
-   * See <a href= "https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J"> <i>Bug
-   * in single-server membership changes</i></a> post by Diego Ongaro for more information.
    * @return the operation to be appended after a new leader is elected in a new term.
    */
   @NonNull

@@ -36,9 +36,7 @@ public interface AppendEntriesSuccessResponse extends RaftMessage {
 
   long getFlowControlSequenceNumber();
 
-  /**
-   * The builder interface for {@link AppendEntriesSuccessResponse}.
-   */
+  /** The builder interface for {@link AppendEntriesSuccessResponse}. */
   interface AppendEntriesSuccessResponseBuilder
     extends RaftMessageBuilder<AppendEntriesSuccessResponse> {
     @NonNull

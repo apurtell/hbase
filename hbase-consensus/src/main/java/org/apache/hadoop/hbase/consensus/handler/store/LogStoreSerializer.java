@@ -15,26 +15,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.hadoop.hbase.consensus.raft.persistence;
+package org.apache.hadoop.hbase.consensus.handler.store;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
- * Similarly to the {@link org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory}, users of
- * the RaftStore implementations must provide methods for converting a few of their types into
- * binary data for persistence. This logic is expected to be relatively straightforward for the
- * implementer, since similar logic will exist within the
- * {@link org.apache.hadoop.hbase.consensus.raft.transport.Transport}. It should be noted that
- * serialization performed here may need to be deserialized for an indefinite period and so
- * evolution of any relevant types should be considered by the implementer.
+ * Codec SPI for the consensus durable log.
+ * <p>
+ * Pluggable on the {@link DurableLogStore} constructor.
+ * <p>
+ * Implementations should be stateless and thread-safe. The same instance is shared across the
+ * producing threads of all groups multiplexed onto a single {@link DurableLogStore}.
  */
-public interface RaftStoreSerializer {
+@InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.TOOLS })
+public interface LogStoreSerializer {
   Serializer<RaftGroupMembersView> raftGroupMembersViewSerializer();
 
   Serializer<RaftEndpoint> raftEndpointSerializer();
@@ -45,7 +47,7 @@ public interface RaftStoreSerializer {
 
   Serializer<RaftEndpointPersistentState> raftEndpointPersistentStateSerializer();
 
-  Serializer<RaftTermPersistentState> raftTermPersistentState();
+  Serializer<RaftTermPersistentState> raftTermPersistentStateSerializer();
 
   interface Serializer<T> {
     @NonNull

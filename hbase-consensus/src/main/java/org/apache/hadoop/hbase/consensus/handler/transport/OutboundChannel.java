@@ -43,12 +43,12 @@ import org.apache.hbase.thirdparty.io.netty.channel.ChannelFuture;
 /**
  * Per-peer outbound side of {@link CoalescingTransport}.
  * <p>
- * Owns a JCTools {@link MpscUnboundedArrayQueue} of pending messages, a current Netty
- * {@link Channel} reference, and a tiny reconnect state machine. The transport's flush scheduler
- * pings {@link #flushTick()} at {@code hbase.consensus.log.sync.batch.ms}; producers call
+ * Owns a {@link MpscUnboundedArrayQueue} of pending messages, a current Netty {@link Channel}
+ * reference, and a tiny reconnect state machine. The transport's flush scheduler pings
+ * {@link #flushTick()} at {@code hbase.consensus.log.sync.batch.ms}; producers call
  * {@link #enqueue} from any thread.
  * <p>
- * Single-consumer drain is enforced by an {@link AtomicBoolean} latch: producers pile messages into
+ * Single-consumer drain is enforced by an {@link AtomicBoolean} latch. Producers pile messages into
  * the MPSC, the first arrival CASes the latch on, and only the drain runnable polls the queue. The
  * drain is always run on the channel's event loop so per-peer FIFO holds even across reconnects.
  */
@@ -57,7 +57,7 @@ final class OutboundChannel {
 
   private static final Logger LOG = LoggerFactory.getLogger(OutboundChannel.class);
 
-  /** Lightweight enqueue record: every queued message is bucketed during the drain. */
+  /** Lightweight enqueue record. */
   private static final class Pending {
     final RaftMessage message;
     final boolean immediate;
@@ -73,7 +73,6 @@ final class OutboundChannel {
   private final Bootstrap bootstrap;
   private final ProtoConverter converter;
   private final TransportConfig config;
-
   private final MpscUnboundedArrayQueue<Pending> mailbox;
   private final AtomicBoolean draining = new AtomicBoolean(false);
   private final AtomicReference<Channel> channelRef = new AtomicReference<>();
@@ -111,21 +110,6 @@ final class OutboundChannel {
     return ch != null && ch.isActive();
   }
 
-  /** Visible for tests. */
-  long nextConnectAtMillis() {
-    return nextConnectAtMillis;
-  }
-
-  /** Visible for tests. */
-  long currentBackoffMs() {
-    return currentBackoffMs;
-  }
-
-  /** Visible for tests. */
-  int pendingMailboxSize() {
-    return mailbox.size();
-  }
-
   /**
    * Enqueues {@code message} for the peer. Non-blocking. {@code immediate=true} hints the drain
    * that this message should be flushed in its own {@link ConsensusProtos.ConsensusFrame} rather
@@ -140,7 +124,6 @@ final class OutboundChannel {
     if (ch != null && ch.isActive() && ch.isWritable()) {
       scheduleDrainOn(ch);
     }
-    // else: flush tick will pick this up after a connect completes.
   }
 
   /**
@@ -224,7 +207,7 @@ final class OutboundChannel {
   /**
    * Schedule a drain pass on {@code ch}'s event loop. Lost-wakeup-safe via {@link #draining}
    * (mirrors the {@code GroupExecutor.scheduled} pattern). The drain itself runs single-threaded on
-   * the event loop, satisfying JCTools MPSC's single-consumer invariant.
+   * the event loop, satisfying the MPSC's single-consumer invariant.
    */
   private void scheduleDrainOn(Channel ch) {
     if (closed.get()) {
@@ -238,8 +221,8 @@ final class OutboundChannel {
           } finally {
             draining.set(false);
           }
-          // Lost-wakeup-safe re-arm: if a producer enqueued after our last poll
-          // but before we cleared the latch, schedule another drain pass.
+          // Lost-wakeup-safe re-arm. If a producer enqueued after our last poll, but before we
+          // cleared the latch, schedule another drain pass.
           if (mailbox.peek() != null && ch.isActive() && ch.isWritable()) {
             scheduleDrainOn(ch);
           }
@@ -280,8 +263,8 @@ final class OutboundChannel {
           immediates.add(converter.toFrame(p.message));
         }
       } catch (RuntimeException ex) {
-        // Defensive: if conversion fails (e.g. compression, unknown op type), drop just this
-        // message and keep draining the rest.
+        // If conversion fails (e.g. compression, unknown op type), drop just this message and
+        // keep draining the rest.
         LOG.warn("Failed to encode {} for {}; dropping", p.message.getClass().getName(), address,
           ex);
       }
@@ -320,6 +303,21 @@ final class OutboundChannel {
     ) {
       ch.flush();
     }
+  }
+
+  /** Visible for tests. */
+  long nextConnectAtMillis() {
+    return nextConnectAtMillis;
+  }
+
+  /** Visible for tests. */
+  long currentBackoffMs() {
+    return currentBackoffMs;
+  }
+
+  /** Visible for tests. */
+  int pendingMailboxSize() {
+    return mailbox.size();
   }
 
   /** Visible for tests. */

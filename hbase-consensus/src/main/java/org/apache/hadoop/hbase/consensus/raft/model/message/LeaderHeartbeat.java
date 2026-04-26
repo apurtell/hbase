@@ -34,14 +34,12 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 public interface LeaderHeartbeat extends RaftMessage {
   /**
    * Returns the leader's known commit index. Followers must clamp any local commit advance to
-   * {@code min(getCommitIndex(), localLastLogOrSnapshotIndex)} — heartbeats never reach beyond what
+   * {@code min(getCommitIndex(), localLastLogOrSnapshotIndex)}. Heartbeats never reach beyond what
    * the follower has actually persisted.
    */
   long getCommitIndex();
 
-  /**
-   * The builder interface for {@link LeaderHeartbeat}.
-   */
+  /** The builder interface for {@link LeaderHeartbeat}. */
   interface LeaderHeartbeatBuilder extends RaftMessageBuilder<LeaderHeartbeat> {
     @NonNull
     LeaderHeartbeatBuilder setGroupId(@NonNull Object groupId);

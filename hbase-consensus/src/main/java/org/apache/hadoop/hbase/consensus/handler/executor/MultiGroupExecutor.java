@@ -58,18 +58,12 @@ public final class MultiGroupExecutor {
   private final Object lifecycleLock = new Object();
   private volatile boolean closed;
 
-  /** Pool size {@code 2 * availableProcessors}, default drain cap and mailbox chunk size. */
   public MultiGroupExecutor() {
+    // Pool size {@code 2 * availableProcessors}, default drain cap and mailbox chunk size
     this(Math.max(2, 2 * Runtime.getRuntime().availableProcessors()), DEFAULT_DRAIN_BATCH_CAP,
       DEFAULT_MAILBOX_CHUNK_SIZE);
   }
 
-  /**
-   * Constructor.
-   * @param poolSize         shared scheduler worker count (must be at least 1)
-   * @param drainBatchCap    max tasks to run per drain pass per group before re-queueing
-   * @param mailboxChunkSize JCTools MPSC unbounded queue chunk size
-   */
   public MultiGroupExecutor(int poolSize, int drainBatchCap, int mailboxChunkSize) {
     if (poolSize < 1) {
       throw new IllegalArgumentException("poolSize must be >= 1");
@@ -168,8 +162,7 @@ public final class MultiGroupExecutor {
   }
 
   /**
-   * Terminates every registered {@link GroupExecutor} (same effect as each Raft node's terminate
-   * hook) and shuts down the shared pool.
+   * Terminates every registered {@link GroupExecutor} and shuts down the shared pool.
    */
   public void close() throws InterruptedException {
     synchronized (lifecycleLock) {

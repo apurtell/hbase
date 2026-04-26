@@ -21,12 +21,12 @@ import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 
 /**
- * Thrown when an operation cannot be temporarily replicated. It can occur in one of the following
- * cases:
+ * Thrown when an operation cannot be temporarily replicated.
+ * <p>
+ * This can occur in one of the following cases:
  * <ul>
- * <li>There are too many inflight (i.e., appended but not-yet-committed) operations in the Raft
- * group leader,</li>
- * <li>There are too many inflight (i.e., pending at the Raft leader to be executed) queries,</li>
+ * <li>There are too many inflight operations in the Raft group leader,</li>
+ * <li>There are too many inflight queries,</li>
  * <li>A new membership change is attempted before an entry is committed in the current term.</li>
  * </ul>
  * @see RaftConfig#getMaxPendingLogEntryCount()

@@ -20,9 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
 
-/**
- * State maintained by the Raft group leader during leadership transfer.
- */
+/** State maintained by the Raft group leader during leadership transfer. */
 public final class LeadershipTransferState {
   private int term;
   private RaftEndpoint endpoint;
@@ -35,30 +33,22 @@ public final class LeadershipTransferState {
     this.future = future;
   }
 
-  /**
-   * Returns the term in which this leadership transfer process is triggered.
-   */
+  /** Returns the term in which this leadership transfer process is triggered. */
   public int term() {
     return term;
   }
 
-  /**
-   * Returns the endpoint that is supposed to be the new Raft group leader.
-   */
+  /** Returns the endpoint that is supposed to be the new Raft group leader. */
   public RaftEndpoint endpoint() {
     return endpoint;
   }
 
-  /**
-   * Returns if we can retry leadership transfer on the target endpoint.
-   */
+  /** Returns if we can retry leadership transfer on the target endpoint. */
   public int incrementTryCount() {
     return ++tryCount;
   }
 
-  /**
-   * Completes the current leadership transfer process with the given result.
-   */
+  /** Completes the current leadership transfer process with the given result. */
   void complete(long commitIndex, Object result) {
     if (result instanceof Throwable) {
       future.fail((Throwable) result);

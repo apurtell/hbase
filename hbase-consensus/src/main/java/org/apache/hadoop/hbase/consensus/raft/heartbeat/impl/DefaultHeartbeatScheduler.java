@@ -33,7 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask;
  * no-op.
  */
 public final class DefaultHeartbeatScheduler implements HeartbeatScheduler {
-  /** Stateless singleton instance. */
+
   public static final DefaultHeartbeatScheduler INSTANCE = new DefaultHeartbeatScheduler();
 
   private DefaultHeartbeatScheduler() {
@@ -47,7 +47,6 @@ public final class DefaultHeartbeatScheduler implements HeartbeatScheduler {
 
   @Override
   public void unregister(@NonNull RaftNodeImpl node) {
-    // HeartbeatTask self-cancels via RaftNodeStatusAwareTask once the node reaches a terminal
-    // status; no per-node bookkeeping needed in the default scheduler.
+    // No per-node bookkeeping needed in the default scheduler.
   }
 }

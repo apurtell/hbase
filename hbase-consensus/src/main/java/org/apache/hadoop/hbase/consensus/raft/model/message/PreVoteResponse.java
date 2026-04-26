@@ -30,9 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 public interface PreVoteResponse extends RaftMessage {
   boolean isGranted();
 
-  /**
-   * The builder interface for {@link PreVoteResponse}.
-   */
+  /** The builder interface for {@link PreVoteResponse}. */
   interface PreVoteResponseBuilder extends RaftMessageBuilder<PreVoteResponse> {
     @NonNull
     PreVoteResponseBuilder setGroupId(@NonNull Object groupId);

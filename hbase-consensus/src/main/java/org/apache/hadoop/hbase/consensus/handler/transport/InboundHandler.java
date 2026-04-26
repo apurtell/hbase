@@ -35,8 +35,7 @@ import org.apache.hbase.thirdparty.io.netty.channel.SimpleChannelInboundHandler;
  * Inbound dispatcher.
  * <p>
  * Turns each {@link ConsensusProtos.ConsensusFrame} arriving on the wire into one or more
- * {@link RaftMessage}s and hands them to the local {@link RaftNode#handle(RaftMessage)} (which
- * itself trampolines through the per-group {@code GroupExecutor}).
+ * {@link RaftMessage}s and hands them to the local {@link RaftNode#handle(RaftMessage)}.
  * <p>
  * Sharable so the inbound pipeline can mount a single instance for every accepted connection.
  */
@@ -64,7 +63,7 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
     try {
       handle(frame);
     } catch (MalformedMessageException e) {
-      // Single bad message: log and drop, keep the channel alive.
+      // Log and drop, keep the channel alive.
       LOG.warn("Dropping malformed ConsensusFrame ({}) from {}: {}", frame.getKind(),
         ctx.channel().remoteAddress(), e.getMessage());
     }

@@ -69,17 +69,14 @@ import org.apache.hbase.thirdparty.io.netty.util.concurrent.ScheduledFuture;
  * <p>
  * One instance per local node owns:
  * <ul>
- * <li>One server bootstrap bound at the configured address (accepts inbound consensus frames).</li>
+ * <li>One server bootstrap bound at the configured address accepts inbound consensus frames.</li>
  * <li>One client bootstrap producing per-peer outbound channels.</li>
  * <li>One shared {@link EventLoopGroup} (Linux Epoll on supported CPUs, NIO otherwise) handling
- * both accept and IO. Mirrors the single-group pattern used by {@code NettyRpcServer} in
- * {@code hbase-server}.</li>
+ * both accept and IO.</li>
  * <li>A {@link RegistryDispatcher} that the user populates with local {@link RaftNode}s via
  * {@link #discoverNode(RaftNode)} / {@link #undiscoverNode(RaftNode)}.</li>
  * <li>A scheduled flush tick driving the outbound coalescing window.</li>
  * </ul>
- * Construction does not bind the server. Call {@link #start()} once the local Raft nodes have been
- * registered (or before — both orderings are supported).
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.CONFIG })
 public final class CoalescingTransport implements Transport, RaftNodeLifecycleAware {
@@ -94,10 +91,8 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   private final PayloadCompressor compressor;
   private final ProtoConverter converter;
   private final RegistryDispatcher registry = new RegistryDispatcher();
-
   private final AtomicBoolean started = new AtomicBoolean(false);
   private final AtomicBoolean stopped = new AtomicBoolean(false);
-
   private final ConcurrentMap<RaftEndpoint, OutboundChannel> peers = new ConcurrentHashMap<>();
 
   private EventLoopGroup eventLoopGroup;
@@ -109,7 +104,7 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   private ScheduledFuture<?> flushTickFuture;
 
   /**
-   * Builds a transport instance. The constructor does not start the Netty event loops; call
+   * Builds a transport instance. The constructor does not start the Netty event loops. Call
    * {@link #start()} when ready.
    * @param localEndpoint  this node's endpoint (used by {@link #send} to reject self-targeting)
    * @param bindAddress    address the server will bind on; set the port to {@code 0} for an
@@ -127,7 +122,6 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       new DefaultRaftModelFactory());
   }
 
-  /** Test-friendly constructor exposing the parsed {@link TransportConfig}. */
   CoalescingTransport(@NonNull RaftEndpoint localEndpoint, @NonNull InetSocketAddress bindAddress,
     @NonNull EndpointResolver resolver, @NonNull OperationCodec operationCodec,
     @NonNull TransportConfig config, @NonNull DefaultRaftModelFactory modelFactory) {
@@ -140,7 +134,6 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
     this.converter = new ProtoConverter(modelFactory, operationCodec, compressor);
   }
 
-  /** Returns the configured bind address (port may be ephemeral until {@link #start()}) */
   public InetSocketAddress getBindAddress() {
     Channel ch = serverChannel;
     if (ch != null && ch.localAddress() instanceof InetSocketAddress) {
@@ -149,44 +142,21 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
     return bindAddress;
   }
 
-  /** Returns the local endpoint identifying this transport instance */
   public RaftEndpoint getLocalEndpoint() {
     return localEndpoint;
   }
 
-  /** Visible for tests / subclassed wiring. */
-  RegistryDispatcher registry() {
-    return registry;
-  }
-
-  /** Visible for tests. */
-  TransportConfig transportConfig() {
-    return config;
-  }
-
-  /** Visible for tests. */
-  ProtoConverter converter() {
-    return converter;
-  }
-
   /**
    * Registers the given local Raft node so frames addressed to its group id are delivered to it.
-   * Mirrors {@code LocalTransport.discoverNode}.
    */
   public void discoverNode(@NonNull RaftNode node) {
     registry.discoverNode(node);
   }
 
-  /**
-   * Unregisters a previously discovered Raft node. Mirrors {@code LocalTransport.undiscoverNode}.
-   */
+  /** Unregisters a previously discovered Raft node. */
   public void undiscoverNode(@NonNull RaftNode node) {
     registry.undiscoverNode(node);
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Transport
-  // -------------------------------------------------------------------------------------------
 
   @Override
   public void send(@NonNull RaftEndpoint target, @NonNull RaftMessage message) {
@@ -214,24 +184,15 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
     return ch != null && ch.isActive();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // RaftNodeLifecycleAware
-  // -------------------------------------------------------------------------------------------
-
   @Override
   public void onRaftNodeStart() {
-    // Transport lifecycle is managed at the ConsensusServer level. Per-RaftNode start is a no-op
-    // so the same transport can be shared by many groups.
+    // Transport lifecycle is managed at the ConsensusServer level
   }
 
   @Override
   public void onRaftNodeTerminate() {
     // See onRaftNodeStart.
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Lifecycle
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Starts the Netty event loops and binds the server. Idempotent.
@@ -398,10 +359,9 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
 
   /**
    * Decide whether the given message must be sent in its own {@link ConsensusProtos.ConsensusFrame}
-   * (vote / install-snapshot / responses) or may be coalesced into a batch envelope.
-   * {@link LeaderHeartbeat}s coalesce into the heartbeat batch and {@link LeaderHeartbeatAck}s
-   * coalesce into the heartbeat-ack batch; {@link AppendEntriesRequest}s coalesce into the append
-   * batch.
+   * or may be coalesced into a batch envelope. {@link LeaderHeartbeat}s coalesce into the heartbeat
+   * batch and {@link LeaderHeartbeatAck}s coalesce into the heartbeat-ack batch;
+   * {@link AppendEntriesRequest}s coalesce into the append batch.
    */
   private static boolean isImmediate(RaftMessage message) {
     if (message instanceof LeaderHeartbeat) {
@@ -414,6 +374,21 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       return false;
     }
     return true;
+  }
+
+  /** Visible for tests. */
+  RegistryDispatcher registry() {
+    return registry;
+  }
+
+  /** Visible for tests. */
+  TransportConfig transportConfig() {
+    return config;
+  }
+
+  /** Visible for tests. */
+  ProtoConverter converter() {
+    return converter;
   }
 
   /** Visible for tests. */

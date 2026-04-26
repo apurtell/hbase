@@ -19,9 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.log;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 
-/**
- * Represents an entry in the Raft log.
- */
+/** Represents an entry in the Raft log. */
 public interface LogEntry extends BaseLogEntry {
   /**
    * The builder interface for {@link LogEntry}.

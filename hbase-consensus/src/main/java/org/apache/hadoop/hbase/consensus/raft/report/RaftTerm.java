@@ -20,9 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.report;
 import edu.umd.cs.findbugs.annotations.Nullable;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 
-/**
- * Contains a snapshot of a Raft node's current state in a term.
- */
+/** Contains a snapshot of a Raft node's current state in a term. */
 public interface RaftTerm {
   /**
    * Returns the term this Raft node is currently at.
@@ -42,8 +40,6 @@ public interface RaftTerm {
   /**
    * Returns the Raft endpoint that this Raft node has voted for in the current term, or null if
    * none.
-   * @return the Raft endpoint that this Raft node has voted for in the current term, or null if
-   *         none
    */
   @Nullable
   RaftEndpoint getVotedEndpoint();

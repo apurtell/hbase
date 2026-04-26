@@ -32,12 +32,8 @@ import org.apache.hbase.thirdparty.io.netty.handler.codec.LengthFieldBasedFrameD
  * Strips the 4-byte length prefix and parses the remaining bytes as a
  * {@link ConsensusProtos.ConsensusFrame}. We do not chain to Netty's {@code ProtobufDecoder} from
  * the shaded netty jar because that class is compiled against the un-shaded
- * {@code com.google.protobuf} runtime, while our generated PB classes use the shaded
- * {@code org.apache.hbase.thirdparty.com.google.protobuf} runtime; doing the parse ourselves keeps
- * everything on the shaded namespace.
- * <p>
- * Byte extraction mirrors {@code NettyRpcFrameDecoder.getHeader} in {@code hbase-server}: prefer
- * the backing array when the {@link ByteBuf} exposes one to avoid an extra copy.
+ * {@code com.google.protobuf} runtime, while our generated PB class. Doing the parse ourselves
+ * keeps everything on the shaded namespace.
  */
 @InterfaceAudience.Private
 final class ConsensusFrameDecoder extends LengthFieldBasedFrameDecoder {

@@ -40,13 +40,9 @@ import java.util.function.LongFunction;
 @SuppressWarnings("checkstyle:magicnumber")
 public final class Long2ObjectHashMap<V> implements Map<Long, V> {
   private static final int MAX_CAPACITY = 1 << 30;
-  /**
-   * The default load factor for constructors not explicitly supplying it
-   */
+  /** The default load factor for constructors not explicitly supplying it */
   public static final double DEFAULT_LOAD_FACTOR = 0.6;
-  /**
-   * The default initial capacity for constructors not explicitly supplying it
-   */
+  /** The default initial capacity for constructors not explicitly supplying it */
   public static final int DEFAULT_INITIAL_CAPACITY = 8;
   private final double loadFactor;
   // cached to avoid allocation
@@ -280,7 +276,7 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
   }
 
   /**
-   * Overloaded version of {@link Map#remove(Object)} that takes a primitive long key. for indexing
+   * Overloaded version of {@link Map#remove(Object)} that takes a primitive long key for indexing
    * the {@link Map}
    * @return the value if found otherwise null
    */
@@ -342,9 +338,6 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
   public Collection<V> values() {
     return valueCollection;
   }
-  ///////////////////////////////////////////////////////////////////////////////////////////////
-  // Internal Sets and Collections
-  ///////////////////////////////////////////////////////////////////////////////////////////////
 
   /**
    * {@inheritDoc} This set's iterator also implements <code>Map.Entry</code> so the
@@ -397,17 +390,10 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
     sb.append('}');
     return sb.toString();
   }
-  ///////////////////////////////////////////////////////////////////////////////////////////////
-  // Iterators
-  ///////////////////////////////////////////////////////////////////////////////////////////////
 
-  /**
-   * Adds non-boxing methods to the standard Set interface.
-   */
+  /** Adds non-boxing methods to the standard Set interface. */
   public class KeySet extends AbstractSet<Long> {
-    /**
-     * Non-boxing variant of contains().
-     */
+    /** Non-boxing variant of contains(). */
     public boolean contains(final long key) {
       return Long2ObjectHashMap.this.containsKey(key);
     }
@@ -442,9 +428,7 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
       Long2ObjectHashMap.this.clear();
     }
 
-    /**
-     * Non-boxing variant of remove().
-     */
+    /** Non-boxing variant of remove(). */
     public boolean remove(final long key) {
       return null != Long2ObjectHashMap.this.remove(key);
     }
@@ -574,18 +558,14 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
     }
   }
 
-  /**
-   * Adds an unboxed next() method to the standard Iterator interface.
-   */
+  /** Adds an unboxed next() method to the standard Iterator interface. */
   public class KeyIterator extends AbstractIterator<Long> {
     @Override
     public Long next() {
       return nextLong();
     }
 
-    /**
-     * Non-boxing variant of next().
-     */
+    /** Non-boxing variant of next(). */
     public long nextLong() {
       findNext();
       return keys[getPosition()];

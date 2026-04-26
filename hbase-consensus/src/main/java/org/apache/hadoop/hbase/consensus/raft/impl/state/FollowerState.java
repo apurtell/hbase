@@ -20,35 +20,27 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
-/**
- * State maintained for each follower by the Raft group leader.
- */
+/** State maintained for each follower by the Raft group leader. */
 public final class FollowerState {
   /**
-   * index of highest log entry known to be replicated on server (initialized to 0, increases
-   * monotonically)
+   * Index of highest log entry known to be replicated on server (initialized to 0, increases
+   * monotonically).
    */
   private long matchIndex;
   /**
-   * index of the next log entry to send to that server (initialized to leader's
-   * {@code lastLogIndex + 1})
+   * Index of the next log entry to send to that server (initialized to leader's
+   * {@code lastLogIndex + 1}).
    */
   private long nextIndex;
-  /**
-   * denotes the current round in the ongoing backoff period
-   */
+  /** Denotes the current round in the ongoing backoff period. */
   private int backoffRound;
-  /**
-   * used for calculating how many rounds will be used in the next backoff period
-   */
+  /** Used for calculating how many rounds will be used in the next backoff period. */
   private int nextBackoffPower;
-  /**
-   * the timestamp of the last append entries or install snapshot response
-   */
+  /** The timestamp of the last append entries or install snapshot response. */
   private long responseTimestamp;
   /**
-   * the flow control sequence number sent to the follower in the last append entries or install
-   * snapshot request
+   * The flow control sequence number sent to the follower in the last append entries or install
+   * snapshot request.
    */
   private long flowControlSequenceNumber;
 
@@ -58,37 +50,27 @@ public final class FollowerState {
     this.responseTimestamp = responseTimestamp;
   }
 
-  /**
-   * Returns the match index for follower.
-   */
+  /** Returns the match index for follower. */
   public long matchIndex() {
     return matchIndex;
   }
 
-  /**
-   * Sets the match index for follower.
-   */
+  /** Sets the match index for follower. */
   public void matchIndex(long matchIndex) {
     this.matchIndex = matchIndex;
   }
 
-  /**
-   * Returns the next index for follower.
-   */
+  /** Returns the next index for follower. */
   public long nextIndex() {
     return nextIndex;
   }
 
-  /**
-   * Sets the next index for follower.
-   */
+  /** Sets the next index for follower. */
   public void nextIndex(long nextIndex) {
     this.nextIndex = nextIndex;
   }
 
-  /**
-   * Returns whether leader is waiting for response of the last append entries request.
-   */
+  /** Returns whether leader is waiting for response of the last append entries request. */
   public boolean isRequestBackoffSet() {
     return backoffRound > 0;
   }
@@ -139,17 +121,13 @@ public final class FollowerState {
     return success;
   }
 
-  /**
-   * Clears the request backoff state.
-   */
+  /** Clears the request backoff state. */
   public void resetRequestBackoff() {
     backoffRound = 0;
     nextBackoffPower = 0;
   }
 
-  /**
-   * Returns the timestamp of the last append entries response.
-   */
+  /** Returns the timestamp of the last append entries response. */
   public long responseTimestamp() {
     return responseTimestamp;
   }

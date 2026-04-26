@@ -23,8 +23,8 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 /**
  * Response for {@link InstallSnapshotRequest}.
  * <p>
- * See <i>7 Log compaction</i> section of <i>In Search of an Understandable Consensus Algorithm</i>
- * paper by <i>Diego Ongaro</i> and <i>John Ousterhout</i>.
+ * See <i>7 Log compaction</i> of <i>In Search of an Understandable Consensus Algorithm</i> paper by
+ * <i>Diego Ongaro</i> and <i>John Ousterhout</i>.
  * <p>
  * A follower can request the missing snapshot chunks in any order from the leader.
  * @see InstallSnapshotRequest
@@ -38,9 +38,7 @@ public interface InstallSnapshotResponse extends RaftMessage {
 
   long getFlowControlSequenceNumber();
 
-  /**
-   * The builder interface for {@link InstallSnapshotResponse}.
-   */
+  /** The builder interface for {@link InstallSnapshotResponse}. */
   interface InstallSnapshotResponseBuilder extends RaftMessageBuilder<InstallSnapshotResponse> {
     @NonNull
     InstallSnapshotResponseBuilder setGroupId(@NonNull Object groupId);

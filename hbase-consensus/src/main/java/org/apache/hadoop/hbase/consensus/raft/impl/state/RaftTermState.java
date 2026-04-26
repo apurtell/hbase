@@ -22,9 +22,7 @@ import static java.util.Objects.requireNonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftTerm;
 
-/**
- * Contains a snapshot of a Raft node's current state in a term.
- */
+/** Contains a snapshot of a Raft node's current state in a term. */
 public final class RaftTermState implements RaftTerm {
   public static final RaftTermState INITIAL = new RaftTermState(0, null, null);
   /**
@@ -35,9 +33,7 @@ public final class RaftTermState implements RaftTerm {
    * [PERSISTENT]
    */
   private final int term;
-  /**
-   * Latest known leader endpoint (or null if not known).
-   */
+  /** Latest known leader endpoint (or null if not known). */
   private final RaftEndpoint leaderEndpoint;
   /**
    * Endpoint that received vote in the current term, or null if none.

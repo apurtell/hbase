@@ -35,9 +35,7 @@ public interface VoteRequest extends RaftMessage {
 
   boolean isSticky();
 
-  /**
-   * The builder interface for {@link VoteRequest}.
-   */
+  /** The builder interface for {@link VoteRequest}. */
   interface VoteRequestBuilder extends RaftMessageBuilder<VoteRequest> {
     @NonNull
     VoteRequestBuilder setGroupId(@NonNull Object groupId);

@@ -103,9 +103,9 @@ public interface RaftStore {
    * Persists the given snapshot chunk.
    * <p>
    * A snapshot is persisted with at least 1 chunk. The number of chunks in a snapshot is provided
-   * via {@link SnapshotChunk#getSnapshotChunkCount()}. A snapshot is considered to be complete when
-   * all of its chunks are provided to this method in any order, and {@link #flush()} will be called
-   * afterwards.
+   * via {@link SnapshotChunk#getSnapshotChunkCount()}. A snapshot is considered to be completed
+   * when all of its chunks are provided to this method in any order, and {@link #flush()} will be
+   * called afterwards.
    * <p>
    * The engine takes snapshots at a predetermined interval, controlled by
    * {@link RaftConfig#getCommitCountToTakeSnapshot()}. For instance, if it is 100, snapshots will
@@ -121,8 +121,6 @@ public interface RaftStore {
    * happen when a Raft follower has fallen so far behind the leader and the leader no longer holds
    * the missing entries. In that case, the follower receives a snapshot from the leader. There is
    * no upper-bound on the gap between the highest log entry and the index of the received snapshot.
-   * the snapshot chunk object to persist if any failure occurs during persisting the given snapshot
-   * chunk
    * @see #flush()
    * @see #persistLogEntries(List)
    * @see RaftConfig
@@ -137,8 +135,7 @@ public interface RaftStore {
    * There is an upper-bound on the number of persisted log entries that can be truncated
    * afterwards, which is specified by {@link RaftConfig#getMaxPendingLogEntryCount()} + 1. Say that
    * it is 5 and the highest persisted log entry index is 20. Then, at most 5 highest entries can be
-   * truncated, hence truncation can start at index=16 or higher. the log index value from which the
-   * log entries must be truncated if any failure occurs during truncating the log entries
+   * truncated, hence truncation can start at index=16 or higher.
    * @see #flush()
    * @see #persistLogEntries(List)
    * @see RaftConfig
@@ -149,8 +146,7 @@ public interface RaftStore {
    * Called after a snapshot is successfully persisted and flushed. This method is used for deleting
    * log entries and snapshot chunks that are before the snapshot index and are not needed to be
    * restored. This is merely an optimization method and its side-effects can be sync'ed to the
-   * storage when {@link #flush()} is called, the log index value until which the log entries and
-   * snapshot chunks must be truncated if any failure occurs during truncating the log entries
+   * storage when {@link #flush()} is called.
    */
   void truncateLogEntriesUntil(long logIndexInclusive) throws IOException;
 
@@ -160,8 +156,7 @@ public interface RaftStore {
    * Those snapshot chunks are no longer valid and must not be restored (or at least must be ignored
    * during the restore process). This is merely an optimization method and its side-effects can be
    * sync'ed to the storage when {@link #flush()} is called. the log index value at which some
-   * snapshot chunks are persisted. the number of snapshot chunks that could have been persisted. if
-   * any failure occurs during deletion.
+   * snapshot chunks are persisted. the number of snapshot chunks that could have been persisted.
    */
   void deleteSnapshotChunks(long logIndex, int snapshotChunkCount) throws IOException;
 
@@ -170,7 +165,7 @@ public interface RaftStore {
    * after those changes are written.
    * <p>
    * When this method returns, all the changes previously done via the other methods have become
-   * durable. if any failure occurs during the flush operation
+   * durable.
    * @see #persistLogEntries(List)
    * @see #persistSnapshotChunk(SnapshotChunk)
    * @see #deleteSnapshotChunks(long, int)

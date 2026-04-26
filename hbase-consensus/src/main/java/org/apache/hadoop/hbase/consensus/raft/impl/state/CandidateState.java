@@ -20,9 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 import java.util.HashSet;
 import java.util.Set;
 
-/**
- * State maintained by each candidate during the pre-voting and voting phases.
- */
+/** State maintained by each candidate during the pre-voting and voting phases. */
 public final class CandidateState {
   private final int majority;
   private final Set<Object> voters = new HashSet<>();
@@ -40,23 +38,17 @@ public final class CandidateState {
     return voters.add(address);
   }
 
-  /**
-   * Returns true if the majority votes are granted, false otherwise.
-   */
+  /** Returns true if the majority votes are granted, false otherwise. */
   public boolean isMajorityGranted() {
     return voteCount() >= majority();
   }
 
-  /**
-   * Returns the number of the majority votes.
-   */
+  /** Returns the number of the majority votes. */
   public int majority() {
     return majority;
   }
 
-  /**
-   * Returns current granted number of the votes.
-   */
+  /** Returns current granted number of the votes. */
   public int voteCount() {
     return voters.size();
   }

@@ -33,9 +33,8 @@ import org.apache.hbase.thirdparty.com.google.protobuf.InvalidProtocolBufferExce
 /**
  * Built-in codec for {@link UpdateRaftGroupMembersOp}. Reserved discriminator id {@code 1}.
  * <p>
- * This is the only operation type the consensus core itself produces (the leader replicates one via
- * {@link org.apache.hadoop.hbase.consensus.raft.RaftNode#changeMembership} when the user mutates
- * membership). User operations are dispatched by separately registered codecs; combine them via
+ * This is the only operation type the consensus core itself produces. User operations are
+ * dispatched by separately registered codecs. Combine them via
  * {@link OperationCodecs#composite(OperationCodec...)}.
  */
 @InterfaceAudience.Private
@@ -49,7 +48,6 @@ public final class UpdateRaftGroupMembersOpCodec implements OperationCodec {
     this(new DefaultRaftModelFactory());
   }
 
-  /** Visible for tests / advanced wiring. */
   public UpdateRaftGroupMembersOpCodec(@NonNull DefaultRaftModelFactory factory) {
     this.factory = factory;
   }

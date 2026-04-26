@@ -30,9 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftLogStats;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftTerm;
 
-/**
- * Contains a snapshot of a Raft node's internal state.
- */
+/** Contains a snapshot of a Raft node's internal state. */
 public final class RaftNodeReportImpl implements RaftNodeReport {
   private final RaftNodeReportReason reason;
   private final Object groupId;

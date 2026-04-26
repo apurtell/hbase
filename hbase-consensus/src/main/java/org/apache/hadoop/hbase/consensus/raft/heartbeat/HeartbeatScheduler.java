@@ -41,8 +41,8 @@ public interface HeartbeatScheduler {
   void register(@NonNull RaftNodeImpl node);
 
   /**
-   * Called from {@code RaftNodeImpl.terminate} before component teardown. Idempotent: invocations
-   * for a node that was never registered, or registered and already removed, must be no-ops.
+   * Called from {@code RaftNodeImpl.terminate} before component teardown. Invocations for a node
+   * that was never registered, or registered and already removed, must be no-ops.
    */
   void unregister(@NonNull RaftNodeImpl node);
 }

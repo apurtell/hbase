@@ -17,16 +17,11 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.model;
 
-import java.io.Serializable;
-import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
-import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
-
 /**
  * The base interface for the objects that hit network and persistent storage.
  * <p>
- * RaftModel objects must be immutable.
- * @see RaftMessage
- * @see BaseLogEntry
+ * RaftModel objects must be immutable. The wire/persistence representation is protobuf via
+ * {@code ConsensusProtos} and {@code DefaultLogStoreSerializer}.
  */
-public interface RaftModel extends Serializable {
+public interface RaftModel {
 }

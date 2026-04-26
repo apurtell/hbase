@@ -30,9 +30,7 @@ public interface TriggerLeaderElectionRequest extends RaftMessage {
 
   long getLastLogIndex();
 
-  /**
-   * The builder interface for {@link TriggerLeaderElectionRequest}.
-   */
+  /** The builder interface for {@link TriggerLeaderElectionRequest}. */
   interface TriggerLeaderElectionRequestBuilder
     extends RaftMessageBuilder<TriggerLeaderElectionRequest> {
     @NonNull

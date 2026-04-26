@@ -95,7 +95,7 @@ public interface RaftNodeReport {
   /**
    * Returns the role of the Raft node in the current term. If the returned role is
    * {@link RaftRole#LEADER}, it means the local Raft node has received heartbeats from the majority
-   * in the last {@link RaftConfig#getLeaderHeartbeatTimeoutMillis()} milliseconds (follower view).
+   * in the last {@link RaftConfig#getLeaderHeartbeatTimeoutMillis()} milliseconds.
    * @return the role of the Raft node in the current term
    */
   @NonNull
@@ -154,26 +154,18 @@ public interface RaftNodeReport {
   @NonNull
   Optional<Long> getLeaderHeartbeatTimestamp();
 
-  /**
-   * Denotes the reason for a given report
-   */
+  /** Denotes the reason for a given report. */
   enum RaftNodeReportReason {
-    /**
-     * The report is created on a periodic reporting tick of the {@link RaftNode}.
-     */
+    /** The report is created on a periodic reporting tick of the {@link RaftNode}. */
     PERIODIC,
-    /**
-     * The report is created when a {@link RaftNode} changes its {@link RaftNodeStatus}.
-     */
+    /** The report is created when a {@link RaftNode} changes its {@link RaftNodeStatus}. */
     STATUS_CHANGE,
     /**
      * The report is created on when a {@link RaftNode} changes its role or discovers the leader in
      * the current term.
      */
     ROLE_CHANGE,
-    /**
-     * The report is created when a {@link RaftNode} moves to a new Raft group member list.
-     */
+    /** The report is created when a {@link RaftNode} moves to a new Raft group member list. */
     GROUP_MEMBERS_CHANGE,
     /**
      * The report is created when a {@link RaftNode} takes a snapshot of the {@link StateMachine}
@@ -184,9 +176,7 @@ public interface RaftNodeReport {
      * {@link RaftRole#LEADER}.
      */
     INSTALL_SNAPSHOT,
-    /**
-     * The report is created for a {@link RaftNode#getReport()} call.
-     */
+    /** The report is created for a {@link RaftNode#getReport()} call. */
     API_CALL
   }
 }

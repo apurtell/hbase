@@ -46,9 +46,7 @@ public interface AppendEntriesRequest extends RaftMessage {
 
   long getFlowControlSequenceNumber();
 
-  /**
-   * The builder interface for {@link AppendEntriesRequest}.
-   */
+  /** The builder interface for {@link AppendEntriesRequest}. */
   interface AppendEntriesRequestBuilder extends RaftMessageBuilder<AppendEntriesRequest> {
     @NonNull
     AppendEntriesRequestBuilder setGroupId(@NonNull Object groupId);
