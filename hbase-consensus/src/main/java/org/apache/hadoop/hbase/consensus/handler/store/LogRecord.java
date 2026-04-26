@@ -27,6 +27,7 @@ import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
 import java.util.zip.CRC32C;
+import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -153,8 +154,8 @@ public final class LogRecord {
     buf.putInt(0);
     int recordStart = buf.position();
     buf.put((byte) record.kind.ordinal());
-    putVarLong(buf, record.seq);
-    putVarInt(buf, record.groupId.length);
+    StreamUtils.writeRawVInt64(buf, record.seq);
+    StreamUtils.writeRawVInt32(buf, record.groupId.length);
     buf.put(record.groupId);
     buf.put(record.payload);
     int recordEnd = buf.position();
@@ -182,8 +183,8 @@ public final class LogRecord {
   /** Builds a {@link Kind#TRUNCATE_FROM} or {@link Kind#TRUNCATE_UNTIL} payload. */
   @NonNull
   public static byte[] encodeTruncatePayload(long logIndex) {
-    ByteBuffer tmp = ByteBuffer.allocate(varLongLen(logIndex));
-    putVarLong(tmp, logIndex);
+    ByteBuffer tmp = ByteBuffer.allocate(StreamUtils.vintSize(logIndex));
+    StreamUtils.writeRawVInt64(tmp, logIndex);
     tmp.flip();
     byte[] out = new byte[tmp.remaining()];
     tmp.get(out);
@@ -193,15 +194,20 @@ public final class LogRecord {
   /** Decodes a single varint-encoded {@code logIndex} payload. */
   public static long decodeTruncatePayload(@NonNull byte[] payload) {
     ByteBuffer buf = ByteBuffer.wrap(payload);
-    return getVarLong(buf);
+    try {
+      return StreamUtils.readRawVarint64(buf);
+    } catch (IOException e) {
+      throw new IllegalStateException("Malformed truncate payload", e);
+    }
   }
 
   /** Builds a {@link Kind#DELETE_SNAPSHOT_CHUNKS} payload. */
   @NonNull
   public static byte[] encodeDeleteSnapshotChunksPayload(long logIndex, int chunkCount) {
-    ByteBuffer tmp = ByteBuffer.allocate(varLongLen(logIndex) + varIntLen(chunkCount));
-    putVarLong(tmp, logIndex);
-    putVarInt(tmp, chunkCount);
+    ByteBuffer tmp =
+      ByteBuffer.allocate(StreamUtils.vintSize(logIndex) + StreamUtils.vintSize(chunkCount));
+    StreamUtils.writeRawVInt64(tmp, logIndex);
+    StreamUtils.writeRawVInt32(tmp, chunkCount);
     tmp.flip();
     byte[] out = new byte[tmp.remaining()];
     tmp.get(out);
@@ -214,17 +220,22 @@ public final class LogRecord {
   @NonNull
   public static long[] decodeDeleteSnapshotChunksPayload(@NonNull byte[] payload) {
     ByteBuffer buf = ByteBuffer.wrap(payload);
-    long idx = getVarLong(buf);
-    int count = getVarInt(buf);
-    return new long[] { idx, count };
+    try {
+      long idx = StreamUtils.readRawVarint64(buf);
+      int count = StreamUtils.readRawVarint32(buf);
+      return new long[] { idx, count };
+    } catch (IOException e) {
+      throw new IllegalStateException("Malformed delete-snapshot-chunks payload", e);
+    }
   }
 
   /** Builds a {@link Kind#SEGMENT_HEADER} payload. */
   @NonNull
   public static byte[] encodeSegmentHeaderPayload(long segmentId, long createTimeMs) {
-    ByteBuffer tmp = ByteBuffer.allocate(varLongLen(segmentId) + varLongLen(createTimeMs));
-    putVarLong(tmp, segmentId);
-    putVarLong(tmp, createTimeMs);
+    ByteBuffer tmp =
+      ByteBuffer.allocate(StreamUtils.vintSize(segmentId) + StreamUtils.vintSize(createTimeMs));
+    StreamUtils.writeRawVInt64(tmp, segmentId);
+    StreamUtils.writeRawVInt64(tmp, createTimeMs);
     tmp.flip();
     byte[] out = new byte[tmp.remaining()];
     tmp.get(out);
@@ -235,16 +246,20 @@ public final class LogRecord {
   @NonNull
   public static long[] decodeSegmentHeaderPayload(@NonNull byte[] payload) {
     ByteBuffer buf = ByteBuffer.wrap(payload);
-    long segId = getVarLong(buf);
-    long createTimeMs = getVarLong(buf);
-    return new long[] { segId, createTimeMs };
+    try {
+      long segId = StreamUtils.readRawVarint64(buf);
+      long createTimeMs = StreamUtils.readRawVarint64(buf);
+      return new long[] { segId, createTimeMs };
+    } catch (IOException e) {
+      throw new IllegalStateException("Malformed segment-header payload", e);
+    }
   }
 
   /** Builds a {@link Kind#SEGMENT_FOOTER} payload. */
   @NonNull
   public static byte[] encodeSegmentFooterPayload(long nextSegmentId, boolean cleanShutdown) {
-    ByteBuffer tmp = ByteBuffer.allocate(varLongLen(nextSegmentId) + 1);
-    putVarLong(tmp, nextSegmentId);
+    ByteBuffer tmp = ByteBuffer.allocate(StreamUtils.vintSize(nextSegmentId) + 1);
+    StreamUtils.writeRawVInt64(tmp, nextSegmentId);
     tmp.put((byte) (cleanShutdown ? 1 : 0));
     tmp.flip();
     byte[] out = new byte[tmp.remaining()];
@@ -364,8 +379,8 @@ public final class LogRecord {
       ByteBuffer rec = body.slice();
       try {
         Kind kind = Kind.fromOrdinal(rec.get() & 0xFF);
-        long seq = getVarLong(rec);
-        int gidLen = getVarInt(rec);
+        long seq = StreamUtils.readRawVarint64(rec);
+        int gidLen = StreamUtils.readRawVarint32(rec);
         if (gidLen < 0 || gidLen > rec.remaining()) {
           return new ReadResult.Truncated(frameStart);
         }
@@ -376,7 +391,7 @@ public final class LogRecord {
         position = frameStart + total;
         LogRecord lr = new LogRecord(kind, seq, gid, payload);
         return new ReadResult.Ok(lr, position);
-      } catch (RuntimeException e) {
+      } catch (RuntimeException | IOException e) {
         return new ReadResult.Truncated(frameStart);
       }
     }
@@ -408,65 +423,10 @@ public final class LogRecord {
     return (int) crc.getValue();
   }
 
-  /**
-   * Writes an unsigned LEB128 varint to {@code buf}. Supports the full unsigned long range.
-   */
-  static void putVarLong(@NonNull ByteBuffer buf, long value) {
-    while ((value & ~0x7FL) != 0L) {
-      buf.put((byte) ((value & 0x7F) | 0x80));
-      value >>>= 7;
-    }
-    buf.put((byte) (value & 0x7F));
-  }
-
-  static void putVarInt(@NonNull ByteBuffer buf, int value) {
-    putVarLong(buf, value & 0xFFFFFFFFL);
-  }
-
-  static long getVarLong(@NonNull ByteBuffer buf) {
-    long result = 0L;
-    int shift = 0;
-    while (true) {
-      if (!buf.hasRemaining()) {
-        throw new IllegalStateException("Truncated varint");
-      }
-      byte b = buf.get();
-      result |= (long) (b & 0x7F) << shift;
-      if ((b & 0x80) == 0) {
-        return result;
-      }
-      shift += 7;
-      if (shift > 63) {
-        throw new IllegalStateException("Varint > 64 bits");
-      }
-    }
-  }
-
-  static int getVarInt(@NonNull ByteBuffer buf) {
-    long v = getVarLong(buf);
-    if (v < 0L || v > 0xFFFFFFFFL) {
-      throw new IllegalStateException("Varint out of int range: " + v);
-    }
-    return (int) v;
-  }
-
-  static int varLongLen(long value) {
-    int n = 1;
-    long v = value;
-    while ((v & ~0x7FL) != 0L) {
-      v >>>= 7;
-      n++;
-    }
-    return n;
-  }
-
-  static int varIntLen(int value) {
-    return varLongLen(value & 0xFFFFFFFFL);
-  }
-
   private static int recordBytesLen(LogRecord r) {
     int gidLen = r.groupId.length;
-    return 1 + varLongLen(r.seq) + varIntLen(gidLen) + gidLen + r.payload.length;
+    return 1 + StreamUtils.vintSize(r.seq) + StreamUtils.vintSize(gidLen) + gidLen
+      + r.payload.length;
   }
 
   private static void readFully(FileChannel ch, ByteBuffer dst, long startOffset)

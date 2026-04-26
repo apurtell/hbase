@@ -49,6 +49,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 package org.apache.hadoop.hbase.util;
 
+import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -157,24 +158,12 @@ public class SimpleMutableByteRange extends AbstractByteRange {
     return this;
   }
 
-  // Copied from com.google.protobuf.CodedOutputStream v2.5.0 writeRawVarint64
   @Override
   public int putVLong(int index, long val) {
-    int rPos = 0;
-    while (true) {
-      if ((val & ~0x7F) == 0) {
-        bytes[offset + index + rPos] = (byte) val;
-        break;
-      } else {
-        bytes[offset + index + rPos] = (byte) ((val & 0x7F) | 0x80);
-        val >>>= 7;
-      }
-      rPos++;
-    }
+    int n = StreamUtils.writeRawVInt64(bytes, offset + index, val);
     clearHashCache();
-    return rPos + 1;
+    return n;
   }
-  // end copied from protobuf
 
   @Override
   public ByteRange deepCopy() {

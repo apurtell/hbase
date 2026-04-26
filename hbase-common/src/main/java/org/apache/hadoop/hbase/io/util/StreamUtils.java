@@ -208,6 +208,204 @@ public class StreamUtils {
   }
 
   /**
+   * Write a 64-bit unsigned LEB128 (protobuf-style) varint to {@code output}. Values are treated as
+   * unsigned, so negative {@code long} values are encoded in the full 10 bytes.
+   */
+  public static void writeRawVInt64(OutputStream output, long value) throws IOException {
+    while (true) {
+      if ((value & ~0x7FL) == 0L) {
+        output.write((int) value);
+        return;
+      } else {
+        output.write(((int) value & 0x7F) | 0x80);
+        value >>>= 7;
+      }
+    }
+  }
+
+  /**
+   * Read a 64-bit unsigned LEB128 varint written by {@link #writeRawVInt64(OutputStream, long)}
+   * from {@code input}.
+   * @throws IOException if the varint is malformed (more than 10 bytes) or the stream ends early
+   */
+  public static long readRawVarint64(InputStream input) throws IOException {
+    long result = 0L;
+    int shift = 0;
+    while (shift < 64) {
+      int b = input.read();
+      if (b < 0) {
+        throw new EOFException();
+      }
+      result |= ((long) (b & 0x7F)) << shift;
+      if ((b & 0x80) == 0) {
+        return result;
+      }
+      shift += 7;
+    }
+    throw new IOException("Malformed varint");
+  }
+
+  /**
+   * Read a 64-bit unsigned LEB128 varint from a {@link ByteBuff}, advancing its position.
+   */
+  public static long readRawVarint64(ByteBuff input) throws IOException {
+    long result = 0L;
+    int shift = 0;
+    while (shift < 64) {
+      byte b = input.get();
+      result |= ((long) (b & 0x7F)) << shift;
+      if ((b & 0x80) == 0) {
+        return result;
+      }
+      shift += 7;
+    }
+    throw new IOException("Malformed varint");
+  }
+
+  /**
+   * Write a 32-bit unsigned LEB128 varint to {@code out}, advancing its position. The buffer must
+   * have at least {@link #vintSize(int) vintSize(value)} bytes remaining.
+   */
+  public static void writeRawVInt32(ByteBuffer out, int value) {
+    while ((value & ~0x7F) != 0) {
+      out.put((byte) ((value & 0x7F) | 0x80));
+      value >>>= 7;
+    }
+    out.put((byte) value);
+  }
+
+  /**
+   * Write a 64-bit unsigned LEB128 varint to {@code out}, advancing its position. The buffer must
+   * have at least {@link #vintSize(long) vintSize(value)} bytes remaining.
+   */
+  public static void writeRawVInt64(ByteBuffer out, long value) {
+    while ((value & ~0x7FL) != 0L) {
+      out.put((byte) (((int) value & 0x7F) | 0x80));
+      value >>>= 7;
+    }
+    out.put((byte) value);
+  }
+
+  /**
+   * Read a 32-bit unsigned LEB128 varint from {@code in}, advancing its position.
+   * @throws IOException if the varint is malformed (more than 5 bytes)
+   */
+  public static int readRawVarint32(ByteBuffer in) throws IOException {
+    int result = 0;
+    int shift = 0;
+    while (shift < 32) {
+      byte b = in.get();
+      result |= (b & 0x7F) << shift;
+      if ((b & 0x80) == 0) {
+        return result;
+      }
+      shift += 7;
+    }
+    // We've already consumed 5 bytes of varint payload; protobuf permits up to 10 bytes when an
+    // int was sign-extended into a long on the writer side. Drain and discard the upper bytes.
+    for (int i = 0; i < 5; i++) {
+      if ((in.get() & 0x80) == 0) {
+        return result;
+      }
+    }
+    throw new IOException("Malformed varint");
+  }
+
+  /**
+   * Read a 64-bit unsigned LEB128 varint from {@code in}, advancing its position.
+   * @throws IOException if the varint is malformed (more than 10 bytes)
+   */
+  public static long readRawVarint64(ByteBuffer in) throws IOException {
+    long result = 0L;
+    int shift = 0;
+    while (shift < 64) {
+      byte b = in.get();
+      result |= ((long) (b & 0x7F)) << shift;
+      if ((b & 0x80) == 0) {
+        return result;
+      }
+      shift += 7;
+    }
+    throw new IOException("Malformed varint");
+  }
+
+  /**
+   * Write a 32-bit unsigned LEB128 varint to {@code dst} starting at {@code offset}.
+   * @return the number of bytes written
+   */
+  public static int writeRawVInt32(byte[] dst, int offset, int value) {
+    int p = offset;
+    while ((value & ~0x7F) != 0) {
+      dst[p++] = (byte) ((value & 0x7F) | 0x80);
+      value >>>= 7;
+    }
+    dst[p++] = (byte) value;
+    return p - offset;
+  }
+
+  /**
+   * Write a 64-bit unsigned LEB128 varint to {@code dst} starting at {@code offset}.
+   * @return the number of bytes written
+   */
+  public static int writeRawVInt64(byte[] dst, int offset, long value) {
+    int p = offset;
+    while ((value & ~0x7FL) != 0L) {
+      dst[p++] = (byte) (((int) value & 0x7F) | 0x80);
+      value >>>= 7;
+    }
+    dst[p++] = (byte) value;
+    return p - offset;
+  }
+
+  /**
+   * Read a 64-bit unsigned LEB128 varint from {@code input} starting at {@code offset}.
+   * @return a pair of (value, bytes-consumed)
+   * @throws IOException if the varint is malformed
+   */
+  public static Pair<Long, Integer> readRawVarint64(byte[] input, int offset) throws IOException {
+    long result = 0L;
+    int shift = 0;
+    int p = offset;
+    while (shift < 64) {
+      byte b = input[p++];
+      result |= ((long) (b & 0x7F)) << shift;
+      if ((b & 0x80) == 0) {
+        return new Pair<>(result, p - offset);
+      }
+      shift += 7;
+    }
+    throw new IOException("Malformed varint");
+  }
+
+  /**
+   * Number of bytes a 32-bit unsigned LEB128 varint with this value will occupy.
+   */
+  public static int vintSize(int value) {
+    if ((value & (~0 << 7)) == 0) return 1;
+    if ((value & (~0 << 14)) == 0) return 2;
+    if ((value & (~0 << 21)) == 0) return 3;
+    if ((value & (~0 << 28)) == 0) return 4;
+    return 5;
+  }
+
+  /**
+   * Number of bytes a 64-bit unsigned LEB128 varint with this value will occupy.
+   */
+  public static int vintSize(long value) {
+    // Treat negatives as full 10-byte varints, matching protobuf encoding rules.
+    if ((value & (~0L << 7)) == 0L) return 1;
+    if ((value & (~0L << 14)) == 0L) return 2;
+    if ((value & (~0L << 21)) == 0L) return 3;
+    if ((value & (~0L << 28)) == 0L) return 4;
+    if ((value & (~0L << 35)) == 0L) return 5;
+    if ((value & (~0L << 42)) == 0L) return 6;
+    if ((value & (~0L << 49)) == 0L) return 7;
+    if ((value & (~0L << 56)) == 0L) return 8;
+    if ((value & (~0L << 63)) == 0L) return 9;
+    return 10;
+  }
+
+  /**
    * Read a byte from the given stream using the read method, and throw EOFException if it returns
    * -1, like the implementation in {@code DataInputStream}.
    * <p/>

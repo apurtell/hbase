@@ -49,6 +49,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 package org.apache.hadoop.hbase.util;
 
+import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
@@ -217,7 +218,6 @@ public abstract class AbstractByteRange implements ByteRange {
     return l;
   }
 
-  // Copied from com.google.protobuf.CodedInputStream v2.5.0 readRawVarint64
   @Override
   public long getVLong(int index) {
     int shift = 0;
@@ -232,15 +232,13 @@ public abstract class AbstractByteRange implements ByteRange {
     }
     return result;
   }
-  // end of copied from protobuf
 
+  /**
+   * Returns the number of bytes a 64-bit unsigned LEB128 varint with this value will occupy. Kept
+   * for backward compatibility; new callers should prefer {@link StreamUtils#vintSize(long)}.
+   */
   public static int getVLongSize(long val) {
-    int rPos = 0;
-    while ((val & ~0x7F) != 0) {
-      val >>>= 7;
-      rPos++;
-    }
-    return rPos + 1;
+    return StreamUtils.vintSize(val);
   }
 
   //

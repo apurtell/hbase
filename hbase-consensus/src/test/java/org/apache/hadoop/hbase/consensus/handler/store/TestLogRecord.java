@@ -26,6 +26,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
+import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -180,14 +181,14 @@ public class TestLogRecord extends TestBase {
   }
 
   @Test
-  public void testVarintBoundaries() {
+  public void testVarintBoundaries() throws IOException {
     long[] cases =
       { 0L, 1L, 127L, 128L, (1L << 14) - 1, 1L << 14, Integer.MAX_VALUE, Long.MAX_VALUE };
     for (long v : cases) {
-      ByteBuffer buf = ByteBuffer.allocate(LogRecord.varLongLen(v));
-      LogRecord.putVarLong(buf, v);
+      ByteBuffer buf = ByteBuffer.allocate(StreamUtils.vintSize(v));
+      StreamUtils.writeRawVInt64(buf, v);
       buf.flip();
-      assertThat(LogRecord.getVarLong(buf)).isEqualTo(v);
+      assertThat(StreamUtils.readRawVarint64(buf)).isEqualTo(v);
       assertThat(buf.hasRemaining()).isFalse();
     }
   }

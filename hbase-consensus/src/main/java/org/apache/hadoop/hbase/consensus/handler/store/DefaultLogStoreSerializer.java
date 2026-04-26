@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.handler.store;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodec;
 import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodecs;
@@ -33,6 +34,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
 import org.apache.hadoop.hbase.io.compress.Compression;
+import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.InvalidProtocolBufferException;
@@ -159,8 +161,8 @@ public final class DefaultLogStoreSerializer implements LogStoreSerializer {
       public byte[] serialize(@NonNull RaftEndpointPersistentState element) {
         byte[] idBytes = endpointIdBytes(element.getLocalEndpoint());
         ByteBuffer buf =
-          ByteBuffer.allocate(LogRecord.varIntLen(idBytes.length) + idBytes.length + 1);
-        LogRecord.putVarInt(buf, idBytes.length);
+          ByteBuffer.allocate(StreamUtils.vintSize(idBytes.length) + idBytes.length + 1);
+        StreamUtils.writeRawVInt32(buf, idBytes.length);
         buf.put(idBytes);
         buf.put((byte) (element.isVoting() ? 1 : 0));
         buf.flip();
@@ -173,7 +175,12 @@ public final class DefaultLogStoreSerializer implements LogStoreSerializer {
       @Override
       public RaftEndpointPersistentState deserialize(@NonNull byte[] element) {
         ByteBuffer buf = ByteBuffer.wrap(element);
-        int idLen = LogRecord.getVarInt(buf);
+        int idLen;
+        try {
+          idLen = StreamUtils.readRawVarint32(buf);
+        } catch (IOException e) {
+          throw new IllegalArgumentException("Malformed RaftEndpointPersistentState payload", e);
+        }
         if (idLen < 0 || idLen > buf.remaining()) {
           throw new IllegalArgumentException(
             "RaftEndpointPersistentState id length out of range: " + idLen);
@@ -200,10 +207,11 @@ public final class DefaultLogStoreSerializer implements LogStoreSerializer {
       public byte[] serialize(@NonNull RaftTermPersistentState element) {
         byte[] idBytes =
           element.getVotedFor() == null ? new byte[0] : endpointIdBytes(element.getVotedFor());
-        ByteBuffer buf = ByteBuffer.allocate(LogRecord.varLongLen(element.getTerm())
-          + LogRecord.varIntLen(idBytes.length) + idBytes.length);
-        LogRecord.putVarLong(buf, element.getTerm() & 0xFFFFFFFFL);
-        LogRecord.putVarInt(buf, idBytes.length);
+        long termAsUnsigned = element.getTerm() & 0xFFFFFFFFL;
+        ByteBuffer buf = ByteBuffer.allocate(StreamUtils.vintSize(termAsUnsigned)
+          + StreamUtils.vintSize(idBytes.length) + idBytes.length);
+        StreamUtils.writeRawVInt64(buf, termAsUnsigned);
+        StreamUtils.writeRawVInt32(buf, idBytes.length);
         buf.put(idBytes);
         buf.flip();
         byte[] out = new byte[buf.remaining()];
@@ -215,9 +223,15 @@ public final class DefaultLogStoreSerializer implements LogStoreSerializer {
       @Override
       public RaftTermPersistentState deserialize(@NonNull byte[] element) {
         ByteBuffer buf = ByteBuffer.wrap(element);
-        long termLong = LogRecord.getVarLong(buf);
+        long termLong;
+        int idLen;
+        try {
+          termLong = StreamUtils.readRawVarint64(buf);
+          idLen = StreamUtils.readRawVarint32(buf);
+        } catch (IOException e) {
+          throw new IllegalArgumentException("Malformed RaftTermPersistentState payload", e);
+        }
         int term = (int) (termLong & 0xFFFFFFFFL);
-        int idLen = LogRecord.getVarInt(buf);
         if (idLen < 0 || idLen > buf.remaining()) {
           throw new IllegalArgumentException(
             "RaftTermPersistentState voted_for id length out of range: " + idLen);
