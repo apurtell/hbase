@@ -33,6 +33,8 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode.RaftNodeBuilder;
 import org.apache.hadoop.hbase.consensus.raft.RaftRole;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.DefaultHeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.log.DefaultRaftGroupMembersViewOrBuilder;
@@ -63,6 +65,7 @@ public class RaftNodeBuilderImpl implements RaftNodeBuilder {
   private RaftModelFactory modelFactory = new DefaultRaftModelFactory();
   private Random random = new Random();
   private Clock clock = Clock.systemUTC();
+  private HeartbeatScheduler heartbeatScheduler = DefaultHeartbeatScheduler.INSTANCE;
   private boolean done;
 
   @NonNull
@@ -184,6 +187,13 @@ public class RaftNodeBuilderImpl implements RaftNodeBuilder {
 
   @NonNull
   @Override
+  public RaftNodeBuilder setHeartbeatScheduler(@NonNull HeartbeatScheduler heartbeatScheduler) {
+    this.heartbeatScheduler = requireNonNull(heartbeatScheduler);
+    return this;
+  }
+
+  @NonNull
+  @Override
   public RaftNode build() {
     if (done) {
       throw new IllegalStateException("Raft node is already built!");
@@ -202,13 +212,13 @@ public class RaftNodeBuilderImpl implements RaftNodeBuilder {
     done = true;
     if (restoredState != null) {
       return new RaftNodeImpl(groupId, restoredState, config, executor, stateMachine, transport,
-        modelFactory, store, listener, random, clock);
+        modelFactory, store, listener, random, clock, heartbeatScheduler);
     } else {
       // this groupMembers object does not hit network or disk.
       RaftGroupMembersView groupMembers = new DefaultRaftGroupMembersViewOrBuilder().setLogIndex(0)
         .setMembers(initialGroupMembers).setVotingMembers(initialVotingGroupMembers).build();
       return new RaftNodeImpl(groupId, localEndpoint, groupMembers, config, executor, stateMachine,
-        transport, modelFactory, store, listener, random, clock);
+        transport, modelFactory, store, listener, random, clock, heartbeatScheduler);
     }
   }
 }

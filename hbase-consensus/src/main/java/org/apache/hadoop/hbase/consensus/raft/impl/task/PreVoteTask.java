@@ -53,7 +53,6 @@ public final class PreVoteTask extends RaftNodeStatusAwareTask implements Runnab
       return;
     }
     if (state.remoteVotingMembers().isEmpty()) {
-      // TODO(basri): why do we have this check?
       LOGGER.warn("{} Remote voting members is empty. No need for pre-voting.", localEndpointStr());
       return;
     }

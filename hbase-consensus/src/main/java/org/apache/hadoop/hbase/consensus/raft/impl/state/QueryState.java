@@ -26,6 +26,8 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.statemachine.NoOp;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class is used to keep query operations until a heartbeat round is completed. These query
@@ -37,6 +39,8 @@ import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
  * Raft log for read-only queries and still preserve linearizability.
  */
 public final class QueryState {
+  private static final Logger LOGGER = LoggerFactory.getLogger(QueryState.class);
+
   /**
    * Queries waiting to be executed.
    */
@@ -78,6 +82,9 @@ public final class QueryState {
     if (firstQuery) {
       querySequenceNumber++;
     }
+    LOGGER.trace(
+      "TRACE> QueryState.addQuery commitIndex={} readIndex={} queries={} qsn={} first={}",
+      commitIndex, readIndex, queries.size(), querySequenceNumber, firstQuery);
     return firstQuery;
   }
 
@@ -90,13 +97,18 @@ public final class QueryState {
     // If there is no query waiting to be executed or the received ack
     // belongs to an earlier query, we ignore it.
     if (queries.isEmpty() || this.querySequenceNumber > querySequenceNumber) {
+      LOGGER.trace("TRACE> QueryState.tryAck IGNORED follower={} ackQsn={} curQsn={} queries={}",
+        follower.getId(), querySequenceNumber, this.querySequenceNumber, queries.size());
       return false;
     }
     if (querySequenceNumber != this.querySequenceNumber) {
       throw new IllegalStateException(
         this + ", acked query sequence number: " + querySequenceNumber + ", follower: " + follower);
     }
-    return acks.add(follower);
+    boolean added = acks.add(follower);
+    LOGGER.trace("TRACE> QueryState.tryAck follower={} qsn={} added={} acks={} queries={}",
+      follower.getId(), querySequenceNumber, added, acks, queries.size());
+    return added;
   }
 
   /**
@@ -114,6 +126,21 @@ public final class QueryState {
   }
 
   /**
+   * Advances the query sequence number to invalidate any in-flight acknowledgments from followers
+   * that were issued under the previous sequence number. Used when the effective voting membership
+   * changes and the leader can no longer rely on the previously dispatched read-quorum round; any
+   * subsequent acks for the old qsn must be treated as stale by
+   * {@link #tryAck(long, RaftEndpoint)}.
+   */
+  public void incrementQuerySequenceNumber() {
+    long previous = querySequenceNumber;
+    querySequenceNumber++;
+    acks.clear();
+    LOGGER.trace("TRACE> QueryState.incrementQuerySequenceNumber {} -> {} queries={}", previous,
+      querySequenceNumber, queries.size());
+  }
+
+  /**
    * Returns {@code true} if there are queries waiting and acks are received from the log
    * replication quorum.
    * <p>
@@ -125,7 +152,11 @@ public final class QueryState {
       throw new IllegalStateException(
         "Cannot execute: " + this + ", current commit index: " + commitIndex);
     }
-    return queries.size() > 0 && quorumSize <= ackCount();
+    boolean ok = queries.size() > 0 && quorumSize <= ackCount();
+    LOGGER
+      .trace("TRACE> QueryState.isQuorumAckReceived commitIndex={} quorumSize={} queries={} acks={}"
+        + " ackCount={} ok={}", commitIndex, quorumSize, queries.size(), acks, ackCount(), ok);
+    return ok;
   }
 
   /**
@@ -140,7 +171,13 @@ public final class QueryState {
    * Returns {@code true} if more acks are needed to complete the given quorum size.
    */
   public boolean isAckNeeded(RaftEndpoint follower, int quorumSize) {
-    return queryCount() > 0 && !acks.contains(follower) && ackCount() < quorumSize;
+    boolean needed = queryCount() > 0 && !acks.contains(follower) && ackCount() < quorumSize;
+    LOGGER.trace(
+      "TRACE> QueryState.isAckNeeded follower={} quorumSize={} queries={} acks={} ackCount={}"
+        + " contains={} needed={}",
+      follower.getId(), quorumSize, queries.size(), acks, ackCount(), acks.contains(follower),
+      needed);
+    return needed;
   }
 
   /**
@@ -161,6 +198,8 @@ public final class QueryState {
    * Fails the pending query futures with the given throwable.
    */
   public void fail(Throwable t) {
+    LOGGER.trace("TRACE> QueryState.fail queries={} acks={} qsn={} cause={}", queries.size(), acks,
+      querySequenceNumber, t.getClass().getSimpleName(), t);
     for (QueryContainer query : queries) {
       query.fail(t);
     }
@@ -171,6 +210,8 @@ public final class QueryState {
    * Resets the collection of waiting queries and acks.
    */
   public void reset() {
+    LOGGER.trace("TRACE> QueryState.reset queries={} acks={} qsn={}", queries.size(), acks,
+      querySequenceNumber);
     queries.clear();
     acks.clear();
   }
@@ -196,13 +237,19 @@ public final class QueryState {
         if (!(operation instanceof NoOp)) {
           result = stateMachine.runOperation(commitIndex, operation);
         }
+        LOGGER.trace("TRACE> QueryContainer.run COMPLETE commitIndex={} operation={} resultNull={}",
+          commitIndex, operation, result == null);
         future.complete(commitIndex, result);
       } catch (Throwable t) {
+        LOGGER.trace("TRACE> QueryContainer.run THREW commitIndex={} operation={} cause={}",
+          commitIndex, operation, t.getClass().getSimpleName(), t);
         fail(t);
       }
     }
 
     public void fail(Throwable t) {
+      LOGGER.trace("TRACE> QueryContainer.fail operation={} cause={}", operation,
+        t.getClass().getSimpleName());
       future.fail(t);
     }
   }

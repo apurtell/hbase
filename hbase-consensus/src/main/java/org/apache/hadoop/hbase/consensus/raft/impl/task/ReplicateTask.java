@@ -66,6 +66,8 @@ public final class ReplicateTask implements Runnable {
   @Override
   public void run() {
     try {
+      LOGGER.trace("TRACE> {} ReplicateTask.run operation={} role={} status={} term={}",
+        raftNode.localEndpointStr(), operation, state.role(), raftNode.getStatus(), state.term());
       if (!verifyRaftNodeStatus()) {
         return;
       } else if (state.role() != LEADER) {
@@ -74,10 +76,6 @@ public final class ReplicateTask implements Runnable {
       } else if (!raftNode.canReplicateNewOperation(operation)) {
         future.fail(raftNode.newCannotReplicateException());
         return;
-      }
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(
-          raftNode.localEndpointStr() + " Replicating: " + operation + " in term: " + state.term());
       }
       RaftLog log = state.log();
       if (!log.checkAvailableCapacity(1)) {
@@ -89,6 +87,8 @@ public final class ReplicateTask implements Runnable {
       LogEntry entry = raftNode.getModelFactory().createLogEntryBuilder().setTerm(state.term())
         .setIndex(newEntryLogIndex).setOperation(operation).build();
       log.appendEntry(entry);
+      LOGGER.trace("TRACE> {} ReplicateTask appended index={} term={} op={}",
+        raftNode.localEndpointStr(), newEntryLogIndex, state.term(), operation);
       prepareGroupOp(newEntryLogIndex, operation);
       raftNode.broadcastAppendEntriesRequest();
       if (
@@ -125,8 +125,13 @@ public final class ReplicateTask implements Runnable {
 
   private void prepareGroupOp(long logIndex, Object operation) {
     if (operation instanceof UpdateRaftGroupMembersOp) {
-      raftNode.setStatus(UPDATING_RAFT_GROUP_MEMBER_LIST);
       UpdateRaftGroupMembersOp groupOp = (UpdateRaftGroupMembersOp) operation;
+      LOGGER.trace(
+        "TRACE> {} ReplicateTask.prepareGroupOp logIndex={} mode={} endpoint={} newMembers={}"
+          + " newVoting={}",
+        raftNode.localEndpointStr(), logIndex, groupOp.getMode(), groupOp.getEndpoint().getId(),
+        groupOp.getMembers(), groupOp.getVotingMembers());
+      raftNode.setStatus(UPDATING_RAFT_GROUP_MEMBER_LIST);
       raftNode.updateGroupMembers(logIndex, groupOp.getMembers(), groupOp.getVotingMembers());
     }
   }

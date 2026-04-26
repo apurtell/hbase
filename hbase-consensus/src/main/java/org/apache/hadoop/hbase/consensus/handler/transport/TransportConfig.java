@@ -27,7 +27,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * Transport-side configuration parsed from a Hadoop {@link Configuration}.
  * <p>
  * All keys are namespaced under {@code hbase.consensus.*}. Defaults are chosen so the transport is
- * usable out-of-the-box for tests; production wiring (Phase 7) is expected to override the port and
+ * usable out-of-the-box for tests; production deployments are expected to override the port and
  * possibly the watermarks based on operator policy.
  * <p>
  * Key-naming convention follows the rest of HBase ({@code XYZ_KEY} string + {@code DEFAULT_XYZ}

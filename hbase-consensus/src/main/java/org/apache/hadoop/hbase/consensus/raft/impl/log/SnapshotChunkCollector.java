@@ -99,7 +99,6 @@ public final class SnapshotChunkCollector {
       throw new IllegalArgumentException("Invalid snapshot chunk at snapshot index: "
         + snapshotIndex + " current snapshot index: " + this.snapshotIndex);
     }
-    // TODO(basri): exponential backoff maybe?
     // Un-mark the unresponsive endpoint even if the given chunk is already here
     unresponsiveMembers.remove(endpoint);
     if (

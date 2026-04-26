@@ -27,6 +27,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.hadoop.hbase.util.NettyFutureUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -46,10 +48,9 @@ import org.apache.hbase.thirdparty.io.netty.channel.ChannelFuture;
  * pings {@link #flushTick()} at {@code hbase.consensus.log.sync.batch.ms}; producers call
  * {@link #enqueue} from any thread.
  * <p>
- * Single-consumer drain is enforced by an {@link AtomicBoolean} latch identical in spirit to
- * {@code GroupExecutor.scheduled} (Phase 2): producers pile messages into the MPSC, the first
- * arrival CASes the latch on, and only the drain runnable polls the queue. The drain is always run
- * on the channel's event loop so per-peer FIFO holds even across reconnects.
+ * Single-consumer drain is enforced by an {@link AtomicBoolean} latch: producers pile messages into
+ * the MPSC, the first arrival CASes the latch on, and only the drain runnable polls the queue. The
+ * drain is always run on the channel's event loop so per-peer FIFO holds even across reconnects.
  */
 @InterfaceAudience.Private
 final class OutboundChannel {
@@ -261,6 +262,7 @@ final class OutboundChannel {
     }
     List<ConsensusProtos.GroupAppendEntriesPB> appendBucket = new ArrayList<>();
     List<ConsensusProtos.GroupHeartbeatPB> heartbeatBucket = new ArrayList<>();
+    List<ConsensusProtos.GroupHeartbeatAckPB> heartbeatAckBucket = new ArrayList<>();
     List<ConsensusProtos.ConsensusFrame> immediates = new ArrayList<>();
 
     Pending p;
@@ -268,14 +270,11 @@ final class OutboundChannel {
       try {
         if (p.immediate) {
           immediates.add(converter.toFrame(p.message));
-        } else if (
-          p.message instanceof HeartbeatRaftMessage && p.message instanceof AppendEntriesRequest
-        ) {
-          heartbeatBucket.add(converter.toGroupHeartbeatPB((AppendEntriesRequest) p.message));
+        } else if (p.message instanceof LeaderHeartbeat) {
+          heartbeatBucket.add(converter.toGroupHeartbeatPB((LeaderHeartbeat) p.message));
+        } else if (p.message instanceof LeaderHeartbeatAck) {
+          heartbeatAckBucket.add(converter.toGroupHeartbeatAckPB((LeaderHeartbeatAck) p.message));
         } else if (p.message instanceof AppendEntriesRequest) {
-          // Empty-entries AppendEntries (the canonical heartbeat shape) MUST go through
-          // the GroupAppendEntriesPB path so previousLogTerm/Index survive the wire round-trip.
-          // Folding them into a HeartbeatBatchPB here would silently rewrite those fields to 0.
           appendBucket.add(converter.toGroupAppendPB((AppendEntriesRequest) p.message));
         } else {
           immediates.add(converter.toFrame(p.message));
@@ -304,10 +303,21 @@ final class OutboundChannel {
         .build();
       NettyFutureUtils.safeWrite(ch, frame);
     }
+    if (!heartbeatAckBucket.isEmpty()) {
+      ConsensusProtos.ConsensusFrame frame = ConsensusProtos.ConsensusFrame.newBuilder()
+        .setKind(ConsensusProtos.ConsensusFrame.Kind.HEARTBEAT_ACK_BATCH)
+        .setHeartbeatAckBatch(
+          ConsensusProtos.BatchHeartbeatAckPB.newBuilder().addAllGroups(heartbeatAckBucket).build())
+        .build();
+      NettyFutureUtils.safeWrite(ch, frame);
+    }
     for (ConsensusProtos.ConsensusFrame frame : immediates) {
       NettyFutureUtils.safeWrite(ch, frame);
     }
-    if (!appendBucket.isEmpty() || !heartbeatBucket.isEmpty() || !immediates.isEmpty()) {
+    if (
+      !appendBucket.isEmpty() || !heartbeatBucket.isEmpty() || !heartbeatAckBucket.isEmpty()
+        || !immediates.isEmpty()
+    ) {
       ch.flush();
     }
   }

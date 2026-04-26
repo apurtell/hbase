@@ -79,6 +79,12 @@ public final class MembershipChangeTask implements Runnable {
   @Override
   public void run() {
     try {
+      LOGGER.trace(
+        "TRACE> {} MembershipChangeTask.run mode={} endpoint={} groupMembersCommitIndex={}"
+          + " role={} status={} effectiveVoting={} commitIndex={}",
+        raftNode.localEndpointStr(), membershipChangeMode, endpoint.getId(),
+        groupMembersCommitIndex, state.role(), raftNode.getStatus(),
+        state.effectiveGroupMembers().getVotingMembers(), state.commitIndex());
       if (!verifyRaftNodeStatus()) {
         return;
       } else if (state.role() != LEADER) {

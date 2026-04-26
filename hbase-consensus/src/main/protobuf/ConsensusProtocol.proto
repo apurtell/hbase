@@ -35,7 +35,7 @@ message RaftEndpointPB {
 message LogEntryPB {
   optional int64 index = 1;
   optional int32 term = 2;
-  optional int32 op_type = 3;       // OperationCodec discriminator
+  optional int32 op_type = 3;
   optional int32 op_payload_compression = 4;
   optional bytes op_payload = 5;
 }
@@ -88,14 +88,23 @@ message GroupAppendEntriesPB {
   optional int64 flow_control_seq = 9;
 }
 
-// Dataless heartbeat for one group.
+// Dataless heartbeat for one group. Carries only what LeaderHeartbeat needs.
 message GroupHeartbeatPB {
   optional bytes group_id = 1;
   optional RaftEndpointPB sender = 2;
   optional int32 term = 3;
   optional int64 commit_index = 4;
-  optional int64 query_seq = 5;
-  optional int64 flow_control_seq = 6;
+}
+
+// Acknowledgment of one LeaderHeartbeat. The follower also reports the highest
+// local log index that has been verified to match the leader's log
+// (last_verified_log_index). The leader uses this to detect when a follower's
+// runtime verification state lags its persisted log.
+message GroupHeartbeatAckPB {
+  optional bytes group_id = 1;
+  optional RaftEndpointPB sender = 2;
+  optional int32 term = 3;
+  optional int64 last_verified_log_index = 4;
 }
 
 message GroupAppendSuccessPB {
@@ -191,6 +200,10 @@ message HeartbeatBatchPB {
   repeated GroupHeartbeatPB groups = 1;
 }
 
+message BatchHeartbeatAckPB {
+  repeated GroupHeartbeatAckPB groups = 1;
+}
+
 // Top-level frame; one per outbound flush window per peer.
 message ConsensusFrame {
   enum Kind {
@@ -205,17 +218,19 @@ message ConsensusFrame {
     PRE_VOTE_REQUEST        = 9;
     PRE_VOTE_RESPONSE       = 10;
     TRIGGER_LEADER_ELECTION = 11;
+    HEARTBEAT_ACK_BATCH     = 12;
   }
   optional Kind kind = 1;
-  optional BatchAppendEntriesPB      batch_append      = 2;
-  optional HeartbeatBatchPB          heartbeat_batch   = 3;
-  optional GroupAppendSuccessPB      append_success    = 4;
-  optional GroupAppendFailurePB      append_failure    = 5;
-  optional InstallSnapshotRequestPB  install_request   = 6;
-  optional InstallSnapshotResponsePB install_response  = 7;
-  optional VoteRequestPB             vote_request      = 8;
-  optional VoteResponsePB            vote_response     = 9;
-  optional PreVoteRequestPB          pre_vote_request  = 10;
-  optional PreVoteResponsePB         pre_vote_response = 11;
-  optional TriggerLeaderElectionPB   trigger_election  = 12;
+  optional BatchAppendEntriesPB      batch_append        = 2;
+  optional HeartbeatBatchPB          heartbeat_batch     = 3;
+  optional GroupAppendSuccessPB      append_success      = 4;
+  optional GroupAppendFailurePB      append_failure      = 5;
+  optional InstallSnapshotRequestPB  install_request     = 6;
+  optional InstallSnapshotResponsePB install_response    = 7;
+  optional VoteRequestPB             vote_request        = 8;
+  optional VoteResponsePB            vote_response       = 9;
+  optional PreVoteRequestPB          pre_vote_request    = 10;
+  optional PreVoteResponsePB         pre_vote_response   = 11;
+  optional TriggerLeaderElectionPB   trigger_election    = 12;
+  optional BatchHeartbeatAckPB       heartbeat_ack_batch = 13;
 }

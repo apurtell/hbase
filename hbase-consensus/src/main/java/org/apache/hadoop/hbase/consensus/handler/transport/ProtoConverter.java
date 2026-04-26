@@ -36,6 +36,8 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
@@ -295,28 +297,40 @@ final class ProtoConverter {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Heartbeat (dataless AppendEntries reused on the inbound side)
+  // LeaderHeartbeat / LeaderHeartbeatAck — lightweight, log-free liveness signaling.
   // ---------------------------------------------------------------------------------------------
 
-  ConsensusProtos.GroupHeartbeatPB toGroupHeartbeatPB(AppendEntriesRequest req) {
-    return ConsensusProtos.GroupHeartbeatPB.newBuilder()
-      .setGroupId(groupIdToBytes(req.getGroupId())).setSender(toEndpointPB(req.getSender()))
-      .setTerm(req.getTerm()).setCommitIndex(req.getCommitIndex())
-      .setQuerySeq(req.getQuerySequenceNumber())
-      .setFlowControlSeq(req.getFlowControlSequenceNumber()).build();
+  ConsensusProtos.GroupHeartbeatPB toGroupHeartbeatPB(LeaderHeartbeat hb) {
+    return ConsensusProtos.GroupHeartbeatPB.newBuilder().setGroupId(groupIdToBytes(hb.getGroupId()))
+      .setSender(toEndpointPB(hb.getSender())).setTerm(hb.getTerm())
+      .setCommitIndex(hb.getCommitIndex()).build();
   }
 
-  AppendEntriesRequest fromGroupHeartbeatPB(ConsensusProtos.GroupHeartbeatPB pb) {
+  LeaderHeartbeat fromGroupHeartbeatPB(ConsensusProtos.GroupHeartbeatPB pb) {
     requireGroupId(pb.hasGroupId(), "GroupHeartbeatPB");
     requireSender(pb.hasSender(), "GroupHeartbeatPB");
     requireTerm(pb.hasTerm(), "GroupHeartbeatPB");
     requireField(pb.hasCommitIndex(), "GroupHeartbeatPB", "commit_index");
-    requireField(pb.hasQuerySeq(), "GroupHeartbeatPB", "query_seq");
-    requireField(pb.hasFlowControlSeq(), "GroupHeartbeatPB", "flow_control_seq");
-    return factory.createAppendEntriesRequestBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
-      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm()).setPreviousLogTerm(0)
-      .setPreviousLogIndex(0L).setCommitIndex(pb.getCommitIndex()).setLogEntries(List.of())
-      .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
+    return factory.createLeaderHeartbeatBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+      .setCommitIndex(pb.getCommitIndex()).build();
+  }
+
+  ConsensusProtos.GroupHeartbeatAckPB toGroupHeartbeatAckPB(LeaderHeartbeatAck ack) {
+    return ConsensusProtos.GroupHeartbeatAckPB.newBuilder()
+      .setGroupId(groupIdToBytes(ack.getGroupId())).setSender(toEndpointPB(ack.getSender()))
+      .setTerm(ack.getTerm()).setLastVerifiedLogIndex(ack.getLastVerifiedLogIndex()).build();
+  }
+
+  LeaderHeartbeatAck fromGroupHeartbeatAckPB(ConsensusProtos.GroupHeartbeatAckPB pb) {
+    requireGroupId(pb.hasGroupId(), "GroupHeartbeatAckPB");
+    requireSender(pb.hasSender(), "GroupHeartbeatAckPB");
+    requireTerm(pb.hasTerm(), "GroupHeartbeatAckPB");
+    // last_verified_log_index is optional for wire-compatibility; default 0 is safe (the leader
+    // will treat absent / 0 as "follower may need verification" and send a catch-up AE).
+    return factory.createLeaderHeartbeatAckBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+      .setLastVerifiedLogIndex(pb.hasLastVerifiedLogIndex() ? pb.getLastVerifiedLogIndex() : 0L)
       .build();
   }
 

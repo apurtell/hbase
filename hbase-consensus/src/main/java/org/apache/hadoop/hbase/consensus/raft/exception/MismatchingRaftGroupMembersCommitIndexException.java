@@ -27,7 +27,6 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * committed.
  */
 public class MismatchingRaftGroupMembersCommitIndexException extends RaftException {
-  // TODO(basri): find a shorter name
   private static final long serialVersionUID = -109570074579015635L;
   private final long commitIndex;
   private final Collection<RaftEndpoint> members;

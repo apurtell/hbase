@@ -69,11 +69,14 @@ import org.apache.hadoop.hbase.consensus.raft.exception.LaggingCommitIndexExcept
 import org.apache.hadoop.hbase.consensus.raft.exception.NotLeaderException;
 import org.apache.hadoop.hbase.consensus.raft.exception.RaftException;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesFailureResponseHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesRequestHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesSuccessResponseHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.InstallSnapshotRequestHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.InstallSnapshotResponseHandler;
+import org.apache.hadoop.hbase.consensus.raft.impl.handler.LeaderHeartbeatAckHandler;
+import org.apache.hadoop.hbase.consensus.raft.impl.handler.LeaderHeartbeatHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.PreVoteRequestHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.PreVoteResponseHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.TriggerLeaderElectionHandler;
@@ -118,6 +121,8 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
@@ -161,6 +166,7 @@ public final class RaftNodeImpl implements RaftNode {
   private final String localEndpointStr;
   private final Random random;
   private final Clock clock;
+  private final HeartbeatScheduler heartbeatScheduler;
   private final long leaderHeartbeatTimeoutMillis;
   private final int commitCountToTakeSnapshot;
   private final int appendEntriesRequestBatchSize;
@@ -187,7 +193,7 @@ public final class RaftNodeImpl implements RaftNode {
   RaftNodeImpl(Object groupId, RaftEndpoint localEndpoint, RaftGroupMembersView initialGroupMembers,
     RaftConfig config, RaftNodeExecutor executor, StateMachine stateMachine, Transport transport,
     RaftModelFactory modelFactory, RaftStore store, RaftNodeReportListener raftNodeReportListener,
-    Random random, Clock clock) {
+    Random random, Clock clock, HeartbeatScheduler heartbeatScheduler) {
     requireNonNull(localEndpoint);
     this.groupId = requireNonNull(groupId);
     this.transport = requireNonNull(transport);
@@ -210,6 +216,7 @@ public final class RaftNodeImpl implements RaftNode {
     this.maxBackoffRounds = getMaxBackoffRounds(config);
     this.random = requireNonNull(random);
     this.clock = requireNonNull(clock);
+    this.heartbeatScheduler = requireNonNull(heartbeatScheduler);
     populateLifecycleAwareComponents();
   }
 
@@ -217,7 +224,7 @@ public final class RaftNodeImpl implements RaftNode {
   RaftNodeImpl(Object groupId, RestoredRaftState restoredState, RaftConfig config,
     RaftNodeExecutor executor, StateMachine stateMachine, Transport transport,
     RaftModelFactory modelFactory, RaftStore store, RaftNodeReportListener raftNodeReportListener,
-    Random random, Clock clock) {
+    Random random, Clock clock, HeartbeatScheduler heartbeatScheduler) {
     requireNonNull(store);
     this.groupId = requireNonNull(groupId);
     this.transport = requireNonNull(transport);
@@ -241,6 +248,7 @@ public final class RaftNodeImpl implements RaftNode {
     this.maxBackoffRounds = getMaxBackoffRounds(config);
     this.random = requireNonNull(random);
     this.clock = requireNonNull(clock);
+    this.heartbeatScheduler = requireNonNull(heartbeatScheduler);
     populateLifecycleAwareComponents();
   }
 
@@ -452,7 +460,12 @@ public final class RaftNodeImpl implements RaftNode {
     } else if (this.status == newStatus) {
       return;
     }
+    RaftNodeStatus previousStatus = this.status;
     this.status = newStatus;
+    if (LOGGER.isTraceEnabled()) {
+      LOGGER.trace("TRACE> {} setStatus {} -> {}", localEndpointStr, previousStatus, newStatus,
+        new Throwable("setStatus call site"));
+    }
     if (newStatus == ACTIVE) {
       LOGGER.info("{} Status is set to {}", localEndpointStr, newStatus);
     } else {
@@ -551,8 +564,7 @@ public final class RaftNodeImpl implements RaftNode {
       leaderFlushTask = new FlushTask(this);
     }
     leaderBackoffResetTask = new LeaderBackoffResetTask(this);
-    executor.schedule(new HeartbeatTask(this), config.getLeaderHeartbeatPeriodMillis(),
-      MILLISECONDS);
+    heartbeatScheduler.register(this);
     executor.schedule(new RaftStateSummaryPublishTask(this),
       config.getRaftNodeReportPublishPeriodSecs(), SECONDS);
   }
@@ -565,6 +577,13 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   private void terminateComponents() {
+    LOGGER.trace("TRACE> {} terminateComponents enter status={} role={}", localEndpointStr, status,
+      state.role());
+    try {
+      heartbeatScheduler.unregister(this);
+    } catch (Throwable t) {
+      LOGGER.error(localEndpointStr + " failure during heartbeat scheduler unregister", t);
+    }
     for (RaftNodeLifecycleAware component : startedLifecycleAwareComponents) {
       try {
         component.onRaftNodeTerminate();
@@ -639,6 +658,10 @@ public final class RaftNodeImpl implements RaftNode {
       handler = new InstallSnapshotRequestHandler(this, (InstallSnapshotRequest) message);
     } else if (message instanceof InstallSnapshotResponse) {
       handler = new InstallSnapshotResponseHandler(this, (InstallSnapshotResponse) message);
+    } else if (message instanceof LeaderHeartbeat) {
+      handler = new LeaderHeartbeatHandler(this, (LeaderHeartbeat) message);
+    } else if (message instanceof LeaderHeartbeatAck) {
+      handler = new LeaderHeartbeatAckHandler(this, (LeaderHeartbeatAck) message);
     } else if (message instanceof VoteRequest) {
       handler = new VoteRequestHandler(this, (VoteRequest) message);
     } else if (message instanceof VoteResponse) {
@@ -878,7 +901,8 @@ public final class RaftNodeImpl implements RaftNode {
    * future if any available.
    */
   private void applyLogEntry(LogEntry entry) {
-    LOGGER.debug("{} Processing {}", localEndpointStr, entry);
+    LOGGER.trace("TRACE> {} applyLogEntry index={} term={} op={}", localEndpointStr,
+      entry.getIndex(), entry.getTerm(), entry.getOperation());
     long logIndex = entry.getIndex();
     Object operation = entry.getOperation();
     Object response;
@@ -898,6 +922,8 @@ public final class RaftNodeImpl implements RaftNode {
           groupOp.getEndpoint().equals(getLocalEndpoint())
             && groupOp.getMode() == MembershipChangeMode.REMOVE_MEMBER
         ) {
+          LOGGER.trace("TRACE> {} applyLogEntry self-REMOVE -> setStatus(TERMINATED) at index={}",
+            localEndpointStr, logIndex);
           setStatus(TERMINATED);
         } else {
           setStatus(ACTIVE);
@@ -960,7 +986,6 @@ public final class RaftNodeImpl implements RaftNode {
       return;
     }
     LOGGER.debug("{} is taking snapshot at index: {}", localEndpointStr, snapshotIndex);
-    // TODO: swap chunked install-snapshot for CatchUpReference
     List<Object> chunkObjects = new ArrayList<>();
     try {
       stateMachine.takeSnapshot(snapshotIndex, chunkObjects::add);
@@ -1103,6 +1128,28 @@ public final class RaftNodeImpl implements RaftNode {
   public void updateGroupMembers(long logIndex, Collection<RaftEndpoint> members,
     Collection<RaftEndpoint> votingMembers) {
     state.updateGroupMembers(logIndex, members, votingMembers, clock.millis());
+    // If we are the leader and this membership change excludes us from the voting set (typically a
+    // self-targeted REMOVE_MEMBER), our tenure as a quorum participant is over. Any in-flight
+    // linearizable query that has been dispatched but not yet completed cannot be safely satisfied
+    // by acks issued under the previous query sequence number: those acks reflect a quorum
+    // computation that included this leader as an implicit ack, but the effective voting set has
+    // just shrunk underneath us. To prevent a query from completing successfully on a stale
+    // quorum, we (1) fail any pending queries immediately with NotLeaderException, and
+    // (2) advance the query sequence number so that any subsequent acks for the old sequence
+    // number are explicitly treated as stale by QueryState.tryAck.
+    LeaderState leaderState = state.leaderState();
+    if (leaderState != null && !votingMembers.contains(getLocalEndpoint())) {
+      QueryState queryState = leaderState.queryState();
+      int pending = queryState.queryCount();
+      if (pending > 0) {
+        LOGGER.trace(
+          "TRACE> {} updateGroupMembers self removed from voting -> failing {} pending queries"
+            + " logIndex={} newVoting={}",
+          localEndpointStr, pending, logIndex, votingMembers);
+        queryState.fail(newNotLeaderException());
+      }
+      queryState.incrementQuerySequenceNumber();
+    }
     publishRaftNodeReport(RaftNodeReportReason.GROUP_MEMBERS_CHANGE);
   }
 
@@ -1187,8 +1234,131 @@ public final class RaftNodeImpl implements RaftNode {
    * parameters.
    */
   public void broadcastAppendEntriesRequest() {
+    LOGGER.trace("TRACE> {} broadcastAppendEntriesRequest remotes={}", localEndpointStr,
+      state.remoteMembers());
     for (RaftEndpoint follower : state.remoteMembers()) {
       sendAppendEntriesRequest(follower);
+    }
+  }
+
+  /**
+   * Drives the periodic heartbeat / election-timer logic for this node.
+   * <p>
+   * Called by {@link HeartbeatScheduler} implementations on this node's executor. Public to enable
+   * alternate schedulers without exposing internals via reflection. Rescheduling (when relevant) is
+   * the caller's responsibility.
+   * <p>
+   * On the leader path: if the lease has expired the node demotes to follower and the tick exits.
+   * Otherwise the node broadcasts a lightweight {@link LeaderHeartbeat} to every remote member and
+   * fires {@link #sendCatchupAppendsIfNeeded()} for followers that need real
+   * {@code AppendEntriesRequest}s for log catch-up, snapshot trigger, or initial match-index
+   * discovery.
+   * <p>
+   * On the follower path: detects missing or timed-out leaders, leaders that are not members of the
+   * effective group, and triggers a pre-vote round through
+   * {@link #resetLeaderAndTryTriggerPreVote(boolean)}.
+   */
+  public void runHeartbeatTick() {
+    if (state.leaderState() != null) {
+      if (demoteToFollowerIfLeaseExpired()) {
+        return;
+      }
+      broadcastLeaderHeartbeat();
+      sendCatchupAppendsIfNeeded();
+      return;
+    }
+    RaftEndpoint leader = state.leader();
+    if (leader == null) {
+      if (state.role() == FOLLOWER && state.preCandidateState() == null) {
+        LOGGER.warn(
+          "{} We are FOLLOWER and there is no current leader. Will start new election round.",
+          localEndpointStr);
+        resetLeaderAndTryTriggerPreVote(false);
+      }
+    } else if (isElectionTimerElapsed() && state.preCandidateState() == null) {
+      LOGGER.warn("{} Current leader {}'s heartbeats are timed-out.", localEndpointStr,
+        leader.getId());
+      resetLeaderAndTryTriggerPreVote(true);
+    } else if (
+      !state.committedGroupMembers().isKnownMember(leader) && state.preCandidateState() == null
+    ) {
+      LOGGER.warn("{} Current leader {} is not member anymore.", localEndpointStr, leader.getId());
+      resetLeaderAndTryTriggerPreVote(true);
+    }
+  }
+
+  /**
+   * Sends one lightweight {@link LeaderHeartbeat} to each remote member of the Raft group.
+   * <p>
+   * Heartbeats only carry {@code (groupId, sender, term, commitIndex)} and do not touch the log on
+   * the receiving side; followers update their commit index (clamped by the local
+   * {@code lastLogOrSnapshotIndex}) and reply with a {@link LeaderHeartbeatAck}. Match-index
+   * discovery, log catch-up, and snapshot triggering are handled separately by
+   * {@link #sendCatchupAppendsIfNeeded()}.
+   */
+  public void broadcastLeaderHeartbeat() {
+    for (RaftEndpoint follower : state.remoteMembers()) {
+      LeaderHeartbeat hb = modelFactory.createLeaderHeartbeatBuilder().setGroupId(getGroupId())
+        .setSender(getLocalEndpoint()).setTerm(state.term()).setCommitIndex(state.commitIndex())
+        .build();
+      send(follower, hb);
+    }
+  }
+
+  /**
+   * Fires {@link #sendAppendEntriesRequest(RaftEndpoint)} only for those followers whose state
+   * indicates they need it, that is: their {@code matchIndex} is behind the leader's
+   * {@code lastLogOrSnapshotIndex} (lagging follower or new follower with {@code matchIndex == 0}),
+   * or their {@code nextIndex} is at or below the leader's snapshot index (snapshot trigger). All
+   * other followers are kept in sync via the cheaper {@link #broadcastLeaderHeartbeat()} path.
+   * <p>
+   * Followers with active request-backoff (waiting on a previous AE response) are skipped here;
+   * they are followed up by {@code AppendEntriesSuccessResponseHandler.trySendAppendRequest} on
+   * response receipt or by the backoff reset task on timeout.
+   */
+  public void sendCatchupAppendsIfNeeded() {
+    LeaderState leaderState = state.leaderState();
+    if (leaderState == null) {
+      return;
+    }
+    RaftLog log = state.log();
+    long lastLogOrSnapshotIndex = log.lastLogOrSnapshotIndex();
+    long snapshotIndex = log.snapshotIndex();
+    for (RaftEndpoint follower : state.remoteMembers()) {
+      FollowerState fs = leaderState.getFollowerStateOrNull(follower);
+      if (fs == null || fs.isRequestBackoffSet()) {
+        continue;
+      }
+      boolean needsAppendCatchup = fs.matchIndex() < lastLogOrSnapshotIndex;
+      boolean needsSnapshot = fs.nextIndex() <= snapshotIndex;
+      if (needsAppendCatchup || needsSnapshot) {
+        sendAppendEntriesRequest(follower);
+      }
+    }
+  }
+
+  /**
+   * Resets this node's known leader (optionally) and runs a pre-vote round, or promotes itself to a
+   * singleton leader if it is the only voting member left.
+   * <p>
+   * Body moved verbatim from {@code HeartbeatTask.resetLeaderAndTryTriggerPreVote(boolean)}.
+   * Package-private so {@link HeartbeatTask} (and any future scheduler-driven tick) can delegate.
+   */
+  void resetLeaderAndTryTriggerPreVote(boolean resetLeader) {
+    if (resetLeader) {
+      leader(null);
+    }
+    if (state.role() == LEARNER) {
+      LOGGER.debug("{} is not starting pre-vote since it is {}", localEndpointStr, LEARNER);
+      return;
+    }
+    if (state.leaderElectionQuorumSize() > 1) {
+      runPreVote();
+    } else if (state.effectiveGroupMembers().getVotingMembers().contains(getLocalEndpoint())) {
+      // we can encounter this case if the leader crashes before it
+      // commit the replicated membership change while it is leaving.
+      LOGGER.info("{} is the single voting member left in the Raft group.", localEndpointStr);
+      toSingletonLeader();
     }
   }
 
@@ -1216,11 +1386,19 @@ public final class RaftNodeImpl implements RaftNode {
         localEndpointStr, target.getId());
       return;
     } else if (followerState.isRequestBackoffSet()) {
+      LOGGER.trace(
+        "TRACE> {} sendAppendEntriesRequest SKIP backoff target={} matchIndex={} nextIndex={}",
+        localEndpointStr, target.getId(), followerState.matchIndex(), followerState.nextIndex());
       // The target still has not sent a response for the last append request.
       // We will send a new append request either when the follower sends a response
       // or a back-off timeout occurs.
       return;
     }
+    LOGGER.trace(
+      "TRACE> {} sendAppendEntriesRequest target={} matchIndex={} nextIndex={} lastLogIndex={}"
+        + " commitIndex={} status={} role={}",
+      localEndpointStr, target.getId(), followerState.matchIndex(), followerState.nextIndex(),
+      log.lastLogOrSnapshotIndex(), state.commitIndex(), status, state.role());
     long nextIndex = followerState.nextIndex();
     // we never send query sequencer number to learners
     // since they are excluded from the replication quorum.
@@ -1305,10 +1483,10 @@ public final class RaftNodeImpl implements RaftNode {
       requestBuilder.setFlowControlSequenceNumber(enableBackoff(followerState));
     }
     RaftMessage request = requestBuilder.setLogEntries(entries).build();
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug(localEndpointStr + " Sending " + request + " to " + target.getId()
-        + " with next index: " + nextIndex);
-    }
+    LOGGER.trace(
+      "TRACE> {} sendAppendEntriesRequest SEND target={} nextIndex={} entries={} qsn={}"
+        + " backoff={}",
+      localEndpointStr, target.getId(), nextIndex, entries.size(), querySequenceNumber, backoff);
     send(target, request);
     if (backoff) {
       scheduleLeaderRequestBackoffResetTask(leaderState);
@@ -1317,12 +1495,10 @@ public final class RaftNodeImpl implements RaftNode {
       entries.size() > 0
         && entries.get(entries.size() - 1).getIndex() > leaderState.flushedLogIndex()
     ) {
-      // TODO(basri): we can skip this if the target is a learner...
-      // If I am sending any non-flushed entry to the target, I should
-      // trigger the flush task. I hope that I will flush before
-      // receiving append entries responses from half of the followers...
-      // This is a very critical optimization because it makes the leader
-      // and followers flush in parallel...
+      // If any non-flushed entry is being sent to the target, the local flush task is triggered
+      // so that the leader and followers flush in parallel. The leader flush ideally completes
+      // before the responses come back from a majority of the followers. This is a very important
+      // optimization for end-to-end commit latency.
       submitLeaderFlushTask(leaderState);
     }
   }
@@ -1491,6 +1667,8 @@ public final class RaftNodeImpl implements RaftNode {
     // set commitIndex = N (§5.3, §5.4)
     long quorumMatchIndex = findQuorumMatchIndex();
     long commitIndex = state.commitIndex();
+    LOGGER.trace("TRACE> {} tryAdvanceCommitIndex enter quorumMatchIndex={} commitIndex={} term={}",
+      localEndpointStr, quorumMatchIndex, commitIndex, state.term());
     RaftLog log = state.log();
     for (; quorumMatchIndex > commitIndex; quorumMatchIndex--) {
       // Only log entries from the leader’s current term are committed by counting
@@ -1500,6 +1678,8 @@ public final class RaftNodeImpl implements RaftNode {
       // because of the Log Matching Property.
       LogEntry entry = log.getLogEntry(quorumMatchIndex);
       if (entry.getTerm() == state.term()) {
+        LOGGER.trace("TRACE> {} tryAdvanceCommitIndex committing index={} entryTerm={}",
+          localEndpointStr, quorumMatchIndex, entry.getTerm());
         commitEntries(quorumMatchIndex);
         return true;
       } else if (LOGGER.isDebugEnabled()) {
@@ -1507,24 +1687,29 @@ public final class RaftNodeImpl implements RaftNode {
           + " since an entry from the current term: " + state.term() + " is needed.");
       }
     }
+    LOGGER.trace("TRACE> {} tryAdvanceCommitIndex no-advance commitIndex={} quorumMatchIndex={}",
+      localEndpointStr, commitIndex, quorumMatchIndex);
     return false;
   }
 
   private void commitEntries(long commitIndex) {
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug(localEndpointStr + " Setting commit index: " + commitIndex);
-    }
+    LOGGER.trace("TRACE> {} commitEntries enter commitIndex={} status={} role={}", localEndpointStr,
+      commitIndex, status, state.role());
     state.commitIndex(commitIndex);
     applyLogEntries();
     // the leader might have left the Raft group, but still we can send
     // an append request at this point
     broadcastAppendEntriesRequest();
+    LOGGER.trace("TRACE> {} commitEntries afterApply status={} role={} commitIndex={}",
+      localEndpointStr, status, state.role(), state.commitIndex());
     if (status != TERMINATED) {
       // the leader is still part of the Raft group
       tryRunQueries();
       tryRunScheduledQueries();
     } else {
       // the leader has left the Raft group
+      LOGGER.trace("TRACE> {} commitEntries leader removed -> invalidate+toFollower+terminate",
+        localEndpointStr);
       state.invalidateScheduledQueries();
       toFollower(state.term());
       terminateComponents();
@@ -1534,16 +1719,18 @@ public final class RaftNodeImpl implements RaftNode {
   public void tryAckQuery(long querySequenceNumber, RaftEndpoint sender) {
     LeaderState leaderState = state.leaderState();
     if (leaderState == null) {
+      LOGGER.trace("TRACE> {} tryAckQuery leaderState=null sender={} qsn={}", localEndpointStr,
+        sender.getId(), querySequenceNumber);
       return;
     } else if (!state.isVotingMember(sender)) {
+      LOGGER.trace("TRACE> {} tryAckQuery sender NOT voting sender={} qsn={}", localEndpointStr,
+        sender.getId(), querySequenceNumber);
       return;
     }
     QueryState queryState = leaderState.queryState();
     if (queryState.tryAck(querySequenceNumber, sender)) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(localEndpointStr() + " ack from " + sender.getId()
-          + " for query sequence number: " + querySequenceNumber);
-      }
+      LOGGER.trace("TRACE> {} tryAckQuery acked sender={} qsn={} -> tryRunQueries",
+        localEndpointStr, sender.getId(), querySequenceNumber);
       tryRunQueries();
     }
   }
@@ -1559,18 +1746,25 @@ public final class RaftNodeImpl implements RaftNode {
   public void tryRunQueries() {
     LeaderState leaderState = state.leaderState();
     if (leaderState == null) {
+      LOGGER.trace("TRACE> {} tryRunQueries leaderState=null status={} role={}", localEndpointStr,
+        status, state.role());
       return;
     }
     QueryState queryState = leaderState.queryState();
     long commitIndex = state.commitIndex();
-    if (!queryState.isQuorumAckReceived(commitIndex, state.logReplicationQuorumSize())) {
+    int quorumSize = state.logReplicationQuorumSize();
+    boolean localIsVoting = state.isVotingMember(getLocalEndpoint());
+    LOGGER.trace(
+      "TRACE> {} tryRunQueries enter status={} role={} commitIndex={} quorumSize={}"
+        + " localIsVoting={} effectiveVoting={}",
+      localEndpointStr, status, state.role(), commitIndex, quorumSize, localIsVoting,
+      state.effectiveGroupMembers().getVotingMembers());
+    if (!queryState.isQuorumAckReceived(commitIndex, quorumSize)) {
       return;
     }
     Collection<QueryContainer> operations = queryState.queries();
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug(localEndpointStr + " running " + operations.size() + " queries at commit index: "
-        + commitIndex + ", query sequence number: " + queryState.querySequenceNumber());
-    }
+    LOGGER.trace("TRACE> {} tryRunQueries RUNNING count={} commitIndex={} qsn={}", localEndpointStr,
+      operations.size(), commitIndex, queryState.querySequenceNumber());
     for (QueryContainer query : operations) {
       query.run(commitIndex, stateMachine);
     }
@@ -1699,7 +1893,6 @@ public final class RaftNodeImpl implements RaftNode {
   private void initRestoredState() {
     SnapshotEntry snapshotEntry = state.log().snapshotEntry();
     if (isNonInitial(snapshotEntry)) {
-      // TODO: swap chunked install-snapshot for CatchUpReference
       List<Object> chunkOperations = ((List<SnapshotChunk>) snapshotEntry.getOperation()).stream()
         .map(SnapshotChunk::getOperation).collect(toList());
       stateMachine.installSnapshot(snapshotEntry.getIndex(), chunkOperations);
@@ -1788,6 +1981,11 @@ public final class RaftNodeImpl implements RaftNode {
    * with {@link NotLeaderException}. the new term to switch
    */
   public void toFollower(int term) {
+    if (LOGGER.isTraceEnabled()) {
+      LOGGER.trace("TRACE> {} toFollower enter newTerm={} prevTerm={} prevRole={} status={}",
+        localEndpointStr, term, state.term(), state.role(), status,
+        new Throwable("toFollower call site"));
+    }
     state.toFollower(term);
     publishRaftNodeReport(RaftNodeReportReason.ROLE_CHANGE);
   }

@@ -38,8 +38,11 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode.RaftNodeBuilder;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftTermState;
+import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.hadoop.hbase.consensus.raft.persistence.NopRaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
@@ -70,12 +73,18 @@ public final class LocalRaftGroup {
   private final List<RaftEndpoint> initialMembers = new ArrayList<>();
   private final Map<RaftEndpoint, RaftNodeContext> nodeContexts = new HashMap<>();
   private final BiFunction<RaftEndpoint, RaftConfig, RaftStore> raftStoreFactory;
+  private final HeartbeatScheduler heartbeatScheduler;
+  private final Function<RaftEndpoint, HeartbeatScheduler> heartbeatSchedulerFactory;
 
   private LocalRaftGroup(int groupSize, int votingMemberCount, RaftConfig config,
-    boolean newTermEntryEnabled, BiFunction<RaftEndpoint, RaftConfig, RaftStore> raftStoreFactory) {
+    boolean newTermEntryEnabled, BiFunction<RaftEndpoint, RaftConfig, RaftStore> raftStoreFactory,
+    HeartbeatScheduler heartbeatScheduler,
+    Function<RaftEndpoint, HeartbeatScheduler> heartbeatSchedulerFactory) {
     this.config = config;
     this.newTermEntryEnabled = newTermEntryEnabled;
     this.raftStoreFactory = raftStoreFactory;
+    this.heartbeatScheduler = heartbeatScheduler;
+    this.heartbeatSchedulerFactory = heartbeatSchedulerFactory;
     createNodes(groupSize, votingMemberCount, config, raftStoreFactory);
   }
 
@@ -143,6 +152,14 @@ public final class LocalRaftGroup {
         .setRaftNodeReportListener(new RecordingRaftNodeReportListener());
       if (raftStoreFactory != null) {
         nodeBuilder.setStore(raftStoreFactory.apply(endpoint, config));
+      }
+      if (heartbeatSchedulerFactory != null) {
+        HeartbeatScheduler scheduler = heartbeatSchedulerFactory.apply(endpoint);
+        if (scheduler != null) {
+          nodeBuilder.setHeartbeatScheduler(scheduler);
+        }
+      } else if (heartbeatScheduler != null) {
+        nodeBuilder.setHeartbeatScheduler(heartbeatScheduler);
       }
       RaftNodeImpl node = (RaftNodeImpl) nodeBuilder.build();
       RaftNodeContext context = new RaftNodeContext((DefaultRaftNodeExecutor) node.getExecutor(),
@@ -538,6 +555,53 @@ public final class LocalRaftGroup {
   }
 
   /**
+   * Drops both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the source to
+   * the target Raft endpoint.
+   * <p>
+   * Phase&nbsp;4 of the consensus design split the leader's keep-alive traffic into two distinct
+   * messages: {@link AppendEntriesRequest} (used only to replicate log entries) and
+   * {@link LeaderHeartbeat} (used solely as a leader-liveness signal). Tests written against the
+   * pre-Phase-4 protocol that simulated a one-way leader-to-follower partition by dropping only
+   * {@link AppendEntriesRequest} no longer suffice, because the follower would still observe
+   * heartbeats and never become election-eligible. This helper drops both message types together,
+   * preserving the original semantic of "the follower hears nothing from this leader".
+   */
+  public void dropAppendsAndHeartbeatsTo(RaftEndpoint source, RaftEndpoint target) {
+    getFirewall(source).dropMessagesTo(target, AppendEntriesRequest.class);
+    getFirewall(source).dropMessagesTo(target, LeaderHeartbeat.class);
+  }
+
+  /**
+   * Re-allows both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the
+   * source to the target Raft endpoint, undoing a prior call to
+   * {@link #dropAppendsAndHeartbeatsTo(RaftEndpoint, RaftEndpoint)}.
+   */
+  public void allowAppendsAndHeartbeatsTo(RaftEndpoint source, RaftEndpoint target) {
+    getFirewall(source).allowMessagesTo(target, AppendEntriesRequest.class);
+    getFirewall(source).allowMessagesTo(target, LeaderHeartbeat.class);
+  }
+
+  /**
+   * Drops both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the source
+   * Raft endpoint to all other Raft endpoints. See
+   * {@link #dropAppendsAndHeartbeatsTo(RaftEndpoint, RaftEndpoint)} for rationale.
+   */
+  public void dropAppendsAndHeartbeatsToAll(RaftEndpoint source) {
+    getFirewall(source).dropMessagesToAll(AppendEntriesRequest.class);
+    getFirewall(source).dropMessagesToAll(LeaderHeartbeat.class);
+  }
+
+  /**
+   * Re-allows both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the
+   * source Raft endpoint to all other Raft endpoints, undoing a prior call to
+   * {@link #dropAppendsAndHeartbeatsToAll(RaftEndpoint)}.
+   */
+  public void allowAppendsAndHeartbeatsToAll(RaftEndpoint source) {
+    getFirewall(source).allowMessagesToAll(AppendEntriesRequest.class);
+    getFirewall(source).allowMessagesToAll(LeaderHeartbeat.class);
+  }
+
+  /**
    * Resets all drop rules from the source Raft endpoint.
    */
   public void resetAllRulesFrom(RaftEndpoint source) {
@@ -597,6 +661,8 @@ public final class LocalRaftGroup {
     private RaftConfig config = DEFAULT_RAFT_CONFIG;
     private boolean newTermOperationEnabled;
     private BiFunction<RaftEndpoint, RaftConfig, RaftStore> raftStoreFactory;
+    private HeartbeatScheduler heartbeatScheduler;
+    private Function<RaftEndpoint, HeartbeatScheduler> heartbeatSchedulerFactory;
 
     private LocalRaftGroupBuilder(int groupSize) {
       if (groupSize < 1) {
@@ -651,13 +717,39 @@ public final class LocalRaftGroup {
     }
 
     /**
+     * Sets a shared {@link HeartbeatScheduler} that every Raft node in this group will register
+     * with via the {@code RaftNodeBuilder.setHeartbeatScheduler} seam.
+     * @return the builder object for fluent calls
+     */
+    public LocalRaftGroupBuilder setHeartbeatScheduler(HeartbeatScheduler heartbeatScheduler) {
+      requireNonNull(heartbeatScheduler);
+      this.heartbeatScheduler = heartbeatScheduler;
+      return this;
+    }
+
+    /**
+     * Sets a per-node {@link HeartbeatScheduler} factory. Each Raft node in this group is built
+     * with the {@code HeartbeatScheduler} returned by {@code factory.apply(endpoint)}. Useful for
+     * tests of {@code SweepingHeartbeatScheduler}, where every test "physical node" needs its own
+     * scheduler instance because a sweeping scheduler is keyed by groupId. If both
+     * {@link #setHeartbeatScheduler} and this method are configured, this factory wins.
+     * @return the builder object for fluent calls
+     */
+    public LocalRaftGroupBuilder
+      setHeartbeatSchedulerFactory(Function<RaftEndpoint, HeartbeatScheduler> factory) {
+      requireNonNull(factory);
+      this.heartbeatSchedulerFactory = factory;
+      return this;
+    }
+
+    /**
      * Builds the local Raft group with the configured settings. Please note that the returned Raft
      * group is not started yet.
      * @return the created local Raft group
      */
     public LocalRaftGroup build() {
       return new LocalRaftGroup(groupSize, votingMemberCount, config, newTermOperationEnabled,
-        raftStoreFactory);
+        raftStoreFactory, heartbeatScheduler, heartbeatSchedulerFactory);
     }
 
     /**
@@ -666,7 +758,7 @@ public final class LocalRaftGroup {
      */
     public LocalRaftGroup start() {
       LocalRaftGroup group = new LocalRaftGroup(groupSize, votingMemberCount, config,
-        newTermOperationEnabled, raftStoreFactory);
+        newTermOperationEnabled, raftStoreFactory, heartbeatScheduler, heartbeatSchedulerFactory);
       group.start();
       return group;
     }

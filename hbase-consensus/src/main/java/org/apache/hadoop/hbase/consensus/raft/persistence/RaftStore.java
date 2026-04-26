@@ -82,7 +82,7 @@ public interface RaftStore {
    * follower has fallen so far behind that the missing entries are no longer available from the
    * leader. In that case the leader will send its snapshot entry instead.
    * <p>
-   * In another rare failure scenario, MicroRaft can delete a range of the latest entries which are
+   * In another rare failure scenario, the engine can delete a range of the latest entries which are
    * uncommitted and roll back to a previous log index which is known to be committed. Consider the
    * following case where Raft persists 3 log entries and then deletes entries from index=2:
    * <ul>
@@ -107,7 +107,7 @@ public interface RaftStore {
    * all of its chunks are provided to this method in any order, and {@link #flush()} will be called
    * afterwards.
    * <p>
-   * MicroRaft takes snapshots at a predetermined interval, controlled by
+   * The engine takes snapshots at a predetermined interval, controlled by
    * {@link RaftConfig#getCommitCountToTakeSnapshot()}. For instance, if it is 100, snapshots will
    * occur at indices 100, 200, 300, and so on.
    * <p>
@@ -146,23 +146,22 @@ public interface RaftStore {
   void truncateLogEntriesFrom(long logIndexInclusive) throws IOException;
 
   /**
-   * MicroRaft calls this method after it successfully persists and flushes a snapshot. This method
-   * is used for deleting log entries and snapshot chunks that are before the snapshot index and are
-   * not needed to be restored. This is merely an optimization method and its side-effects can be
-   * sync'ed to the storage when {@link #flush()} is called, the log index value until which the log
-   * entries and snapshot chunks must be truncated if any failure occurs during truncating the log
-   * entries
+   * Called after a snapshot is successfully persisted and flushed. This method is used for deleting
+   * log entries and snapshot chunks that are before the snapshot index and are not needed to be
+   * restored. This is merely an optimization method and its side-effects can be sync'ed to the
+   * storage when {@link #flush()} is called, the log index value until which the log entries and
+   * snapshot chunks must be truncated if any failure occurs during truncating the log entries
    */
   void truncateLogEntriesUntil(long logIndexInclusive) throws IOException;
 
   /**
-   * Deletes persisted snapshot chunks at the given log index. MicroRaft calls this method when it
-   * detects that it needs to start installing a newer snapshot while there is a snapshot persisted
-   * partially. Those snapshot chunks are no longer valid and must not be restored (or at least must
-   * be ignored during the restore process). This is merely an optimization method and its
-   * side-effects can be sync'ed to the storage when {@link #flush()} is called. the log index value
-   * at which some snapshot chunks are persisted. the number of snapshot chunks that could have been
-   * persisted. if any failure occurs during deletion.
+   * Deletes persisted snapshot chunks at the given log index. Called when it is detected that
+   * installation of a newer snapshot must start while there is a snapshot persisted partially.
+   * Those snapshot chunks are no longer valid and must not be restored (or at least must be ignored
+   * during the restore process). This is merely an optimization method and its side-effects can be
+   * sync'ed to the storage when {@link #flush()} is called. the log index value at which some
+   * snapshot chunks are persisted. the number of snapshot chunks that could have been persisted. if
+   * any failure occurs during deletion.
    */
   void deleteSnapshotChunks(long logIndex, int snapshotChunkCount) throws IOException;
 

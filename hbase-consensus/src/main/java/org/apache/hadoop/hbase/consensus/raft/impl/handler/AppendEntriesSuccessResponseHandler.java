@@ -57,6 +57,11 @@ public class AppendEntriesSuccessResponseHandler
 
   @Override
   protected void handleResponse(@NonNull AppendEntriesSuccessResponse response) {
+    LOGGER.trace(
+      "TRACE> {} AESuccessHandler enter sender={} qsn={} lastLogIndex={} term={} role={}"
+        + " status={}",
+      localEndpointStr(), response.getSender().getId(), response.getQuerySequenceNumber(),
+      response.getLastLogIndex(), state.term(), state.role(), node.getStatus());
     if (response.getTerm() > state.term()) {
       LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
         response.getTerm(), state.term(), response);
@@ -68,11 +73,19 @@ public class AppendEntriesSuccessResponseHandler
       return;
     }
     LOGGER.debug("{} received {}.", localEndpointStr(), response);
-    if (updateFollowerIndices(response)) {
-      if (!node.tryAdvanceCommitIndex()) {
+    boolean indicesChanged = updateFollowerIndices(response);
+    LOGGER.trace("TRACE> {} AESuccessHandler updateFollowerIndices indicesChanged={}",
+      localEndpointStr(), indicesChanged);
+    if (indicesChanged) {
+      boolean advanced = node.tryAdvanceCommitIndex();
+      LOGGER.trace("TRACE> {} AESuccessHandler tryAdvanceCommitIndex advanced={}",
+        localEndpointStr(), advanced);
+      if (!advanced) {
         trySendAppendRequest(response);
       }
     } else {
+      LOGGER.trace("TRACE> {} AESuccessHandler indices NOT changed -> tryRunQueries",
+        localEndpointStr());
       node.tryRunQueries();
     }
     checkIfQueryAckNeeded(response);
@@ -138,29 +151,36 @@ public class AppendEntriesSuccessResponseHandler
   private void checkIfQueryAckNeeded(AppendEntriesSuccessResponse response) {
     LeaderState leaderState = state.leaderState();
     if (leaderState == null) {
-      // this can happen if this node was removed from the group when
-      // the commit index was advanced.
+      LOGGER.trace("TRACE> {} checkIfQueryAckNeeded leaderState=null sender={}", localEndpointStr(),
+        response.getSender().getId());
       return;
     } else if (!state.isVotingMember(response.getSender())) {
-      // learners are not part of the replication quorum.
+      LOGGER.trace("TRACE> {} checkIfQueryAckNeeded sender NOT voting sender={} effectiveVoting={}",
+        localEndpointStr(), response.getSender().getId(),
+        state.effectiveGroupMembers().getVotingMembers());
       return;
     }
     QueryState queryState = leaderState.queryState();
     if (queryState.isAckNeeded(response.getSender(), state.logReplicationQuorumSize())) {
+      LOGGER.trace("TRACE> {} checkIfQueryAckNeeded YES -> sendAppendEntriesRequest sender={}",
+        localEndpointStr(), response.getSender().getId());
       node.sendAppendEntriesRequest(response.getSender());
     }
   }
 
   private void trySendAppendRequest(AppendEntriesSuccessResponse response) {
     long followerLastLogIndex = response.getLastLogIndex();
-    if (
-      state.log().lastLogOrSnapshotIndex() > followerLastLogIndex
-        || state.commitIndex() == followerLastLogIndex
-    ) {
-      // If the follower is still missing some log entries or has not learnt the
-      // latest commit index yet,
-      // then send another append request.
+    long lastLog = state.log().lastLogOrSnapshotIndex();
+    long commitIdx = state.commitIndex();
+    if (lastLog > followerLastLogIndex || commitIdx == followerLastLogIndex) {
+      LOGGER.trace(
+        "TRACE> {} trySendAppendRequest YES sender={} lastLog={} followerLast={} commitIdx={}",
+        localEndpointStr(), response.getSender().getId(), lastLog, followerLastLogIndex, commitIdx);
       node.sendAppendEntriesRequest(response.getSender());
+    } else {
+      LOGGER.trace(
+        "TRACE> {} trySendAppendRequest NO sender={} lastLog={} followerLast={} commitIdx={}",
+        localEndpointStr(), response.getSender().getId(), lastLog, followerLastLogIndex, commitIdx);
     }
   }
 }

@@ -61,7 +61,7 @@ public interface StateMachine {
    * committed. In addition to that, an operation can be replayed, i.e., executed again, if a Raft
    * node crashes and restarts with persisting its internal state.
    * <p>
-   * MicroRaft does not inform the state machines if the operation is being executed for the first
+   * The engine does not inform the state machines if the operation is being executed for the first
    * time or replayed, and it is the state machine implementations' responsibility to ensure
    * determinism in both cases. For instance, if a state machine implementation creates some side
    * effects on operation execution, it can also persist the log index of the last executed
@@ -107,12 +107,15 @@ public interface StateMachine {
   void installSnapshot(long commitIndex, @NonNull List<Object> snapshotChunks);
 
   /**
-   * Installs catch-up state by reference (metadata only).
+   * Installs catch-up state by reference (metadata only). State machines that support catch-up by
+   * reference must override this method; the default implementation throws
+   * {@link UnsupportedOperationException}.
    * @param commitIndex snapshot / catch-up commit index
-   * @param reference   opaque catch-up metadata (e.g. HFile paths placeholder)
+   * @param reference   opaque catch-up metadata describing the location of the source data
    */
   default void installSnapshotReference(long commitIndex, @NonNull CatchUpReference reference) {
-    throw new UnsupportedOperationException("installSnapshotReference is not wired yet");
+    throw new UnsupportedOperationException(
+      "installSnapshotReference is not implemented by this StateMachine");
   }
 
   /**

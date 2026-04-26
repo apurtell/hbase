@@ -66,7 +66,12 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
   // method
   protected void handle(@NonNull AppendEntriesRequest request) {
     requireNonNull(request);
-    LOGGER.debug("{} received {}.", localEndpointStr(), request);
+    LOGGER.trace(
+      "TRACE> {} AERequestHandler enter sender={} term={} prevLogIndex={} prevLogTerm={}"
+        + " leaderCommit={} entries={} qsn={} curTerm={} role={}",
+      localEndpointStr(), request.getSender().getId(), request.getTerm(),
+      request.getPreviousLogIndex(), request.getPreviousLogTerm(), request.getCommitIndex(),
+      request.getLogEntries().size(), request.getQuerySequenceNumber(), state.term(), state.role());
     RaftEndpoint leader = request.getSender();
     // Reply false if term < currentTerm (§5.1)
     if (request.getTerm() < state.term()) {
@@ -101,6 +106,10 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
     Entry<Long, List<LogEntry>> e = appendLogEntries(request, log);
     long lastLogIndex = e.getKey();
     List<LogEntry> newLogEntries = e.getValue();
+    // Advance lastVerifiedLogIndex first so the subsequent commitIndex update can rely on the
+    // invariant lastVerifiedLogIndex >= commitIndex, and so that any concurrent LeaderHeartbeat
+    // handler observes the new safe upper bound.
+    state.lastVerifiedLogIndex(lastLogIndex);
     long oldCommitIndex = state.commitIndex();
     // Update the commit index
     if (request.getCommitIndex() > oldCommitIndex) {
@@ -115,6 +124,10 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
         .setGroupId(node.getGroupId()).setSender(localEndpoint()).setTerm(state.term())
         .setLastLogIndex(lastLogIndex).setQuerySequenceNumber(request.getQuerySequenceNumber())
         .setFlowControlSequenceNumber(request.getFlowControlSequenceNumber()).build();
+      LOGGER.trace(
+        "TRACE> {} AERequestHandler SEND-success leader={} lastLogIndex={} qsn={} commitIndex={}",
+        localEndpointStr(), leader.getId(), lastLogIndex, request.getQuerySequenceNumber(),
+        state.commitIndex());
       node.send(leader, response);
     } finally {
       boolean commitIndexAdvanced = (state.commitIndex() > oldCommitIndex);

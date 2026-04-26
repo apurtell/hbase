@@ -34,6 +34,8 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 import org.apache.hadoop.hbase.util.JVM;
@@ -218,8 +220,8 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
 
   @Override
   public void onRaftNodeStart() {
-    // Transport lifecycle is managed at the ConsensusServer level (Phase 7). Per-RaftNode start
-    // is a no-op so the same transport can be shared by many groups.
+    // Transport lifecycle is managed at the ConsensusServer level. Per-RaftNode start is a no-op
+    // so the same transport can be shared by many groups.
   }
 
   @Override
@@ -396,12 +398,16 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
 
   /**
    * Decide whether the given message must be sent in its own {@link ConsensusProtos.ConsensusFrame}
-   * (vote / install-snapshot / responses) or may be coalesced into a batch envelope. Heartbeats
-   * carry the {@link HeartbeatRaftMessage} marker and go into the heartbeat batch; non-heartbeat
-   * {@link AppendEntriesRequest}s with at least one entry coalesce into the append batch.
+   * (vote / install-snapshot / responses) or may be coalesced into a batch envelope.
+   * {@link LeaderHeartbeat}s coalesce into the heartbeat batch and {@link LeaderHeartbeatAck}s
+   * coalesce into the heartbeat-ack batch; {@link AppendEntriesRequest}s coalesce into the append
+   * batch.
    */
   private static boolean isImmediate(RaftMessage message) {
-    if (message instanceof HeartbeatRaftMessage) {
+    if (message instanceof LeaderHeartbeat) {
+      return false;
+    }
+    if (message instanceof LeaderHeartbeatAck) {
       return false;
     }
     if (message instanceof AppendEntriesRequest) {

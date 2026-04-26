@@ -31,6 +31,8 @@ import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultAppendEn
 import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultAppendEntriesSuccessResponseOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultInstallSnapshotRequestOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultInstallSnapshotResponseOrBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultLeaderHeartbeatAckOrBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultLeaderHeartbeatOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultPreVoteRequestOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultPreVoteResponseOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.message.DefaultTriggerLeaderElectionRequestOrBuilder;
@@ -47,6 +49,8 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse.AppendEntriesSuccessResponseBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest.InstallSnapshotRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse.InstallSnapshotResponseBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat.LeaderHeartbeatBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck.LeaderHeartbeatAckBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest.PreVoteRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse.PreVoteResponseBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest.TriggerLeaderElectionRequestBuilder;
@@ -107,6 +111,18 @@ public class DefaultRaftModelFactory implements RaftModelFactory {
   @Override
   public InstallSnapshotResponseBuilder createInstallSnapshotResponseBuilder() {
     return new DefaultInstallSnapshotResponseOrBuilder();
+  }
+
+  @NonNull
+  @Override
+  public LeaderHeartbeatBuilder createLeaderHeartbeatBuilder() {
+    return new DefaultLeaderHeartbeatOrBuilder();
+  }
+
+  @NonNull
+  @Override
+  public LeaderHeartbeatAckBuilder createLeaderHeartbeatAckBuilder() {
+    return new DefaultLeaderHeartbeatAckOrBuilder();
   }
 
   @NonNull

@@ -22,7 +22,7 @@ import org.apache.hadoop.hbase.consensus.raft.exception.CannotReplicateException
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 
 /**
- * Contains the configuration parameters for MicroRaft's implementation.
+ * Contains the configuration parameters for the Raft implementation.
  * <p>
  * RaftConfig is an immutable configuration class. You can use a RaftConfigBuilder to build a
  * RaftConfig object.
@@ -82,8 +82,8 @@ public final class RaftConfig implements Serializable {
    * actual failure.
    * <p>
    * Even though there is a single "election timeout" parameter in the Raft paper for both
-   * timing-out a leader election round and detecting failure of the leader, MicroRaft uses two
-   * different parameters for these cases.
+   * timing-out a leader election round and detecting failure of the leader, this implementation
+   * uses two different parameters for these cases.
    * <p>
    * You can set {@link #leaderElectionTimeoutMillis} and this field to the same duration to align
    * with the "election timeout" definition in the Raft paper.
@@ -111,9 +111,9 @@ public final class RaftConfig implements Serializable {
    */
   private final int maxPendingLogEntryCount;
   /**
-   * In MicroRaft, a leader Raft node sends log entries to its followers in batches to improve the
-   * throughput. This configuration parameter specifies the maximum number of Raft log entries that
-   * can be sent as a batch in a single append entries request.
+   * A leader Raft node sends log entries to its followers in batches to improve throughput. This
+   * configuration parameter specifies the maximum number of Raft log entries that can be sent as a
+   * batch in a single append entries request.
    */
   private final int appendEntriesRequestBatchSize;
   /**
@@ -130,8 +130,8 @@ public final class RaftConfig implements Serializable {
   /**
    * If enabled, when a Raft follower falls far behind the Raft leader and needs to install a
    * snapshot, it transfers the snapshot chunks from both the Raft leader and other followers in
-   * parallel. This is a safe optimization because in MicroRaft snapshots are taken at the same log
-   * indices on all Raft nodes.
+   * parallel. This is a safe optimization because snapshots are taken at the same log indices on
+   * all Raft nodes.
    */
   private final boolean transferSnapshotsFromFollowersEnabled;
   /**

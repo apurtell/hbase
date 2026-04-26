@@ -18,21 +18,20 @@
 package org.apache.hadoop.hbase.consensus.raft.impl.task;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static org.apache.hadoop.hbase.consensus.raft.RaftRole.FOLLOWER;
-import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEARNER;
 
-import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
- * Checks whether currently there is a known leader endpoint and triggers the pre-voting mechanism
- * there is no known leader or the leader has timed out.
+ * Per-RaftNode self-rescheduling heartbeat task used by the default
+ * {@code DefaultHeartbeatScheduler}.
+ * <p>
+ * The actual per-tick logic (leader heartbeat broadcast, catch-up appends, election-timer checks,
+ * pre-vote triggering) lives on {@link RaftNodeImpl#runHeartbeatTick()} so it can be shared with
+ * any alternate {@code HeartbeatScheduler}. This task is a thin wrapper that delegates and then
+ * re-schedules itself on the node's own executor at {@code config.getLeaderHeartbeatPeriodMillis()}
+ * cadence.
  */
 public class HeartbeatTask extends RaftNodeStatusAwareTask {
-  private static final Logger LOGGER = LoggerFactory.getLogger(HeartbeatTask.class);
-
   public HeartbeatTask(RaftNodeImpl node) {
     super(node);
   }
@@ -40,54 +39,10 @@ public class HeartbeatTask extends RaftNodeStatusAwareTask {
   @Override
   protected void doRun() {
     try {
-      if (state.leaderState() != null) {
-        if (!node.demoteToFollowerIfLeaseExpired()) {
-          node.broadcastAppendEntriesRequest();
-          // TODO(basri) append no-op if snapshotIndex > 0 && snapshotIndex ==
-          // lastLogIndex
-        }
-        return;
-      }
-      RaftEndpoint leader = state.leader();
-      if (leader == null) {
-        if (state.role() == FOLLOWER && state.preCandidateState() == null) {
-          LOGGER.warn(
-            "{} We are FOLLOWER and there is no current leader. Will start new election round.",
-            localEndpointStr());
-          resetLeaderAndTryTriggerPreVote(false);
-        }
-      } else if (node.isElectionTimerElapsed() && state.preCandidateState() == null) {
-        LOGGER.warn("{} Current leader {}'s heartbeats are timed-out.", localEndpointStr(),
-          leader.getId());
-        resetLeaderAndTryTriggerPreVote(true);
-      } else if (
-        !state.committedGroupMembers().isKnownMember(leader) && state.preCandidateState() == null
-      ) {
-        LOGGER.warn("{} Current leader {} is not member anymore.", localEndpointStr(),
-          leader.getId());
-        resetLeaderAndTryTriggerPreVote(true);
-      }
+      node.runHeartbeatTick();
     } finally {
       node.getExecutor().schedule(this, node.getConfig().getLeaderHeartbeatPeriodMillis(),
         MILLISECONDS);
-    }
-  }
-
-  void resetLeaderAndTryTriggerPreVote(boolean resetLeader) {
-    if (resetLeader) {
-      node.leader(null);
-    }
-    if (state.role() == LEARNER) {
-      LOGGER.debug("{} is not starting pre-vote since it is {}", localEndpointStr(), LEARNER);
-      return;
-    }
-    if (state.leaderElectionQuorumSize() > 1) {
-      node.runPreVote();
-    } else if (state.effectiveGroupMembers().getVotingMembers().contains(localEndpoint())) {
-      // we can encounter this case if the leader crashes before it
-      // commit the replicated membership change while it is leaving.
-      LOGGER.info("{} is the single voting member left in the Raft group.", localEndpointStr());
-      node.toSingletonLeader();
     }
   }
 }

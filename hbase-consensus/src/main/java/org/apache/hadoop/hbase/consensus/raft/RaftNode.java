@@ -32,6 +32,8 @@ import org.apache.hadoop.hbase.consensus.raft.exception.MismatchingRaftGroupMemb
 import org.apache.hadoop.hbase.consensus.raft.exception.NotLeaderException;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.DefaultHeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeBuilderImpl;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
@@ -578,6 +580,20 @@ public interface RaftNode {
      * @return the builder object for fluent calls
      */
     RaftNodeBuilder setClock(Clock clock);
+
+    /**
+     * Sets the {@link HeartbeatScheduler} this Raft node will register itself with on start and
+     * unregister from on terminate.
+     * <p>
+     * If not set, {@link DefaultHeartbeatScheduler#INSTANCE} is used, which schedules an
+     * independent self-rescheduling task on each Raft node's own executor at the configured
+     * {@link RaftConfig#getLeaderHeartbeatPeriodMillis()} cadence.
+     * @return the builder object for fluent calls
+     * @see HeartbeatScheduler
+     * @see DefaultHeartbeatScheduler
+     */
+    @NonNull
+    RaftNodeBuilder setHeartbeatScheduler(@NonNull HeartbeatScheduler heartbeatScheduler);
 
     /**
      * Builds and returns the RaftNode instance with the given settings.

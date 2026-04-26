@@ -36,7 +36,7 @@ import org.apache.hbase.thirdparty.io.netty.channel.SimpleChannelInboundHandler;
  * <p>
  * Turns each {@link ConsensusProtos.ConsensusFrame} arriving on the wire into one or more
  * {@link RaftMessage}s and hands them to the local {@link RaftNode#handle(RaftMessage)} (which
- * itself trampolines through the per-group {@code GroupExecutor} from Phase 2).
+ * itself trampolines through the per-group {@code GroupExecutor}).
  * <p>
  * Sharable so the inbound pipeline can mount a single instance for every accepted connection.
  */
@@ -138,6 +138,13 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
         dispatch(pb.getGroupId(), converter.fromTriggerElectionPB(pb));
         break;
       }
+      case HEARTBEAT_ACK_BATCH:
+        requirePayload(frame.hasHeartbeatAckBatch(), frame.getKind(), "heartbeat_ack_batch");
+        for (ConsensusProtos.GroupHeartbeatAckPB pb : frame.getHeartbeatAckBatch()
+          .getGroupsList()) {
+          dispatch(pb.getGroupId(), converter.fromGroupHeartbeatAckPB(pb));
+        }
+        break;
       default:
         LOG.debug("Dropping ConsensusFrame with unknown kind {}", frame.getKind());
         break;

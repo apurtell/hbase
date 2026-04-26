@@ -27,17 +27,19 @@
  * ({@link org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos}). For each peer
  * one outbound TCP channel is opened lazily and all messages bound for that peer in one flush
  * window are coalesced into a single {@code ConsensusFrame}: {@code AppendEntries} from many
- * groups land in a {@code BatchAppendEntriesPB}, heartbeats land in a {@code HeartbeatBatchPB}
- * (tagged via {@link org.apache.hadoop.hbase.consensus.handler.transport.HeartbeatRaftMessage}),
- * and single-message frames (vote, install snapshot, append responses, etc.) flush immediately
- * in arrival order to preserve per-peer FIFO.
+ * groups land in a {@code BatchAppendEntriesPB},
+ * {@link org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat}s land in a
+ * {@code HeartbeatBatchPB},
+ * {@link org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck}s land in a
+ * {@code BatchHeartbeatAckPB}, and single-message frames (vote, install snapshot, append
+ * responses, etc.) flush immediately in arrival order to preserve per-peer FIFO.
  * <p>
  * Inbound delivery is demultiplexed by group id via
  * {@link org.apache.hadoop.hbase.consensus.handler.transport.RegistryDispatcher} and forwarded to
  * the local
  * {@link org.apache.hadoop.hbase.consensus.raft.RaftNode#handle(org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage)},
  * which itself trampolines through the per-group
- * {@link org.apache.hadoop.hbase.consensus.handler.executor.MultiGroupExecutor} from Phase 2; the
+ * {@link org.apache.hadoop.hbase.consensus.handler.executor.MultiGroupExecutor}; the
  * transport never blocks on Raft state.
  * <p>
  * Two SPIs are injected at construction:

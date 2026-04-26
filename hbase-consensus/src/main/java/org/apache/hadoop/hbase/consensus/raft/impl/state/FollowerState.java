@@ -116,6 +116,16 @@ public final class FollowerState {
   }
 
   /**
+   * Updates the timestamp of the last received {@code LeaderHeartbeatAck} response. Distinct from
+   * {@link #responseReceived(long, long)} because heartbeat acks do not carry a flow-control
+   * sequence number. They only refresh the response timestamp used by leader-lease quorum
+   * calculations and never touch the request-backoff state.
+   */
+  public void heartbeatAcked(long currentTimeMillis) {
+    responseTimestamp = max(responseTimestamp, currentTimeMillis);
+  }
+
+  /**
    * Updates the timestamp of the last received append entries or install snapshot response. In
    * addition, if the received flow control sequence number is equal to the last sent flow sequence
    * number, the internal request backoff state is also reset.

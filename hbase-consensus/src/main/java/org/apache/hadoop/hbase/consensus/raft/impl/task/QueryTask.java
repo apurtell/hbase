@@ -65,6 +65,11 @@ public final class QueryTask implements Runnable {
   @Override
   public void run() {
     try {
+      LOGGER.trace(
+        "TRACE> {} QueryTask.run policy={} operation={} role={} status={} commitIndex={}"
+          + " minCommitIndex={}",
+        raftNode.localEndpointStr(), queryPolicy, operation, state.role(), raftNode.getStatus(),
+        state.commitIndex(), minCommitIndex);
       if (!verifyOperation() || !verifyRaftNodeStatus()) {
         return;
       }
@@ -114,9 +119,13 @@ public final class QueryTask implements Runnable {
 
   private void queryWithLinearizability() {
     if (state.role() != LEADER) {
+      LOGGER.trace("TRACE> {} queryWithLinearizability NOT LEADER role={}",
+        raftNode.localEndpointStr(), state.role());
       future.fail(raftNode.newNotLeaderException());
       return;
     } else if (!raftNode.canQueryLinearizable()) {
+      LOGGER.trace("TRACE> {} queryWithLinearizability cannot query linearizable",
+        raftNode.localEndpointStr());
       future.fail(raftNode.newCannotReplicateException());
       return;
     }
@@ -127,10 +136,10 @@ public final class QueryTask implements Runnable {
     }
     if (state.logReplicationQuorumSize() > 1) {
       QueryState queryState = state.leaderState().queryState();
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(raftNode.localEndpointStr() + " Adding query at commit index: " + commitIndex
-          + ", query sequence number: " + queryState.querySequenceNumber());
-      }
+      LOGGER.trace(
+        "TRACE> {} queryWithLinearizability addQuery commitIndex={} curQsn={} quorumSize={}",
+        raftNode.localEndpointStr(), commitIndex, queryState.querySequenceNumber(),
+        state.logReplicationQuorumSize());
       if (queryState.addQuery(commitIndex, operation, future)) {
         raftNode.broadcastAppendEntriesRequest();
       }

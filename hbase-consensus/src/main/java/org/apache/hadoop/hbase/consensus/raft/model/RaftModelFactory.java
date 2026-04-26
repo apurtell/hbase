@@ -31,6 +31,8 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse.AppendEntriesSuccessResponseBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest.InstallSnapshotRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse.InstallSnapshotResponseBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat.LeaderHeartbeatBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck.LeaderHeartbeatAckBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest.PreVoteRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse.PreVoteResponseBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest.TriggerLeaderElectionRequestBuilder;
@@ -44,10 +46,10 @@ import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 /**
  * Used for creating {@link RaftModel} objects with the builder pattern.
  * <p>
- * Users of MicroRaft can provide an implementation of this interface while creating
- * {@link RaftNode} instances. Otherwise, {@link DefaultRaftModelFactory} is used. {@link RaftModel}
- * objects created by a Raft model factory implementation are passed to {@link Transport} for
- * networking, and {@link RaftStore} for persistence.
+ * Callers can provide an implementation of this interface while creating {@link RaftNode}
+ * instances. Otherwise, {@link DefaultRaftModelFactory} is used. {@link RaftModel} objects created
+ * by a Raft model factory implementation are passed to {@link Transport} for networking, and
+ * {@link RaftStore} for persistence.
  * <p>
  * A {@link RaftModelFactory} implementation can implement {@link RaftNodeLifecycleAware} to perform
  * initialization and clean up work during {@link RaftNode} startup and termination.
@@ -79,6 +81,12 @@ public interface RaftModelFactory {
 
   @NonNull
   InstallSnapshotResponseBuilder createInstallSnapshotResponseBuilder();
+
+  @NonNull
+  LeaderHeartbeatBuilder createLeaderHeartbeatBuilder();
+
+  @NonNull
+  LeaderHeartbeatAckBuilder createLeaderHeartbeatAckBuilder();
 
   @NonNull
   PreVoteRequestBuilder createPreVoteRequestBuilder();

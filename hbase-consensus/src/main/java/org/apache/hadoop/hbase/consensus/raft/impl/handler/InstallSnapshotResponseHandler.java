@@ -80,7 +80,6 @@ public class InstallSnapshotResponseHandler
         return;
       }
     }
-    // TODO: swap chunked install-snapshot for CatchUpReference
     node.sendSnapshotChunk(response.getSender(), response.getSnapshotIndex(),
       response.getRequestedSnapshotChunkIndex());
   }

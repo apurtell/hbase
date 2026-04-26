@@ -132,6 +132,28 @@ public final class RaftState {
    */
   private long lastApplied;
   /**
+   * Highest local log index proven to match the current leader's log.
+   * <p>
+   * Set by {@code AppendEntriesRequestHandler} after the {@code prevLogIndex / prevLogTerm}
+   * consistency check passes (and any new entries are appended) and by
+   * {@code RaftNodeImpl#installSnapshot} after a snapshot is installed. On {@link #toFollower(int)}
+   * for a strictly-newer term it is clamped down to the current {@code commitIndex} since
+   * previous-leader verifications do not transfer to a new leader (only committed entries are
+   * guaranteed to match by the Raft election-safety property).
+   * <p>
+   * Used by {@code LeaderHeartbeatHandler} as the upper bound when advancing {@code commitIndex}
+   * from the leader's heartbeat: heartbeats carry no {@code prevLogIndex / prevLogTerm} so the
+   * follower must clamp to a known log-matched index, never to its raw
+   * {@code lastLogOrSnapshotIndex} (which may include uncommitted, conflicting entries from a
+   * previous term).
+   * <p>
+   * Invariant: {@code lastVerifiedLogIndex >= commitIndex} at all times.
+   * <p>
+   * [NOT-PERSISTENT] because it is rebuilt at runtime from snapshot index, AE successes, and
+   * snapshot installs.
+   */
+  private long lastVerifiedLogIndex;
+  /**
    * State maintained by the Raft group leader, or null if this Raft node is not the leader.
    */
   private LeaderState leaderState;
@@ -201,6 +223,7 @@ public final class RaftState {
       this.commitIndex = snapshot.getIndex();
       this.lastApplied = snapshot.getIndex();
     }
+    this.lastVerifiedLogIndex = this.commitIndex;
     this.store = requireNonNull(store);
     this.log = RaftLog.restore(logCapacity, snapshot, restoredState.getLogEntries(), store);
     this.modelFactory = modelFactory;
@@ -335,12 +358,40 @@ public final class RaftState {
   }
 
   /**
-   * Updates the commit index.
+   * Updates the commit index. Maintains the invariant {@code lastVerifiedLogIndex >= commitIndex}:
+   * callers on a follower are expected to have already advanced {@code lastVerifiedLogIndex} (via
+   * {@code lastVerifiedLogIndex(long)}) before raising the commit index past it; on the leader
+   * (where {@code tryAdvanceCommitIndex} drives commit advance directly)
+   * {@code lastVerifiedLogIndex} is auto-bumped here since the leader's own log is the source of
+   * truth.
    */
   public void commitIndex(long index) {
     assert index >= commitIndex
       : "new commit index: " + index + " is smaller than current commit index: " + commitIndex;
     commitIndex = index;
+    if (commitIndex > lastVerifiedLogIndex) {
+      lastVerifiedLogIndex = commitIndex;
+    }
+  }
+
+  /**
+   * Returns the highest local log index proven to match the current leader's log. Used by
+   * {@code LeaderHeartbeatHandler} to bound commit-index advancement from a leader heartbeat (which
+   * carries no per-entry consistency check).
+   */
+  public long lastVerifiedLogIndex() {
+    return lastVerifiedLogIndex;
+  }
+
+  /**
+   * Updates the last verified log index, monotonically. the new value (must be {@code >=} the
+   * current value)
+   */
+  public void lastVerifiedLogIndex(long index) {
+    if (index <= lastVerifiedLogIndex) {
+      return;
+    }
+    lastVerifiedLogIndex = index;
   }
 
   /**
@@ -399,6 +450,7 @@ public final class RaftState {
    * term. current term
    */
   public void toFollower(int term) {
+    int oldTerm = termState.getTerm();
     if (role != LEARNER) {
       // If I am a LEARNER, I will stay in this role until I get promoted.
       role = FOLLOWER;
@@ -416,6 +468,13 @@ public final class RaftState {
       currentLeaderState.queryState().fail(new NotLeaderException(localEndpoint, leader()));
     }
     invalidateFuturesFrom(commitIndex + 1, new IndeterminateStateException());
+    if (term > oldTerm) {
+      // A strictly-newer term means a (potentially) different leader. Verifications obtained from
+      // the previous leader's AppendEntries no longer apply. Only entries up to commitIndex are
+      // guaranteed to match the new leader's log. Subsequent AppendEntries from the new leader
+      // will rebuild it past commitIndex via prevLogIndex/prevLogTerm verification.
+      lastVerifiedLogIndex = commitIndex;
+    }
   }
 
   private void persistTerm(RaftTermState termStateToPersist) {
