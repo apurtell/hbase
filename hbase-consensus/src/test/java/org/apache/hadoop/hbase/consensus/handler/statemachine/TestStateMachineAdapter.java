@@ -23,8 +23,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetrics;
+import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetricsWrapper;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -38,8 +41,51 @@ public class TestStateMachineAdapter extends TestBase {
 
   private static final Object GROUP_ID = "g1";
 
+  private ConsensusServerMetrics metrics;
+
+  @AfterEach
+  public void closeMetrics() {
+    if (metrics != null) {
+      metrics.close();
+      metrics = null;
+    }
+  }
+
   private static byte[] payload(String s) {
     return s.getBytes(StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Builds a stand-alone {@link ConsensusServerMetrics} backed by a stub wrapper so unit tests can
+   * exercise the metrics-recording path without a live {@code ConsensusServer}.
+   */
+  private static ConsensusServerMetrics newMetrics(String endpointId) {
+    return new ConsensusServerMetrics(new ConsensusServerMetricsWrapper() {
+      @Override
+      public String getEndpointId() {
+        return endpointId;
+      }
+
+      @Override
+      public int getActiveGroups() {
+        return 0;
+      }
+
+      @Override
+      public int getMaxGroups() {
+        return 0;
+      }
+
+      @Override
+      public long getRestoredGroups() {
+        return 0L;
+      }
+
+      @Override
+      public String getLifecycleState() {
+        return "TEST";
+      }
+    });
   }
 
   @Test
@@ -189,5 +235,79 @@ public class TestStateMachineAdapter extends TestBase {
     StateMachineAdapter adapter = new StateMachineAdapter(GROUP_ID, spi);
 
     assertThat(adapter.getNewTermOperation()).isNull();
+  }
+
+  @Test
+  public void testCommitApplyMetricsRecordedOnDrain() {
+    metrics = newMetrics("sm-1");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    StateMachineAdapter adapter = new StateMachineAdapter(GROUP_ID, spi, metrics);
+
+    adapter.runOperation(1L, payload("aa"));
+    adapter.runOperation(2L, payload("bbb"));
+    adapter.onApplyBatchEnd();
+
+    assertThat(metrics.getCommitApplyTimer().getHistogram().getCount())
+      .as("one batch -> one commitApply sample").isEqualTo(1);
+    assertThat(metrics.getCommitBatchSizeHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getCommitBatchBytesHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getCommitBatchSizeHistogram().snapshot().getMax()).isEqualTo(2);
+    assertThat(metrics.getCommitBatchBytesHistogram().snapshot().getMax()).isEqualTo(5);
+    assertThat(metrics.getCommitBatchesCount()).isEqualTo(1);
+    assertThat(metrics.getCommitEntriesCount()).isEqualTo(2);
+    assertThat(metrics.getCommitBytesCount()).isEqualTo(5);
+  }
+
+  @Test
+  public void testFlushCompleteMetricsRecorded() {
+    metrics = newMetrics("sm-2");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    StateMachineAdapter adapter = new StateMachineAdapter(GROUP_ID, spi, metrics);
+
+    adapter.runOperation(1L, payload("a"));
+    adapter.runOperation(2L, new FlushMarker(7L, 0L, new byte[0]));
+    adapter.onApplyBatchEnd();
+
+    assertThat(metrics.getFlushCompleteTimer().getHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getFlushCompletesCount()).isEqualTo(1);
+    assertThat(metrics.getCommitApplyTimer().getHistogram().getCount())
+      .as("flush marker drains the pre-flush batch -> one commitApply sample").isEqualTo(1);
+  }
+
+  @Test
+  public void testSnapshotMetricsRecorded() {
+    metrics = newMetrics("sm-3");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    StateMachineAdapter adapter = new StateMachineAdapter(GROUP_ID, spi, metrics);
+
+    adapter.runOperation(1L, payload("a"));
+    adapter.onApplyBatchEnd();
+    List<Object> chunks = new ArrayList<>();
+    adapter.takeSnapshot(1L, chunks::add);
+
+    assertThat(metrics.getTakeSnapshotTimer().getHistogram().getCount()).isEqualTo(1);
+    assertThat(chunks).hasSize(1);
+
+    InMemoryConsensusSpi destSpi = new InMemoryConsensusSpi();
+    StateMachineAdapter dest = new StateMachineAdapter(GROUP_ID, destSpi, metrics);
+    dest.installSnapshot(1L, chunks);
+
+    assertThat(metrics.getInstallSnapshotTimer().getHistogram().getCount()).isEqualTo(1);
+  }
+
+  @Test
+  public void testNoMetricsWhenWrapperOmitted() {
+    metrics = newMetrics("sm-4");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    StateMachineAdapter adapter = new StateMachineAdapter(GROUP_ID, spi);
+
+    adapter.runOperation(1L, payload("a"));
+    adapter.onApplyBatchEnd();
+    adapter.runOperation(2L, new FlushMarker(7L, 0L, new byte[0]));
+    adapter.onApplyBatchEnd();
+
+    assertThat(metrics.getCommitApplyTimer().getHistogram().getCount())
+      .as("legacy ctor must not push into the metrics object").isZero();
+    assertThat(metrics.getFlushCompleteTimer().getHistogram().getCount()).isZero();
   }
 }

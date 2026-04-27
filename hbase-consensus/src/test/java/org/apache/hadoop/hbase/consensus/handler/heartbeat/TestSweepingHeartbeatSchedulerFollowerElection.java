@@ -29,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftGroup;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -78,7 +79,7 @@ public class TestSweepingHeartbeatSchedulerFollowerElection extends TestBase {
     group.splitMembers(isolated);
 
     long deadline =
-      System.currentTimeMillis() + 2 * CONFIG.getLeaderHeartbeatTimeoutMillis() + 2_000L;
+      EnvironmentEdgeManager.currentTime() + 2 * CONFIG.getLeaderHeartbeatTimeoutMillis() + 2_000L;
 
     eventually(() -> {
       RaftEndpoint newLeader = null;
@@ -97,6 +98,6 @@ public class TestSweepingHeartbeatSchedulerFollowerElection extends TestBase {
         }
       }
       assertThat(newLeader).isNotEqualTo(isolated);
-    }, Math.max(5L, (deadline - System.currentTimeMillis()) / 1_000));
+    }, Math.max(5L, (deadline - EnvironmentEdgeManager.currentTime()) / 1_000));
   }
 }

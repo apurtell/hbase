@@ -22,6 +22,9 @@ import static java.util.Objects.requireNonNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
 import java.net.InetSocketAddress;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -376,6 +379,22 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       return false;
     }
     return true;
+  }
+
+  /**
+   * Returns an immutable point-in-time snapshot of every per-peer outbound channel's frame
+   * counters.
+   */
+  @NonNull
+  public Map<RaftEndpoint, OutboundChannelStats> getOutboundStats() {
+    if (peers.isEmpty()) {
+      return Collections.emptyMap();
+    }
+    Map<RaftEndpoint, OutboundChannelStats> out = new LinkedHashMap<>(peers.size());
+    for (Map.Entry<RaftEndpoint, OutboundChannel> e : peers.entrySet()) {
+      out.put(e.getKey(), e.getValue().stats());
+    }
+    return Collections.unmodifiableMap(out);
   }
 
   /** Visible for tests. */

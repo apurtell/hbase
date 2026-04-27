@@ -23,10 +23,14 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetrics;
+import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetricsWrapper;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.InMemoryConsensusSpi.LeaderElection;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftRole;
@@ -36,6 +40,7 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftTerm;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -50,8 +55,26 @@ public class TestLeaderReportListener extends TestBase {
 
   private final AtomicLong now = new AtomicLong(0L);
 
+  private ConsensusServerMetrics metrics;
+
+  @AfterEach
+  public void closeMetrics() {
+    if (metrics != null) {
+      metrics.close();
+      metrics = null;
+    }
+  }
+
   private RaftNodeReport report(RaftRole role, int term, @Nullable RaftEndpoint leader,
     long lastSnapshotIndex, Map<RaftEndpoint, Long> followerMatchIndices) {
+    return report(role, term, leader, lastSnapshotIndex, followerMatchIndices, 0L, 0L,
+      Optional.empty(), Optional.empty());
+  }
+
+  private RaftNodeReport report(RaftRole role, int term, @Nullable RaftEndpoint leader,
+    long lastSnapshotIndex, Map<RaftEndpoint, Long> followerMatchIndices, long commitIndex,
+    long lastLogOrSnapshotIndex, Optional<Long> quorumHeartbeatTs,
+    Optional<Long> leaderHeartbeatTs) {
     RaftTerm raftTerm = mock(RaftTerm.class);
     when(raftTerm.getTerm()).thenReturn(term);
     when(raftTerm.getLeaderEndpoint()).thenReturn(leader);
@@ -59,13 +82,46 @@ public class TestLeaderReportListener extends TestBase {
     RaftLogStats log = mock(RaftLogStats.class);
     when(log.getLastSnapshotIndex()).thenReturn(lastSnapshotIndex);
     when(log.getFollowerMatchIndices()).thenReturn(followerMatchIndices);
+    when(log.getCommitIndex()).thenReturn(commitIndex);
+    when(log.getLastLogOrSnapshotIndex()).thenReturn(lastLogOrSnapshotIndex);
 
     RaftNodeReport rpt = mock(RaftNodeReport.class);
     when(rpt.getGroupId()).thenReturn(GROUP_ID);
     when(rpt.getRole()).thenReturn(role);
     when(rpt.getTerm()).thenReturn(raftTerm);
     when(rpt.getLog()).thenReturn(log);
+    when(rpt.getQuorumHeartbeatTimestamp()).thenReturn(quorumHeartbeatTs);
+    when(rpt.getLeaderHeartbeatTimestamp()).thenReturn(leaderHeartbeatTs);
     return rpt;
+  }
+
+  private static ConsensusServerMetrics newMetrics(String endpointId) {
+    return new ConsensusServerMetrics(new ConsensusServerMetricsWrapper() {
+      @Override
+      public String getEndpointId() {
+        return endpointId;
+      }
+
+      @Override
+      public int getActiveGroups() {
+        return 0;
+      }
+
+      @Override
+      public int getMaxGroups() {
+        return 0;
+      }
+
+      @Override
+      public long getRestoredGroups() {
+        return 0L;
+      }
+
+      @Override
+      public String getLifecycleState() {
+        return "TEST";
+      }
+    });
   }
 
   @Test
@@ -202,5 +258,93 @@ public class TestLeaderReportListener extends TestBase {
     InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
     assertThatThrownBy(() -> new LeaderReportListener(spi, -1L, now::get))
       .isInstanceOf(IllegalArgumentException.class).hasMessageContaining(">= 0");
+  }
+
+  @Test
+  public void testCommitBacklogSampledOnEveryTick() {
+    metrics = newMetrics("lr-1");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    LeaderReportListener listener = new LeaderReportListener(spi, 0L, now::get, metrics);
+    RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
+
+    listener.accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap(), 4L, 10L,
+      Optional.empty(), Optional.empty()));
+
+    assertThat(metrics.getCommitBacklogHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getCommitBacklogHistogram().snapshot().getMax()).isEqualTo(6);
+  }
+
+  @Test
+  public void testQuorumHeartbeatLagSampledOnLeader() {
+    metrics = newMetrics("lr-2");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    LeaderReportListener listener = new LeaderReportListener(spi, 0L, now::get, metrics);
+    RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
+
+    now.set(1_000L);
+    listener.accept(report(RaftRole.LEADER, 1, leader, 0L, Collections.emptyMap(), 0L, 0L,
+      Optional.of(950L), Optional.empty()));
+
+    assertThat(metrics.getQuorumHeartbeatLagHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getQuorumHeartbeatLagHistogram().snapshot().getMax()).isEqualTo(50);
+    assertThat(metrics.getLeaderHeartbeatLagHistogram().getCount())
+      .as("LEADER role must not record leader-heartbeat lag (leader-side has no inbound heartbeat)")
+      .isZero();
+  }
+
+  @Test
+  public void testReplicationLagSampledFromSlowestFollower() {
+    metrics = newMetrics("lr-3");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    LeaderReportListener listener = new LeaderReportListener(spi, 0L, now::get, metrics);
+    RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
+    RaftEndpoint a = LocalRaftEndpoint.newEndpoint();
+    RaftEndpoint b = LocalRaftEndpoint.newEndpoint();
+    RaftEndpoint c = LocalRaftEndpoint.newEndpoint();
+
+    Map<RaftEndpoint, Long> matches = new LinkedHashMap<>();
+    matches.put(a, 8L);
+    matches.put(b, 5L);
+    matches.put(c, 9L);
+
+    listener.accept(
+      report(RaftRole.LEADER, 1, leader, 0L, matches, 5L, 10L, Optional.empty(), Optional.empty()));
+
+    assertThat(metrics.getReplicationLagHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getReplicationLagHistogram().snapshot().getMax())
+      .as("slowest follower (b) is 5 entries behind lastLogIndex=10").isEqualTo(5);
+  }
+
+  @Test
+  public void testLeaderHeartbeatLagSampledOnFollower() {
+    metrics = newMetrics("lr-4");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    LeaderReportListener listener = new LeaderReportListener(spi, 0L, now::get, metrics);
+    RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
+
+    now.set(2_000L);
+    listener.accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap(), 0L, 0L,
+      Optional.empty(), Optional.of(1_975L)));
+
+    assertThat(metrics.getLeaderHeartbeatLagHistogram().getCount()).isEqualTo(1);
+    assertThat(metrics.getLeaderHeartbeatLagHistogram().snapshot().getMax()).isEqualTo(25);
+    assertThat(metrics.getQuorumHeartbeatLagHistogram().getCount())
+      .as("FOLLOWER role must not record quorum-heartbeat lag").isZero();
+  }
+
+  @Test
+  public void testLeaderElectionAndNoLeaderCounters() {
+    metrics = newMetrics("lr-5");
+    InMemoryConsensusSpi spi = new InMemoryConsensusSpi();
+    LeaderReportListener listener = new LeaderReportListener(spi, 0L, now::get, metrics);
+    RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
+
+    listener.accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap()));
+    listener.accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap()));
+    listener.accept(report(RaftRole.FOLLOWER, 1, null, 0L, Collections.emptyMap()));
+
+    assertThat(metrics.getLeaderElectionsCount())
+      .as("idempotent re-fire across same (term, leader)").isEqualTo(1);
+    assertThat(metrics.getNoLeaderEventsCount()).isEqualTo(1);
   }
 }

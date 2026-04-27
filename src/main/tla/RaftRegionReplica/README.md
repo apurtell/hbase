@@ -295,3 +295,59 @@ java -XX:+UseParallelGC -Xmx8g -cp tla2tools.jar \
   -simulate -depth 500 -workers auto \
   -config MCRaftRegionReplica_liveness_write.cfg
 ```
+
+## Side specs
+
+### `OutboundChannelFlush.tla` — outbound transport flush latency
+
+`OutboundChannelFlush.tla` is a standalone, single-channel model of the per-peer outbound mailbox in `OutboundChannel.java` that the deadline-based flush wakeup mechanism (introduced to bound head-of-line latency in `CoalescingTransport`) operates on. It models four producers of "schedule a drain" wake-ups: immediate enqueues, coalescible enqueues with the new head-age deadline check, the periodic `BATCH_MS` tick (folded into `ClockTick`), and the post-drain tail re-arm. Both the CAS-fail behavior of `scheduleDrainOn` and the unbounded-poll loop in `drainOnce` are modeled so the spec captures the lost-wakeup window the deadline mechanism is designed to close.
+
+Composition with `RaftRegionReplica.tla` is by *assumption*, not `INSTANCE`: the consensus spec's atomic `LeaderHeartbeat` action assumes wire delivery is "fast enough" relative to `leaderHeartbeatTimeoutMillis`. `OutboundChannelFlush.tla` proves a tight value for that "fast enough" — `BoundedDeliveryLatency(L)` with `L = TickPeriod + DrainCost` in the worst case — that the implementation must respect. As long as the configured `hbase.consensus.transport.flush.deadline.ms` plus the worst-case observed `OutboundChannelStats.drainWallNanos` stays well below `2 * leaderHeartbeatTimeoutMillis`, the leader-election liveness story in the main spec carries over.
+
+| Configuration | Module | Constants | Purpose | States | Result |
+|---|---|---|---|---|---|
+| Base safety | `MCOutboundChannelFlush` (`MCOutboundChannelFlush.cfg`) | TickPeriod=1, FlushDeadline=3, DrainCost=1, MaxClock=8, MaxEnqueues=3, **L=2** | Tight latency bound at TickPeriod=DrainCost=1; L=1 is provably violated, L=2 holds. | 35,205 | Pass |
+| Stress safety | `MCOutboundChannelFlush` (`MCOutboundChannelFlush_stress.cfg`) | TickPeriod=4, FlushDeadline=2, DrainCost=5, MaxClock=16, MaxEnqueues=4, **L=9** | DrainCost > FlushDeadline regime; mirrors the 1000-group stress where one drain absorbs ~1s of encode work. L=9 = TickPeriod + DrainCost is tight. | 3,212,421 | Pass |
+| Liveness | `MCOutboundChannelFlush` (`MCOutboundChannelFlush_liveness.cfg`) | TickPeriod=1, FlushDeadline=3, DrainCost=1, MaxClock=10, MaxEnqueues=3 | `EventualDelivery` under WF on ClockTick / BeginDrain / EndDrain. | 109,837 | Pass |
+| Simulation | `MCOutboundChannelFlush` (`MCOutboundChannelFlush_sim.cfg`) | TickPeriod=5, FlushDeadline=3, DrainCost=7, MaxClock=60, MaxEnqueues=12, L=12 | Deeper random exploration, ~3.4 minutes. | 192,000,001 | Pass |
+
+The verification fed three concrete decisions back into the implementation plan:
+
+1. **Default `hbase.consensus.transport.flush.deadline.ms = 250 ms`** — the deadline only changes the worst case under tick starvation (where the mechanism is the only safety net). With sustained producer activity it caps head age at FlushDeadline + DrainCost, so 250 ms keeps the head-of-line latency under one second in the realistic worst case (DrainCost ≈ 700 ms for an 8000-batch encode on an oversubscribed event loop).
+2. **`TestConsensusServerScale.leaderHeartbeatLag.p99 < 2 * leaderHeartbeatTimeoutMillis`** — the model's tight bound is well below `2 * 5 s = 10 s`, so the hardened invariant is achievable.
+3. **No additional wake-up sites needed** — counterexample triage showed all known lost-wakeup scenarios are closed by the combination of `scheduleDrainOn`'s CAS, the unbounded poll in `drainOnce`, and the deadline check in `enqueue()`. The tail re-arm extension to also fire on stale heads is the only Java-side protocol change required.
+
+#### Counterexample log
+
+The TLC iteration that produced the model also produced a small, useful list of "would-have-been-bug" traces. All were closed by tightening the model rather than the implementation; none required a Java code change.
+
+| # | Counterexample | Triage | Fix |
+|---|---|---|---|
+| 1 | TLC interleaved arbitrary `ClockTick`s between `drainScheduled = TRUE` and `BeginDrain`, inflating latency past L. | Modeling artifact — the implementation queues the drain runnable synchronously with the CAS. | Added `~drainScheduled` precondition to `ClockTick`. |
+| 2 | TickFlush as a may-fire action with no fairness let TLC defer ticks arbitrarily, again inflating latency past L. | Modeling artifact — `scheduleWithFixedDelay` is deterministic on its period. | Folded the periodic tick into `ClockTick` so it fires at every clock multiple of `TickPeriod`. |
+| 3 | TLC interleaved `ClockTick`s past the EndDrain enabling boundary (`clock >= drainStart + DrainCost`). | Modeling artifact — once a drain has consumed its work it proceeds straight to releasing the latch. | Added `~(draining /\ clock >= drainStart + DrainCost)` precondition to `ClockTick`. |
+| 4 | Liveness CE: producer enqueue at `clock = MaxClock` left the mailbox non-empty with no clock budget for a drain to complete. | Model-horizon artifact. | Added `EnqueueHonoursHorizon` CONSTRAINT used by the liveness config. |
+
+#### Running
+
+```bash
+JAR=/path/to/tla2tools.jar
+cd src/main/tla/RaftRegionReplica
+
+# Base safety (~1s, exhaustive)
+java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
+  -config MCOutboundChannelFlush.cfg MCOutboundChannelFlush
+
+# Stress safety (~10s, exhaustive)
+java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
+  -config MCOutboundChannelFlush_stress.cfg MCOutboundChannelFlush
+
+# Liveness (~3s, exhaustive)
+java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
+  -config MCOutboundChannelFlush_liveness.cfg MCOutboundChannelFlush
+
+# Simulation (~3 minutes)
+java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
+  -simulate num=200000 -depth 60 \
+  -config MCOutboundChannelFlush_sim.cfg MCOutboundChannelFlush
+```

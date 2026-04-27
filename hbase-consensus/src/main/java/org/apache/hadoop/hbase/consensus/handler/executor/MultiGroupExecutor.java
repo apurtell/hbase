@@ -152,12 +152,21 @@ public final class MultiGroupExecutor {
     }
   }
 
-  void unregister(@NonNull Object groupId) {
-    registry.remove(requireNonNull(groupId));
+  /**
+   * Removes the registry entry for {@code groupId} only if the current value is {@code self}. This
+   * is essential to prevent a terminating GroupExecutor's late unregister from clobbering a fresh
+   * replacement that a racing executorFor call has already installed for the same group id.
+   */
+  void unregister(@NonNull Object groupId, @NonNull GroupExecutor self) {
+    registry.remove(requireNonNull(groupId), requireNonNull(self));
   }
 
   /**
-   * Returns the serial executor for the given Raft group id, creating it if absent.
+   * Returns the serial executor for the given Raft group id, creating a new one if the registry is
+   * empty for that id or the registered entry is already terminated. The latter handles the narrow
+   * window where a previous owner's {@code onRaftNodeTerminate} has flipped the terminated flag but
+   * the unregister has not yet been observed by this lookup. Returning a terminated executor would
+   * silently drop the very first task submitted to it and hang the caller.
    * @throws IllegalStateException if {@link #close()} has completed
    */
   @NonNull
@@ -167,7 +176,7 @@ public final class MultiGroupExecutor {
     // only needed to serialize creation against close() so we never insert into the registry after
     // close has snapshotted it for termination.
     GroupExecutor existing = registry.get(gid);
-    if (existing != null) {
+    if (existing != null && !existing.isTerminated()) {
       if (closed) {
         throw new IllegalStateException("MultiGroupExecutor is closed");
       }
@@ -177,7 +186,18 @@ public final class MultiGroupExecutor {
       if (closed) {
         throw new IllegalStateException("MultiGroupExecutor is closed");
       }
-      return registry.computeIfAbsent(gid, id -> new GroupExecutor(this, id, mailboxChunkSize));
+      // compute() runs under per-bin lock, so any terminate / executorFor is serialized
+      for (;;) {
+        GroupExecutor result = registry.compute(gid, (k, prev) -> {
+          if (prev != null && !prev.isTerminated()) {
+            return prev;
+          }
+          return new GroupExecutor(this, k, mailboxChunkSize);
+        });
+        if (!result.isTerminated()) {
+          return result;
+        }
+      }
     }
   }
 

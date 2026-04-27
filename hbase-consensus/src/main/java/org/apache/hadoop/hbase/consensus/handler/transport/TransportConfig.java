@@ -48,6 +48,17 @@ public final class TransportConfig {
   public static final long BATCH_MS_DEFAULT = 5L;
 
   /**
+   * Per-peer outbound mailbox head-of-line latency budget, in milliseconds. When the head of an
+   * {@code OutboundChannel} mailbox has aged past this threshold, a coalescible enqueue triggers an
+   * immediate drain even if the periodic {@link #BATCH_MS_KEY} tick has not fired yet, and the
+   * post-drain tail re-arm fires for stale heads as well as immediates. Provides a fail-safe upper
+   * bound on head-of-line latency under event-loop contention.
+   */
+  public static final String FLUSH_DEADLINE_MS_KEY =
+    ConfigKey.LONG("hbase.consensus.transport.flush.deadline.ms", v -> v >= 1L);
+  public static final long FLUSH_DEADLINE_MS_DEFAULT = 250L;
+
+  /**
    * Outbound compression algorithm name accepted by
    * {@link Compression#getCompressionAlgorithmByName}. The selected algorithm only governs how this
    * node compresses entries it produces. Receivers learn the algorithm from the
@@ -122,6 +133,7 @@ public final class TransportConfig {
 
   private final int port;
   private final long batchMs;
+  private final long flushDeadlineMs;
   private final Compression.Algorithm compression;
   private final int ioThreads;
   private final int connectTimeoutMs;
@@ -137,6 +149,7 @@ public final class TransportConfig {
   public TransportConfig(@NonNull Configuration conf) {
     this.port = conf.getInt(PORT_KEY, PORT_DEFAULT);
     this.batchMs = conf.getLong(BATCH_MS_KEY, BATCH_MS_DEFAULT);
+    this.flushDeadlineMs = conf.getLong(FLUSH_DEADLINE_MS_KEY, FLUSH_DEADLINE_MS_DEFAULT);
     String algoName = conf.get(COMPRESSION_KEY, COMPRESSION_DEFAULT);
     this.compression = Compression.getCompressionAlgorithmByName(algoName);
     this.ioThreads =
@@ -169,6 +182,10 @@ public final class TransportConfig {
 
   public long getBatchMs() {
     return batchMs;
+  }
+
+  public long getFlushDeadlineMs() {
+    return flushDeadlineMs;
   }
 
   @NonNull

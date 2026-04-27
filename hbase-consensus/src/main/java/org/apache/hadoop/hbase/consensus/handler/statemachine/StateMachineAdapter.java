@@ -25,7 +25,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Consumer;
+import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetrics;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -56,11 +58,30 @@ public final class StateMachineAdapter implements StateMachine {
 
   private final Object groupId;
   private final ConsensusSpi spi;
+  @Nullable
+  private final ConsensusServerMetrics metrics;
   private final List<CommittedEntry> pending = new ArrayList<>();
+  /**
+   * Running byte total of the {@link #pending} payloads, refreshed in {@link #runOperation} and
+   * reset in {@link #drainPending}. Avoids a second pass over the batch to compute
+   * {@code commitBatchBytes} for the metrics sink.
+   */
+  private long pendingBytes = 0L;
 
   public StateMachineAdapter(@NonNull Object groupId, @NonNull ConsensusSpi spi) {
+    this(groupId, spi, null);
+  }
+
+  /**
+   * Builds an adapter that records SPI commit/flush/snapshot latencies into the supplied
+   * {@link ConsensusServerMetrics}. Pass {@code null} to disable metrics recording (the
+   * {@code (groupId, spi)} constructor delegates here with {@code null}).
+   */
+  public StateMachineAdapter(@NonNull Object groupId, @NonNull ConsensusSpi spi,
+    @Nullable ConsensusServerMetrics metrics) {
     this.groupId = requireNonNull(groupId, "groupId");
     this.spi = requireNonNull(spi, "spi");
+    this.metrics = metrics;
   }
 
   @Nullable
@@ -69,11 +90,17 @@ public final class StateMachineAdapter implements StateMachine {
     requireNonNull(operation, "operation");
     if (operation instanceof FlushMarker) {
       drainPending();
+      long start = EnvironmentEdgeManager.currentTime();
       spi.onFlushComplete(groupId, (FlushMarker) operation);
+      if (metrics != null) {
+        metrics.updateFlushComplete(EnvironmentEdgeManager.currentTime() - start);
+      }
       return null;
     }
     if (operation instanceof byte[]) {
-      pending.add(new CommittedEntry(commitIndex, (byte[]) operation));
+      byte[] payload = (byte[]) operation;
+      pending.add(new CommittedEntry(commitIndex, payload));
+      pendingBytes += payload.length;
       return null;
     }
     throw new IllegalArgumentException(
@@ -89,7 +116,11 @@ public final class StateMachineAdapter implements StateMachine {
   @Override
   public void takeSnapshot(long commitIndex, @NonNull Consumer<Object> snapshotChunkConsumer) {
     requireNonNull(snapshotChunkConsumer, "snapshotChunkConsumer");
+    long start = EnvironmentEdgeManager.currentTime();
     byte[] snapshot = spi.takeStateSnapshot(groupId, commitIndex);
+    if (metrics != null) {
+      metrics.updateTakeSnapshot(EnvironmentEdgeManager.currentTime() - start);
+    }
     if (snapshot == null) {
       throw new IllegalStateException("ConsensusSpi.takeStateSnapshot returned null for groupId="
         + groupId + " commitIndex=" + commitIndex);
@@ -110,7 +141,12 @@ public final class StateMachineAdapter implements StateMachine {
         + (chunk == null ? "null" : chunk.getClass().getName()));
     }
     pending.clear();
+    pendingBytes = 0L;
+    long start = EnvironmentEdgeManager.currentTime();
     spi.installStateSnapshot(groupId, commitIndex, (byte[]) chunk);
+    if (metrics != null) {
+      metrics.updateInstallSnapshot(EnvironmentEdgeManager.currentTime() - start);
+    }
   }
 
   @Nullable
@@ -123,8 +159,16 @@ public final class StateMachineAdapter implements StateMachine {
     if (pending.isEmpty()) {
       return;
     }
+    int entryCount = pending.size();
+    long batchBytes = pendingBytes;
     List<CommittedEntry> batch = Collections.unmodifiableList(new ArrayList<>(pending));
     pending.clear();
+    pendingBytes = 0L;
+    long start = EnvironmentEdgeManager.currentTime();
     spi.onCommit(groupId, batch);
+    if (metrics != null) {
+      metrics.updateCommitApply(EnvironmentEdgeManager.currentTime() - start, entryCount,
+        batchBytes);
+    }
   }
 }

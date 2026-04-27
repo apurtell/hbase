@@ -163,6 +163,15 @@ public class UnifiedRaftStore implements DurableLogStore {
 
   private final AtomicLong nextSeq = new AtomicLong(0L);
 
+  // Lightweight counters powering {@link #getStats()}. Updated only on the writer thread. Uses
+  // {@link AtomicLong} so reader threads (test harnesses, metrics scrapers) see consistent values
+  // without a lock.
+  private final AtomicLong fdatasyncCount = new AtomicLong();
+  private final AtomicLong bytesAppended = new AtomicLong();
+  private final AtomicLong framesAppended = new AtomicLong();
+  private final AtomicLong segmentRolls = new AtomicLong();
+  private final AtomicLong batchesProcessed = new AtomicLong();
+
   private volatile boolean running = false;
   private volatile boolean loaded = false;
   private volatile boolean closed = false;
@@ -185,6 +194,16 @@ public class UnifiedRaftStore implements DurableLogStore {
   @NonNull
   public LogStoreConfig getConfig() {
     return config;
+  }
+
+  /**
+   * Returns a point-in-time snapshot of the write-path counters. Cheap (a handful of volatile
+   * reads); safe to call from any thread; never blocks the writer.
+   */
+  @NonNull
+  public LogStoreStats getStats() {
+    return new LogStoreStats(fdatasyncCount.get(), bytesAppended.get(), framesAppended.get(),
+      segmentRolls.get(), batchesProcessed.get(), mailbox.size());
   }
 
   @NonNull
@@ -503,16 +522,21 @@ public class UnifiedRaftStore implements DurableLogStore {
   private void processBatch(List<PendingWrite> batch) throws IOException {
     List<ByteBuffer> framesList = new ArrayList<>(batch.size());
     boolean anyFsync = false;
+    long batchBytes = 0L;
     for (PendingWrite pw : batch) {
       if (pw.encodedFrame != null) {
         framesList.add(pw.encodedFrame);
+        batchBytes += pw.encodedFrame.remaining();
       }
       if (pw.fsyncRequested) {
         anyFsync = true;
       }
     }
+    batchesProcessed.incrementAndGet();
     if (!framesList.isEmpty()) {
       currentSegment.appendFrames(framesList.toArray(new ByteBuffer[0]));
+      bytesAppended.addAndGet(batchBytes);
+      framesAppended.addAndGet(framesList.size());
     }
     for (PendingWrite pw : batch) {
       if (pw.kind == LogRecord.Kind.LOG_ENTRY || pw.kind == LogRecord.Kind.SNAPSHOT_CHUNK) {
@@ -525,9 +549,11 @@ public class UnifiedRaftStore implements DurableLogStore {
     }
     if (anyFsync && currentSegment != null) {
       currentSegment.force(false);
+      fdatasyncCount.incrementAndGet();
     }
     if (currentSegment != null && currentSegment.currentSize() >= config.getSegmentSizeBytes()) {
       rollSegment();
+      segmentRolls.incrementAndGet();
     }
     maybeGcSegments();
     for (PendingWrite pw : batch) {

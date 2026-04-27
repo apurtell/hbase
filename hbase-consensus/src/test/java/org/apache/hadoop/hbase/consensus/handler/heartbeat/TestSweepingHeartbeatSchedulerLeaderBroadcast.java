@@ -29,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftGroup;
 import org.apache.hadoop.hbase.consensus.raft.test.util.RaftTestUtils;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -81,7 +82,7 @@ public class TestSweepingHeartbeatSchedulerLeaderBroadcast extends TestBase {
     assertThat(laterLease).as("lease must advance under sweeping heartbeats")
       .isGreaterThan(initialLease);
 
-    long now = System.currentTimeMillis();
+    long now = EnvironmentEdgeManager.currentTime();
     assertThat(laterLease - now).as("lease must remain in the future")
       .isGreaterThan(RaftTestUtils.TEST_RAFT_CONFIG.getLeaderHeartbeatTimeoutMillis() / 2);
   }

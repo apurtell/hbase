@@ -160,10 +160,13 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
       f.cancel(false);
     }
     scheduledFutures.clear();
+    // Eagerly evict ourselves from the parent registry. This must happen before the terminating
+    // {@link RaftNodeImpl#terminate()} future completes. Value-aware remove inside
+    // unregisterOnce() guards against clobbering a fresh replacement.
+    unregisterOnce();
     if (scheduled.compareAndSet(false, true)) {
       if (!parent.submitDrain(drainRunnable)) {
         scheduled.set(false);
-        unregisterOnce();
       }
     }
   }
@@ -234,7 +237,7 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
 
   private void unregisterOnce() {
     if (unregisterDone.compareAndSet(false, true)) {
-      parent.unregister(groupId);
+      parent.unregister(groupId, this);
     }
   }
 

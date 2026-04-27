@@ -32,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftGroup;
 import org.apache.hadoop.hbase.consensus.raft.test.util.RaftTestUtils;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -64,7 +65,7 @@ public class TestDefaultHeartbeatScheduler extends TestBase {
     assertThat(getRole(leader)).isEqualTo(RaftRole.LEADER);
     long leaseExpiry =
       readRaftState(leader, () -> leader.state().leaderState().leaseExpiryMillis());
-    assertThat(leaseExpiry).isGreaterThan(System.currentTimeMillis());
+    assertThat(leaseExpiry).isGreaterThan(EnvironmentEdgeManager.currentTime());
   }
 
   @Test

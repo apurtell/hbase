@@ -55,8 +55,7 @@ import org.mockito.invocation.InvocationOnMock;
 /**
  * End-to-end tests for {@link CoalescingTransport} using two ephemeral-port instances on loopback.
  * Verifies round-trip messaging, per-peer FIFO ordering, append-batch coalescing, back-pressure on
- * small watermarks, testReconnect after the peer goes away, and integrity through the configured
- * payload compressor.
+ * small watermarks, and reconnect after the peer goes away.
  */
 @Tag(SmallTests.TAG)
 public class TestCoalescingTransport extends TestBase {
@@ -359,6 +358,140 @@ public class TestCoalescingTransport extends TestBase {
     assertThat(receivedEntry.getIndex()).isEqualTo(1L);
     assertThat(receivedEntry.getOperation()).isInstanceOf(byte[].class);
     assertThat((byte[]) receivedEntry.getOperation()).containsExactly(payload);
+  }
+
+  /**
+   * The deadline-based fail-safe wakeup must drain a stale head between two periodic flush ticks.
+   * The test sets BATCH_MS deliberately wider than (FLUSH_DEADLINE + sleep window) so the only
+   * thing that can drain the head before the next tick is the producer-side deadline check.
+   */
+  @Test
+  public void testDeadlineWakeupForcesFlush() {
+    LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
+    LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
+
+    // BATCH_MS wide enough to dwarf (deadline + inter-send sleep), so any drain that fires
+    // inside the test window came from the deadline mechanism, not the periodic tick. BATCH_MS
+    // still has to be small enough that OutboundChannel.flushTick (the only connection-trigger)
+    // fires in time. 1500 ms is well below the 10 s test budget.
+    Configuration conf = baseConf();
+    conf.setLong(TransportConfig.BATCH_MS_KEY, 1_500L);
+    conf.setLong(TransportConfig.FLUSH_DEADLINE_MS_KEY, 50L);
+
+    Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
+    EndpointResolver resolver = ep -> {
+      InetSocketAddress addr = addrs.get(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
+      return addr;
+    };
+
+    CoalescingTransport a = newStarted(epA, conf, resolver);
+    CoalescingTransport b = newStarted(epB, conf, resolver);
+    addrs.put(epA, a.getBindAddress());
+    addrs.put(epB, b.getBindAddress());
+
+    ConcurrentLinkedQueue<RaftMessage> seenAtB = new ConcurrentLinkedQueue<>();
+    b.discoverNode(mockNode(GROUP, seenAtB));
+
+    DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
+
+    // Warm-up to register the peer channel and bootstrap the connection.
+    a.send(epB, factory.createVoteRequestBuilder().setGroupId(GROUP).setSender(epA).setTerm(1)
+      .setLastLogTerm(0).setLastLogIndex(0L).setSticky(false).build());
+    await().atMost(10, TimeUnit.SECONDS).until(() -> a.isReachable(epB));
+    await().atMost(5, TimeUnit.SECONDS).until(() -> seenAtB.size() >= 1);
+    seenAtB.clear();
+
+    long forcedBefore = a.getOutboundStats().get(epB).getForcedFlushesByDeadline();
+
+    // First coalescible enqueue on a known-connected channel.
+    AppendEntriesRequest first = factory.createAppendEntriesRequestBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(1).setPreviousLogTerm(1).setPreviousLogIndex(0L).setCommitIndex(0L)
+      .setLogEntries(List.of(factory.createLogEntryBuilder().setIndex(1L).setTerm(1)
+        .setOperation(new byte[] { 0x01 }).build()))
+      .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build();
+    a.send(epB, first);
+
+    // Sleep past the deadline, then enqueue a second coalescible whose post-offer head-age check
+    // observes the first message older than FLUSH_DEADLINE_MS_KEY and forces a drain.
+    sleepFor(150);
+    AppendEntriesRequest second = factory.createAppendEntriesRequestBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(1).setPreviousLogTerm(1).setPreviousLogIndex(1L).setCommitIndex(0L)
+      .setLogEntries(List.of(factory.createLogEntryBuilder().setIndex(2L).setTerm(1)
+        .setOperation(new byte[] { 0x02 }).build()))
+      .setQuerySequenceNumber(1L).setFlowControlSequenceNumber(1L).build();
+    a.send(epB, second);
+
+    await().atMost(5, TimeUnit.SECONDS).until(() -> seenAtB.size() >= 2);
+
+    OutboundChannelStats statsForB = a.getOutboundStats().get(epB);
+    assertThat(statsForB).as("outbound stats for peer B").isNotNull();
+    assertThat(statsForB.getForcedFlushesByDeadline() - forcedBefore)
+      .as("the second enqueue must trigger the deadline wakeup at least once")
+      .isGreaterThanOrEqualTo(1L);
+  }
+
+  /**
+   * Under healthy load the deadline wakeup must NOT fire, since the periodic tick keeps the head
+   * fresh. Guards against an over-eager deadline-trigger regression that would defeat the O(peers)
+   * coalescing property.
+   */
+  @Test
+  public void testDeadlineWakeupQuietUnderHealthyLoad() {
+    LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
+    LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
+
+    Configuration conf = baseConf();
+    conf.setLong(TransportConfig.BATCH_MS_KEY, 5L);
+    conf.setLong(TransportConfig.FLUSH_DEADLINE_MS_KEY, 250L);
+
+    Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
+    EndpointResolver resolver = ep -> {
+      InetSocketAddress addr = addrs.get(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
+      return addr;
+    };
+
+    CoalescingTransport a = newStarted(epA, conf, resolver);
+    CoalescingTransport b = newStarted(epB, conf, resolver);
+    addrs.put(epA, a.getBindAddress());
+    addrs.put(epB, b.getBindAddress());
+
+    ConcurrentLinkedQueue<RaftMessage> seenAtB = new ConcurrentLinkedQueue<>();
+    b.discoverNode(mockNode(GROUP, seenAtB));
+
+    DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
+    int total = 50;
+    for (int i = 0; i < total; i++) {
+      LogEntry e = factory.createLogEntryBuilder().setIndex(i + 1).setTerm(1)
+        .setOperation(new byte[] { (byte) i }).build();
+      AppendEntriesRequest req =
+        factory.createAppendEntriesRequestBuilder().setGroupId(GROUP).setSender(epA).setTerm(1)
+          .setPreviousLogTerm(1).setPreviousLogIndex(i).setCommitIndex(0L).setLogEntries(List.of(e))
+          .setQuerySequenceNumber(i).setFlowControlSequenceNumber(i).build();
+      a.send(epB, req);
+    }
+
+    await().atMost(10, TimeUnit.SECONDS).until(() -> seenAtB.size() >= total);
+
+    OutboundChannelStats statsForB = a.getOutboundStats().get(epB);
+    assertThat(statsForB).as("outbound stats for peer B").isNotNull();
+    assertThat(statsForB.getForcedFlushesByDeadline())
+      .as("the deadline wakeup must stay silent under healthy load (BATCH_MS << deadline)")
+      .isZero();
+  }
+
+  private static void sleepFor(long ms) {
+    try {
+      Thread.sleep(ms);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(e);
+    }
   }
 
   @Test

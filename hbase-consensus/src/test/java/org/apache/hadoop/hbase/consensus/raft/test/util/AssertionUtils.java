@@ -22,6 +22,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,12 +76,12 @@ public final class AssertionUtils {
     if (millis <= 0) {
       return;
     }
-    long now = System.currentTimeMillis();
+    long now = EnvironmentEdgeManager.currentTime();
     long deadline = now + millis;
     while (now < deadline) {
       try {
         MILLISECONDS.sleep(deadline - now);
-        now = Math.max(now, System.currentTimeMillis());
+        now = Math.max(now, EnvironmentEdgeManager.currentTime());
       } catch (InterruptedException e) {
         LOG.info("Interrupted while sleeping {} millis.", millis);
         Thread.currentThread().interrupt();
