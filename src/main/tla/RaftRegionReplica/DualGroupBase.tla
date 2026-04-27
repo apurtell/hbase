@@ -133,6 +133,7 @@ PerGroupSafety ==
     /\ G1!LeaseImpliesLeadership     /\ G2!LeaseImpliesLeadership
     /\ G1!LeaseExpiresBeforeElection /\ G2!LeaseExpiresBeforeElection
     /\ G1!CatchUpDataIntegrity       /\ G2!CatchUpDataIntegrity
+    /\ G1!NoFollowerExposureRollback /\ G2!NoFollowerExposureRollback
     /\ G1!WriteBarrierSafety         /\ G2!WriteBarrierSafety
     /\ G1!FollowerSeqIdConsistency   /\ G2!FollowerSeqIdConsistency
     /\ G1!NoOrphanMemstoreDrop       /\ G2!NoOrphanMemstoreDrop

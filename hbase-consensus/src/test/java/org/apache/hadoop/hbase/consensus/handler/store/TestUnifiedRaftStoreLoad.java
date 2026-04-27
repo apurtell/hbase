@@ -58,7 +58,7 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
   private final RaftEndpoint b = LocalRaftEndpoint.newEndpoint();
 
   private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 2L, 20L, 64));
+    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 2L, 64));
   }
 
   @AfterEach

@@ -55,16 +55,6 @@ public final class LogStoreConfig {
     ConfigKey.LONG("hbase.consensus.log.sync.batch.ms", v -> v >= 1L);
   public static final long BATCH_MS_DEFAULT = 10L;
 
-  /**
-   * Cadence in milliseconds at which the {@code DurableLogStore} fires
-   * {@code FileChannel.force(false)} on the active segment to bound page-cache loss for entries
-   * that did not request synchronous fsync. Sync-fsync paths ({@code persistAndFlush*}) always
-   * force inline regardless of this knob.
-   */
-  public static final String FDATASYNC_INTERVAL_MS_KEY =
-    ConfigKey.LONG("hbase.consensus.log.fdatasync.interval.ms", v -> v >= 1L);
-  public static final long FDATASYNC_INTERVAL_MS_DEFAULT = 100L;
-
   /** MPSC mailbox initial chunk size. */
   public static final String MAILBOX_CHUNK_SIZE_KEY =
     ConfigKey.INT("hbase.consensus.log.writer.mailbox.chunk", v -> v >= 1);
@@ -73,7 +63,6 @@ public final class LogStoreConfig {
   private final File logDir;
   private final int segmentSizeMb;
   private final long batchMs;
-  private final long fdatasyncIntervalMs;
   private final int mailboxChunkSize;
 
   /** Test-only override for segment size in bytes. */
@@ -87,24 +76,21 @@ public final class LogStoreConfig {
     this.logDir = new File(dirStr);
     this.segmentSizeMb = conf.getInt(SEGMENT_SIZE_MB_KEY, SEGMENT_SIZE_MB_DEFAULT);
     this.batchMs = conf.getLong(BATCH_MS_KEY, BATCH_MS_DEFAULT);
-    this.fdatasyncIntervalMs =
-      conf.getLong(FDATASYNC_INTERVAL_MS_KEY, FDATASYNC_INTERVAL_MS_DEFAULT);
     this.mailboxChunkSize = conf.getInt(MAILBOX_CHUNK_SIZE_KEY, MAILBOX_CHUNK_SIZE_DEFAULT);
     this.segmentSizeBytesOverride = -1L;
     validate();
   }
 
   public LogStoreConfig(@NonNull File logDir, int segmentSizeMb, long batchMs,
-    long fdatasyncIntervalMs, int mailboxChunkSize) {
-    this(logDir, segmentSizeMb, batchMs, fdatasyncIntervalMs, mailboxChunkSize, -1L);
+    int mailboxChunkSize) {
+    this(logDir, segmentSizeMb, batchMs, mailboxChunkSize, -1L);
   }
 
-  public LogStoreConfig(@NonNull File logDir, int segmentSizeMb, long batchMs,
-    long fdatasyncIntervalMs, int mailboxChunkSize, long segmentSizeBytesOverride) {
+  public LogStoreConfig(@NonNull File logDir, int segmentSizeMb, long batchMs, int mailboxChunkSize,
+    long segmentSizeBytesOverride) {
     this.logDir = logDir;
     this.segmentSizeMb = segmentSizeMb;
     this.batchMs = batchMs;
-    this.fdatasyncIntervalMs = fdatasyncIntervalMs;
     this.mailboxChunkSize = mailboxChunkSize;
     this.segmentSizeBytesOverride = segmentSizeBytesOverride;
     validate();
@@ -120,10 +106,6 @@ public final class LogStoreConfig {
     }
     if (batchMs < 1) {
       throw new IllegalArgumentException(BATCH_MS_KEY + " must be >= 1, got " + batchMs);
-    }
-    if (fdatasyncIntervalMs < batchMs) {
-      throw new IllegalArgumentException(FDATASYNC_INTERVAL_MS_KEY + " (" + fdatasyncIntervalMs
-        + ") must be >= " + BATCH_MS_KEY + " (" + batchMs + ")");
     }
     if (mailboxChunkSize < 1) {
       throw new IllegalArgumentException(
@@ -148,10 +130,6 @@ public final class LogStoreConfig {
 
   public long getBatchMs() {
     return batchMs;
-  }
-
-  public long getFdatasyncIntervalMs() {
-    return fdatasyncIntervalMs;
   }
 
   public int getMailboxChunkSize() {

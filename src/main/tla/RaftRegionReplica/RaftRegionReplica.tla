@@ -308,6 +308,9 @@
  *     (HFiles on HDFS in the design-target path; replayed chunks plus
  *     locally-flushed HFiles in the chunked path).
  *
+ *   - DurableLogStore on-disk files. The spec captures safety-relevant
+ *     consequences via CrashRestartWithLogLoss.
+ *
  * Write path actions model the leader's HRegion.doMiniBatchMutate()
  * pipeline for RAFT-enabled regions: BeginWrite (doWALAppend, step 3),
  * WALSyncComplete/WALSyncFail (wal.sync, step 4a), RAFTCommitWrite
@@ -339,7 +342,64 @@
  * Vote durability is a hard requirement, not configurable;
  * hbase-consensus always uses a durable RaftStore.
  *
- * Safety properties (14 invariants):
+ * Durable log store: The consensus log is a single multiplexed append-only
+ * log per RegionServer shared by every RAFT group on the server.
+ * Each RaftNode receives a per-group adapter (GroupRaftStore) that
+ * forwards every RaftStore call to the shared store under its bound
+ * group id.  Records are tagged with their group id so a single
+ * sequential write stream serves every group at once.
+ *
+ * Durability tiering on the consensus log:
+ *
+ *   - Sync-fsynced before the corresponding RPC response: term and
+ *     vote (persistAndFlushTerm), local endpoint
+ *     (persistAndFlushLocalEndpoint), and initial members
+ *     (persistAndFlushInitialGroupMembers).  These are always durable
+ *     across any crash.  The spec already treats currentTerm and
+ *     votedFor as durable across CrashRestart, matching this tier.
+ *
+ *   - Coalesced fsync before commit: log entries, snapshot chunks,
+ *     and truncation markers are enqueued without a per-record fsync,
+ *     but every coalescing window of the writer thread that contains a
+ *     RaftStore.flush() barrier ends with a single FileChannel.force
+ *     covering the whole batch (see UnifiedRaftStore.flushBarrier).
+ *     A follower's AppendEntriesSuccessResponse is sent only after
+ *     RaftStore.flush() returns, and the leader's flushedLogIndex (its
+ *     own contribution to the commit quorum, in FlushTask) is set only
+ *     after RaftStore.flush() returns; the leader counts only on-disk
+ *     acks toward commit-index advancement.  In other words, the
+ *     implementation enforces fsync-before-commit.
+ *
+ *   - CRC-tail recovery on load(): on the first non-OK read result
+ *     anywhere in the on-disk log, DurableLogStore.load() truncates
+ *     the offending segment at the bad offset and deletes every
+ *     segment with a higher id.  CRC failures and torn-tail
+ *     truncations are treated identically.  The surviving log is a
+ *     prefix of the pre-crash log.  Because every committed entry is
+ *     fsynced before it can contribute to commit quorum, the suffix
+ *     a single member loses to CRC-tail truncation never includes
+ *     a committed entry that was not also majority-on-disk.
+ *
+ * Crash recovery flows through RAFT, not local repair: a node that
+ * comes back with a shorter log is treated by the protocol simply as
+ * out of date.  The RAFT log up-to-date check on RequestVote
+ * prevents it from winning elections against peers with the full
+ * committed log, and standard catchup paths refill the missing tail
+ * (AppendEntries from a peer with intact log for small gaps,
+ * InstallSnapshot via the shared-storage CatchUpReference for entries
+ * below an applied flush marker).  CrashRestartWithLogLoss models
+ * this behavior; see that action's header for details.
+ *
+ * HDFS WAL durability assumption:  the HBase WAL on HDFS is a
+ * system-level durability mechanism for the leader's mutations.
+ * With fsync-before-commit on the consensus log, a RAFT-committed
+ * mutation is on a majority of disks the moment it is committed, so
+ * CatchUpDataIntegrity's majority-raftLog or HFiles-on-HDFS recovery
+ * paths are the primary durability guarantee. The HDFS WAL is
+ * an additional system-level safety net for catastrophic correlated
+ * faults that simultaneously destroy a majority's RAFT logs.
+ *
+ * Safety properties (15 invariants):
  *   RAFT consensus:
  *   - LeaderUniqueness: at most one leader per term
  *   - LeaseImpliesLeadership: a valid lease implies the Leader role
@@ -348,6 +408,10 @@
  *   - CatchUpDataIntegrity: every committed entry is recoverable via
  *     RAFT log replay (majority) or HFiles on HDFS (flush with durable
  *     HFiles); subsumes the weaker RaftLogConsistency
+ *   - NoFollowerExposureRollback: every memstore-exposed seqId is
+ *     recoverable via majority raftLogs or HFiles on HDFS, so an
+ *     entry once visible to a Timeline-consistency reader cannot be
+ *     rolled back by any combination of crashes
  *   Write path:
  *   - WriteBarrierSafety: a write is visible (Applied) only after
  *     both WAL sync and RAFT commit have completed; subsumes
@@ -1118,6 +1182,50 @@ CrashRestart(m) ==
     /\ CrashRestartGuard(m)
     /\ CrashRestartEffect(m)
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
+                   globalCommitVars,
+                   flushDropBound, masterConfirmedTerm>>
+
+\* Models a crash-restart in which the durable RAFT log on m loses a
+\* suffix relative to its pre-crash state.  Per the implementation, the
+\* surviving log is a prefix bounded by the last fsync barrier and
+\* possibly truncated further at a CRC failure or torn-write boundary.
+\* The torn-write boundary is detected during DurableLogStore.load().  Term
+\* and vote remain durable (sync-fsynced; see persistAndFlushTerm).
+\* m is treated by the RAFT protocol as a follower whose log is out
+\* of date; standard catchup paths (AppendEntries from a peer with
+\* intact log for small gaps, InstallSnapshot via the shared-storage
+\* CatchUpReference for entries below an applied flush marker) refill
+\* the missing tail.
+\*
+\* Every entry in the lost suffix must remain recoverable either from
+\* a majority of OTHER members' raftLogs (RAFT AppendEntries) or from a
+\* flush marker with HFiles on HDFS (CatchUpReference). The check covers
+\* uncommitted-but-replicated entries as well as committed ones,
+\* because the spec models RAFT propose atomically. Once an entry has
+\* been placed in a majority of raftLogs the leader has the right to
+\* commit it.  Fsync-before-commit makes this guard an enforced property
+\* of the durability layer. a follower's AppendEntriesSuccessResponse
+\* is sent only after RaftStore.flush() returns and so reflects on-disk
+\* content, the leader's flushedLogIndex (its own contribution to the
+\* commit quorum) is set only after RaftStore.flush() returns, and
+\* commit-index advancement counts only on-disk acks.  Any entry that
+\* could be lost from m by suffix truncation is therefore present on
+\* disk on a majority of OTHER members.
+CrashRestartWithLogLossEffect(m) ==
+    \E w \in 0..MaxSeqId :
+        /\ \E e \in raftLog[m] : e > w
+        /\ \A e \in raftLog[m] :
+              e > w =>
+                  \/ \E f \in flushMarkerEntries \cap hdfsHFiles :
+                        e <= flushDropBound[f]
+                  \/ Cardinality({n \in Members \ {m} : e \in raftLog[n]})
+                       >= Majority
+        /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e <= w}]
+
+CrashRestartWithLogLoss(m) ==
+    /\ CrashRestartWithLogLossEffect(m)
+    /\ CrashRestartEffect(m)
+    /\ UNCHANGED <<currentTerm, votedFor, clock, partition,
                    globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
 
@@ -2103,6 +2211,7 @@ Next ==
     \/ \E m \in Members     : ClockTick(m)
     \* Crash recovery
     \/ \E m \in Members     : CrashRestart(m)
+    \/ \E m \in Members     : CrashRestartWithLogLoss(m)
     \* Network
     \/ CreatePartition
     \/ HealPartition
@@ -2161,6 +2270,24 @@ CatchUpDataIntegrity ==
     \A s \in committedEntries :
         \/ Cardinality({m \in Members : s \in raftLog[m]}) >= Majority
         \/ \E f \in flushMarkerEntries \cap hdfsHFiles : s <= flushDropBound[f]
+
+\* Every seqId that is exposed to clients via any member's memstore is
+\* recoverable from the durable surface. It is on a majority's raftLogs,
+\* or it is covered by a committed flush marker whose HFiles are durable on
+\* HDFS. A follower may make an entry visible to Timeline-
+\* consistency clients on RAFT commit, and that exposure must remain
+\* recoverable even if every member then crashes simultaneously.
+\*
+\* This is logically implied by FollowerSeqIdConsistency
+\* (memstore ⊆ committedEntries) plus CatchUpDataIntegrity, but is stated
+\* explicitly so a counterexample directly identifies a phantom-read
+\* failure.
+NoFollowerExposureRollback ==
+    \A m \in Members :
+        \A s \in memstore[m] :
+            \/ Cardinality({n \in Members : s \in raftLog[n]}) >= Majority
+            \/ \E f \in flushMarkerEntries \cap hdfsHFiles :
+                  s <= flushDropBound[f]
 
 \* ---- Write path invariants ----
 
@@ -2374,6 +2501,7 @@ THEOREM SafetyTHM ==
                /\ LeaseImpliesLeadership
                /\ LeaseExpiresBeforeElection
                /\ CatchUpDataIntegrity
+               /\ NoFollowerExposureRollback
                /\ WriteBarrierSafety
                /\ FollowerSeqIdConsistency
                /\ NoOrphanMemstoreDrop

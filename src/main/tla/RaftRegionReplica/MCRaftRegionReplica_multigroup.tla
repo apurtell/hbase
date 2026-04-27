@@ -55,6 +55,7 @@ MultiGroupDataPathNext ==
     \/ (G2GroupDataPathNextMetaGated /\ UNCHANGED g1_vars)
     \/ \E m \in Members : MultiGroupClockTick(m)
     \/ \E m \in Members : MultiGroupCrashRestart(m)
+    \/ \E m \in Members : MultiGroupCrashRestartWithLogLoss(m)
     \/ MultiGroupCreatePartition
     \/ MultiGroupHealPartition
     \/ \E m \in Members : UnifiedLogGC(m)

@@ -25,13 +25,20 @@
  * Per-group actions are dispatched via G1!GroupNext / G2!GroupNext,
  * with G2!MasterConfirmPromotion replaced by a gated version.
  *
- * Five "shared-impact" actions are replaced with multi-group
- * versions: ClockTick, CrashRestart, CreatePartition, HealPartition,
- * and RaftLogGC (replaced by UnifiedLogGC).
+ * Six "shared-impact" actions are replaced with multi-group
+ * versions: ClockTick, CrashRestart, CrashRestartWithLogLoss,
+ * CreatePartition, HealPartition, and RaftLogGC (replaced by
+ * UnifiedLogGC).
  *
  * Server crash (MultiGroupCrashRestart) resets volatile state for
  * BOTH groups on the crashed member, modeling the physical reality
  * that a process crash kills all RAFT groups on that server.
+ * Server crash with consensus-log loss
+ * (MultiGroupCrashRestartWithLogLoss) additionally truncates the
+ * raftLog of one or both groups to a prefix, modeling page-cache or
+ * torn-tail loss in the shared UnifiedRaftStore on a crash; standard
+ * Raft catchup (AppendEntries / InstallSnapshot) restores the
+ * missing tail.
  *
  * All 14 single-group safety invariants are checked per-group via
  * INSTANCE (G1!LeaderUniqueness, G2!LeaderUniqueness, etc.).
@@ -95,6 +102,41 @@ MultiGroupCrashRestart(m) ==
                    flushMarkerEntries_1, hdfsHFiles_1,
                    flushDropBound_1, masterConfirmedTerm_1,
                    currentTerm_2, votedFor_2, raftLog_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   flushDropBound_2, masterConfirmedTerm_2>>
+
+\* Server crash with consensus-log suffix loss on the crashed member.
+\* Models a process crash that truncates at a CRC / torn-write boundary
+\* on segment load for the shared multiplexed consensus log.  Volatile
+\* state for BOTH groups is reset; at least one group's raftLog is
+\* truncated to a prefix satisfying the per-group catchup precondition
+\* (every dropped committed entry remains recoverable via majority of
+\* OTHER members' raftLogs or via a flush marker with HFiles on HDFS).
+\* See G1!CrashRestartWithLogLoss for the per-group action header.
+\*
+\* Either or both groups may truncate.  Fsync-before-commit means a
+\* committed log entry on this server is on disk on a majority of OTHER
+\* servers (UnifiedRaftStore.flushBarrier issues FileChannel.force
+\* before flush() returns; the leader's flushedLogIndex and a follower's
+\* AppendEntriesSuccessResponse only advertise on-disk content), so a
+\* crash-time truncation here cannot remove an entry from the global
+\* durable surface.  The pure no-truncation shape is covered by
+\* MultiGroupCrashRestart above.
+MultiGroupCrashRestartWithLogLoss(m) ==
+    /\ G1!CrashRestartEffect(m)
+    /\ G2!CrashRestartEffect(m)
+    /\ \/ /\ G1!CrashRestartWithLogLossEffect(m)
+          /\ \/ G2!CrashRestartWithLogLossEffect(m)
+             \/ raftLog_2' = raftLog_2
+       \/ /\ raftLog_1' = raftLog_1
+          /\ G2!CrashRestartWithLogLossEffect(m)
+    /\ UNCHANGED <<clock, partition,
+                   currentTerm_1, votedFor_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   flushDropBound_1, masterConfirmedTerm_1,
+                   currentTerm_2, votedFor_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    flushDropBound_2, masterConfirmedTerm_2>>
@@ -202,6 +244,7 @@ Next ==
     \* Shared-impact actions
     \/ \E m \in Members : MultiGroupClockTick(m)
     \/ \E m \in Members : MultiGroupCrashRestart(m)
+    \/ \E m \in Members : MultiGroupCrashRestartWithLogLoss(m)
     \/ MultiGroupCreatePartition
     \/ MultiGroupHealPartition
     \* Unified log GC (replaces per-group RaftLogGC)

@@ -154,6 +154,14 @@ SplitCrashRestart(m) ==
     /\ daughterGroupsActive' = [daughterGroupsActive EXCEPT ![m] = FALSE]
     /\ UNCHANGED splitMarkerSeqId
 
+\* Server crash with consensus-log suffix loss (page-cache or torn-tail
+\* truncation; see Parent!CrashRestartWithLogLoss for details).  Resets
+\* daughter state on the crashed member.
+SplitCrashRestartWithLogLoss(m) ==
+    /\ Parent!CrashRestartWithLogLoss(m)
+    /\ daughterGroupsActive' = [daughterGroupsActive EXCEPT ![m] = FALSE]
+    /\ UNCHANGED splitMarkerSeqId
+
 ----
 (* ---- Gated per-group action sets ---- *)
 
@@ -186,6 +194,7 @@ Next ==
     \* Shared-impact actions
     \/ (\E m \in Members : Parent!ClockTick(m) /\ UNCHANGED splitVars)
     \/ \E m \in Members : SplitCrashRestart(m)
+    \/ \E m \in Members : SplitCrashRestartWithLogLoss(m)
     \/ (Parent!CreatePartition /\ UNCHANGED splitVars)
     \/ (Parent!HealPartition /\ UNCHANGED splitVars)
     \/ (Parent!HealAllPartitions /\ UNCHANGED splitVars)
@@ -205,6 +214,7 @@ SplitDataPathNext ==
     \* Shared-impact actions
     \/ (\E m \in Members : Parent!ClockTick(m) /\ UNCHANGED splitVars)
     \/ \E m \in Members : SplitCrashRestart(m)
+    \/ \E m \in Members : SplitCrashRestartWithLogLoss(m)
     \/ (Parent!CreatePartition /\ UNCHANGED splitVars)
     \/ (Parent!HealPartition /\ UNCHANGED splitVars)
     \/ (Parent!HealAllPartitions /\ UNCHANGED splitVars)
@@ -228,6 +238,7 @@ ParentGroupSafety ==
     /\ Parent!LeaseImpliesLeadership
     /\ Parent!LeaseExpiresBeforeElection
     /\ Parent!CatchUpDataIntegrity
+    /\ Parent!NoFollowerExposureRollback
     /\ Parent!WriteBarrierSafety
     /\ Parent!FollowerSeqIdConsistency
     /\ Parent!NoOrphanMemstoreDrop

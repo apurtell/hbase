@@ -47,7 +47,7 @@ public class TestUnifiedRaftStoreSegments extends TestBase {
 
   /** ~4 KiB segments so a few entries can roll the log within a single test. */
   private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 1, 5L, 50L, 64, 4096L));
+    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 1, 5L, 64, 4096L));
   }
 
   @AfterEach
@@ -97,7 +97,7 @@ public class TestUnifiedRaftStoreSegments extends TestBase {
   @Test
   public void testTruncateFromEmitsMarkerWithoutGc() throws IOException {
     UnifiedRaftStore small =
-      new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 1, 5L, 50L, 64, 1L << 30));
+      new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 1, 5L, 64, 1L << 30));
     store = small;
     store.load();
     RaftStore g = store.newGroupStore("g".getBytes());

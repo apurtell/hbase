@@ -102,7 +102,7 @@ public final class LocalRaftGroup {
         if (!subdir.exists() && !subdir.mkdirs()) {
           throw new java.io.IOException("Failed to create " + subdir);
         }
-        LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 50L, 64);
+        LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 64);
         OperationCodec codec = OperationCodecs.composite(OperationCodecs.defaultCodecs(),
           new SimpleStateMachineOpCodec());
         LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),
@@ -310,7 +310,7 @@ public final class LocalRaftGroup {
     if (!subdir.exists() && !subdir.mkdirs()) {
       throw new java.io.IOException("Failed to create " + subdir);
     }
-    LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 50L, 64);
+    LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 64);
     OperationCodec codec =
       OperationCodecs.composite(OperationCodecs.defaultCodecs(), new SimpleStateMachineOpCodec());
     LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),

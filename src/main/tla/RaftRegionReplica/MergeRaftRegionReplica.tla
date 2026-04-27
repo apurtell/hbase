@@ -126,6 +126,32 @@ MergeCrashRestart(m) ==
                    flushDropBound_2, masterConfirmedTerm_2,
                    mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
 
+\* Server crash with consensus-log suffix loss on the crashed member.
+\* Models page-cache or torn-tail loss in the shared multiplexed
+\* consensus log (UnifiedRaftStore).  Volatile state for BOTH groups
+\* and the merged group is reset; at least one group's raftLog is
+\* truncated to a prefix satisfying the per-group catchup precondition.
+\* See G1!CrashRestartWithLogLoss for details.
+MergeCrashRestartWithLogLoss(m) ==
+    /\ G1!CrashRestartEffect(m)
+    /\ G2!CrashRestartEffect(m)
+    /\ mergedGroupActive' = [mergedGroupActive EXCEPT ![m] = FALSE]
+    /\ \/ /\ G1!CrashRestartWithLogLossEffect(m)
+          /\ \/ G2!CrashRestartWithLogLossEffect(m)
+             \/ raftLog_2' = raftLog_2
+       \/ /\ raftLog_1' = raftLog_1
+          /\ G2!CrashRestartWithLogLossEffect(m)
+    /\ UNCHANGED <<clock, partition,
+                   currentTerm_1, votedFor_1,
+                   nextSeqId_1, committedEntries_1, markerEntries_1,
+                   flushMarkerEntries_1, hdfsHFiles_1,
+                   flushDropBound_1, masterConfirmedTerm_1,
+                   currentTerm_2, votedFor_2,
+                   nextSeqId_2, committedEntries_2, markerEntries_2,
+                   flushMarkerEntries_2, hdfsHFiles_2,
+                   flushDropBound_2, masterConfirmedTerm_2,
+                   mergeMarkerSeqId_1, mergeMarkerSeqId_2>>
+
 \* Network partition — shared across both groups.
 MergeCreatePartition ==
     \E m1, m2 \in Members :
@@ -286,6 +312,7 @@ Next ==
     \* Shared-impact actions
     \/ \E m \in Members : MergeClockTick(m)
     \/ \E m \in Members : MergeCrashRestart(m)
+    \/ \E m \in Members : MergeCrashRestartWithLogLoss(m)
     \/ MergeCreatePartition
     \/ MergeHealPartition
     \/ \E m \in Members : MergeUnifiedLogGC(m)
@@ -306,6 +333,7 @@ MergeDataPathNext ==
     \* Shared-impact actions
     \/ \E m \in Members : MergeClockTick(m)
     \/ \E m \in Members : MergeCrashRestart(m)
+    \/ \E m \in Members : MergeCrashRestartWithLogLoss(m)
     \/ MergeCreatePartition
     \/ MergeHealPartition
     \/ \E m \in Members : MergeUnifiedLogGC(m)

@@ -127,6 +127,7 @@ DataPathNext ==
     \/ GroupDataPathNext
     \/ \E m \in Members : ClockTick(m)
     \/ \E m \in Members : CrashRestart(m)
+    \/ \E m \in Members : CrashRestartWithLogLoss(m)
     \/ CreatePartition
     \/ HealPartition
     \/ \E m \in Members : RaftLogGC(m)

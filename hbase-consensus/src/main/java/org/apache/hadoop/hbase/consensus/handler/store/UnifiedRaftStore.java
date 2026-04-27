@@ -39,9 +39,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -57,10 +54,9 @@ import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.jctools.queues.MpscUnboundedArrayQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Default {@link DurableLogStore} implementation.
@@ -74,18 +70,26 @@ import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFacto
  * coalescing windows of {@link LogStoreConfig#getBatchMs() batchMs}, issues a single
  * {@link FileChannel#write(ByteBuffer[]) gathered write}, calls {@link FileChannel#force(boolean)
  * force(false)} when any frame in the batch requested sync-fsync, then completes every
- * {@link CompletableFuture} in the batch. Page-cache loss for non-fsync paths is bounded by a
- * periodic {@code force(false)} fired from {@link LogStoreConfig#getFdatasyncIntervalMs() the
- * fdatasync timer}.
+ * {@link CompletableFuture} in the batch.
  * <p>
- * <b>Sync-fsync routing.</b> {@code persistAndFlush{Term,LocalEndpoint,InitialGroupMembers}} block
- * until {@code force(false)} returns. Log entries / snapshot chunks ride the page cache and the
- * fdatasync timer.
+ * <b>Fsync-before-commit contract.</b> {@code persistAndFlush{Term,LocalEndpoint,
+ * InitialGroupMembers}} block until {@code force(false)} returns (per-call fsync). Log entries and
+ * snapshot chunks are enqueued without a per-record fsync, but every caller of
+ * {@link RaftStore#flush()} blocks until the writer issues an {@code force(false)} that covers the
+ * active segment, so all log-entry frames written before the call are on disk by the time
+ * {@code flush()} returns. This is the durability anchor that Raft commit-index advancement relies
+ * on: a follower's {@code AppendEntriesSuccessResponse.lastLogIndex} is sent only after
+ * {@link RaftStore#flush()} returns, and the leader's {@code FlushTask} sets {@code
+ * leaderState.flushedLogIndex()} only after {@link RaftStore#flush()} returns. The leader's
+ * commit-index advancement counts only on-disk acks; an entry on a majority's logs is, by
+ * construction, on a majority's disks.
  * <p>
  * <b>Flush barrier.</b> {@link RaftStore#flush()} on a per-group adapter enqueues an empty-frame
- * {@code PendingWrite} that the writer recognises as a no-op marker. The marker isn't written to
- * disk but its {@link CompletableFuture} only completes at the end of the next coalescing window.
- * Multiple groups blocked on {@code flush()} collapse onto the same window.
+ * {@code PendingWrite} with {@code fsyncRequested=true}. The writer recognises the empty frame as a
+ * no-op marker, so nothing is written for it, but the marker drives the batch's {@code
+ * anyFsync} flag and the marker's {@link CompletableFuture} is completed only after the writer has
+ * issued {@code force(false)} for the batch. Multiple groups blocked on {@code flush()} collapse
+ * onto the same window and amortise the single fsync.
  * <p>
  * <b>Segment rolling, GC, truncation.</b> When the active segment crosses
  * {@link LogStoreConfig#getSegmentSizeBytes()}, the writer appends a best-effort
@@ -141,11 +145,8 @@ public class UnifiedRaftStore implements DurableLogStore {
   private final LogStoreSerializer serializer;
 
   // write-path state
-  private final org.jctools.queues.MpscUnboundedArrayQueue<PendingWrite> mailbox;
+  private final MpscUnboundedArrayQueue<PendingWrite> mailbox;
   private final Thread writer;
-  private final ScheduledExecutorService fdatasyncTimer;
-  @Nullable
-  private ScheduledFuture<?> fdatasyncFuture;
 
   // segment + GC state
   private final SegmentIndex segmentIndex = new SegmentIndex();
@@ -172,11 +173,8 @@ public class UnifiedRaftStore implements DurableLogStore {
   public UnifiedRaftStore(@NonNull LogStoreConfig config, @NonNull LogStoreSerializer serializer) {
     this.config = config;
     this.serializer = serializer;
-    this.mailbox = new org.jctools.queues.MpscUnboundedArrayQueue<>(config.getMailboxChunkSize());
+    this.mailbox = new MpscUnboundedArrayQueue<>(config.getMailboxChunkSize());
     this.writer = new Thread(this::writerLoop);
-    this.fdatasyncTimer = Executors.newSingleThreadScheduledExecutor(
-      new ThreadFactoryBuilder().setNameFormat("UnifiedRaftStore-fdatasync").setDaemon(true)
-        .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
   }
 
   public UnifiedRaftStore(@NonNull Configuration conf) {
@@ -274,8 +272,6 @@ public class UnifiedRaftStore implements DurableLogStore {
     loaded = true;
     Threads.setDaemonThreadRunning(writer, "UnifiedRaftStore-writer",
       Threads.LOGGING_EXCEPTION_HANDLER);
-    fdatasyncFuture = fdatasyncTimer.scheduleWithFixedDelay(this::fdatasyncTick,
-      config.getFdatasyncIntervalMs(), config.getFdatasyncIntervalMs(), TimeUnit.MILLISECONDS);
 
     LOG.info("UnifiedRaftStore loaded: {} group(s), {} segment(s), nextSeq={}", out.size(),
       segmentIndex.size(), nextSeq.get());
@@ -309,10 +305,6 @@ public class UnifiedRaftStore implements DurableLogStore {
         Thread.currentThread().interrupt();
       }
     }
-    if (fdatasyncFuture != null) {
-      fdatasyncFuture.cancel(false);
-    }
-    fdatasyncTimer.shutdownNow();
     if (currentSegment != null) {
       try {
         currentSegment.force(true);
@@ -391,7 +383,15 @@ public class UnifiedRaftStore implements DurableLogStore {
 
   void flushBarrier(@NonNull byte[] groupId) throws IOException {
     requireOpen();
-    PendingWrite pw = new PendingWrite(null, groupId, null, -1L, false);
+    // fsyncRequested = true: the writer thread coalesces this barrier with any other concurrent
+    // entries / barriers in the same window and issues a single force(false) at the end of the
+    // window. flush() therefore returns only after the active segment has been fsynced, so every
+    // log-entry frame appended before this call is on disk. This is the durability anchor that
+    // Raft commit-index advancement depends on. A follower sends its AppendEntriesSuccessResponse
+    // after log.flush() returns, so the matchIndex it advertises reflects on-disk content. The
+    // leader's FlushTask sets flushedLogIndex (its own contribution to the commit quorum) after
+    // log.flush() returns for the same reason.
+    PendingWrite pw = new PendingWrite(null, groupId, null, -1L, true);
     submit(pw);
     await(pw);
   }
@@ -581,18 +581,6 @@ public class UnifiedRaftStore implements DurableLogStore {
           LOG.warn("Failed to GC segment {}", s, ioe);
         }
       }
-    }
-  }
-
-  private void fdatasyncTick() {
-    LogSegment seg = currentSegment;
-    if (seg == null) {
-      return;
-    }
-    try {
-      seg.force(false);
-    } catch (IOException e) {
-      LOG.warn("Periodic fdatasync failed on segment {}", seg, e);
     }
   }
 
@@ -911,6 +899,18 @@ public class UnifiedRaftStore implements DurableLogStore {
   @Nullable
   LogSegment currentSegmentForTesting() {
     return currentSegment;
+  }
+
+  /**
+   * Visible for tests. Installs {@code segment} as the active segment, also re-registering it under
+   * the same id in the {@link SegmentIndex} so the writer's own GC pass treats it as the active
+   * segment. Caller must quiesce the writer first (e.g. via
+   * {@link #awaitMailboxDrainedForTesting()}) and must not exercise segment roll while the wrapper
+   * is in place.
+   */
+  void replaceCurrentSegmentForTesting(@NonNull LogSegment segment) {
+    this.currentSegment = segment;
+    segmentIndex.register(segment);
   }
 
   /** Visible for tests */

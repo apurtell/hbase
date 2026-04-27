@@ -38,7 +38,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * a redundant {@code stat()}.
  */
 @InterfaceAudience.Private
-final class LogSegment implements Closeable {
+class LogSegment implements Closeable {
   static final String FILE_PREFIX = "raft-";
   static final String FILE_SUFFIX = ".log";
 
@@ -48,7 +48,7 @@ final class LogSegment implements Closeable {
   private long currentSize;
   private final Map<ByteBuffer, Long> maxLogIndexByGroup = new HashMap<>();
 
-  private LogSegment(long segmentId, Path path, FileChannel channel, long currentSize) {
+  LogSegment(long segmentId, Path path, FileChannel channel, long currentSize) {
     this.segmentId = segmentId;
     this.path = path;
     this.channel = channel;

@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
@@ -54,7 +55,7 @@ public class TestUnifiedRaftStoreWritePath extends TestBase {
   private final RaftEndpoint b = LocalRaftEndpoint.newEndpoint();
 
   private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 5L, 50L, 64));
+    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 5L, 64));
   }
 
   @AfterEach
@@ -92,6 +93,34 @@ public class TestUnifiedRaftStoreWritePath extends TestBase {
     g.persistLogEntries(Collections.singletonList(e2));
     g.flush();
     assertThat(store.currentSegmentForTesting().currentSize()).isGreaterThan(sizeAfterFirst);
+  }
+
+  /**
+   * Fsync-before-commit contract: {@link RaftStore#flush()} must issue a {@code force(false)} on
+   * the active segment before returning. Without this, a follower's
+   * {@code AppendEntriesSuccessResponse} would acknowledge a page-cache-only frame and the leader's
+   * commit-index advancement would count non-durable acks.
+   */
+  @Test
+  public void testFlushBarrierFsyncsActiveSegment() throws IOException {
+    store = newStore();
+    store.load();
+    store.awaitMailboxDrainedForTesting();
+    CountingLogSegment counting = new CountingLogSegment(store.currentSegmentForTesting());
+    store.replaceCurrentSegmentForTesting(counting);
+
+    RaftStore g = store.newGroupStore("g".getBytes());
+    LogEntry e =
+      factory.createLogEntryBuilder().setIndex(1L).setTerm(1).setOperation(new byte[8]).build();
+    g.persistLogEntries(Collections.singletonList(e));
+    long before = counting.forceCount.get();
+    g.flush();
+    assertThat(counting.forceCount.get()).isGreaterThan(before);
+
+    // A subsequent bare flush() (no new entries) must still cross another force boundary.
+    long beforeBare = counting.forceCount.get();
+    g.flush();
+    assertThat(counting.forceCount.get()).isGreaterThan(beforeBare);
   }
 
   @Test
@@ -178,5 +207,25 @@ public class TestUnifiedRaftStoreWritePath extends TestBase {
     store = newStore();
     store.load();
     assertThatThrownBy(() -> store.load()).isInstanceOf(IllegalStateException.class);
+  }
+
+  /**
+   * Test-only {@link LogSegment} subclass used to observe the fsync-before-commit contract by
+   * counting {@link LogSegment#force(boolean)} calls. Wraps an existing segment by sharing its
+   * {@code FileChannel}, path, id, and current size so the writer thread can route through this
+   * instance unchanged.
+   */
+  private static final class CountingLogSegment extends LogSegment {
+    final AtomicLong forceCount = new AtomicLong();
+
+    CountingLogSegment(LogSegment original) {
+      super(original.segmentId(), original.path(), original.channel(), original.currentSize());
+    }
+
+    @Override
+    void force(boolean metadata) throws IOException {
+      forceCount.incrementAndGet();
+      super.force(metadata);
+    }
   }
 }

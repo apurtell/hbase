@@ -57,7 +57,7 @@ public class TestUnifiedRaftStoreCorruption extends TestBase {
   private final RaftEndpoint a = LocalRaftEndpoint.newEndpoint();
 
   private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 5L, 50L, 64));
+    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 5L, 64));
   }
 
   @AfterEach
