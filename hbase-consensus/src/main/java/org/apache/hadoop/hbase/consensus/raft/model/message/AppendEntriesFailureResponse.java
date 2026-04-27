@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.message;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesRequestHandler;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Response for a failed {@link AppendEntriesRequest}.
@@ -29,6 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesRequestH
  * @see AppendEntriesRequest
  * @see AppendEntriesRequestHandler
  */
+@InterfaceAudience.Private
 public interface AppendEntriesFailureResponse extends RaftMessage {
   long getExpectedNextIndex();
 

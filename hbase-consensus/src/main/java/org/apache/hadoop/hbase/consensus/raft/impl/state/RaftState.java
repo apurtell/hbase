@@ -54,13 +54,15 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry;
 import org.apache.hadoop.hbase.consensus.raft.persistence.NopRaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /** State maintained by each Raft node. **/
+@InterfaceAudience.Private
 @SuppressWarnings({ "checkstyle:methodcount" })
 public final class RaftState {
-  private static final Logger LOGGER = LoggerFactory.getLogger(RaftState.class);
+  private static final Logger LOG = LoggerFactory.getLogger(RaftState.class);
   /** Unique ID of the Raft group that this Raft node belongs to. */
   private final Object groupId;
   /** Endpoint of this Raft node. */
@@ -764,7 +766,7 @@ public final class RaftState {
       }
     }
     if (count > 0) {
-      LOGGER.warn("{} Invalidated {} futures from log index: {} with: {}", localEndpoint, count,
+      LOG.warn("{} Invalidated {} futures from log index: {} with: {}", localEndpoint, count,
         startIndexInclusive, e);
     }
   }
@@ -787,7 +789,7 @@ public final class RaftState {
       }
     }
     if (count > 0) {
-      LOGGER.warn("{} Completed {} futures until log index: {} with {}", localEndpoint, count,
+      LOG.warn("{} Completed {} futures until log index: {} with {}", localEndpoint, count,
         endIndexInclusive, e);
     }
   }
@@ -815,7 +817,7 @@ public final class RaftState {
     }
     scheduledQueries.clear();
     if (invalidated > 0) {
-      LOGGER.warn("{} invalidated {} waiting queries.", localEndpoint, invalidated);
+      LOG.warn("{} invalidated {} waiting queries.", localEndpoint, invalidated);
     }
   }
 

@@ -32,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
 import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,8 +43,9 @@ import org.slf4j.LoggerFactory;
  * <p>
  * New appends are temporarily rejected until the leadership transfer process completes.
  */
+@InterfaceAudience.Private
 public class TransferLeadershipTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(TransferLeadershipTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TransferLeadershipTask.class);
   private final RaftNodeImpl node;
   private final RaftEndpoint targetEndpoint;
   private final OrderedFuture<Object> future;
@@ -62,7 +64,7 @@ public class TransferLeadershipTask implements Runnable {
       return;
     }
     if (node.getLocalEndpoint().equals(targetEndpoint)) {
-      LOGGER.warn("{} I am already the leader... There is no leadership transfer to myself.",
+      LOG.warn("{} I am already the leader... There is no leadership transfer to myself.",
         node.localEndpointStr());
       future.completeNull(state.commitIndex());
       return;
@@ -98,8 +100,7 @@ public class TransferLeadershipTask implements Runnable {
   private void transferLeadership(RaftState state) {
     LeaderState leaderState = state.leaderState();
     if (leaderState == null) {
-      LOGGER.debug("{} not retrying leadership transfer since not leader...",
-        node.localEndpointStr());
+      LOG.debug("{} not retrying leadership transfer since not leader...", node.localEndpointStr());
       // no need to notify the future here because it is already
       // completed when the leader steps down to the follower role for
       // any reason.
@@ -110,8 +111,8 @@ public class TransferLeadershipTask implements Runnable {
     if (
       leadershipTransferState == null || !leadershipTransferState.endpoint().equals(targetEndpoint)
     ) {
-      LOGGER.error("{} no leadership transfer state for target endpoint: {}",
-        node.localEndpointStr(), targetEndpoint.getId());
+      LOG.error("{} no leadership transfer state for target endpoint: {}", node.localEndpointStr(),
+        targetEndpoint.getId());
       return;
     }
     int tryCount = leadershipTransferState.incrementTryCount();
@@ -121,23 +122,22 @@ public class TransferLeadershipTask implements Runnable {
     ) {
       String msg = node.localEndpointStr() + " leadership transfer to " + targetEndpoint.getId()
         + " timed out!";
-      LOGGER.warn(msg);
+      LOG.warn(msg);
       state.completeLeadershipTransfer(new TimeoutException(msg));
       return;
     }
     if (state.commitIndex() < state.log().lastLogOrSnapshotIndex()) {
-      LOGGER.warn(
+      LOG.warn(
         "{} waiting until all appended entries to be committed before transferring leadership to {}",
         node.localEndpointStr(), targetEndpoint.getId());
       scheduleRetry(state);
       return;
     }
     if (tryCount > 1) {
-      LOGGER.debug("{} retrying leadership transfer to {}", node.localEndpointStr(),
+      LOG.debug("{} retrying leadership transfer to {}", node.localEndpointStr(),
         targetEndpoint.getId());
     } else {
-      LOGGER.info("{} transferring leadership to {}", node.localEndpointStr(),
-        targetEndpoint.getId());
+      LOG.info("{} transferring leadership to {}", node.localEndpointStr(), targetEndpoint.getId());
     }
     leaderState.getFollowerState(targetEndpoint).resetRequestBackoff();
     node.sendAppendEntriesRequest(targetEndpoint);
@@ -154,7 +154,7 @@ public class TransferLeadershipTask implements Runnable {
       node.getExecutor().schedule(() -> transferLeadership(state),
         node.getConfig().getLeaderHeartbeatPeriodMillis(), MILLISECONDS);
     } catch (Throwable t) {
-      LOGGER.error(node.localEndpointStr() + " failed to schedule retry of leadership transfer to "
+      LOG.error(node.localEndpointStr() + " failed to schedule retry of leadership transfer to "
         + targetEndpoint.getId(), t);
     }
   }

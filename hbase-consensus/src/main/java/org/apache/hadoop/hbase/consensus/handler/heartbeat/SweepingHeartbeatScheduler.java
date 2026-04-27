@@ -29,12 +29,16 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.conf.ConfigKey;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Store-level reference {@link HeartbeatScheduler} that drives every registered
@@ -51,12 +55,14 @@ import org.slf4j.LoggerFactory;
 public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, AutoCloseable {
 
   /** Sweep interval in milliseconds. */
-  public static final String KEY_INTERVAL_MS = "hbase.consensus.heartbeat.interval.ms";
-  public static final int DEFAULT_INTERVAL_MS = 250;
+  public static final String INTERVAL_MS_KEY =
+    ConfigKey.INT("hbase.consensus.heartbeat.interval.ms", v -> v >= 1);
+  public static final int INTERVAL_MS_DEFAULT = 250;
 
   /** Number of timer threads in the shared sweeper {@link ScheduledThreadPoolExecutor}. */
-  public static final String KEY_TIMER_THREADS = "hbase.consensus.heartbeat.sweeper.timer.threads";
-  public static final int DEFAULT_TIMER_THREADS = 1;
+  public static final String TIMER_THREADS_KEY =
+    ConfigKey.INT("hbase.consensus.heartbeat.sweeper.timer.threads", v -> v >= 1);
+  public static final int TIMER_THREADS_DEFAULT = 1;
 
   private static final Logger LOG = LoggerFactory.getLogger(SweepingHeartbeatScheduler.class);
   private static final AtomicInteger POOL_ID = new AtomicInteger();
@@ -70,8 +76,8 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
   private volatile boolean closed;
 
   public SweepingHeartbeatScheduler(@NonNull Configuration conf) {
-    this(requireNonNull(conf).getInt(KEY_INTERVAL_MS, DEFAULT_INTERVAL_MS),
-      conf.getInt(KEY_TIMER_THREADS, DEFAULT_TIMER_THREADS));
+    this(requireNonNull(conf).getInt(INTERVAL_MS_KEY, INTERVAL_MS_DEFAULT),
+      conf.getInt(TIMER_THREADS_KEY, TIMER_THREADS_DEFAULT));
   }
 
   public SweepingHeartbeatScheduler(int intervalMs, int timerThreads) {
@@ -83,13 +89,9 @@ public final class SweepingHeartbeatScheduler implements HeartbeatScheduler, Aut
     }
     this.intervalMs = intervalMs;
     final int id = POOL_ID.getAndIncrement();
-    final AtomicInteger threadId = new AtomicInteger();
-    ThreadFactory tf = runnable -> {
-      Thread t = new Thread(runnable,
-        "hbase-consensus-heartbeat-sweeper-" + id + "-" + threadId.getAndIncrement());
-      t.setDaemon(true);
-      return t;
-    };
+    ThreadFactory tf =
+      new ThreadFactoryBuilder().setNameFormat("hbase-consensus-heartbeat-sweeper-" + id + "-%d")
+        .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build();
     this.timer = new ScheduledThreadPoolExecutor(timerThreads, tf);
     this.timer.setRemoveOnCancelPolicy(true);
     this.timer.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);

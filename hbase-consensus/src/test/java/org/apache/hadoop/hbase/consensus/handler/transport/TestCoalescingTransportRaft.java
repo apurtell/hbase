@@ -195,10 +195,6 @@ public class TestCoalescingTransportRaft extends TestBase {
     }
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Helpers
-  // -------------------------------------------------------------------------------------------
-
   private CoalescingTransport newStarted(RaftEndpoint local, Configuration conf,
     EndpointResolver resolver, OperationCodec codec) {
     CoalescingTransport t =
@@ -258,9 +254,9 @@ public class TestCoalescingTransportRaft extends TestBase {
 
   private static Configuration baseConf() {
     Configuration c = HBaseConfiguration.create();
-    c.setBoolean(TransportConfig.KEY_NATIVE_TRANSPORT, false);
-    c.setLong(TransportConfig.KEY_BATCH_MS, 5L);
-    c.setInt(TransportConfig.KEY_IO_THREADS, 2);
+    c.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
+    c.setLong(TransportConfig.BATCH_MS_KEY, 5L);
+    c.setInt(TransportConfig.IO_THREADS_KEY, 2);
     return c;
   }
 

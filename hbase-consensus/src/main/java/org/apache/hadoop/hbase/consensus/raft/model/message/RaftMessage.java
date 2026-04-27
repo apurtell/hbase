@@ -21,6 +21,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModel;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Implemented by request and response classes of the Raft consensus algorithm RPCs. Raft messages
@@ -33,6 +34,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
  * @see RaftModel
  * @see RaftModelFactory
  */
+@InterfaceAudience.Private
 public interface RaftMessage extends RaftModel {
   /**
    * Returns the group id of the Raft node which created this message

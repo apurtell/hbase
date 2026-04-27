@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.LeaderState;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesFailureResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,9 +42,10 @@ import org.slf4j.LoggerFactory;
  * @see AppendEntriesRequest
  * @see InstallSnapshotRequest
  */
+@InterfaceAudience.Private
 public class AppendEntriesFailureResponseHandler
   extends AbstractResponseHandler<AppendEntriesFailureResponse> {
-  private static final Logger LOGGER =
+  private static final Logger LOG =
     LoggerFactory.getLogger(AppendEntriesFailureResponseHandler.class);
 
   public AppendEntriesFailureResponseHandler(RaftNodeImpl raftNode,
@@ -54,18 +56,18 @@ public class AppendEntriesFailureResponseHandler
   @Override
   protected void handleResponse(@NonNull AppendEntriesFailureResponse response) {
     if (state.role() != LEADER) {
-      LOGGER.warn("{} {} is ignored since we are not LEADER.", localEndpointStr(), response);
+      LOG.warn("{} {} is ignored since we are not LEADER.", localEndpointStr(), response);
       return;
     }
     if (response.getTerm() > state.term()) {
       // If the response term is greater than the local term, update the local term
       // and convert to follower (§5.1)
-      LOGGER.info("{} Switching to term: {} after {} from current term: {}", localEndpointStr(),
+      LOG.info("{} Switching to term: {} after {} from current term: {}", localEndpointStr(),
         response.getTerm(), response, state.term());
       node.toFollower(response.getTerm());
       return;
     }
-    LOGGER.debug("{} received {}.", localEndpointStr(), response);
+    LOG.debug("{} received {}.", localEndpointStr(), response);
     node.tryAckQuery(response.getQuerySequenceNumber(), response.getSender());
     if (updateNextIndex(response)) {
       node.sendAppendEntriesRequest(response.getSender());
@@ -77,7 +79,7 @@ public class AppendEntriesFailureResponseHandler
     LeaderState leaderState = state.leaderState();
     FollowerState followerState = leaderState.getFollowerStateOrNull(follower);
     if (followerState == null) {
-      LOGGER.warn("{} follower/learner: {} not found for {}.", localEndpointStr(), follower.getId(),
+      LOG.warn("{} follower/learner: {} not found for {}.", localEndpointStr(), follower.getId(),
         response);
       return false;
     }
@@ -89,12 +91,12 @@ public class AppendEntriesFailureResponseHandler
       // this is the response of the request I have sent for this nextIndex
       nextIndex--;
       if (nextIndex <= matchIndex) {
-        LOGGER.error("{} Cannot decrement next index: {} below match index: {} for follower: {}",
+        LOG.error("{} Cannot decrement next index: {} below match index: {} for follower: {}",
           localEndpointStr(), nextIndex, matchIndex, follower.getId());
         return false;
       }
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(localEndpointStr() + " Updating next index: " + nextIndex + " for follower: "
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(localEndpointStr() + " Updating next index: " + nextIndex + " for follower: "
           + follower.getId());
       }
       followerState.nextIndex(nextIndex);

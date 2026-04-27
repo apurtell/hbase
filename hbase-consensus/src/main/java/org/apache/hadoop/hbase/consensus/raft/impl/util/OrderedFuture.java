@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.util;
 import java.util.concurrent.CompletableFuture;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * A utility class to implement {@link CompletableFuture} and {@link Ordered} interfaces together.
@@ -28,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
  * <p>
  * Please note that completion methods here can be called from a single thread.
  */
+@InterfaceAudience.Private
 public class OrderedFuture<T> extends CompletableFuture<Ordered<T>> implements Ordered<T> {
   private long commitIndex;
   private T result;

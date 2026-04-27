@@ -18,6 +18,7 @@
 package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.hadoop.hbase.exceptions.HBaseException;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -25,7 +26,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * given endpoint. {@link CoalescingTransport#send} catches this and silently drops the message.
  */
 @InterfaceAudience.Private
-public class UnknownEndpointException extends Exception {
+public class UnknownEndpointException extends HBaseException {
   private static final long serialVersionUID = 1L;
 
   public UnknownEndpointException(String message) {

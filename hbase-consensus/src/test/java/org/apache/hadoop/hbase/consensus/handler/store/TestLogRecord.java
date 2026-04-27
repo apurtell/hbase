@@ -62,8 +62,8 @@ public class TestLogRecord extends TestBase {
       long seq = 1L;
       for (LogRecord.Kind kind : LogRecord.Kind.values()) {
         LogRecord.ReadResult rr = reader.next();
-        assertThat(rr).isInstanceOf(LogRecord.ReadResult.Ok.class);
-        LogRecord rec = ((LogRecord.ReadResult.Ok) rr).record();
+        assertThat(rr.kind()).isEqualTo(LogRecord.ReadResult.Kind.OK);
+        LogRecord rec = rr.record();
         assertThat(rec.getKind()).isEqualTo(kind);
         assertThat(rec.getSeq()).isEqualTo(seq++);
         if (kind == LogRecord.Kind.SEGMENT_HEADER || kind == LogRecord.Kind.SEGMENT_FOOTER) {
@@ -74,7 +74,7 @@ public class TestLogRecord extends TestBase {
         assertThat(new String(rec.getPayload())).isEqualTo("payload-" + kind.name());
       }
       LogRecord.ReadResult eof = reader.next();
-      assertThat(eof).isInstanceOf(LogRecord.ReadResult.EndOfFile.class);
+      assertThat(eof.kind()).isEqualTo(LogRecord.ReadResult.Kind.END_OF_FILE);
     }
   }
 
@@ -99,8 +99,8 @@ public class TestLogRecord extends TestBase {
     try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
       LogRecord.Reader reader = new LogRecord.Reader(ch)) {
       LogRecord.ReadResult rr = reader.next();
-      assertThat(rr).isInstanceOf(LogRecord.ReadResult.Crc.class);
-      assertThat(((LogRecord.ReadResult.Crc) rr).offset()).isEqualTo(LogRecord.PROLOGUE_BYTES);
+      assertThat(rr.kind()).isEqualTo(LogRecord.ReadResult.Kind.CRC);
+      assertThat(rr.offset()).isEqualTo(LogRecord.PROLOGUE_BYTES);
     }
   }
 
@@ -119,7 +119,7 @@ public class TestLogRecord extends TestBase {
     try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
       LogRecord.Reader reader = new LogRecord.Reader(ch)) {
       LogRecord.ReadResult rr = reader.next();
-      assertThat(rr).isInstanceOf(LogRecord.ReadResult.Truncated.class);
+      assertThat(rr.kind()).isEqualTo(LogRecord.ReadResult.Kind.TRUNCATED);
     }
   }
 
@@ -138,7 +138,7 @@ public class TestLogRecord extends TestBase {
     try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
       LogRecord.Reader reader = new LogRecord.Reader(ch)) {
       LogRecord.ReadResult rr = reader.next();
-      assertThat(rr).isInstanceOf(LogRecord.ReadResult.Truncated.class);
+      assertThat(rr.kind()).isEqualTo(LogRecord.ReadResult.Kind.TRUNCATED);
     }
   }
 

@@ -77,7 +77,7 @@ public final class LocalRaftGroup {
       return new InMemoryRaftStore();
     };
 
-  private static final Logger LOGGER = LoggerFactory.getLogger(LocalRaftGroup.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LocalRaftGroup.class);
   private final RaftConfig config;
   private final boolean newTermEntryEnabled;
   private final List<RaftEndpoint> initialMembers = new ArrayList<>();
@@ -503,7 +503,7 @@ public final class LocalRaftGroup {
   public void slowDownNode(RaftEndpoint endpoint, int seconds) {
     nodeContexts.get(endpoint).executor.submit(() -> {
       try {
-        LOGGER.info(endpoint.getId() + " is under high load for " + seconds + " seconds.");
+        LOG.info(endpoint.getId() + " is under high load for " + seconds + " seconds.");
         Thread.sleep(TimeUnit.SECONDS.toMillis(seconds));
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();

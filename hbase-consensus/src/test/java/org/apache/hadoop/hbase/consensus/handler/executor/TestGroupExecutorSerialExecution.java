@@ -50,7 +50,7 @@ public class TestGroupExecutorSerialExecution extends TestBase {
   public void testSerialPerProducer() throws Exception {
     final int producers = 8;
     final int perProducer = 10_000;
-    mge = new MultiGroupExecutor(8, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 256);
+    mge = new MultiGroupExecutor(8, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 256);
     RaftNodeExecutor exec = mge.executorFor("g");
 
     // Per-producer last-seen sequence (tasks for a given producer must run in submission order).

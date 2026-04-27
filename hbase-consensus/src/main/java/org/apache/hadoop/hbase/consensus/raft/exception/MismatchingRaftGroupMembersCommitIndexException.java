@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.exception;
 
 import java.util.Collection;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Thrown when a membership change is triggered with an expected group members commit index that
@@ -26,6 +27,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * A group members commit index is the Raft log index at which the current Raft group member list is
  * committed.
  */
+@InterfaceAudience.Private
 public class MismatchingRaftGroupMembersCommitIndexException extends RaftException {
   private static final long serialVersionUID = -109570074579015635L;
   private final long commitIndex;

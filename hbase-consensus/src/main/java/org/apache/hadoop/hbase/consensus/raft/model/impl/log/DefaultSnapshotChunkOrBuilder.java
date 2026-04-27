@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk.SnapshotChunkBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link SnapshotChunk} and {@link SnapshotChunkBuilder} interfaces. When
@@ -32,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk.SnapshotCh
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultSnapshotChunkOrBuilder implements SnapshotChunk, SnapshotChunkBuilder {
   private int term;
   private long index;

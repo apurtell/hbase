@@ -26,8 +26,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class AssertionUtils {
-  public static final int EVENTUAL_ASSERTION_TIMEOUT_SECS;
-  private static final Logger LOGGER = LoggerFactory.getLogger(AssertionUtils.class);
+  private static final Logger LOG = LoggerFactory.getLogger(AssertionUtils.class);
+  public static final int EVENTUAL_ASSERTION_TIMEOUT_SECS =
+    getInteger("eventual.timeout.seconds", 120);
 
   private AssertionUtils() {
   }
@@ -81,7 +82,7 @@ public final class AssertionUtils {
         MILLISECONDS.sleep(deadline - now);
         now = Math.max(now, System.currentTimeMillis());
       } catch (InterruptedException e) {
-        LOGGER.info("Interrupted while sleeping {} millis.", millis);
+        LOG.info("Interrupted while sleeping {} millis.", millis);
         Thread.currentThread().interrupt();
         break;
       }
@@ -95,10 +96,5 @@ public final class AssertionUtils {
   @FunctionalInterface
   public interface AssertTask {
     void run() throws Exception;
-  }
-
-  static {
-    EVENTUAL_ASSERTION_TIMEOUT_SECS = getInteger("eventual.timeout.seconds", 120);
-    LOGGER.debug("EVENTUAL ASSERTION TIMEOUT SECONDS = " + EVENTUAL_ASSERTION_TIMEOUT_SECS);
   }
 }

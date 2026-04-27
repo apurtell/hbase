@@ -17,6 +17,9 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.impl.statemachine;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
+@InterfaceAudience.Private
 public final class NoOp {
   public static final NoOp INSTANCE = new NoOp();
 

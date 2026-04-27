@@ -42,6 +42,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPers
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState.RaftTermPersistentStateBuilder;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Used for creating {@link RaftModel} objects with the builder pattern.
@@ -57,6 +58,7 @@ import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
  * method on {@link RaftModelFactory}, and finally calls
  * {@link RaftNodeLifecycleAware#onRaftNodeTerminate()} on termination.
  */
+@InterfaceAudience.Private
 public interface RaftModelFactory {
   @NonNull
   LogEntryBuilder createLogEntryBuilder();

@@ -23,11 +23,13 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * State maintained by the Raft group leader.
  * @see FollowerState
  */
+@InterfaceAudience.Private
 public final class LeaderState {
   /** A {@link FollowerState} object will be maintained for each follower. */
   private final Map<RaftEndpoint, FollowerState> followerStates = new HashMap<>();

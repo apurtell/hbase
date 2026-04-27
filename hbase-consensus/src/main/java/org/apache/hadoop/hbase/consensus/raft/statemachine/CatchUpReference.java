@@ -21,8 +21,10 @@ import static java.util.Objects.requireNonNull;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Arrays;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Lightweight catch-up metadata for state transfer by reference. */
+@InterfaceAudience.Private
 public final class CatchUpReference {
   private final long flushOpSeqId;
   private final long snapshotMaxSeqId;

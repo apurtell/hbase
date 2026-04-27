@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The abstraction used by {@link RaftNode} to execute the Raft consensus algorithm with the Actor
@@ -44,6 +45,7 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
  * @see DefaultRaftNodeExecutor
  * @see RaftNodeLifecycleAware
  */
+@InterfaceAudience.Private
 public interface RaftNodeExecutor {
   /**
    * Executes the given task on the underlying platform.

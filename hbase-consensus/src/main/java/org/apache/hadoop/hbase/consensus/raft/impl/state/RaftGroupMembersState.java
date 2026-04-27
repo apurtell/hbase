@@ -29,8 +29,10 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView.RaftGroupMembersViewBuilder;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftGroupMembers;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Contains member list of a Raft group. **/
+@InterfaceAudience.Private
 public final class RaftGroupMembersState implements RaftGroupMembers {
   private final long index;
   private final Collection<RaftEndpoint> members;

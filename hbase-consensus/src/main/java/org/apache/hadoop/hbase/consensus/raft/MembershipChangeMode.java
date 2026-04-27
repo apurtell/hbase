@@ -17,9 +17,12 @@
  */
 package org.apache.hadoop.hbase.consensus.raft;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /**
  * Types of membership changes that occur on Raft groups.
  */
+@InterfaceAudience.Private
 public enum MembershipChangeMode {
   /**
    * Denotes that a new Raft endpoint will be added to the Raft group as a {@link RaftRole#LEARNER}.

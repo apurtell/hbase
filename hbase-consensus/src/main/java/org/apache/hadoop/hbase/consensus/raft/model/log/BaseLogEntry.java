@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.log;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModel;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Base class for Raft log entries.
@@ -33,6 +34,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
  * @see RaftModel
  * @see RaftModelFactory
  */
+@InterfaceAudience.Private
 public interface BaseLogEntry extends RaftModel {
   long getIndex();
 

@@ -45,8 +45,10 @@ import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Builder for {@link RaftNode}. */
+@InterfaceAudience.Private
 public class RaftNodeBuilderImpl implements RaftNodeBuilder {
   private Object groupId;
   private RaftEndpoint localEndpoint;

@@ -26,6 +26,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.task.LeaderElectionTask;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.PreVoteTask;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,8 +39,9 @@ import org.slf4j.LoggerFactory;
  * @see PreVoteTask
  * @see LeaderElectionTask
  */
+@InterfaceAudience.Private
 public class PreVoteResponseHandler extends AbstractResponseHandler<PreVoteResponse> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(PreVoteResponseHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(PreVoteResponseHandler.class);
 
   public PreVoteResponseHandler(RaftNodeImpl raftNode, PreVoteResponse response) {
     super(raftNode, response);
@@ -47,29 +49,29 @@ public class PreVoteResponseHandler extends AbstractResponseHandler<PreVoteRespo
 
   @Override
   protected void handleResponse(@NonNull PreVoteResponse response) {
-    LOGGER.debug("{} received {}.", localEndpointStr(), response);
+    LOG.debug("{} received {}.", localEndpointStr(), response);
     if (state.role() != FOLLOWER) {
-      LOGGER.debug("{} Ignored {}. We are not FOLLOWER anymore.", localEndpointStr(), response);
+      LOG.debug("{} Ignored {}. We are not FOLLOWER anymore.", localEndpointStr(), response);
       return;
     }
     if (response.getTerm() < state.term()) {
-      LOGGER.warn("{} Stale {} is received, current term: {}", localEndpointStr(), response,
+      LOG.warn("{} Stale {} is received, current term: {}", localEndpointStr(), response,
         state.term());
       return;
     }
     CandidateState preCandidateState = state.preCandidateState();
     if (preCandidateState == null) {
-      LOGGER.debug("{} Ignoring {}. We are not interested in pre-votes anymore.",
-        localEndpointStr(), response);
+      LOG.debug("{} Ignoring {}. We are not interested in pre-votes anymore.", localEndpointStr(),
+        response);
       return;
     }
     if (response.isGranted() && preCandidateState.grantVote(response.getSender())) {
-      LOGGER.info("{} Pre-vote granted from {} for term: {}, number of votes: {}, majority: {}",
+      LOG.info("{} Pre-vote granted from {} for term: {}, number of votes: {}, majority: {}",
         localEndpointStr(), response.getSender().getId(), response.getTerm(),
         preCandidateState.voteCount(), preCandidateState.majority());
     }
     if (preCandidateState.isMajorityGranted()) {
-      LOGGER.info("{} We have the majority during pre-vote phase. Let's start real election!",
+      LOG.info("{} We have the majority during pre-vote phase. Let's start real election!",
         localEndpointStr());
       new LeaderElectionTask(node, true).run();
     }

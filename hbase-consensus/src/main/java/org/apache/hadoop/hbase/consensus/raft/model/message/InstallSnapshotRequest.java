@@ -24,6 +24,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Raft message for the InstallSnapshot RPC.
@@ -35,6 +36,7 @@ import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
  * defined by the follower and the follower is free to request the chunks in any order.
  * @see InstallSnapshotResponse
  */
+@InterfaceAudience.Private
 public interface InstallSnapshotRequest extends RaftMessage {
   boolean isSenderLeader();
 

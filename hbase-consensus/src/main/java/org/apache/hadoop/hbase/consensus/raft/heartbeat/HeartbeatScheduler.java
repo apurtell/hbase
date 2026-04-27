@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.heartbeat;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * SPI for arranging periodic invocation of {@link RaftNodeImpl#runHeartbeatTick()}.
@@ -28,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
  * registered node schedules its own self-rescheduling task on its own {@code RaftNodeExecutor} at
  * the configured {@code leaderHeartbeatPeriodMillis} cadence.
  */
+@InterfaceAudience.Private
 public interface HeartbeatScheduler {
   /**
    * Called from {@code RaftNodeImpl.initTasks} during start up. The scheduler arranges for

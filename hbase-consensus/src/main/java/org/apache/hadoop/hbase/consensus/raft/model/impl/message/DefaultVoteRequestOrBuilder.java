@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest.VoteRequestBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link VoteRequest} and {@link VoteRequestBuilder} interfaces. When an
@@ -32,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest.VoteRequ
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultVoteRequestOrBuilder implements VoteRequest, VoteRequestBuilder {
   private Object groupId;
   private RaftEndpoint sender;

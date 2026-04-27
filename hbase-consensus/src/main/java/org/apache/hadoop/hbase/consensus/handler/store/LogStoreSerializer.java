@@ -26,6 +26,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 /**
  * Codec SPI for the consensus durable log.
@@ -36,6 +37,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * producing threads of all groups multiplexed onto a single {@link DurableLogStore}.
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.TOOLS })
+@InterfaceStability.Evolving
 public interface LogStoreSerializer {
   Serializer<RaftGroupMembersView> raftGroupMembersViewSerializer();
 

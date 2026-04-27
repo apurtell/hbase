@@ -28,11 +28,13 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Contains restored state of a {@link RaftNode}. All the fields in this class are persisted via
  * {@link RaftStore}.
  */
+@InterfaceAudience.Private
 public final class RestoredRaftState {
   private final RaftEndpointPersistentState localEndpointPersistentState;
   private final RaftGroupMembersView initialGroupMembers;

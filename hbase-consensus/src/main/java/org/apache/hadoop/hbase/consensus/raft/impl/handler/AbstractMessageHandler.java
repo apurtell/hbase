@@ -21,10 +21,12 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.RaftNodeStatusAwareTask;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Base class for {@link RaftMessage} handlers.
  */
+@InterfaceAudience.Private
 public abstract class AbstractMessageHandler<T extends RaftMessage>
   extends RaftNodeStatusAwareTask {
   protected final T message;

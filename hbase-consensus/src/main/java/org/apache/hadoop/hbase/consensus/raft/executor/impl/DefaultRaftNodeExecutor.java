@@ -22,10 +22,13 @@ import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+import org.apache.hadoop.hbase.util.Threads;
+import org.apache.yetus.audience.InterfaceAudience;
+
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * The default implementation of {@link RaftNodeExecutor}.
@@ -35,11 +38,11 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
  * @see RaftNode
  * @see RaftNodeExecutor
  */
+@InterfaceAudience.Private
 public class DefaultRaftNodeExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
-  private static final AtomicInteger RAFT_THREAD_ID = new AtomicInteger(0);
-  private final ThreadGroup threadGroup = new ThreadGroup("RaftThread");
-  private final ScheduledExecutorService executor = newSingleThreadScheduledExecutor(
-    r -> new Thread(threadGroup, r, "Raft-" + RAFT_THREAD_ID.getAndIncrement()));
+  private final ScheduledExecutorService executor =
+    newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("Raft-%d")
+      .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
 
   @Override
   public void execute(@NonNull Runnable task) {

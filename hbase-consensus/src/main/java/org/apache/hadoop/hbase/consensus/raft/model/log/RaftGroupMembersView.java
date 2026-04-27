@@ -21,11 +21,13 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Collection;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModel;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Represents the member list of a Raft group with an index identifying on which log index the given
  * member list is appended to the Raft log.
  */
+@InterfaceAudience.Private
 public interface RaftGroupMembersView extends RaftModel {
   /**
    * Returns the Raft log index that contains this Raft group member list.

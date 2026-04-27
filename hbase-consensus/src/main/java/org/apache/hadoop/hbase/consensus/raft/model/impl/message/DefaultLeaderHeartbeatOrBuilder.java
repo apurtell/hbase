@@ -23,12 +23,14 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat.LeaderHeartbeatBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link LeaderHeartbeat} and {@link LeaderHeartbeatBuilder} interfaces.
  * When an instance of this class is created, it is in the builder mode and its state is populated.
  * Once all fields are set, the object switches to the DTO mode where it no longer allows mutations.
  */
+@InterfaceAudience.Private
 public class DefaultLeaderHeartbeatOrBuilder implements LeaderHeartbeat, LeaderHeartbeatBuilder {
   private Object groupId;
   private RaftEndpoint sender;

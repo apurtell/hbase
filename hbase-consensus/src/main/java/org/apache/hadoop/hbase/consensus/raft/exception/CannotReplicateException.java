@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.exception;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Thrown when an operation cannot be temporarily replicated.
@@ -31,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * </ul>
  * @see RaftConfig#getMaxPendingLogEntryCount()
  */
+@InterfaceAudience.Private
 public class CannotReplicateException extends RaftException {
   private static final long serialVersionUID = 4407025930140337716L;
 

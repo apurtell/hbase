@@ -17,12 +17,15 @@
  */
 package org.apache.hadoop.hbase.consensus.raft;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /**
  * Represents result of an operation that is triggered on a Raft node via one of the methods in the
  * {@link RaftNode} interface, along with at which commit index the given operation is executed /
  * performed.
  * @param <T> type of the actual result object
  */
+@InterfaceAudience.Private
 public interface Ordered<T> {
   /**
    * Returns the commit index at which the operation is executed / performed.

@@ -26,6 +26,7 @@ import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 /**
  * Container SPI for a durable, multiplexed consensus log shared by every Raft group on a
@@ -51,6 +52,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * </ol>
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.TOOLS })
+@InterfaceStability.Evolving
 public interface DurableLogStore extends Closeable {
   /**
    * One-shot whole-disk replay; opens the store for writes.

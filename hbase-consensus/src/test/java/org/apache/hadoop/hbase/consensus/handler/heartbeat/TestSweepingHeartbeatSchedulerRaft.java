@@ -192,10 +192,6 @@ public class TestSweepingHeartbeatSchedulerRaft extends TestBase {
     assertNewLeaderEventually(y, isolated, timeoutSecs);
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Helpers
-  // -------------------------------------------------------------------------------------------
-
   private Cluster startGroup(String groupId, List<RaftEndpoint> members,
     Map<RaftEndpoint, CoalescingTransport> tx, Map<RaftEndpoint, SweepingHeartbeatScheduler> hb) {
     Cluster c = new Cluster();
@@ -286,9 +282,9 @@ public class TestSweepingHeartbeatSchedulerRaft extends TestBase {
 
   private static Configuration baseConf() {
     Configuration c = HBaseConfiguration.create();
-    c.setBoolean(TransportConfig.KEY_NATIVE_TRANSPORT, false);
-    c.setLong(TransportConfig.KEY_BATCH_MS, 5L);
-    c.setInt(TransportConfig.KEY_IO_THREADS, 2);
+    c.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
+    c.setLong(TransportConfig.BATCH_MS_KEY, 5L);
+    c.setInt(TransportConfig.IO_THREADS_KEY, 2);
     return c;
   }
 

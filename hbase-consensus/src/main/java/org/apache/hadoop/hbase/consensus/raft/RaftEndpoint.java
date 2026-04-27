@@ -18,6 +18,7 @@
 package org.apache.hadoop.hbase.consensus.raft;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Represents an endpoint that participates to at least one Raft group and executes the Raft
@@ -27,6 +28,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
  * with a unique id, and that is why we only have a single method in this interface. It is users'
  * responsibility to assign unique ids to different Raft endpoints.
  */
+@InterfaceAudience.Private
 public interface RaftEndpoint {
   /** Returns the unique identifier of the Raft endpoint. */
   @NonNull

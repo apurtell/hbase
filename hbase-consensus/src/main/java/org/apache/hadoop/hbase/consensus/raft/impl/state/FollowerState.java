@@ -20,7 +20,10 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /** State maintained for each follower by the Raft group leader. */
+@InterfaceAudience.Private
 public final class FollowerState {
   /**
    * Index of highest log entry known to be replicated on server (initialized to 0, increases

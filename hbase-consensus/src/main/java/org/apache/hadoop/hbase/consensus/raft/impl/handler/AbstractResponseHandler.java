@@ -22,6 +22,7 @@ import static java.util.Objects.requireNonNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,8 +32,11 @@ import org.slf4j.LoggerFactory;
  * If {@link RaftMessage#getSender()} is not a known Raft group member, then the response is
  * ignored.
  */
+@InterfaceAudience.Private
 public abstract class AbstractResponseHandler<T extends RaftMessage>
   extends AbstractMessageHandler<T> {
+  private static final Logger LOG = LoggerFactory.getLogger(AbstractResponseHandler.class);
+
   AbstractResponseHandler(RaftNodeImpl raftNode, T response) {
     super(raftNode, response);
   }
@@ -41,8 +45,7 @@ public abstract class AbstractResponseHandler<T extends RaftMessage>
   protected final void handle(@NonNull T response) {
     requireNonNull(response);
     if (!node.state().isKnownMember(response.getSender())) {
-      Logger logger = LoggerFactory.getLogger(getClass());
-      logger.warn("{} Won't run, since {} is unknown to us.", localEndpointStr(),
+      LOG.warn("{} Won't run, since {} is unknown to us.", localEndpointStr(),
         response.getSender().getId());
       return;
     }

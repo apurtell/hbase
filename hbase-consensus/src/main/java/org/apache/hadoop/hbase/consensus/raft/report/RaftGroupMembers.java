@@ -21,6 +21,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Collection;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftRole;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Represents member list of a Raft group with an index identifying on which log index the given
@@ -28,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftRole;
  * <p>
  * The initial member list of a Raft group has log index of 0.
  */
+@InterfaceAudience.Private
 public interface RaftGroupMembers {
   /**
    * The maximum number of {@link RaftRole#LEARNER} members allowed in the Raft group member list.

@@ -19,8 +19,10 @@ package org.apache.hadoop.hbase.consensus.raft.report;
 
 import java.util.Map;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Contains statistics about a Raft node's Raft log. */
+@InterfaceAudience.Private
 public interface RaftLogStats {
   /**
    * Returns index of the highest log entry known to be committed.

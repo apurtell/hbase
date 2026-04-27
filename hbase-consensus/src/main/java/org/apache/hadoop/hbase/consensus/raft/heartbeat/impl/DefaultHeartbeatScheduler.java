@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Default {@link HeartbeatScheduler}: schedules a per-RaftNode {@link HeartbeatTask} on the node's
@@ -32,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask;
  * the underlying executor is shut down on terminate, so {@link #unregister(RaftNodeImpl)} is a
  * no-op.
  */
+@InterfaceAudience.Private
 public final class DefaultHeartbeatScheduler implements HeartbeatScheduler {
 
   public static final DefaultHeartbeatScheduler INSTANCE = new DefaultHeartbeatScheduler();

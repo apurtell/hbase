@@ -18,15 +18,26 @@
 package org.apache.hadoop.hbase.consensus.raft.test.util;
 
 import java.util.Optional;
+import org.apache.hadoop.hbase.HBaseJupiterExtension;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-@ExtendWith(TestBase.TimingTestWatcher.class)
+/**
+ * Base class for {@code hbase-consensus} JUnit 5 tests. Combines the project-local timing watcher
+ * with the shared {@link HBaseJupiterExtension}, which enforces the {@code @Tag(SmallTests.TAG)}
+ * style scale tag, applies the per-tag class timeout (mirrors {@code HBaseClassTestRule} on the
+ * JUnit 4 side), and installs the {@code TestSecurityManager} that intercepts {@code System.exit}.
+ * <p>
+ * Test classes that extend {@code TestBase} should annotate themselves with one of
+ * {@code @Tag(SmallTests.TAG)}, {@code @Tag(MediumTests.TAG)}, {@code @Tag(LargeTests.TAG)} or
+ * {@code @Tag(IntegrationTests.TAG)}; otherwise the extension fails the class.
+ */
+@ExtendWith({ HBaseJupiterExtension.class, TestBase.TimingTestWatcher.class })
 public class TestBase {
-  static final Logger LOGGER = LoggerFactory.getLogger("Test");
+  private static final Logger LOG = LoggerFactory.getLogger(TestBase.class);
   static final ExtensionContext.Namespace NS =
     ExtensionContext.Namespace.create(TimingTestWatcher.class);
 
@@ -35,31 +46,31 @@ public class TestBase {
     @Override
     public void beforeTestExecution(ExtensionContext context) {
       context.getStore(NS).put("start", System.nanoTime());
-      LOGGER.info("- STARTED: " + context.getDisplayName());
+      LOG.info("- STARTED: {}", context.getDisplayName());
     }
 
     @Override
     public void testSuccessful(ExtensionContext context) {
       long elapsed = elapsed(context);
-      LOGGER.info("+ SUCCEEDED: " + context.getDisplayName() + " IN " + format(elapsed));
+      LOG.info("+ SUCCEEDED: {} IN {}", context.getDisplayName(), format(elapsed));
     }
 
     @Override
     public void testFailed(ExtensionContext context, Throwable cause) {
       long elapsed = elapsed(context);
-      LOGGER.info("- FAILED: " + context.getDisplayName() + " IN " + format(elapsed));
+      LOG.info("- FAILED: {} IN {}", context.getDisplayName(), format(elapsed));
     }
 
     @Override
     public void testAborted(ExtensionContext context, Throwable cause) {
       long elapsed = elapsed(context);
-      LOGGER.info("- ABORTED: " + context.getDisplayName() + " IN " + format(elapsed));
+      LOG.info("- ABORTED: {} IN {}", context.getDisplayName(), format(elapsed));
     }
 
     @Override
     public void testDisabled(ExtensionContext context, Optional<String> reason) {
-      LOGGER.info(
-        "- DISABLED: " + context.getDisplayName() + reason.map(r -> " (" + r + ")").orElse(""));
+      LOG.info("- DISABLED: {}{}", context.getDisplayName(),
+        reason.map(r -> " (" + r + ")").orElse(""));
     }
 
     private long elapsed(ExtensionContext context) {
@@ -71,9 +82,15 @@ public class TestBase {
       long micros = nanos / 1000;
       long millis = micros / 1000;
       long secs = millis / 1000;
-      if (secs > 0) return secs + " secs";
-      if (millis > 0) return millis + " millis";
-      if (micros > 0) return micros + " micros";
+      if (secs > 0) {
+        return secs + " secs";
+      }
+      if (millis > 0) {
+        return millis + " millis";
+      }
+      if (micros > 0) {
+        return micros + " micros";
+      }
       return nanos + " nanos";
     }
   }

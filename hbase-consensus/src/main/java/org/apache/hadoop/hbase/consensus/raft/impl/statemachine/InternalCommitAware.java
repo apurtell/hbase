@@ -17,7 +17,10 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.impl.statemachine;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 // mainly used for testing
+@InterfaceAudience.Private
 public interface InternalCommitAware {
   default void onInternalCommit(long commitIndex) {
   }

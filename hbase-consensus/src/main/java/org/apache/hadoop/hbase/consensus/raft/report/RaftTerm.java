@@ -19,8 +19,10 @@ package org.apache.hadoop.hbase.consensus.raft.report;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Contains a snapshot of a Raft node's current state in a term. */
+@InterfaceAudience.Private
 public interface RaftTerm {
   /**
    * Returns the term this Raft node is currently at.

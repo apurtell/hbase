@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.function.LongFunction;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * {@link java.util.Map} implementation specialised for {@code long} keys using open addressing and
@@ -37,6 +38,7 @@ import java.util.function.LongFunction;
  * NOTE: This map doesn't support {@code null} keys and values.
  * @param <V> values stored in the {@link java.util.Map}
  */
+@InterfaceAudience.Private
 @SuppressWarnings("checkstyle:magicnumber")
 public final class Long2ObjectHashMap<V> implements Map<Long, V> {
   private static final int MAX_CAPACITY = 1 << 30;

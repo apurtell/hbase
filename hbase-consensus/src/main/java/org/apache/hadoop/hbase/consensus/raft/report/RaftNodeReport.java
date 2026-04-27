@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
 import org.apache.hadoop.hbase.consensus.raft.RaftRole;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Contains information about a Raft node's local state related to the execution of the Raft
@@ -44,6 +45,7 @@ import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
  * @see RaftTerm
  * @see RaftLogStats
  */
+@InterfaceAudience.Private
 public interface RaftNodeReport {
   RaftNodeReportReason getReason();
 

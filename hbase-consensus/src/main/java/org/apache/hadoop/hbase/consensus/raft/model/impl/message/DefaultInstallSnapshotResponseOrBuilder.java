@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse.InstallSnapshotResponseBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link InstallSnapshotResponse} and
@@ -33,6 +34,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRespo
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultInstallSnapshotResponseOrBuilder
   implements InstallSnapshotResponse, InstallSnapshotResponseBuilder {
   private Object groupId;

@@ -30,6 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.NettyFutureUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.jctools.queues.MpscUnboundedArrayQueue;
@@ -165,7 +166,7 @@ final class OutboundChannel {
     if (closed.get()) {
       return;
     }
-    if (System.currentTimeMillis() < nextConnectAtMillis) {
+    if (EnvironmentEdgeManager.currentTime() < nextConnectAtMillis) {
       return;
     }
     if (!connecting.compareAndSet(false, true)) {
@@ -183,13 +184,14 @@ final class OutboundChannel {
           NettyFutureUtils.addListener(ch.closeFuture(), closeFuture -> {
             channelRef.compareAndSet(ch, null);
             // Schedule next connect attempt at min backoff.
-            nextConnectAtMillis = System.currentTimeMillis() + config.getReconnectBackoffMinMs();
+            nextConnectAtMillis =
+              EnvironmentEdgeManager.currentTime() + config.getReconnectBackoffMinMs();
           });
           // Drain whatever was queued while we were down.
           scheduleDrainOn(ch);
         } else {
           long backoff = currentBackoffMs;
-          nextConnectAtMillis = System.currentTimeMillis() + backoff;
+          nextConnectAtMillis = EnvironmentEdgeManager.currentTime() + backoff;
           long doubled = Math.min(backoff * 2L, config.getReconnectBackoffMaxMs());
           currentBackoffMs = doubled;
           if (LOG.isDebugEnabled()) {

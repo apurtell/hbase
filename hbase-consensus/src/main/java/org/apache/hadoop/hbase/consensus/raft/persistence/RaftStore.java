@@ -31,6 +31,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * This interface is used for persisting only the internal state of the Raft consensus algorithm.
@@ -45,6 +46,7 @@ import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
  * @see RaftModelFactory
  * @see RaftNode
  */
+@InterfaceAudience.Private
 public interface RaftStore {
   /**
    * Persists and flushes the given local Raft endpoint and its voting flag.

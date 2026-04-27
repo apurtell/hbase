@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest.TriggerLeaderElectionRequestBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link TriggerLeaderElectionRequest} and
@@ -33,6 +34,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectio
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultTriggerLeaderElectionRequestOrBuilder
   implements TriggerLeaderElectionRequest, TriggerLeaderElectionRequestBuilder {
   private Object groupId;

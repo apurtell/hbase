@@ -30,10 +30,15 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.conf.ConfigKey;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Multi-group executor.
@@ -44,9 +49,25 @@ import org.slf4j.LoggerFactory;
 @InterfaceAudience.Private
 public final class MultiGroupExecutor {
 
-  public static final int DEFAULT_MAILBOX_CHUNK_SIZE = 256;
+  /**
+   * Worker count of the shared {@link ScheduledThreadPoolExecutor} backing every group's drain and
+   * scheduled tasks. Defaults to {@code max(2, 2 * availableProcessors)} when unset.
+   */
+  public static final String POOL_SIZE_KEY =
+    ConfigKey.INT("hbase.consensus.executor.pool.size", v -> v >= 1);
 
-  public static final int DEFAULT_DRAIN_BATCH_CAP = 64;
+  /**
+   * Maximum number of mailbox messages a single drain pass on a {@link GroupExecutor} consumes
+   * before yielding the worker thread back to the shared pool.
+   */
+  public static final String DRAIN_BATCH_CAP_KEY =
+    ConfigKey.INT("hbase.consensus.executor.drain.batch.cap", v -> v >= 1);
+  public static final int DRAIN_BATCH_CAP_DEFAULT = 64;
+
+  /** Initial chunk size of the per-group MPSC mailbox. */
+  public static final String MAILBOX_CHUNK_SIZE_KEY =
+    ConfigKey.INT("hbase.consensus.executor.mailbox.chunk", v -> v >= 2);
+  public static final int MAILBOX_CHUNK_SIZE_DEFAULT = 256;
 
   private static final Logger LOG = LoggerFactory.getLogger(MultiGroupExecutor.class);
   private static final AtomicInteger POOL_ID = new AtomicInteger();
@@ -59,34 +80,39 @@ public final class MultiGroupExecutor {
   private volatile boolean closed;
 
   public MultiGroupExecutor() {
-    // Pool size {@code 2 * availableProcessors}, default drain cap and mailbox chunk size
-    this(Math.max(2, 2 * Runtime.getRuntime().availableProcessors()), DEFAULT_DRAIN_BATCH_CAP,
-      DEFAULT_MAILBOX_CHUNK_SIZE);
+    this(defaultPoolSize(), DRAIN_BATCH_CAP_DEFAULT, MAILBOX_CHUNK_SIZE_DEFAULT);
+  }
+
+  public MultiGroupExecutor(@NonNull Configuration conf) {
+    this(requireNonNull(conf).getInt(POOL_SIZE_KEY, defaultPoolSize()),
+      conf.getInt(DRAIN_BATCH_CAP_KEY, DRAIN_BATCH_CAP_DEFAULT),
+      conf.getInt(MAILBOX_CHUNK_SIZE_KEY, MAILBOX_CHUNK_SIZE_DEFAULT));
   }
 
   public MultiGroupExecutor(int poolSize, int drainBatchCap, int mailboxChunkSize) {
     if (poolSize < 1) {
-      throw new IllegalArgumentException("poolSize must be >= 1");
+      throw new IllegalArgumentException(POOL_SIZE_KEY + " must be >= 1, got " + poolSize);
     }
     if (drainBatchCap < 1) {
-      throw new IllegalArgumentException("drainBatchCap must be >= 1");
+      throw new IllegalArgumentException(
+        DRAIN_BATCH_CAP_KEY + " must be >= 1, got " + drainBatchCap);
     }
     if (mailboxChunkSize < 2) {
-      throw new IllegalArgumentException("mailboxChunkSize must be >= 2");
+      throw new IllegalArgumentException(
+        MAILBOX_CHUNK_SIZE_KEY + " must be >= 2, got " + mailboxChunkSize);
     }
     this.drainBatchCap = drainBatchCap;
     this.mailboxChunkSize = mailboxChunkSize;
     final int id = POOL_ID.getAndIncrement();
-    final AtomicInteger threadId = new AtomicInteger();
-    ThreadFactory tf = runnable -> {
-      Thread t =
-        new Thread(runnable, "hbase-consensus-mge-" + id + "-" + threadId.getAndIncrement());
-      t.setDaemon(true);
-      return t;
-    };
+    ThreadFactory tf = new ThreadFactoryBuilder().setNameFormat("hbase-consensus-mge-" + id + "-%d")
+      .setDaemon(true).setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build();
     this.pool = new ScheduledThreadPoolExecutor(poolSize, tf);
     this.pool.setRemoveOnCancelPolicy(true);
     this.pool.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+  }
+
+  private static int defaultPoolSize() {
+    return Math.max(2, 2 * Runtime.getRuntime().availableProcessors());
   }
 
   int drainBatchCap() {
@@ -137,10 +163,9 @@ public final class MultiGroupExecutor {
   @NonNull
   public RaftNodeExecutor executorFor(@NonNull Object groupId) {
     final Object gid = requireNonNull(groupId);
-    // Fast path: registered groups are looked up without acquiring the
-    // lifecycle lock. The lock is only needed to serialize creation against
-    // close() so we never insert into the registry after close has snapshotted
-    // it for termination.
+    // Fast path. Registered groups are looked up without acquiring the lifecycle lock. The lock is
+    // only needed to serialize creation against close() so we never insert into the registry after
+    // close has snapshotted it for termination.
     GroupExecutor existing = registry.get(gid);
     if (existing != null) {
       if (closed) {

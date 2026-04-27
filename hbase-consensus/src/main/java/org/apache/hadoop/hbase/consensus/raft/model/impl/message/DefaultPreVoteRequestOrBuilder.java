@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest.PreVoteRequestBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link PreVoteRequest} and {@link PreVoteRequestBuilder} interfaces. When
@@ -32,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest.PreVo
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultPreVoteRequestOrBuilder implements PreVoteRequest, PreVoteRequestBuilder {
   private Object groupId;
   private RaftEndpoint sender;

@@ -39,6 +39,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesFailure
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,8 +53,9 @@ import org.slf4j.LoggerFactory;
  * @see AppendEntriesSuccessResponse
  * @see AppendEntriesFailureResponse
  */
+@InterfaceAudience.Private
 public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEntriesRequest> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(AppendEntriesRequestHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(AppendEntriesRequestHandler.class);
 
   public AppendEntriesRequestHandler(RaftNodeImpl raftNode, AppendEntriesRequest request) {
     super(raftNode, request);
@@ -66,7 +68,7 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
   // method
   protected void handle(@NonNull AppendEntriesRequest request) {
     requireNonNull(request);
-    LOGGER.trace(
+    LOG.trace(
       "TRACE> {} AERequestHandler enter sender={} term={} prevLogIndex={} prevLogTerm={}"
         + " leaderCommit={} entries={} qsn={} curTerm={} role={}",
       localEndpointStr(), request.getSender().getId(), request.getTerm(),
@@ -75,8 +77,8 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
     RaftEndpoint leader = request.getSender();
     // Reply false if term < currentTerm (§5.1)
     if (request.getTerm() < state.term()) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.warn(
+      if (LOG.isDebugEnabled()) {
+        LOG.warn(
           localEndpointStr() + " Stale " + request + " received in current term: " + state.term());
       }
       node.send(leader, createAppendEntriesFailureResponse(state.term(), 0, 0));
@@ -88,12 +90,12 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
     if (request.getTerm() > state.term() || (state.role() != FOLLOWER && state.role() != LEARNER)) {
       // If the request term is greater than the local term, update the local term and
       // convert to follower (§5.1)
-      LOGGER.info("{} Moving to new term: {} and leader: {} from current term: {}.",
+      LOG.info("{} Moving to new term: {} and leader: {} from current term: {}.",
         localEndpointStr(), request.getTerm(), leader.getId(), state.term());
       node.toFollower(request.getTerm());
     }
     if (!leader.equals(state.leader())) {
-      LOGGER.info("{} Setting leader: {}", localEndpointStr(), leader.getId());
+      LOG.info("{} Setting leader: {}", localEndpointStr(), leader.getId());
       node.leader(leader);
     }
     node.leaderHeartbeatReceived();
@@ -116,7 +118,7 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
       // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of
       // last new entry)
       long newCommitIndex = min(request.getCommitIndex(), lastLogIndex);
-      LOGGER.debug("{} Setting commit index: {}.", localEndpointStr(), newCommitIndex);
+      LOG.debug("{} Setting commit index: {}.", localEndpointStr(), newCommitIndex);
       state.commitIndex(newCommitIndex);
     }
     try {
@@ -124,7 +126,7 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
         .setGroupId(node.getGroupId()).setSender(localEndpoint()).setTerm(state.term())
         .setLastLogIndex(lastLogIndex).setQuerySequenceNumber(request.getQuerySequenceNumber())
         .setFlowControlSequenceNumber(request.getFlowControlSequenceNumber()).build();
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} AERequestHandler SEND-success leader={} lastLogIndex={} qsn={} commitIndex={}",
         localEndpointStr(), leader.getId(), lastLogIndex, request.getQuerySequenceNumber(),
         state.commitIndex());
@@ -157,8 +159,8 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
         // matches prevLogTerm (§5.3)
         LogEntry prevEntry = log.getLogEntry(request.getPreviousLogIndex());
         if (prevEntry == null) {
-          if (LOGGER.isDebugEnabled()) {
-            LOGGER.warn(localEndpointStr() + " Failed to get previous log index for " + request
+          if (LOG.isDebugEnabled()) {
+            LOG.warn(localEndpointStr() + " Failed to get previous log index for " + request
               + ", last" + " log index: " + lastLogIndex);
           }
           return false;
@@ -166,8 +168,8 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
         prevLogTerm = prevEntry.getTerm();
       }
       if (request.getPreviousLogTerm() != prevLogTerm) {
-        if (LOGGER.isDebugEnabled()) {
-          LOGGER.warn(localEndpointStr() + " Previous log term of " + request
+        if (LOG.isDebugEnabled()) {
+          LOG.warn(localEndpointStr() + " Previous log term of " + request
             + " is different than ours: " + prevLogTerm);
         }
         return false;
@@ -198,12 +200,11 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
         // delete the existing entry and all that follow it (§5.3)
         if (requestEntry.getTerm() != localEntry.getTerm()) {
           List<LogEntry> truncatedEntries = log.truncateEntriesFrom(requestEntry.getIndex());
-          if (LOGGER.isDebugEnabled()) {
-            LOGGER
-              .warn(localEndpointStr() + " Truncated " + truncatedEntries.size() + " entries from "
-                + "entry index: " + requestEntry.getIndex() + " => " + truncatedEntries);
+          if (LOG.isDebugEnabled()) {
+            LOG.warn(localEndpointStr() + " Truncated " + truncatedEntries.size() + " entries from "
+              + "entry index: " + requestEntry.getIndex() + " => " + truncatedEntries);
           } else {
-            LOGGER.warn("{} Truncated {} entries from entry index: {}", localEndpointStr(),
+            LOG.warn("{} Truncated {} entries from entry index: {}", localEndpointStr(),
               truncatedEntries.size(), requestEntry.getIndex());
           }
           state.invalidateFuturesFrom(requestEntry.getIndex(), node.newNotLeaderException());
@@ -215,16 +216,16 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
       }
       if (newLogEntries.size() > 0) {
         if (log.availableCapacity() < newLogEntries.size()) {
-          if (LOGGER.isDebugEnabled()) {
-            LOGGER.warn(localEndpointStr() + " Truncating " + newLogEntries.size() + " entries to "
+          if (LOG.isDebugEnabled()) {
+            LOG.warn(localEndpointStr() + " Truncating " + newLogEntries.size() + " entries to "
               + log.availableCapacity() + " to fit into the available capacity of the Raft log");
           }
           truncatedRequestEntryCount = newLogEntries.size() - log.availableCapacity();
           newLogEntries = newLogEntries.subList(0, log.availableCapacity());
         }
         // Append any new entries not already in the log
-        if (LOGGER.isDebugEnabled()) {
-          LOGGER.debug(localEndpointStr() + " Appending " + newLogEntries.size() + " entries: "
+        if (LOG.isDebugEnabled()) {
+          LOG.debug(localEndpointStr() + " Appending " + newLogEntries.size() + " entries: "
             + newLogEntries);
         }
         log.appendEntries(newLogEntries);
@@ -232,11 +233,9 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
       }
     }
     // I cannot use log.lastLogOrSnapshotIndex() for lastLogIndex because my log may
-    // contain
-    // some pending entries from the previous leader and those entries will be
-    // truncated soon
-    // I can only send a response based on how many entries I have appended from
-    // this append request
+    // contain some pending entries from the previous leader and those entries will be
+    // truncated soon. I can only send a response based on how many entries I have
+    // appended from this append request.
     long lastLogIndex =
       request.getPreviousLogIndex() + request.getLogEntries().size() - truncatedRequestEntryCount;
     return new SimpleImmutableEntry<>(lastLogIndex, newLogEntries);

@@ -23,6 +23,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.FollowerState;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.LeaderState;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,10 +49,10 @@ import org.slf4j.LoggerFactory;
  * @see InstallSnapshotRequest
  * @see InstallSnapshotResponse
  */
+@InterfaceAudience.Private
 public class InstallSnapshotResponseHandler
   extends AbstractResponseHandler<InstallSnapshotResponse> {
-  private static final Logger LOGGER =
-    LoggerFactory.getLogger(InstallSnapshotResponseHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(InstallSnapshotResponseHandler.class);
 
   public InstallSnapshotResponseHandler(RaftNodeImpl raftNode, InstallSnapshotResponse response) {
     super(raftNode, response);
@@ -59,9 +60,9 @@ public class InstallSnapshotResponseHandler
 
   @Override
   protected void handleResponse(@NonNull InstallSnapshotResponse response) {
-    LOGGER.debug("{} received {}.", localEndpointStr(), response);
+    LOG.debug("{} received {}.", localEndpointStr(), response);
     if (response.getTerm() > state.term()) {
-      LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
+      LOG.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
         response.getTerm(), state.term(), response);
       node.toFollower(response.getTerm());
       return;

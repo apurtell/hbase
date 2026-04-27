@@ -47,7 +47,7 @@ public class TestGroupExecutorSchedule extends TestBase {
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
   public void testScheduledTaskFiresWithoutOverlap() throws Exception {
-    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
+    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 64);
     RaftNodeExecutor exec = mge.executorFor("g");
 
     final long delayMillis = 100;
@@ -93,14 +93,14 @@ public class TestGroupExecutorSchedule extends TestBase {
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
   public void testTerminateCancelsScheduled() throws Exception {
-    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
+    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 64);
     GroupExecutor exec = (GroupExecutor) mge.executorFor("g");
     final long delayMillis = 200;
     final CountDownLatch ran = new CountDownLatch(1);
     exec.schedule(ran::countDown, delayMillis, TimeUnit.MILLISECONDS);
     ((RaftNodeLifecycleAware) exec).onRaftNodeTerminate();
     // Latch await returns false if the task never counts down within the
-    // window. The window must be longer than the schedule delay; if the
+    // window. The window must be longer than the schedule delay. If the
     // cancellation regresses, the latch fires immediately and the assertion
     // surfaces the failure without waiting the full window.
     assertThat(ran.await(delayMillis * 5, TimeUnit.MILLISECONDS))

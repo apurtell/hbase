@@ -17,10 +17,13 @@
  */
 package org.apache.hadoop.hbase.consensus.raft;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /**
  * Statuses of a Raft node during its own and its Raft group's lifecycle.
  * @see RaftNode
  */
+@InterfaceAudience.Private
 public enum RaftNodeStatus {
   /**
    * Initial status of a Raft node. It stays in this status until it is started.

@@ -32,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry;
 import org.apache.hadoop.hbase.consensus.raft.persistence.NopRaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * {@code RaftLog} keeps and maintains Raft log entries and snapshot.
@@ -49,6 +50,7 @@ import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
  * @see LogEntry
  * @see SnapshotEntry
  */
+@InterfaceAudience.Private
 public final class RaftLog {
   public static final int FIRST_VALID_LOG_INDEX = 1;
   private static final float KEPT_LOG_ENTRY_RATIO_BEFORE_SNAPSHOT_INDEX = 0.1f;

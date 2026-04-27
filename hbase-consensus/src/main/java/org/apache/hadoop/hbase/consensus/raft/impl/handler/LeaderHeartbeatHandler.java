@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,8 +40,9 @@ import org.slf4j.LoggerFactory;
  * @see LeaderHeartbeat
  * @see LeaderHeartbeatAck
  */
+@InterfaceAudience.Private
 public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbeat> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(LeaderHeartbeatHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LeaderHeartbeatHandler.class);
 
   public LeaderHeartbeatHandler(RaftNodeImpl raftNode, LeaderHeartbeat request) {
     super(raftNode, request);
@@ -49,24 +51,24 @@ public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbe
   @Override
   protected void handle(@NonNull LeaderHeartbeat request) {
     requireNonNull(request);
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug("{} received {}.", localEndpointStr(), request);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("{} received {}.", localEndpointStr(), request);
     }
     RaftEndpoint leader = request.getSender();
     if (request.getTerm() < state.term()) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug("{} stale {} received in current term: {}", localEndpointStr(), request,
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("{} stale {} received in current term: {}", localEndpointStr(), request,
           state.term());
       }
       return;
     }
     if (request.getTerm() > state.term() || (state.role() != FOLLOWER && state.role() != LEARNER)) {
-      LOGGER.info("{} moving to new term: {} and leader: {} from current term: {} after heartbeat",
+      LOG.info("{} moving to new term: {} and leader: {} from current term: {} after heartbeat",
         localEndpointStr(), request.getTerm(), leader.getId(), state.term());
       node.toFollower(request.getTerm());
     }
     if (!leader.equals(state.leader())) {
-      LOGGER.info("{} setting leader: {}", localEndpointStr(), leader.getId());
+      LOG.info("{} setting leader: {}", localEndpointStr(), leader.getId());
       node.leader(leader);
     }
     node.leaderHeartbeatReceived();
@@ -80,8 +82,8 @@ public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbe
       // that is destined to be truncated.
       long newCommitIndex = min(request.getCommitIndex(), state.lastVerifiedLogIndex());
       if (newCommitIndex > state.commitIndex()) {
-        if (LOGGER.isDebugEnabled()) {
-          LOGGER.debug("{} setting commit index from heartbeat: {}", localEndpointStr(),
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("{} setting commit index from heartbeat: {}", localEndpointStr(),
             newCommitIndex);
         }
         state.commitIndex(newCommitIndex);

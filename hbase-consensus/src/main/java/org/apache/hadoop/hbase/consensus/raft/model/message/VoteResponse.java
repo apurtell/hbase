@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.message;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Response for {@link VoteRequest}.
@@ -27,6 +28,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * Algorithm</i> paper by <i>Diego Ongaro</i> and <i>John Ousterhout</i>.
  * @see VoteRequest
  */
+@InterfaceAudience.Private
 public interface VoteResponse extends RaftMessage {
   boolean isGranted();
 

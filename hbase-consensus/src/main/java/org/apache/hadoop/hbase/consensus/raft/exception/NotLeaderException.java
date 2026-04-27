@@ -18,11 +18,13 @@
 package org.apache.hadoop.hbase.consensus.raft.exception;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Thrown when an operation, query, or a membership change is triggered on a non-leader Raft node.
  * In this case, the operation can be retried on another Raft node of the Raft group.
  */
+@InterfaceAudience.Private
 public class NotLeaderException extends RaftException {
   private static final long serialVersionUID = 1817579502149525710L;
 

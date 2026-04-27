@@ -48,7 +48,7 @@ public class TestGroupExecutorLifecycle extends TestBase {
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
   public void testTerminateClearsMailbox() throws Exception {
-    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
+    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 64);
     GroupExecutor a = (GroupExecutor) mge.executorFor("group-a");
     final AtomicInteger ran = new AtomicInteger();
     final CountDownLatch firstStarted = new CountDownLatch(1);
@@ -95,7 +95,7 @@ public class TestGroupExecutorLifecycle extends TestBase {
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
   public void testTerminateKeepsPoolAlive() throws Exception {
-    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
+    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 64);
     GroupExecutor a = (GroupExecutor) mge.executorFor("group-a");
     GroupExecutor b = (GroupExecutor) mge.executorFor("group-b");
     final CountDownLatch bRan = new CountDownLatch(1);
@@ -112,7 +112,7 @@ public class TestGroupExecutorLifecycle extends TestBase {
   @Test
   @Timeout(value = 30, unit = TimeUnit.SECONDS)
   public void testCloseShutsDownPool() throws Exception {
-    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
+    mge = new MultiGroupExecutor(2, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 64);
     RaftNodeExecutor a = mge.executorFor("a");
     final CountDownLatch ran = new CountDownLatch(1);
     a.execute(ran::countDown);

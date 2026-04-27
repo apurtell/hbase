@@ -37,6 +37,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.RaftGroupOp;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.UpdateRaftGroupMembersOp;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -57,8 +58,9 @@ import org.slf4j.LoggerFactory;
  * Raft group via passing it to {@link ReplicateTask}.
  * @see MembershipChangeMode
  */
+@InterfaceAudience.Private
 public final class MembershipChangeTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(MembershipChangeTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(MembershipChangeTask.class);
   private final RaftNodeImpl raftNode;
   private final RaftState state;
   private final long groupMembersCommitIndex;
@@ -79,7 +81,7 @@ public final class MembershipChangeTask implements Runnable {
   @Override
   public void run() {
     try {
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} MembershipChangeTask.run mode={} endpoint={} groupMembersCommitIndex={}"
           + " role={} status={} effectiveVoting={} commitIndex={}",
         raftNode.localEndpointStr(), membershipChangeMode, endpoint.getId(),
@@ -152,7 +154,7 @@ public final class MembershipChangeTask implements Runnable {
             "Unknown membership change mode: " + membershipChangeMode));
           return;
       }
-      LOGGER.info("{} New group members after {} of {}: {}, voting members: {}",
+      LOG.info("{} New group members after {} of {}: {}, voting members: {}",
         raftNode.localEndpointStr(), membershipChangeMode, endpoint.getId(),
         members.stream().map(RaftEndpoint::getId).collect(toList()),
         votingMembers.stream().map(RaftEndpoint::getId).collect(toList()));
@@ -161,7 +163,7 @@ public final class MembershipChangeTask implements Runnable {
         .setMode(membershipChangeMode).build();
       new ReplicateTask(raftNode, operation, future).run();
     } catch (Throwable t) {
-      LOGGER.error(raftNode.localEndpointStr() + " " + this + " failed.", t);
+      LOG.error(raftNode.localEndpointStr() + " " + this + " failed.", t);
       future.fail(new RaftException("Internal failure", raftNode.getLeaderEndpoint(), t));
     }
   }
@@ -169,7 +171,7 @@ public final class MembershipChangeTask implements Runnable {
   private boolean verifyRaftNodeStatus() {
     RaftNodeStatus status = raftNode.getStatus();
     if (status == INITIAL) {
-      LOGGER.error(
+      LOG.error(
         "{} Cannot {} {} with expected members commit index: {} since Raft node is not started.",
         raftNode.localEndpointStr(), membershipChangeMode, endpoint.getId(),
         groupMembersCommitIndex);
@@ -177,7 +179,7 @@ public final class MembershipChangeTask implements Runnable {
         new IllegalStateException("Cannot change group membership because Raft node not started"));
       return false;
     } else if (isTerminal(status)) {
-      LOGGER.error("{} Cannot {} {} with expected members commit index: {} since Raft node is {}.",
+      LOG.error("{} Cannot {} {} with expected members commit index: {} since Raft node is {}.",
         raftNode.localEndpointStr(), membershipChangeMode, endpoint.getId(),
         groupMembersCommitIndex, status);
       future.fail(raftNode.newNotLeaderException());
@@ -189,7 +191,7 @@ public final class MembershipChangeTask implements Runnable {
   private boolean verifyGroupMembersCommitIndex() {
     RaftGroupMembersState groupMembers = state.committedGroupMembers();
     if (groupMembers.getLogIndex() != groupMembersCommitIndex) {
-      LOGGER.error(
+      LOG.error(
         "{} Cannot {} {} because expected members commit index: {} is different than group members commit"
           + " index: {}",
         raftNode.localEndpointStr(), membershipChangeMode, endpoint.getId(),

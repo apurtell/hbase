@@ -25,6 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModel;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Used for communicating Raft nodes with each other.
@@ -48,6 +49,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
  * @see RaftNodeExecutor
  * @see RaftNodeLifecycleAware
  */
+@InterfaceAudience.Private
 public interface Transport {
   /**
    * Sends the given {@link RaftMessage} object to the given endpoint. This method must not block

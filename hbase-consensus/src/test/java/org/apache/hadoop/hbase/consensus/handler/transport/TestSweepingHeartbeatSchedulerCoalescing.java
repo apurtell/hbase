@@ -116,11 +116,11 @@ public class TestSweepingHeartbeatSchedulerCoalescing extends TestBase {
     LocalRaftEndpoint senderEp = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint peerEp = LocalRaftEndpoint.newEndpoint();
     Configuration conf = HBaseConfiguration.create();
-    conf.setBoolean(TransportConfig.KEY_NATIVE_TRANSPORT, false);
+    conf.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
     // BATCH_MS only governs the periodic backstop flush tick (and connect cadence for the
     // warmup)
-    conf.setLong(TransportConfig.KEY_BATCH_MS, 250L);
-    conf.setInt(TransportConfig.KEY_IO_THREADS, 1);
+    conf.setLong(TransportConfig.BATCH_MS_KEY, 250L);
+    conf.setInt(TransportConfig.IO_THREADS_KEY, 1);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     addrs.put(peerEp, serverAddr);
     EndpointResolver resolver = ep -> {

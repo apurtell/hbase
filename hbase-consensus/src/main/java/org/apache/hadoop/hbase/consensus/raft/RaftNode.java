@@ -48,6 +48,7 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftTerm;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * A Raft node runs the Raft consensus algorithm as a member of a Raft group.
@@ -94,6 +95,7 @@ import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
  * @see RaftNodeReportListener
  * @see RaftNodeLifecycleAware
  */
+@InterfaceAudience.Private
 public interface RaftNode {
   /**
    * Returns a new builder to configure RaftNode that is going to be created.

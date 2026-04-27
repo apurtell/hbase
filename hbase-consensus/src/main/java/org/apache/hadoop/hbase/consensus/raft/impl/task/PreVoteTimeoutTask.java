@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.task;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.FOLLOWER;
 
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,8 +28,9 @@ import org.slf4j.LoggerFactory;
  * Scheduled by {@link PreVoteTask} to trigger pre-voting again if the local Raft node is still a
  * follower and a leader is not yet available after the leader election timeout.
  */
+@InterfaceAudience.Private
 public final class PreVoteTimeoutTask extends RaftNodeStatusAwareTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(PreVoteTimeoutTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(PreVoteTimeoutTask.class);
   private final int term;
 
   public PreVoteTimeoutTask(RaftNodeImpl raftNode, int term) {
@@ -41,8 +43,7 @@ public final class PreVoteTimeoutTask extends RaftNodeStatusAwareTask implements
     if (state.role() != FOLLOWER) {
       return;
     }
-    LOGGER.debug("{} Pre-vote for term: {} has timed out!", localEndpointStr(),
-      node.state().term());
+    LOG.debug("{} Pre-vote for term: {} has timed out!", localEndpointStr(), node.state().term());
     new PreVoteTask(node, term).run();
   }
 }

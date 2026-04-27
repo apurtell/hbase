@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 import org.apache.hadoop.hbase.util.JVM;
 import org.apache.hadoop.hbase.util.ReflectionUtils;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,6 +80,7 @@ import org.apache.hbase.thirdparty.io.netty.util.concurrent.ScheduledFuture;
  * </ul>
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.CONFIG })
+@InterfaceStability.Evolving
 public final class CoalescingTransport implements Transport, RaftNodeLifecycleAware {
 
   private static final Logger LOG = LoggerFactory.getLogger(CoalescingTransport.class);
@@ -314,7 +316,7 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
    * HeapByteBufAllocator} pattern used by {@code hbase-server.ipc.HeapByteBufAllocator}.
    */
   private static ByteBufAllocator resolveAllocator(String value) {
-    String trimmed = value == null ? TransportConfig.DEFAULT_ALLOCATOR : value.trim();
+    String trimmed = value == null ? TransportConfig.ALLOCATOR_DEFAULT : value.trim();
     if (TransportConfig.ALLOCATOR_POOLED.equalsIgnoreCase(trimmed)) {
       return PooledByteBufAllocator.DEFAULT;
     }
@@ -328,7 +330,7 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       return ReflectionUtils.newInstance(trimmed);
     } catch (RuntimeException e) {
       throw new IllegalArgumentException(
-        "Unknown " + TransportConfig.KEY_ALLOCATOR + " value: " + trimmed, e);
+        "Unknown " + TransportConfig.ALLOCATOR_KEY + " value: " + trimmed, e);
     }
   }
 

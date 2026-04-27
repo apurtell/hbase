@@ -18,6 +18,7 @@
 package org.apache.hadoop.hbase.consensus.raft.impl.util;
 
 import java.util.Arrays;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The ArrayRingbuffer is responsible for storing the actual contents of a ringbuffer.
@@ -27,6 +28,7 @@ import java.util.Arrays;
  * partition can only be accessed by a single thread at any given moment.
  * @param <E> the type of the data stored in the ringbuffer
  */
+@InterfaceAudience.Private
 public final class ArrayRingbuffer<E> {
   private E[] ringItems;
   private long tailSequence = -1;

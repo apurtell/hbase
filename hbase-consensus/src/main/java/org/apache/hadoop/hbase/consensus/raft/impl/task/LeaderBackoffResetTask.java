@@ -22,11 +22,13 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.FollowerState;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.LeaderState;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * If the append entries request backoff period is active for any follower, this task will send a
  * new append entries request on the backoff completion.
  */
+@InterfaceAudience.Private
 public class LeaderBackoffResetTask extends RaftNodeStatusAwareTask {
   public LeaderBackoffResetTask(RaftNodeImpl node) {
     super(node);

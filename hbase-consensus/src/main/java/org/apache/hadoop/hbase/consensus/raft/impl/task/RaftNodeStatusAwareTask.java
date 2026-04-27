@@ -25,6 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,6 +35,7 @@ import org.slf4j.LoggerFactory;
  * Subclass tasks are executed only if the local Raft node is already started, and not terminated or
  * left the Raft group.
  */
+@InterfaceAudience.Private
 public abstract class RaftNodeStatusAwareTask implements Runnable {
   protected final RaftNodeImpl node;
   protected final RaftState state;

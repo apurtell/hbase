@@ -74,10 +74,6 @@ public class TestCoalescingTransport extends TestBase {
     transports.clear();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Round-trip
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testRoundTrip() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
@@ -87,7 +83,9 @@ public class TestCoalescingTransport extends TestBase {
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
-      if (addr == null) throw new UnknownEndpointException(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
       return addr;
     };
 
@@ -114,10 +112,6 @@ public class TestCoalescingTransport extends TestBase {
     assertThat(got.getGroupId().toString()).isEqualTo(GROUP);
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Ordering
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testFifoOrdering() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
@@ -127,7 +121,9 @@ public class TestCoalescingTransport extends TestBase {
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
-      if (addr == null) throw new UnknownEndpointException(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
       return addr;
     };
 
@@ -163,10 +159,6 @@ public class TestCoalescingTransport extends TestBase {
     assertThat(idx).isEqualTo(total);
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Batch coalescing
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testBatchCoalescing() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
@@ -174,11 +166,13 @@ public class TestCoalescingTransport extends TestBase {
 
     // Big batch window so many enqueues land on the same flush tick.
     Configuration conf = baseConf();
-    conf.setLong(TransportConfig.KEY_BATCH_MS, 200L);
+    conf.setLong(TransportConfig.BATCH_MS_KEY, 200L);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
-      if (addr == null) throw new UnknownEndpointException(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
       return addr;
     };
 
@@ -210,10 +204,6 @@ public class TestCoalescingTransport extends TestBase {
     }
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Back-pressure (channel becomes unwritable, mailbox grows, system survives)
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testBackpressure() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
@@ -222,13 +212,15 @@ public class TestCoalescingTransport extends TestBase {
     // Tiny watermarks force the channel unwritable quickly under load; the drain bails until
     // the kernel buffer drains and the next flush tick re-arms.
     Configuration conf = baseConf();
-    conf.setInt(TransportConfig.KEY_WRITE_LOW_WM_BYTES, 256);
-    conf.setInt(TransportConfig.KEY_WRITE_HIGH_WM_BYTES, 1024);
-    conf.setLong(TransportConfig.KEY_BATCH_MS, 1L);
+    conf.setInt(TransportConfig.WRITE_LOW_WM_BYTES_KEY, 256);
+    conf.setInt(TransportConfig.WRITE_HIGH_WM_BYTES_KEY, 1024);
+    conf.setLong(TransportConfig.BATCH_MS_KEY, 1L);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
-      if (addr == null) throw new UnknownEndpointException(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
       return addr;
     };
 
@@ -258,25 +250,23 @@ public class TestCoalescingTransport extends TestBase {
     assertThat(seenAtB).hasSize(total);
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Reconnect after the peer disappears
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testReconnect() throws IOException {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
 
     Configuration conf = baseConf();
-    conf.setLong(TransportConfig.KEY_RECONNECT_BACKOFF_MIN_MS, 10L);
-    conf.setLong(TransportConfig.KEY_RECONNECT_BACKOFF_MAX_MS, 50L);
-    conf.setLong(TransportConfig.KEY_BATCH_MS, 5L);
+    conf.setLong(TransportConfig.RECONNECT_BACKOFF_MIN_MS_KEY, 10L);
+    conf.setLong(TransportConfig.RECONNECT_BACKOFF_MAX_MS_KEY, 50L);
+    conf.setLong(TransportConfig.BATCH_MS_KEY, 5L);
 
     int port = ephemeralPort();
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
-      if (addr == null) throw new UnknownEndpointException(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
       return addr;
     };
 
@@ -320,24 +310,22 @@ public class TestCoalescingTransport extends TestBase {
     assertThat(sawTerm3).as("VoteRequest term=3 must arrive after testReconnect").isTrue();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Compression (lz4 via aircompressor)
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testCompression() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
 
     Configuration conf = baseConf();
-    conf.set(TransportConfig.KEY_COMPRESSION, Compression.Algorithm.LZ4.getName());
+    conf.set(TransportConfig.COMPRESSION_KEY, Compression.Algorithm.LZ4.getName());
     conf.set("hbase.io.compress.lz4.codec",
       "org.apache.hadoop.hbase.io.compress.aircompressor.Lz4Codec");
     Compression.Algorithm.LZ4.reload(conf);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
-      if (addr == null) throw new UnknownEndpointException(ep);
+      if (addr == null) {
+        throw new UnknownEndpointException(ep);
+      }
       return addr;
     };
 
@@ -371,10 +359,6 @@ public class TestCoalescingTransport extends TestBase {
     assertThat((byte[]) receivedEntry.getOperation()).containsExactly(payload);
   }
 
-  // -------------------------------------------------------------------------------------------
-  // isReachable + send-to-self protection
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testRejectSelfDropUnknown() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
@@ -394,10 +378,6 @@ public class TestCoalescingTransport extends TestBase {
     a.send(epUnknown, ok);
     assertThat(a.isReachable(epUnknown)).isFalse();
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Helpers
-  // -------------------------------------------------------------------------------------------
 
   private CoalescingTransport newStarted(RaftEndpoint local, Configuration conf,
     EndpointResolver resolver) {
@@ -427,9 +407,9 @@ public class TestCoalescingTransport extends TestBase {
   private static Configuration baseConf() {
     Configuration c = HBaseConfiguration.create();
     // Keep tests Linux-portable: don't try to load Epoll JNI on macOS CI where it's missing.
-    c.setBoolean(TransportConfig.KEY_NATIVE_TRANSPORT, false);
-    c.setLong(TransportConfig.KEY_BATCH_MS, 5L);
-    c.setInt(TransportConfig.KEY_IO_THREADS, 2);
+    c.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
+    c.setLong(TransportConfig.BATCH_MS_KEY, 5L);
+    c.setInt(TransportConfig.IO_THREADS_KEY, 2);
     return c;
   }
 

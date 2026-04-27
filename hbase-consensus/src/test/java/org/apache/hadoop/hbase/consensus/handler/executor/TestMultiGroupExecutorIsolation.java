@@ -44,7 +44,7 @@ public class TestMultiGroupExecutorIsolation extends TestBase {
   @Test
   @Timeout(value = 60, unit = TimeUnit.SECONDS)
   public void testSlowGroupIsolated() throws Exception {
-    mge = new MultiGroupExecutor(4, MultiGroupExecutor.DEFAULT_DRAIN_BATCH_CAP, 64);
+    mge = new MultiGroupExecutor(4, MultiGroupExecutor.DRAIN_BATCH_CAP_DEFAULT, 64);
     RaftNodeExecutor a = mge.executorFor("group-a");
     RaftNodeExecutor b = mge.executorFor("group-b");
 

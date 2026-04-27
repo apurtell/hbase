@@ -22,8 +22,10 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport.RaftNodeReportReason;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Publishes a {@link RaftNodeReport} for the current state of the Raft node. */
+@InterfaceAudience.Private
 public class RaftStateSummaryPublishTask extends RaftNodeStatusAwareTask {
   public RaftStateSummaryPublishTask(RaftNodeImpl node) {
     super(node);

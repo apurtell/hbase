@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.message;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Raft message for the VoteRequest RPC.
@@ -28,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * <p>
  * Invoked by candidates to gather votes (§5.2).
  */
+@InterfaceAudience.Private
 public interface VoteRequest extends RaftMessage {
   int getLastLogTerm();
 

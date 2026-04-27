@@ -17,11 +17,14 @@
  */
 package org.apache.hadoop.hbase.consensus.raft;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /**
  * Policies to decide how a query operation will be executed on the state machine. Each policy
  * offers a different consistency guarantee.
  * @see RaftNode#query(Object, QueryPolicy, java.util.Optional, java.util.Optional)
  */
+@InterfaceAudience.Private
 public enum QueryPolicy {
   /**
    * Runs the query on the local state machine of any Raft node.

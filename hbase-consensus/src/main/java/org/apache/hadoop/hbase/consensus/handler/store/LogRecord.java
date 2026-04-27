@@ -26,6 +26,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.zip.CRC32C;
 import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -33,11 +34,10 @@ import org.apache.yetus.audience.InterfaceAudience;
 /**
  * Single record in the unified consensus log.
  * <p>
- * A {@code LogRecord} is both the in-memory value object and the on-disk frame layout (ZooKeeper's
- * {@code FileTxnLog} convention). Encoding runs on the producing thread via
- * {@link #encode(LogRecord)} and returns a direct {@link ByteBuffer} ready for gathered I/O, so the
- * writer thread loop is purely drain-and-write. Decoding streams a {@link FileChannel} via
- * {@link Reader}.
+ * A {@code LogRecord} is both the in-memory value object and the on-disk frame layout. Encoding
+ * runs on the producing thread via {@link #encode(LogRecord)} and returns a direct
+ * {@link ByteBuffer} ready for gathered I/O, so the writer thread loop is purely drain-and-write.
+ * Decoding streams a {@link FileChannel} via {@link Reader}.
  * <h2>Per-frame layout (big-endian throughout)</h2>
  *
  * <pre>
@@ -61,7 +61,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * </pre>
  */
 @InterfaceAudience.Private
-public final class LogRecord {
+public class LogRecord {
   /** {@code 'CSLG'} segment magic. */
   public static final int SEGMENT_MAGIC = 0x43534C47;
   /** Current frame/segment codec version. */
@@ -268,33 +268,95 @@ public final class LogRecord {
   }
 
   /** Outcome of a single {@link Reader#next()} call. */
-  public sealed interface ReadResult
-      permits ReadResult.Ok, ReadResult.Crc, ReadResult.Truncated, ReadResult.EndOfFile {
+  public static final class ReadResult {
 
-    /** Successfully decoded record; {@code endOffset} is the file offset after this frame. */
-    record Ok(@NonNull LogRecord record, long endOffset) implements ReadResult {
+    /** Discriminator for {@link ReadResult}. */
+    public enum Kind {
+      /**
+       * Successfully decoded record; {@link ReadResult#offset()} is the file offset just after the
+       * decoded frame.
+       */
+      OK,
+      /** CRC mismatch detected; {@link ReadResult#offset()} is the start of the bad frame. */
+      CRC,
+      /**
+       * Declared frame_len overruns the file (torn-write tail) or claims a size larger than
+       * {@link LogRecord#MAX_FRAME_BYTES}; {@link ReadResult#offset()} is the start of the bad
+       * frame.
+       */
+      TRUNCATED,
+      /** Clean stop: reader hit end-of-file at a frame boundary. */
+      END_OF_FILE
     }
 
-    /** CRC mismatch detected; {@code offset} is the start of the bad frame. */
-    record Crc(long offset) implements ReadResult {
+    private final Kind kind;
+    @Nullable
+    private final LogRecord record;
+    private final long offset;
+
+    private ReadResult(@NonNull Kind kind, @Nullable LogRecord record, long offset) {
+      this.kind = kind;
+      this.record = record;
+      this.offset = offset;
+    }
+
+    public static ReadResult ok(@NonNull LogRecord record, long endOffset) {
+      return new ReadResult(Kind.OK, Objects.requireNonNull(record, "record"), endOffset);
+    }
+
+    public static ReadResult crc(long offset) {
+      return new ReadResult(Kind.CRC, null, offset);
+    }
+
+    public static ReadResult truncated(long offset) {
+      return new ReadResult(Kind.TRUNCATED, null, offset);
+    }
+
+    public static ReadResult endOfFile(long offset) {
+      return new ReadResult(Kind.END_OF_FILE, null, offset);
+    }
+
+    @NonNull
+    public Kind kind() {
+      return kind;
     }
 
     /**
-     * Declared frame_len overruns the file (torn-write tail) or claims a size larger than
-     * {@link #MAX_FRAME_BYTES}; {@code offset} is the start of the bad frame.
+     * Returns the file offset associated with this result. Semantics depend on {@link #kind()}:
+     * <ul>
+     * <li>{@link Kind#OK}: file offset just after the decoded frame.</li>
+     * <li>{@link Kind#CRC} or {@link Kind#TRUNCATED}: start of the bad frame.</li>
+     * <li>{@link Kind#END_OF_FILE}: end-of-file at a frame boundary.</li>
+     * </ul>
      */
-    record Truncated(long offset) implements ReadResult {
+    public long offset() {
+      return offset;
     }
 
-    /** Clean stop: reader hit end-of-file at a frame boundary. */
-    record EndOfFile(long offset) implements ReadResult {
+    /**
+     * Returns the decoded record. Only valid when {@link #kind()} is {@link Kind#OK}.
+     * @throws IllegalStateException if called on any other kind
+     */
+    @NonNull
+    public LogRecord record() {
+      if (kind != Kind.OK) {
+        throw new IllegalStateException("record() valid only for Kind.OK, got " + kind);
+      }
+      return record;
+    }
+
+    @Override
+    public String toString() {
+      return kind == Kind.OK
+        ? "ReadResult{OK, endOffset=" + offset + ", seq=" + record.getSeq() + "}"
+        : "ReadResult{" + kind + ", offset=" + offset + "}";
     }
   }
 
   /**
    * Streams a single segment file. Validates the {@link #PROLOGUE_BYTES} prologue on construction
-   * one at a time via {@link #next()}; on the first non-{@link ReadResult.Ok} result the caller
-   * should stop reading and treat the offset as the truncation point.
+   * one at a time via {@link #next()}; on the first non-{@link ReadResult.Kind#OK} result the
+   * caller should stop reading and treat the offset as the truncation point.
    */
   public static final class Reader implements Closeable {
     private final FileChannel channel;
@@ -350,21 +412,21 @@ public final class LogRecord {
       long frameStart = position;
       long remaining = fileSize - position;
       if (remaining == 0) {
-        return new ReadResult.EndOfFile(frameStart);
+        return ReadResult.endOfFile(frameStart);
       }
       if (remaining < FRAME_LEN_BYTES) {
-        return new ReadResult.Truncated(frameStart);
+        return ReadResult.truncated(frameStart);
       }
       ByteBuffer hdr = ByteBuffer.allocate(FRAME_LEN_BYTES).order(ByteOrder.BIG_ENDIAN);
       readFully(channel, hdr, position);
       hdr.flip();
       int frameLen = hdr.getInt();
       if (frameLen < CRC_BYTES + 1 || frameLen > MAX_FRAME_BYTES) {
-        return new ReadResult.Truncated(frameStart);
+        return ReadResult.truncated(frameStart);
       }
       long total = (long) FRAME_LEN_BYTES + frameLen;
       if (remaining < total) {
-        return new ReadResult.Truncated(frameStart);
+        return ReadResult.truncated(frameStart);
       }
       ByteBuffer body = ByteBuffer.allocate(frameLen).order(ByteOrder.BIG_ENDIAN);
       readFully(channel, body, position + FRAME_LEN_BYTES);
@@ -374,7 +436,7 @@ public final class LogRecord {
       int recordStart = body.position();
       int actualCrc = crc32cOf(body, recordStart, recordLen);
       if (storedCrc != actualCrc) {
-        return new ReadResult.Crc(frameStart);
+        return ReadResult.crc(frameStart);
       }
       ByteBuffer rec = body.slice();
       try {
@@ -382,7 +444,7 @@ public final class LogRecord {
         long seq = StreamUtils.readRawVarint64(rec);
         int gidLen = StreamUtils.readRawVarint32(rec);
         if (gidLen < 0 || gidLen > rec.remaining()) {
-          return new ReadResult.Truncated(frameStart);
+          return ReadResult.truncated(frameStart);
         }
         byte[] gid = new byte[gidLen];
         rec.get(gid);
@@ -390,9 +452,9 @@ public final class LogRecord {
         rec.get(payload);
         position = frameStart + total;
         LogRecord lr = new LogRecord(kind, seq, gid, payload);
-        return new ReadResult.Ok(lr, position);
+        return ReadResult.ok(lr, position);
       } catch (RuntimeException | IOException e) {
-        return new ReadResult.Truncated(frameStart);
+        return ReadResult.truncated(frameStart);
       }
     }
 

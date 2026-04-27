@@ -25,6 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.MembershipChangeMode;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.UpdateRaftGroupMembersOp;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.UpdateRaftGroupMembersOp.UpdateRaftGroupMembersOpBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link UpdateRaftGroupMembersOp} and {@link UpdateRaftGroupMembersOp}
@@ -35,6 +36,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.groupop.UpdateRaftGroupMembe
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultUpdateRaftGroupMembersOpOrBuilder
   implements UpdateRaftGroupMembersOp, UpdateRaftGroupMembersOpBuilder {
   private Collection<RaftEndpoint> members;

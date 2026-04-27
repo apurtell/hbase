@@ -22,6 +22,7 @@ import java.util.Collection;
 import org.apache.hadoop.hbase.consensus.raft.MembershipChangeMode;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Updates member list of a Raft group.
@@ -29,6 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
  * This operation is replicated when a Raft group membership change is triggered via
  * {@link RaftNode#changeMembership(RaftEndpoint, MembershipChangeMode, long)}.
  */
+@InterfaceAudience.Private
 public interface UpdateRaftGroupMembersOp extends RaftGroupOp {
   @NonNull
   Collection<RaftEndpoint> getMembers();

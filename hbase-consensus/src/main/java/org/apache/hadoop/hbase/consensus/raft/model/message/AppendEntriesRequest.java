@@ -22,6 +22,7 @@ import java.util.List;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesRequestHandler;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Raft message for the AppendEntries RPC.
@@ -32,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
  * Invoked by leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
  * @see AppendEntriesRequestHandler
  */
+@InterfaceAudience.Private
 public interface AppendEntriesRequest extends RaftMessage {
   int getPreviousLogTerm();
 

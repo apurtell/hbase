@@ -18,10 +18,12 @@
 package org.apache.hadoop.hbase.consensus.raft.model.groupop;
 
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModel;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Base interface for the Raft messages to perform Raft group management tasks.
  * @see UpdateRaftGroupMembersOp
  */
+@InterfaceAudience.Private
 public interface RaftGroupOp extends RaftModel {
 }

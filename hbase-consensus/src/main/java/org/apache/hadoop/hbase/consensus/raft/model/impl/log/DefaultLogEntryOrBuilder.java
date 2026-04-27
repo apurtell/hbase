@@ -22,6 +22,7 @@ import static java.util.Objects.requireNonNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry.LogEntryBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link LogEntry} and {@link LogEntryBuilder} interfaces. When an instance
@@ -31,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry.LogEntryBuilder
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultLogEntryOrBuilder extends DefaultAbstractLogEntry
   implements LogEntry, LogEntryBuilder {
   private DefaultLogEntryOrBuilder builder = this;

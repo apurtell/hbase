@@ -19,8 +19,10 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** State maintained by the Raft group leader during leadership transfer. */
+@InterfaceAudience.Private
 public final class LeadershipTransferState {
   private int term;
   private RaftEndpoint endpoint;

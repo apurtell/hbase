@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse.PreVoteResponseBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,8 +46,9 @@ import org.slf4j.LoggerFactory;
  * @see PreVoteResponse
  * @see PreVoteTask
  */
+@InterfaceAudience.Private
 public class PreVoteRequestHandler extends AbstractMessageHandler<PreVoteRequest> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(PreVoteRequestHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(PreVoteRequestHandler.class);
 
   public PreVoteRequestHandler(RaftNodeImpl raftNode, PreVoteRequest request) {
     super(raftNode, request);
@@ -62,7 +64,7 @@ public class PreVoteRequestHandler extends AbstractMessageHandler<PreVoteRequest
       .setGroupId(node.getGroupId()).setSender(localEndpoint);
     // Reply false if term < currentTerm (§5.1)
     if (state.term() > nextTerm) {
-      LOGGER.info("{} Rejecting {} since current term: {} is bigger.", localEndpointStr(), request,
+      LOG.info("{} Rejecting {} since current term: {} is bigger.", localEndpointStr(), request,
         state.term());
       node.send(candidate, responseBuilder.setTerm(state.term()).setGranted(false).build());
       if (state.leaderState() != null) {
@@ -73,14 +75,13 @@ public class PreVoteRequestHandler extends AbstractMessageHandler<PreVoteRequest
     // Reply false if last AppendEntries call was received recently (leader
     // stickiness)
     if (state.leaderState() != null || !node.isLeaderHeartbeatTimeoutElapsed()) {
-      LOGGER.info("{} Rejecting {} since the leader is still alive...", localEndpointStr(),
-        request);
+      LOG.info("{} Rejecting {} since the leader is still alive...", localEndpointStr(), request);
       node.send(candidate, responseBuilder.setTerm(state.term()).setGranted(false).build());
       return;
     }
     BaseLogEntry lastLogEntry = state.log().lastLogOrSnapshotEntry();
     if (lastLogEntry.getTerm() > request.getLastLogTerm()) {
-      LOGGER.info("{} Rejecting {} since our last log term: {} is greater.", localEndpointStr(),
+      LOG.info("{} Rejecting {} since our last log term: {} is greater.", localEndpointStr(),
         request, lastLogEntry.getTerm());
       node.send(candidate, responseBuilder.setTerm(nextTerm).setGranted(false).build());
       return;
@@ -89,16 +90,16 @@ public class PreVoteRequestHandler extends AbstractMessageHandler<PreVoteRequest
       lastLogEntry.getTerm() == request.getLastLogTerm()
         && lastLogEntry.getIndex() > request.getLastLogIndex()
     ) {
-      LOGGER.info("{} Rejecting {} since our last log index: {} is greater.", localEndpointStr(),
+      LOG.info("{} Rejecting {} since our last log index: {} is greater.", localEndpointStr(),
         request, lastLogEntry.getIndex());
       node.send(candidate, responseBuilder.setTerm(nextTerm).setGranted(false).build());
       return;
     }
     if (state.role() == LEARNER) {
-      LOGGER.info("{} is {} but {} asked for pre-vote.", localEndpointStr(), LEARNER,
+      LOG.info("{} is {} but {} asked for pre-vote.", localEndpointStr(), LEARNER,
         candidate.getId());
     }
-    LOGGER.info("{} Granted pre-vote for {}", localEndpointStr(), request);
+    LOG.info("{} Granted pre-vote for {}", localEndpointStr(), request);
     node.send(candidate, responseBuilder.setTerm(nextTerm).setGranted(true).build());
   }
 }

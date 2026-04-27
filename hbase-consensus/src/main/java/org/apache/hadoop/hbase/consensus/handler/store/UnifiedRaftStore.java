@@ -54,9 +54,13 @@ import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPers
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Default {@link DurableLogStore} implementation.
@@ -92,14 +96,14 @@ import org.slf4j.LoggerFactory;
  * {@link LogRecord.Kind#TRUNCATE_FROM} is a marker for replay-time tail discard.
  * <p>
  * <b>Recovery.</b> {@link #load()} replays the on-disk log once, in segment-id order. The first
- * non-{@code Ok} read result anywhere ({@link LogRecord.ReadResult.Crc} or
- * {@link LogRecord.ReadResult.Truncated}) truncates the offending segment at the bad offset,
+ * non-{@code OK} read result anywhere ({@link LogRecord.ReadResult.Kind#CRC} or
+ * {@link LogRecord.ReadResult.Kind#TRUNCATED}) truncates the offending segment at the bad offset,
  * deletes every later segment, and stops replay. Whatever per-group state was reconstructed up to
  * that point is returned. Gaps are closed at the layer above by Raft's
  * {@code AppendEntries}/{@code InstallSnapshot} catch-up.
  */
 @InterfaceAudience.Private
-public final class UnifiedRaftStore implements DurableLogStore {
+public class UnifiedRaftStore implements DurableLogStore {
 
   private static final Logger LOG = LoggerFactory.getLogger(UnifiedRaftStore.class);
 
@@ -169,13 +173,10 @@ public final class UnifiedRaftStore implements DurableLogStore {
     this.config = config;
     this.serializer = serializer;
     this.mailbox = new org.jctools.queues.MpscUnboundedArrayQueue<>(config.getMailboxChunkSize());
-    this.writer = new Thread(this::writerLoop, "UnifiedRaftStore-writer");
-    this.writer.setDaemon(true);
-    this.fdatasyncTimer = Executors.newSingleThreadScheduledExecutor(r -> {
-      Thread t = new Thread(r, "UnifiedRaftStore-fdatasync");
-      t.setDaemon(true);
-      return t;
-    });
+    this.writer = new Thread(this::writerLoop);
+    this.fdatasyncTimer = Executors.newSingleThreadScheduledExecutor(
+      new ThreadFactoryBuilder().setNameFormat("UnifiedRaftStore-fdatasync").setDaemon(true)
+        .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());
   }
 
   public UnifiedRaftStore(@NonNull Configuration conf) {
@@ -198,7 +199,7 @@ public final class UnifiedRaftStore implements DurableLogStore {
       Files.createDirectories(dir);
     }
     if (!Files.isDirectory(dir)) {
-      throw new IOException(LogStoreConfig.KEY_LOG_DIR + " is not a directory: " + dir);
+      throw new IOException(LogStoreConfig.LOG_DIR_KEY + " is not a directory: " + dir);
     }
 
     NavigableMap<Long, Path> segmentsOnDisk = scanSegmentDir(dir);
@@ -271,7 +272,8 @@ public final class UnifiedRaftStore implements DurableLogStore {
 
     running = true;
     loaded = true;
-    writer.start();
+    Threads.setDaemonThreadRunning(writer, "UnifiedRaftStore-writer",
+      Threads.LOGGING_EXCEPTION_HANDLER);
     fdatasyncFuture = fdatasyncTimer.scheduleWithFixedDelay(this::fdatasyncTick,
       config.getFdatasyncIntervalMs(), config.getFdatasyncIntervalMs(), TimeUnit.MILLISECONDS);
 
@@ -467,9 +469,9 @@ public final class UnifiedRaftStore implements DurableLogStore {
   }
 
   private void drainBatch(List<PendingWrite> batch, long batchMs) {
-    long deadline = System.currentTimeMillis() + Math.max(1L, batchMs);
+    long deadline = EnvironmentEdgeManager.currentTime() + Math.max(1L, batchMs);
     long now;
-    while ((now = System.currentTimeMillis()) < deadline) {
+    while ((now = EnvironmentEdgeManager.currentTime()) < deadline) {
       PendingWrite next = mailbox.poll();
       if (next != null) {
         batch.add(next);
@@ -544,7 +546,7 @@ public final class UnifiedRaftStore implements DurableLogStore {
     segmentIndex.register(newSeg);
     currentSegment = newSeg;
     appendHousekeepingFrame(LogRecord.Kind.SEGMENT_HEADER,
-      LogRecord.encodeSegmentHeaderPayload(nextId, System.currentTimeMillis()));
+      LogRecord.encodeSegmentHeaderPayload(nextId, EnvironmentEdgeManager.currentTime()));
     currentSegment.force(true);
   }
 
@@ -607,19 +609,21 @@ public final class UnifiedRaftStore implements DurableLogStore {
       LogRecord.Reader reader = new LogRecord.Reader(ch)) {
       while (true) {
         LogRecord.ReadResult rr = reader.next();
-        if (rr instanceof LogRecord.ReadResult.Ok ok) {
-          highestSeq = Math.max(highestSeq, ok.record().getSeq());
-          applyRecord(ok.record(), perGroup, segMax);
-        } else if (rr instanceof LogRecord.ReadResult.EndOfFile) {
-          return new ReplayResult(true, reader.position(), highestSeq);
-        } else if (rr instanceof LogRecord.ReadResult.Crc crc) {
-          LOG.warn("CRC mismatch in segment {} at offset {}", path, crc.offset());
-          return new ReplayResult(false, crc.offset(), highestSeq);
-        } else if (rr instanceof LogRecord.ReadResult.Truncated trunc) {
-          LOG.info("Torn-write tail in segment {} at offset {}", path, trunc.offset());
-          return new ReplayResult(false, trunc.offset(), highestSeq);
-        } else {
-          throw new IOException("Unexpected ReadResult: " + rr);
+        switch (rr.kind()) {
+          case OK:
+            highestSeq = Math.max(highestSeq, rr.record().getSeq());
+            applyRecord(rr.record(), perGroup, segMax);
+            break;
+          case END_OF_FILE:
+            return new ReplayResult(true, reader.position(), highestSeq);
+          case CRC:
+            LOG.warn("CRC mismatch in segment {} at offset {}", path, rr.offset());
+            return new ReplayResult(false, rr.offset(), highestSeq);
+          case TRUNCATED:
+            LOG.info("Torn-write tail in segment {} at offset {}", path, rr.offset());
+            return new ReplayResult(false, rr.offset(), highestSeq);
+          default:
+            throw new IOException("Unexpected ReadResult: " + rr);
         }
       }
     }
@@ -690,7 +694,7 @@ public final class UnifiedRaftStore implements DurableLogStore {
       currentSegment = seg;
       long seedSeq = highestSeqSeen + 1L;
       LogRecord header = new LogRecord(LogRecord.Kind.SEGMENT_HEADER, seedSeq, EMPTY_GROUP_ID,
-        LogRecord.encodeSegmentHeaderPayload(bootId, System.currentTimeMillis()));
+        LogRecord.encodeSegmentHeaderPayload(bootId, EnvironmentEdgeManager.currentTime()));
       seg.appendFrame(LogRecord.encode(header));
       seg.force(true);
       nextSeq.set(seedSeq + 1L);

@@ -33,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.RaftGroupOp;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,8 +42,9 @@ import org.slf4j.LoggerFactory;
  * {@link StateMachine}.
  * @see QueryPolicy
  */
+@InterfaceAudience.Private
 public final class QueryTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(QueryTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(QueryTask.class);
   private final RaftNodeImpl raftNode;
   private final RaftState state;
   private final Object operation;
@@ -65,7 +67,7 @@ public final class QueryTask implements Runnable {
   @Override
   public void run() {
     try {
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} QueryTask.run policy={} operation={} role={} status={} commitIndex={}"
           + " minCommitIndex={}",
         raftNode.localEndpointStr(), queryPolicy, operation, state.role(), raftNode.getStatus(),
@@ -87,7 +89,7 @@ public final class QueryTask implements Runnable {
           future.fail(new IllegalArgumentException("Invalid query policy: " + queryPolicy));
       }
     } catch (Throwable t) {
-      LOGGER.error(raftNode.localEndpointStr() + queryPolicy + " query failed", t);
+      LOG.error(raftNode.localEndpointStr() + queryPolicy + " query failed", t);
       future.fail(new RaftException("Internal failure", raftNode.getLeaderEndpoint(), t));
     }
   }
@@ -110,8 +112,8 @@ public final class QueryTask implements Runnable {
   }
 
   private void queryWithEventualConsistency() {
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug(raftNode.localEndpointStr() + " Querying: " + operation + " with policy: "
+    if (LOG.isDebugEnabled()) {
+      LOG.debug(raftNode.localEndpointStr() + " Querying: " + operation + " with policy: "
         + queryPolicy + " in term: " + state.term());
     }
     raftNode.runOrScheduleQuery(new QueryContainer(operation, future), minCommitIndex, timeout);
@@ -119,12 +121,12 @@ public final class QueryTask implements Runnable {
 
   private void queryWithLinearizability() {
     if (state.role() != LEADER) {
-      LOGGER.trace("TRACE> {} queryWithLinearizability NOT LEADER role={}",
+      LOG.trace("TRACE> {} queryWithLinearizability NOT LEADER role={}",
         raftNode.localEndpointStr(), state.role());
       future.fail(raftNode.newNotLeaderException());
       return;
     } else if (!raftNode.canQueryLinearizable()) {
-      LOGGER.trace("TRACE> {} queryWithLinearizability cannot query linearizable",
+      LOG.trace("TRACE> {} queryWithLinearizability cannot query linearizable",
         raftNode.localEndpointStr());
       future.fail(raftNode.newCannotReplicateException());
       return;
@@ -136,7 +138,7 @@ public final class QueryTask implements Runnable {
     }
     if (state.logReplicationQuorumSize() > 1) {
       QueryState queryState = state.leaderState().queryState();
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} queryWithLinearizability addQuery commitIndex={} curQsn={} quorumSize={}",
         raftNode.localEndpointStr(), commitIndex, queryState.querySequenceNumber(),
         state.logReplicationQuorumSize());
@@ -159,12 +161,12 @@ public final class QueryTask implements Runnable {
   private boolean verifyRaftNodeStatus() {
     RaftNodeStatus status = raftNode.getStatus();
     if (status == INITIAL) {
-      LOGGER.debug("{} Won't {} query {}, since Raft node is not started.",
+      LOG.debug("{} Won't {} query {}, since Raft node is not started.",
         raftNode.localEndpointStr(), queryPolicy, operation);
       future.fail(new IllegalStateException("Cannot query because Raft node not started"));
       return false;
     } else if (isTerminal(status)) {
-      LOGGER.debug("{} Won't {} query {}, since Raft node is {}.", raftNode.localEndpointStr(),
+      LOG.debug("{} Won't {} query {}, since Raft node is {}.", raftNode.localEndpointStr(),
         queryPolicy, operation, status);
       future.fail(raftNode.newNotLeaderException());
       return false;

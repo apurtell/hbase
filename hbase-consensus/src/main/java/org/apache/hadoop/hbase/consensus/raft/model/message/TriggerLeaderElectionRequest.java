@@ -19,12 +19,14 @@ package org.apache.hadoop.hbase.consensus.raft.model.message;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Raft message for the leadership transfer logic.
  * <p>
  * See <i>4.2.3 Disruptive servers</i> section of of the Raft dissertation.
  */
+@InterfaceAudience.Private
 public interface TriggerLeaderElectionRequest extends RaftMessage {
   int getLastLogTerm();
 

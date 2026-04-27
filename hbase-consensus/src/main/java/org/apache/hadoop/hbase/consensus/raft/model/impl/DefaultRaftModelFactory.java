@@ -58,12 +58,14 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest.VoteRequ
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse.VoteResponseBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState.RaftEndpointPersistentStateBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState.RaftTermPersistentStateBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default implementation of {@link RaftModelFactory}.
  * <p>
  * Creates POJO-style implementations of the {@link RaftModel} objects.
  */
+@InterfaceAudience.Private
 public class DefaultRaftModelFactory implements RaftModelFactory {
   @NonNull
   @Override

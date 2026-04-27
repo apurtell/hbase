@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.exception;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * A Raft leader may demote to the follower role after it appends an entry to its local Raft log,
@@ -34,6 +35,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
  * <p>
  * Idempotent operations can be retried on indeterminate situations.
  */
+@InterfaceAudience.Private
 public class IndeterminateStateException extends RaftException {
   private static final long serialVersionUID = -736303015926722821L;
 

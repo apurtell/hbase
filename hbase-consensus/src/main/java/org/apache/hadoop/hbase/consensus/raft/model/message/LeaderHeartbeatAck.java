@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.message;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Acknowledgement of a {@link LeaderHeartbeat}.
@@ -37,6 +38,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * {@link AppendEntriesRequest} so commit index can resume advancing on the follower.
  * @see LeaderHeartbeat
  */
+@InterfaceAudience.Private
 public interface LeaderHeartbeatAck extends RaftMessage {
   /** The follower's {@code lastVerifiedLogIndex} at the time the ack was sent. */
   long getLastVerifiedLogIndex();

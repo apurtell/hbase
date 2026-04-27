@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.log;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.function.Consumer;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Represents a snapshot chunk.
@@ -31,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
  * chunk contains the committed Raft group member list along with its commit index at the time of
  * the snapshot creation.
  */
+@InterfaceAudience.Private
 public interface SnapshotChunk extends BaseLogEntry {
   int getSnapshotChunkIndex();
 

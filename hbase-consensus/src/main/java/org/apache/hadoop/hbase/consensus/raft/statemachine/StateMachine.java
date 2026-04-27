@@ -24,6 +24,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The abstraction used by {@link RaftNode} instances to execute operations on the user-supplied
@@ -50,6 +51,7 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
  * @see RaftNodeExecutor
  * @see RaftNodeLifecycleAware
  */
+@InterfaceAudience.Private
 public interface StateMachine {
   /**
    * Executes the given operation on the state machine and returns result of the operation.

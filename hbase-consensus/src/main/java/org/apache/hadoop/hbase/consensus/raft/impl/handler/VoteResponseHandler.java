@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,8 +45,9 @@ import org.slf4j.LoggerFactory;
  * @see VoteRequest
  * @see VoteResponse
  */
+@InterfaceAudience.Private
 public class VoteResponseHandler extends AbstractResponseHandler<VoteResponse> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(VoteResponseHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(VoteResponseHandler.class);
 
   public VoteResponseHandler(RaftNodeImpl raftNode, VoteResponse response) {
     super(raftNode, response);
@@ -56,28 +58,28 @@ public class VoteResponseHandler extends AbstractResponseHandler<VoteResponse> {
     if (response.getTerm() > state.term()) {
       // If the response term is greater than the local term, update the local term
       // and convert to follower (§5.1), even if we already became leader in a lower term.
-      LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
+      LOG.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
         response.getTerm(), state.term(), response);
       node.toFollower(response.getTerm());
       return;
     }
     if (response.getTerm() < state.term()) {
-      LOGGER.warn("{} Stale {} is received, current term: {}", localEndpointStr(), response,
+      LOG.warn("{} Stale {} is received, current term: {}", localEndpointStr(), response,
         state.term());
       return;
     }
     if (state.role() != CANDIDATE) {
-      LOGGER.debug("{} Ignored {}. We are not CANDIDATE anymore.", localEndpointStr(), response);
+      LOG.debug("{} Ignored {}. We are not CANDIDATE anymore.", localEndpointStr(), response);
       return;
     }
     CandidateState candidateState = state.candidateState();
     if (response.isGranted() && candidateState.grantVote(response.getSender())) {
-      LOGGER.info("{} Vote granted from {} for term: {}, number of votes: {}, majority: {}",
+      LOG.info("{} Vote granted from {} for term: {}, number of votes: {}, majority: {}",
         localEndpointStr(), response.getSender().getId(), state.term(), candidateState.voteCount(),
         candidateState.majority());
     }
     if (candidateState.isMajorityGranted()) {
-      LOGGER.info("{} We are the LEADER!", localEndpointStr());
+      LOG.info("{} We are the LEADER!", localEndpointStr());
       node.toLeader();
     }
   }

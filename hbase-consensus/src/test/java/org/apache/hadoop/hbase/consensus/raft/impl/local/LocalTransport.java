@@ -32,7 +32,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class LocalTransport implements Transport {
-  private static final Logger LOGGER = LoggerFactory.getLogger(LocalTransport.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LocalTransport.class);
   private final RaftEndpoint localEndpoint;
   private final ConcurrentMap<RaftEndpoint, RaftNode> nodes = new ConcurrentHashMap<>();
   private final Firewall firewall;
@@ -55,13 +55,13 @@ public class LocalTransport implements Transport {
     try {
       RaftMessage maybeAlteredMessage = firewall.tryAlterMessage(target, message);
       if (maybeAlteredMessage == null) {
-        LOGGER.error(message + " sent from " + localEndpoint.getId() + " to " + target.getId()
+        LOG.error(message + " sent from " + localEndpoint.getId() + " to " + target.getId()
           + " is altered to null!");
         return;
       }
       node.handle(maybeAlteredMessage);
     } catch (Exception e) {
-      LOGGER.error("Send " + message + " to " + target + " failed.", e);
+      LOG.error("Send " + message + " to " + target + " failed.", e);
     }
   }
 

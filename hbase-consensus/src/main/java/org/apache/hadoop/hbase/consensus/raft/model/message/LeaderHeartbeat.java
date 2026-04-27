@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.model.message;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Lightweight liveness-only heartbeat sent by a leader to its followers.
@@ -31,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
  * Used by the heartbeat scheduler subsystem: see
  * {@code org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler}.
  */
+@InterfaceAudience.Private
 public interface LeaderHeartbeat extends RaftMessage {
   /**
    * Returns the leader's known commit index. Followers must clamp any local commit advance to

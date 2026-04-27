@@ -21,8 +21,10 @@ import static java.util.Objects.requireNonNull;
 
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftTerm;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Contains a snapshot of a Raft node's current state in a term. */
+@InterfaceAudience.Private
 public final class RaftTermState implements RaftTerm {
   public static final RaftTermState INITIAL = new RaftTermState(0, null, null);
   /**

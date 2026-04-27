@@ -20,11 +20,13 @@ package org.apache.hadoop.hbase.consensus.raft.impl.task;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.log.RaftLog;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.LeaderState;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Flushes the Raft node's local Raft log to the persistent storage and tries to advance the commit
  * index if the Raft node is the leader.
  */
+@InterfaceAudience.Private
 public class FlushTask extends RaftNodeStatusAwareTask {
   public FlushTask(RaftNodeImpl node) {
     super(node);

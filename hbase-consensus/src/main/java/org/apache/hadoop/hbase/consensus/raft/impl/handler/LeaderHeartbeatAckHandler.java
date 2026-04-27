@@ -25,6 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.FollowerState;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.LeaderState;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,8 +34,9 @@ import org.slf4j.LoggerFactory;
  * @see LeaderHeartbeat
  * @see LeaderHeartbeatAck
  */
+@InterfaceAudience.Private
 public class LeaderHeartbeatAckHandler extends AbstractResponseHandler<LeaderHeartbeatAck> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(LeaderHeartbeatAckHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LeaderHeartbeatAckHandler.class);
 
   public LeaderHeartbeatAckHandler(RaftNodeImpl raftNode, LeaderHeartbeatAck response) {
     super(raftNode, response);
@@ -43,14 +45,14 @@ public class LeaderHeartbeatAckHandler extends AbstractResponseHandler<LeaderHea
   @Override
   protected void handleResponse(@NonNull LeaderHeartbeatAck response) {
     if (response.getTerm() > state.term()) {
-      LOGGER.info("{} moving to new term: {} from current term: {} after {}", localEndpointStr(),
+      LOG.info("{} moving to new term: {} from current term: {} after {}", localEndpointStr(),
         response.getTerm(), state.term(), response);
       node.toFollower(response.getTerm());
       return;
     }
     if (state.role() != LEADER) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug("{} ignored {}: not LEADER anymore.", localEndpointStr(), response);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("{} ignored {}: not LEADER anymore.", localEndpointStr(), response);
       }
       return;
     }
@@ -78,8 +80,8 @@ public class LeaderHeartbeatAckHandler extends AbstractResponseHandler<LeaderHea
     if (
       response.getLastVerifiedLogIndex() < leaderLastIndex && !followerState.isRequestBackoffSet()
     ) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
           "{} peer {} lags on verification (peerLastVerified={}, leaderLastIndex={});"
             + " triggering catch-up AppendEntries.",
           node.getLocalEndpoint().getId(), response.getSender().getId(),

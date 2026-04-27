@@ -24,6 +24,7 @@ import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Used by {@link RaftNode} to notify its components for its lifecycle-related changes, such as
@@ -43,6 +44,7 @@ import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
  * @see RaftModelFactory
  * @see RaftNodeReportListener
  */
+@InterfaceAudience.Private
 public interface RaftNodeLifecycleAware {
   /**
    * Called by {@link RaftNode} during startup.

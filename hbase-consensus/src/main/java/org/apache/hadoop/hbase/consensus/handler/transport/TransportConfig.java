@@ -20,27 +20,32 @@ package org.apache.hadoop.hbase.consensus.handler.transport;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
+import org.apache.hadoop.hbase.conf.ConfigKey;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 /**
  * Transport-side configuration parsed from a Hadoop {@link Configuration}.
  * <p>
  * All keys are namespaced under {@code hbase.consensus.*}.
  * <p>
- * Key-naming convention follows the rest of HBase ({@code XYZ_KEY} string + {@code DEFAULT_XYZ}
+ * Key-naming convention follows the rest of HBase ({@code XYZ_KEY} string + {@code XYZ_DEFAULT}
  * sibling, both {@code public static final}); see {@code NettyEventLoopGroupConfig} and
  * {@code NettyRpcServer} for the canonical examples.
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.CONFIG })
+@InterfaceStability.Evolving
 public final class TransportConfig {
   /** TCP port the server listens on. */
-  public static final String KEY_PORT = "hbase.consensus.port";
-  public static final int DEFAULT_PORT = 16080;
+  public static final String PORT_KEY =
+    ConfigKey.INT("hbase.consensus.port", v -> v > 0 && v < 65536);
+  public static final int PORT_DEFAULT = 16080;
 
   /** Outbound flush window in milliseconds: how often per-peer batches are flushed. */
-  public static final String KEY_BATCH_MS = "hbase.consensus.log.sync.batch.ms";
-  public static final long DEFAULT_BATCH_MS = 5L;
+  public static final String BATCH_MS_KEY =
+    ConfigKey.LONG("hbase.consensus.log.sync.batch.ms", v -> v >= 1L);
+  public static final long BATCH_MS_DEFAULT = 5L;
 
   /**
    * Outbound compression algorithm name accepted by
@@ -49,55 +54,59 @@ public final class TransportConfig {
    * {@code LogEntryPB.op_payload_compression} ordinal carried on each entry, so this value does not
    * need to match across peers.
    */
-  public static final String KEY_COMPRESSION = "hbase.consensus.transport.compression";
-  public static final String DEFAULT_COMPRESSION = "none";
+  public static final String COMPRESSION_KEY = "hbase.consensus.transport.compression";
+  public static final String COMPRESSION_DEFAULT = "none";
 
   /** Number of Netty IO threads in each event loop group. */
-  public static final String KEY_IO_THREADS = "hbase.consensus.transport.io.threads";
+  public static final String IO_THREADS_KEY =
+    ConfigKey.INT("hbase.consensus.transport.io.threads", v -> v >= 1);
 
   /** TCP connect timeout in milliseconds for the outbound bootstrap. */
-  public static final String KEY_CONNECT_TIMEOUT_MS =
-    "hbase.consensus.transport.connect.timeout.ms";
-  public static final int DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+  public static final String CONNECT_TIMEOUT_MS_KEY =
+    ConfigKey.INT("hbase.consensus.transport.connect.timeout.ms", v -> v >= 1);
+  public static final int CONNECT_TIMEOUT_MS_DEFAULT = 5_000;
 
   /** Lower bound of the exponential reconnect backoff in milliseconds. */
-  public static final String KEY_RECONNECT_BACKOFF_MIN_MS =
-    "hbase.consensus.transport.reconnect.backoff.min.ms";
-  public static final long DEFAULT_RECONNECT_BACKOFF_MIN_MS = 100L;
+  public static final String RECONNECT_BACKOFF_MIN_MS_KEY =
+    ConfigKey.LONG("hbase.consensus.transport.reconnect.backoff.min.ms", v -> v >= 1L);
+  public static final long RECONNECT_BACKOFF_MIN_MS_DEFAULT = 100L;
 
   /** Upper bound of the exponential reconnect backoff in milliseconds. */
-  public static final String KEY_RECONNECT_BACKOFF_MAX_MS =
-    "hbase.consensus.transport.reconnect.backoff.max.ms";
-  public static final long DEFAULT_RECONNECT_BACKOFF_MAX_MS = 2_000L;
+  public static final String RECONNECT_BACKOFF_MAX_MS_KEY =
+    ConfigKey.LONG("hbase.consensus.transport.reconnect.backoff.max.ms", v -> v >= 1L);
+  public static final long RECONNECT_BACKOFF_MAX_MS_DEFAULT = 2_000L;
 
   /**
    * Channel write buffer high watermark in bytes. When exceeded the channel becomes unwritable and
    * the per-peer drain bails until back-pressure clears.
    */
-  public static final String KEY_WRITE_HIGH_WM_BYTES =
-    "hbase.consensus.transport.write.high.watermark.bytes";
-  public static final int DEFAULT_WRITE_HIGH_WM_BYTES = 8 * 1024 * 1024;
+  public static final String WRITE_HIGH_WM_BYTES_KEY =
+    ConfigKey.INT("hbase.consensus.transport.write.high.watermark.bytes", v -> v >= 1);
+  public static final int WRITE_HIGH_WM_BYTES_DEFAULT = 8 * 1024 * 1024;
 
   /** Channel write buffer low watermark in bytes. */
-  public static final String KEY_WRITE_LOW_WM_BYTES =
-    "hbase.consensus.transport.write.low.watermark.bytes";
-  public static final int DEFAULT_WRITE_LOW_WM_BYTES = 2 * 1024 * 1024;
+  public static final String WRITE_LOW_WM_BYTES_KEY =
+    ConfigKey.INT("hbase.consensus.transport.write.low.watermark.bytes", v -> v >= 1);
+  public static final int WRITE_LOW_WM_BYTES_DEFAULT = 2 * 1024 * 1024;
 
   /** Maximum decoded frame length in bytes. */
-  public static final String KEY_MAX_FRAME_BYTES = "hbase.consensus.transport.max.frame.bytes";
-  public static final int DEFAULT_MAX_FRAME_BYTES = 256 * 1024 * 1024;
+  public static final String MAX_FRAME_BYTES_KEY =
+    ConfigKey.INT("hbase.consensus.transport.max.frame.bytes", v -> v >= 1);
+  public static final int MAX_FRAME_BYTES_DEFAULT = 256 * 1024 * 1024;
 
   /** Per-peer JCTools MPSC mailbox initial chunk size. */
-  public static final String KEY_MAILBOX_CHUNK_SIZE = "hbase.consensus.transport.mailbox.chunk";
-  public static final int DEFAULT_MAILBOX_CHUNK_SIZE = 256;
+  public static final String MAILBOX_CHUNK_SIZE_KEY =
+    ConfigKey.INT("hbase.consensus.transport.mailbox.chunk", v -> v >= 1);
+  public static final int MAILBOX_CHUNK_SIZE_DEFAULT = 256;
 
   /**
    * Whether the transport may use the Linux Epoll event loop on supported architectures (x86_64,
    * aarch64). Mirrors {@code hbase.netty.nativetransport} and falls back to NIO when {@code false}
    * or when running on a non-Linux platform.
    */
-  public static final String KEY_NATIVE_TRANSPORT = "hbase.consensus.netty.nativetransport";
-  public static final boolean DEFAULT_NATIVE_TRANSPORT = true;
+  public static final String NATIVE_TRANSPORT_KEY =
+    ConfigKey.BOOLEAN("hbase.consensus.netty.nativetransport");
+  public static final boolean NATIVE_TRANSPORT_DEFAULT = true;
 
   /**
    * {@link org.apache.hbase.thirdparty.io.netty.buffer.ByteBufAllocator} selector. Accepted values
@@ -105,11 +114,11 @@ public final class TransportConfig {
    * other value is treated as a fully-qualified class name and instantiated reflectively, matching
    * the semantics of {@code hbase.netty.rpcserver.allocator}.
    */
-  public static final String KEY_ALLOCATOR = "hbase.consensus.netty.allocator";
+  public static final String ALLOCATOR_KEY = "hbase.consensus.netty.allocator";
   public static final String ALLOCATOR_POOLED = "pooled";
   public static final String ALLOCATOR_UNPOOLED = "unpooled";
   public static final String ALLOCATOR_HEAP = "heap";
-  public static final String DEFAULT_ALLOCATOR = ALLOCATOR_POOLED;
+  public static final String ALLOCATOR_DEFAULT = ALLOCATOR_POOLED;
 
   private final int port;
   private final long batchMs;
@@ -126,31 +135,31 @@ public final class TransportConfig {
   private final String allocator;
 
   public TransportConfig(@NonNull Configuration conf) {
-    this.port = conf.getInt(KEY_PORT, DEFAULT_PORT);
-    this.batchMs = conf.getLong(KEY_BATCH_MS, DEFAULT_BATCH_MS);
-    String algoName = conf.get(KEY_COMPRESSION, DEFAULT_COMPRESSION);
+    this.port = conf.getInt(PORT_KEY, PORT_DEFAULT);
+    this.batchMs = conf.getLong(BATCH_MS_KEY, BATCH_MS_DEFAULT);
+    String algoName = conf.get(COMPRESSION_KEY, COMPRESSION_DEFAULT);
     this.compression = Compression.getCompressionAlgorithmByName(algoName);
     this.ioThreads =
-      conf.getInt(KEY_IO_THREADS, Math.max(1, Runtime.getRuntime().availableProcessors()));
-    this.connectTimeoutMs = conf.getInt(KEY_CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS);
+      conf.getInt(IO_THREADS_KEY, Math.max(1, Runtime.getRuntime().availableProcessors()));
+    this.connectTimeoutMs = conf.getInt(CONNECT_TIMEOUT_MS_KEY, CONNECT_TIMEOUT_MS_DEFAULT);
     this.reconnectBackoffMinMs =
-      conf.getLong(KEY_RECONNECT_BACKOFF_MIN_MS, DEFAULT_RECONNECT_BACKOFF_MIN_MS);
+      conf.getLong(RECONNECT_BACKOFF_MIN_MS_KEY, RECONNECT_BACKOFF_MIN_MS_DEFAULT);
     this.reconnectBackoffMaxMs =
-      conf.getLong(KEY_RECONNECT_BACKOFF_MAX_MS, DEFAULT_RECONNECT_BACKOFF_MAX_MS);
+      conf.getLong(RECONNECT_BACKOFF_MAX_MS_KEY, RECONNECT_BACKOFF_MAX_MS_DEFAULT);
     this.writeHighWatermarkBytes =
-      conf.getInt(KEY_WRITE_HIGH_WM_BYTES, DEFAULT_WRITE_HIGH_WM_BYTES);
-    this.writeLowWatermarkBytes = conf.getInt(KEY_WRITE_LOW_WM_BYTES, DEFAULT_WRITE_LOW_WM_BYTES);
-    this.maxFrameBytes = conf.getInt(KEY_MAX_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES);
-    this.mailboxChunkSize = conf.getInt(KEY_MAILBOX_CHUNK_SIZE, DEFAULT_MAILBOX_CHUNK_SIZE);
-    this.nativeTransport = conf.getBoolean(KEY_NATIVE_TRANSPORT, DEFAULT_NATIVE_TRANSPORT);
-    this.allocator = conf.get(KEY_ALLOCATOR, DEFAULT_ALLOCATOR);
+      conf.getInt(WRITE_HIGH_WM_BYTES_KEY, WRITE_HIGH_WM_BYTES_DEFAULT);
+    this.writeLowWatermarkBytes = conf.getInt(WRITE_LOW_WM_BYTES_KEY, WRITE_LOW_WM_BYTES_DEFAULT);
+    this.maxFrameBytes = conf.getInt(MAX_FRAME_BYTES_KEY, MAX_FRAME_BYTES_DEFAULT);
+    this.mailboxChunkSize = conf.getInt(MAILBOX_CHUNK_SIZE_KEY, MAILBOX_CHUNK_SIZE_DEFAULT);
+    this.nativeTransport = conf.getBoolean(NATIVE_TRANSPORT_KEY, NATIVE_TRANSPORT_DEFAULT);
+    this.allocator = conf.get(ALLOCATOR_KEY, ALLOCATOR_DEFAULT);
     if (writeLowWatermarkBytes > writeHighWatermarkBytes) {
-      throw new IllegalArgumentException(KEY_WRITE_LOW_WM_BYTES + " (" + writeLowWatermarkBytes
-        + ") must be <= " + KEY_WRITE_HIGH_WM_BYTES + " (" + writeHighWatermarkBytes + ")");
+      throw new IllegalArgumentException(WRITE_LOW_WM_BYTES_KEY + " (" + writeLowWatermarkBytes
+        + ") must be <= " + WRITE_HIGH_WM_BYTES_KEY + " (" + writeHighWatermarkBytes + ")");
     }
     if (reconnectBackoffMinMs > reconnectBackoffMaxMs) {
-      throw new IllegalArgumentException(KEY_RECONNECT_BACKOFF_MIN_MS + " (" + reconnectBackoffMinMs
-        + ") must be <= " + KEY_RECONNECT_BACKOFF_MAX_MS + " (" + reconnectBackoffMaxMs + ")");
+      throw new IllegalArgumentException(RECONNECT_BACKOFF_MIN_MS_KEY + " (" + reconnectBackoffMinMs
+        + ") must be <= " + RECONNECT_BACKOFF_MAX_MS_KEY + " (" + reconnectBackoffMaxMs + ")");
     }
   }
 
@@ -204,7 +213,7 @@ public final class TransportConfig {
     return nativeTransport;
   }
 
-  /** Returns the {@code ByteBufAllocator} selector (see {@link #KEY_ALLOCATOR}) */
+  /** Returns the {@code ByteBufAllocator} selector (see {@link #ALLOCATOR_KEY}) */
   @NonNull
   public String getAllocator() {
     return allocator;

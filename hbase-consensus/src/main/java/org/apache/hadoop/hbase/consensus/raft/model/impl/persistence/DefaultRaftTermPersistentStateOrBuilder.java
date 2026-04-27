@@ -24,6 +24,7 @@ import edu.umd.cs.findbugs.annotations.Nullable;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState.RaftTermPersistentStateBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link RaftTermPersistentState} and
@@ -34,6 +35,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersiste
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultRaftTermPersistentStateOrBuilder
   implements RaftTermPersistentState, RaftTermPersistentStateBuilder {
   private int term;

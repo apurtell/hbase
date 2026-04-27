@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.task;
 
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,8 +33,9 @@ import org.slf4j.LoggerFactory;
  * {@link RaftNodeImpl#getLeaderElectionTimeoutMs()} delay to trigger another round of pre-voting if
  * a leader is not available yet.
  */
+@InterfaceAudience.Private
 public final class PreVoteTask extends RaftNodeStatusAwareTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(PreVoteTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(PreVoteTask.class);
   private final int term;
 
   public PreVoteTask(RaftNodeImpl raftNode, int term) {
@@ -44,16 +46,16 @@ public final class PreVoteTask extends RaftNodeStatusAwareTask implements Runnab
   @Override
   protected void doRun() {
     if (state.leader() != null) {
-      LOGGER.debug("{} No new pre-vote phase, we already have a LEADER: {}", localEndpointStr(),
+      LOG.debug("{} No new pre-vote phase, we already have a LEADER: {}", localEndpointStr(),
         state.leader().getId());
       return;
     } else if (state.term() != term) {
-      LOGGER.debug("{} No new pre-vote phase for term: {} because of new term: {}",
-        localEndpointStr(), term, state.term());
+      LOG.debug("{} No new pre-vote phase for term: {} because of new term: {}", localEndpointStr(),
+        term, state.term());
       return;
     }
     if (state.remoteVotingMembers().isEmpty()) {
-      LOGGER.warn("{} Remote voting members is empty. No need for pre-voting.", localEndpointStr());
+      LOG.warn("{} Remote voting members is empty. No need for pre-voting.", localEndpointStr());
       return;
     }
     node.preCandidate();

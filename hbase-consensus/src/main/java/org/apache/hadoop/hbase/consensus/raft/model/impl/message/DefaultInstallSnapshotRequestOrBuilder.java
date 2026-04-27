@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest.InstallSnapshotRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link InstallSnapshotRequest} and {@link InstallSnapshotRequestBuilder}
@@ -38,6 +39,7 @@ import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultInstallSnapshotRequestOrBuilder
   implements InstallSnapshotRequest, InstallSnapshotRequestBuilder {
   private Object groupId;

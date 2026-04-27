@@ -17,11 +17,14 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.model;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /**
  * The base interface for the objects that hit network and persistent storage.
  * <p>
  * RaftModel objects must be immutable. The wire/persistence representation is protobuf via
  * {@code ConsensusProtos} and {@code DefaultLogStoreSerializer}.
  */
+@InterfaceAudience.Private
 public interface RaftModel {
 }

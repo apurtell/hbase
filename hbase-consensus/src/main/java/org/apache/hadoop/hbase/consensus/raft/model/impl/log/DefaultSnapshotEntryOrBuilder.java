@@ -25,6 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry.SnapshotEntryBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link SnapshotEntry} and {@link SnapshotEntryBuilder} interfaces. When
@@ -34,6 +35,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry.SnapshotEn
  * Please note that {@link #build()} does not verify if all fields are set or not. It is up to the
  * user to populate the DTO state via the builder.
  */
+@InterfaceAudience.Private
 public class DefaultSnapshotEntryOrBuilder extends DefaultAbstractLogEntry
   implements SnapshotEntry, SnapshotEntryBuilder {
   private RaftGroupMembersView groupMembersView;

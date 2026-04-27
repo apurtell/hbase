@@ -17,11 +17,14 @@
  */
 package org.apache.hadoop.hbase.consensus.raft;
 
+import org.apache.yetus.audience.InterfaceAudience;
+
 /**
  * The roles of Raft nodes as defined in the Raft consensus algorithm.
  * <p>
  * At any given time each Raft node is in one of roles defined here.
  */
+@InterfaceAudience.Private
 public enum RaftRole {
   /**
    * A leader handles client requests, commit operations and orchestrates a Raft group.

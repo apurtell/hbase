@@ -24,7 +24,9 @@ import java.util.Collection;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView.RaftGroupMembersViewBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
+@InterfaceAudience.Private
 public class DefaultRaftGroupMembersViewOrBuilder
   implements RaftGroupMembersView, RaftGroupMembersViewBuilder {
   private long logIndex;

@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.task;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.CANDIDATE;
 
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,8 +28,9 @@ import org.slf4j.LoggerFactory;
  * Scheduled by {@link LeaderElectionTask} to trigger leader election again if a leader is not
  * elected yet.
  */
+@InterfaceAudience.Private
 public final class LeaderElectionTimeoutTask extends RaftNodeStatusAwareTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(LeaderElectionTimeoutTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LeaderElectionTimeoutTask.class);
 
   public LeaderElectionTimeoutTask(RaftNodeImpl raftNode) {
     super(raftNode);
@@ -39,7 +41,7 @@ public final class LeaderElectionTimeoutTask extends RaftNodeStatusAwareTask imp
     if (state.role() != CANDIDATE) {
       return;
     }
-    LOGGER.warn("{} Leader election for term: {} has timed out!", localEndpointStr(),
+    LOG.warn("{} Leader election for term: {} has timed out!", localEndpointStr(),
       node.state().term());
     new LeaderElectionTask(node, true).run();
   }

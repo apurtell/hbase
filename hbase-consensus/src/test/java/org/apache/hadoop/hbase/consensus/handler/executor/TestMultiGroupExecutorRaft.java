@@ -115,7 +115,9 @@ public class TestMultiGroupExecutorRaft extends TestBase {
     xLeader.replicate(applyValue("x3")).join();
     eventually(() -> {
       for (RaftNodeImpl n : x.nodes) {
-        if (n.equals(victim)) continue;
+        if (n.equals(victim)) {
+          continue;
+        }
         assertThat(x.stateMachines.get(n.getLocalEndpoint()).valueList()).contains("x3");
       }
     });
@@ -145,7 +147,9 @@ public class TestMultiGroupExecutorRaft extends TestBase {
     }
     for (RaftNodeImpl a : g.nodes) {
       for (RaftNodeImpl b : g.nodes) {
-        if (a == b) continue;
+        if (a == b) {
+          continue;
+        }
         g.transports.get(a.getLocalEndpoint()).discoverNode(b);
       }
     }
@@ -171,7 +175,9 @@ public class TestMultiGroupExecutorRaft extends TestBase {
 
   private void isolate(RaftNodeImpl victim, Group g) {
     for (RaftNodeImpl other : g.nodes) {
-      if (other == victim) continue;
+      if (other == victim) {
+        continue;
+      }
       g.transports.get(other.getLocalEndpoint()).undiscoverNode(victim);
       g.transports.get(victim.getLocalEndpoint()).undiscoverNode(other);
     }

@@ -33,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.impl.util.OrderedFuture;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.UpdateRaftGroupMembersOp;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,8 +50,9 @@ import org.slf4j.LoggerFactory;
  * {@link RaftNodeImpl#canReplicateNewOperation(Object)}), the future is notified with
  * {@link CannotReplicateException}.
  */
+@InterfaceAudience.Private
 public final class ReplicateTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ReplicateTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(ReplicateTask.class);
   private final RaftNodeImpl raftNode;
   private final RaftState state;
   private final Object operation;
@@ -66,7 +68,7 @@ public final class ReplicateTask implements Runnable {
   @Override
   public void run() {
     try {
-      LOGGER.trace("TRACE> {} ReplicateTask.run operation={} role={} status={} term={}",
+      LOG.trace("TRACE> {} ReplicateTask.run operation={} role={} status={} term={}",
         raftNode.localEndpointStr(), operation, state.role(), raftNode.getStatus(), state.term());
       if (!verifyRaftNodeStatus()) {
         return;
@@ -87,7 +89,7 @@ public final class ReplicateTask implements Runnable {
       LogEntry entry = raftNode.getModelFactory().createLogEntryBuilder().setTerm(state.term())
         .setIndex(newEntryLogIndex).setOperation(operation).build();
       log.appendEntry(entry);
-      LOGGER.trace("TRACE> {} ReplicateTask appended index={} term={} op={}",
+      LOG.trace("TRACE> {} ReplicateTask appended index={} term={} op={}",
         raftNode.localEndpointStr(), newEntryLogIndex, state.term(), operation);
       prepareGroupOp(newEntryLogIndex, operation);
       raftNode.broadcastAppendEntriesRequest();
@@ -101,7 +103,7 @@ public final class ReplicateTask implements Runnable {
         raftNode.tryAdvanceCommitIndex();
       }
     } catch (Throwable t) {
-      LOGGER.error(raftNode.localEndpointStr() + " " + operation
+      LOG.error(raftNode.localEndpointStr() + " " + operation
         + " could not be replicated to leader: " + raftNode.getLocalEndpoint(), t);
       future.fail(new RaftException("Internal failure", raftNode.getLeaderEndpoint(), t));
     }
@@ -110,13 +112,13 @@ public final class ReplicateTask implements Runnable {
   private boolean verifyRaftNodeStatus() {
     RaftNodeStatus status = raftNode.getStatus();
     if (status == INITIAL) {
-      LOGGER.debug("{} Won't run {}, since Raft node is not started.", raftNode.localEndpointStr(),
+      LOG.debug("{} Won't run {}, since Raft node is not started.", raftNode.localEndpointStr(),
         operation);
       future.fail(raftNode.newCannotReplicateException());
       return false;
     } else if (isTerminal(status)) {
-      LOGGER.debug("{} Won't run {}, since Raft node is {}.", raftNode.localEndpointStr(),
-        operation, status);
+      LOG.debug("{} Won't run {}, since Raft node is {}.", raftNode.localEndpointStr(), operation,
+        status);
       future.fail(raftNode.newNotLeaderException());
       return false;
     }
@@ -126,7 +128,7 @@ public final class ReplicateTask implements Runnable {
   private void prepareGroupOp(long logIndex, Object operation) {
     if (operation instanceof UpdateRaftGroupMembersOp) {
       UpdateRaftGroupMembersOp groupOp = (UpdateRaftGroupMembersOp) operation;
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} ReplicateTask.prepareGroupOp logIndex={} mode={} endpoint={} newMembers={}"
           + " newVoting={}",
         raftNode.localEndpointStr(), logIndex, groupOp.getMode(), groupOp.getEndpoint().getId(),

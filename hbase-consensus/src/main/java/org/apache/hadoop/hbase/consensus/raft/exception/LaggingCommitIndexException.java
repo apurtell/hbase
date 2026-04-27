@@ -21,6 +21,7 @@ import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Thrown when a Raft node's current commit index is smaller than the commit index specified in a
@@ -29,6 +30,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
  * observed state. Please see the <i>Section: 6.4 Processing read-only queries more efficiently</i>
  * of the Raft dissertation for more details.
  */
+@InterfaceAudience.Private
 public class LaggingCommitIndexException extends RaftException {
   private static final long serialVersionUID = -2244714904905721002L;
 

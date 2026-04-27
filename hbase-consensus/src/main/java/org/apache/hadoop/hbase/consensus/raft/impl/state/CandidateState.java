@@ -19,8 +19,10 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 
 import java.util.HashSet;
 import java.util.Set;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** State maintained by each candidate during the pre-voting and voting phases. */
+@InterfaceAudience.Private
 public final class CandidateState {
   private final int majority;
   private final Set<Object> voters = new HashSet<>();

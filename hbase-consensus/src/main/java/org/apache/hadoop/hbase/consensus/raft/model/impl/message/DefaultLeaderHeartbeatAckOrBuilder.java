@@ -23,6 +23,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck.LeaderHeartbeatAckBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * The default impl of the {@link LeaderHeartbeatAck} and {@link LeaderHeartbeatAckBuilder}
@@ -30,6 +31,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck.L
  * populated. Once all fields are set, the object switches to the DTO mode where it no longer allows
  * mutations.
  */
+@InterfaceAudience.Private
 public class DefaultLeaderHeartbeatAckOrBuilder
   implements LeaderHeartbeatAck, LeaderHeartbeatAckBuilder {
   private Object groupId;

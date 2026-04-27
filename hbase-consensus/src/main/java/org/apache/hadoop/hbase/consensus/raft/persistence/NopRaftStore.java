@@ -25,8 +25,10 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftEndpointPersistentState;
 import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersistentState;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /** Used when a Raft node works transiently (its state is not persisted). */
+@InterfaceAudience.Private
 public class NopRaftStore implements RaftStore {
   @Override
   public void persistAndFlushLocalEndpoint(

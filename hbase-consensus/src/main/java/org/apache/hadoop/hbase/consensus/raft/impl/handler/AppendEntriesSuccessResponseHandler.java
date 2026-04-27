@@ -29,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesFailureResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,9 +46,10 @@ import org.slf4j.LoggerFactory;
  * @see AppendEntriesSuccessResponse
  * @see AppendEntriesFailureResponse
  */
+@InterfaceAudience.Private
 public class AppendEntriesSuccessResponseHandler
   extends AbstractResponseHandler<AppendEntriesSuccessResponse> {
-  private static final Logger LOGGER =
+  private static final Logger LOG =
     LoggerFactory.getLogger(AppendEntriesSuccessResponseHandler.class);
 
   public AppendEntriesSuccessResponseHandler(RaftNodeImpl raftNode,
@@ -57,34 +59,34 @@ public class AppendEntriesSuccessResponseHandler
 
   @Override
   protected void handleResponse(@NonNull AppendEntriesSuccessResponse response) {
-    LOGGER.trace(
+    LOG.trace(
       "TRACE> {} AESuccessHandler enter sender={} qsn={} lastLogIndex={} term={} role={}"
         + " status={}",
       localEndpointStr(), response.getSender().getId(), response.getQuerySequenceNumber(),
       response.getLastLogIndex(), state.term(), state.role(), node.getStatus());
     if (response.getTerm() > state.term()) {
-      LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
+      LOG.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
         response.getTerm(), state.term(), response);
       node.toFollower(response.getTerm());
       return;
     }
     if (state.role() != LEADER) {
-      LOGGER.warn("{} Ignored {}. We are not LEADER anymore.", localEndpointStr(), response);
+      LOG.warn("{} Ignored {}. We are not LEADER anymore.", localEndpointStr(), response);
       return;
     }
-    LOGGER.debug("{} received {}.", localEndpointStr(), response);
+    LOG.debug("{} received {}.", localEndpointStr(), response);
     boolean indicesChanged = updateFollowerIndices(response);
-    LOGGER.trace("TRACE> {} AESuccessHandler updateFollowerIndices indicesChanged={}",
+    LOG.trace("TRACE> {} AESuccessHandler updateFollowerIndices indicesChanged={}",
       localEndpointStr(), indicesChanged);
     if (indicesChanged) {
       boolean advanced = node.tryAdvanceCommitIndex();
-      LOGGER.trace("TRACE> {} AESuccessHandler tryAdvanceCommitIndex advanced={}",
-        localEndpointStr(), advanced);
+      LOG.trace("TRACE> {} AESuccessHandler tryAdvanceCommitIndex advanced={}", localEndpointStr(),
+        advanced);
       if (!advanced) {
         trySendAppendRequest(response);
       }
     } else {
-      LOGGER.trace("TRACE> {} AESuccessHandler indices NOT changed -> tryRunQueries",
+      LOG.trace("TRACE> {} AESuccessHandler indices NOT changed -> tryRunQueries",
         localEndpointStr());
       node.tryRunQueries();
     }
@@ -114,7 +116,7 @@ public class AppendEntriesSuccessResponseHandler
     RaftEndpoint follower = response.getSender();
     FollowerState followerState = leaderState.getFollowerStateOrNull(follower);
     if (followerState == null) {
-      LOGGER.warn("{} follower/learner: {} not found for {}.", localEndpointStr(), follower.getId(),
+      LOG.warn("{} follower/learner: {} not found for {}.", localEndpointStr(), follower.getId(),
         response);
       return false;
     }
@@ -122,8 +124,8 @@ public class AppendEntriesSuccessResponseHandler
       state.isVotingMember(follower)
         && leaderState.queryState().tryAck(response.getQuerySequenceNumber(), follower)
     ) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(localEndpointStr() + " ack from " + follower.getId()
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(localEndpointStr() + " ack from " + follower.getId()
           + " for query sequence number: " + response.getQuerySequenceNumber());
       }
     }
@@ -135,13 +137,13 @@ public class AppendEntriesSuccessResponseHandler
       long newNextIndex = followerLastLogIndex + 1;
       followerState.matchIndex(followerLastLogIndex);
       followerState.nextIndex(newNextIndex);
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(localEndpointStr() + " Updated match index: " + followerLastLogIndex
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(localEndpointStr() + " Updated match index: " + followerLastLogIndex
           + " and next index: " + newNextIndex + " for follower: " + follower.getId());
       }
       return true;
-    } else if (followerLastLogIndex < matchIndex && LOGGER.isDebugEnabled()) {
-      LOGGER
+    } else if (followerLastLogIndex < matchIndex && LOG.isDebugEnabled()) {
+      LOG
         .debug(localEndpointStr() + " Will not update match index for follower: " + follower.getId()
           + ". follower last log index: " + followerLastLogIndex + ", match index: " + matchIndex);
     }
@@ -151,18 +153,18 @@ public class AppendEntriesSuccessResponseHandler
   private void checkIfQueryAckNeeded(AppendEntriesSuccessResponse response) {
     LeaderState leaderState = state.leaderState();
     if (leaderState == null) {
-      LOGGER.trace("TRACE> {} checkIfQueryAckNeeded leaderState=null sender={}", localEndpointStr(),
+      LOG.trace("TRACE> {} checkIfQueryAckNeeded leaderState=null sender={}", localEndpointStr(),
         response.getSender().getId());
       return;
     } else if (!state.isVotingMember(response.getSender())) {
-      LOGGER.trace("TRACE> {} checkIfQueryAckNeeded sender NOT voting sender={} effectiveVoting={}",
+      LOG.trace("TRACE> {} checkIfQueryAckNeeded sender NOT voting sender={} effectiveVoting={}",
         localEndpointStr(), response.getSender().getId(),
         state.effectiveGroupMembers().getVotingMembers());
       return;
     }
     QueryState queryState = leaderState.queryState();
     if (queryState.isAckNeeded(response.getSender(), state.logReplicationQuorumSize())) {
-      LOGGER.trace("TRACE> {} checkIfQueryAckNeeded YES -> sendAppendEntriesRequest sender={}",
+      LOG.trace("TRACE> {} checkIfQueryAckNeeded YES -> sendAppendEntriesRequest sender={}",
         localEndpointStr(), response.getSender().getId());
       node.sendAppendEntriesRequest(response.getSender());
     }
@@ -173,12 +175,12 @@ public class AppendEntriesSuccessResponseHandler
     long lastLog = state.log().lastLogOrSnapshotIndex();
     long commitIdx = state.commitIndex();
     if (lastLog > followerLastLogIndex || commitIdx == followerLastLogIndex) {
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} trySendAppendRequest YES sender={} lastLog={} followerLast={} commitIdx={}",
         localEndpointStr(), response.getSender().getId(), lastLog, followerLastLogIndex, commitIdx);
       node.sendAppendEntriesRequest(response.getSender());
     } else {
-      LOGGER.trace(
+      LOG.trace(
         "TRACE> {} trySendAppendRequest NO sender={} lastLog={} followerLast={} commitIdx={}",
         localEndpointStr(), response.getSender().getId(), lastLog, followerLastLogIndex, commitIdx);
     }

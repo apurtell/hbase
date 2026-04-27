@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.report;
 import java.util.function.Consumer;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Used for informing external systems about events related to the execution of the Raft consensus
@@ -35,5 +36,6 @@ import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
  * @see RaftNodeReport
  * @see RaftNode
  */
+@InterfaceAudience.Private
 public interface RaftNodeReportListener extends Consumer<RaftNodeReport> {
 }

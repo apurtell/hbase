@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse.VoteResponseBuilder;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,8 +43,9 @@ import org.slf4j.LoggerFactory;
  * @see VoteResponse
  * @see LeaderElectionTask
  */
+@InterfaceAudience.Private
 public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(VoteRequestHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(VoteRequestHandler.class);
 
   public VoteRequestHandler(RaftNodeImpl raftNode, VoteRequest request) {
     super(raftNode, request);
@@ -61,7 +63,7 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
     int candidateTerm = request.getTerm();
     // Reply false if term < currentTerm (§5.1)
     if (state.term() > candidateTerm) {
-      LOGGER.info("{} Rejecting {} since current term: {} is bigger.", localEndpointStr(), request,
+      LOG.info("{} Rejecting {} since current term: {} is bigger.", localEndpointStr(), request,
         state.term());
       node.send(candidate, responseBuilder.setTerm(state.term()).setGranted(false).build());
       if (state.leaderState() != null) {
@@ -83,20 +85,19 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
       request.isSticky() && (state.leaderState() != null || !node.isLeaderHeartbeatTimeoutElapsed())
         && !candidate.equals(state.leader())
     ) {
-      LOGGER.info("{} Rejecting {} since the leader is still alive...", localEndpointStr(),
-        request);
+      LOG.info("{} Rejecting {} since the leader is still alive...", localEndpointStr(), request);
       node.send(candidate, responseBuilder.setTerm(state.term()).setGranted(false).build());
       return;
     }
     if (state.term() < candidateTerm) {
       // If the request term is greater than the local term, update the local term and
       // convert to follower (§5.1)
-      LOGGER.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
+      LOG.info("{} Moving to new term: {} from current term: {} after {}", localEndpointStr(),
         candidateTerm, state.term(), request);
       node.toFollower(candidateTerm);
     }
     if (state.leader() != null && !candidate.equals(state.leader())) {
-      LOGGER.warn("{} Rejecting {} since we have a leader: {}", localEndpointStr(), request,
+      LOG.warn("{} Rejecting {} since we have a leader: {}", localEndpointStr(), request,
         state.leader().getId());
       node.send(candidate, responseBuilder.setTerm(candidateTerm).setGranted(false).build());
       return;
@@ -104,9 +105,9 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
     if (state.votedEndpoint() != null) {
       boolean granted = (candidate.equals(state.votedEndpoint()));
       if (granted) {
-        LOGGER.debug("{} Vote granted for {} (duplicate)", localEndpointStr(), request);
+        LOG.debug("{} Vote granted for {} (duplicate)", localEndpointStr(), request);
       } else {
-        LOGGER.debug("{} no vote for {}. currently voted-for: {}", localEndpointStr(), request,
+        LOG.debug("{} no vote for {}. currently voted-for: {}", localEndpointStr(), request,
           state.votedEndpoint().getId());
       }
       node.send(candidate, responseBuilder.setTerm(candidateTerm).setGranted(granted).build());
@@ -114,7 +115,7 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
     }
     BaseLogEntry lastLogEntry = state.log().lastLogOrSnapshotEntry();
     if (lastLogEntry.getTerm() > request.getLastLogTerm()) {
-      LOGGER.info("{} Rejecting {} since our last log term: {} is greater.", localEndpointStr(),
+      LOG.info("{} Rejecting {} since our last log term: {} is greater.", localEndpointStr(),
         request, lastLogEntry.getTerm());
       node.send(candidate, responseBuilder.setTerm(candidateTerm).setGranted(false).build());
       return;
@@ -123,16 +124,15 @@ public class VoteRequestHandler extends AbstractMessageHandler<VoteRequest> {
       lastLogEntry.getTerm() == request.getLastLogTerm()
         && lastLogEntry.getIndex() > request.getLastLogIndex()
     ) {
-      LOGGER.info("{} Rejecting {} since our last log index: {} is greater.", localEndpointStr(),
+      LOG.info("{} Rejecting {} since our last log index: {} is greater.", localEndpointStr(),
         request, lastLogEntry.getIndex());
       node.send(candidate, responseBuilder.setTerm(candidateTerm).setGranted(false).build());
       return;
     }
     if (state.role() == LEARNER) {
-      LOGGER.info("{} is {} but {} asked for vote.", localEndpointStr(), LEARNER,
-        candidate.getId());
+      LOG.info("{} is {} but {} asked for vote.", localEndpointStr(), LEARNER, candidate.getId());
     }
-    LOGGER.info("{} Granted vote for {}", localEndpointStr(), request);
+    LOG.info("{} Granted vote for {}", localEndpointStr(), request);
     state.grantVote(candidateTerm, candidate);
     // Defer our own pre-vote pass so the candidate we just voted for has a
     // chance to win, but do NOT touch lastLeaderHeartbeatTimestamp. A vote

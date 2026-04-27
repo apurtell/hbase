@@ -21,34 +21,39 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.File;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
+import org.apache.hadoop.hbase.conf.ConfigKey;
 import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 /**
  * Configuration parsed from a Hadoop {@link Configuration}.
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.CONFIG })
+@InterfaceStability.Evolving
 public final class LogStoreConfig {
   /**
    * Filesystem directory holding the multiplexed consensus log. The store creates and owns
    * {@code raft-NNN.log} files inside this directory.
    */
-  public static final String KEY_LOG_DIR = "hbase.consensus.log.dir";
+  public static final String LOG_DIR_KEY = "hbase.consensus.log.dir";
 
   /**
    * Target size of a single segment file in megabytes. The writer rolls to a new segment as soon as
    * the active segment crosses this size after a coalesced write batch.
    */
-  public static final String KEY_SEGMENT_SIZE_MB = "hbase.consensus.log.segment.size.mb";
-  public static final int DEFAULT_SEGMENT_SIZE_MB = 256;
+  public static final String SEGMENT_SIZE_MB_KEY =
+    ConfigKey.INT("hbase.consensus.log.segment.size.mb", v -> v >= 1);
+  public static final int SEGMENT_SIZE_MB_DEFAULT = 256;
 
   /**
    * Coalescing window in milliseconds for the writer thread. After taking the first
    * {@code PendingWrite} off the mailbox, the writer drains additional pending writes for up to
    * this much wall-clock time before issuing a single gathered {@code FileChannel.write}. Shares
-   * the same key string with {@code TransportConfig.KEY_BATCH_MS}.
+   * the same key string with {@code TransportConfig.BATCH_MS_KEY}.
    */
-  public static final String KEY_BATCH_MS = "hbase.consensus.log.sync.batch.ms";
-  public static final long DEFAULT_BATCH_MS = 10L;
+  public static final String BATCH_MS_KEY =
+    ConfigKey.LONG("hbase.consensus.log.sync.batch.ms", v -> v >= 1L);
+  public static final long BATCH_MS_DEFAULT = 10L;
 
   /**
    * Cadence in milliseconds at which the {@code DurableLogStore} fires
@@ -56,13 +61,14 @@ public final class LogStoreConfig {
    * that did not request synchronous fsync. Sync-fsync paths ({@code persistAndFlush*}) always
    * force inline regardless of this knob.
    */
-  public static final String KEY_FDATASYNC_INTERVAL_MS =
-    "hbase.consensus.log.fdatasync.interval.ms";
-  public static final long DEFAULT_FDATASYNC_INTERVAL_MS = 100L;
+  public static final String FDATASYNC_INTERVAL_MS_KEY =
+    ConfigKey.LONG("hbase.consensus.log.fdatasync.interval.ms", v -> v >= 1L);
+  public static final long FDATASYNC_INTERVAL_MS_DEFAULT = 100L;
 
   /** MPSC mailbox initial chunk size. */
-  public static final String KEY_MAILBOX_CHUNK_SIZE = "hbase.consensus.log.writer.mailbox.chunk";
-  public static final int DEFAULT_MAILBOX_CHUNK_SIZE = 1024;
+  public static final String MAILBOX_CHUNK_SIZE_KEY =
+    ConfigKey.INT("hbase.consensus.log.writer.mailbox.chunk", v -> v >= 1);
+  public static final int MAILBOX_CHUNK_SIZE_DEFAULT = 1024;
 
   private final File logDir;
   private final int segmentSizeMb;
@@ -74,16 +80,16 @@ public final class LogStoreConfig {
   private final long segmentSizeBytesOverride;
 
   public LogStoreConfig(@NonNull Configuration conf) {
-    String dirStr = conf.get(KEY_LOG_DIR);
+    String dirStr = conf.get(LOG_DIR_KEY);
     if (dirStr == null || dirStr.isEmpty()) {
-      throw new IllegalArgumentException(KEY_LOG_DIR + " is required");
+      throw new IllegalArgumentException(LOG_DIR_KEY + " is required");
     }
     this.logDir = new File(dirStr);
-    this.segmentSizeMb = conf.getInt(KEY_SEGMENT_SIZE_MB, DEFAULT_SEGMENT_SIZE_MB);
-    this.batchMs = conf.getLong(KEY_BATCH_MS, DEFAULT_BATCH_MS);
+    this.segmentSizeMb = conf.getInt(SEGMENT_SIZE_MB_KEY, SEGMENT_SIZE_MB_DEFAULT);
+    this.batchMs = conf.getLong(BATCH_MS_KEY, BATCH_MS_DEFAULT);
     this.fdatasyncIntervalMs =
-      conf.getLong(KEY_FDATASYNC_INTERVAL_MS, DEFAULT_FDATASYNC_INTERVAL_MS);
-    this.mailboxChunkSize = conf.getInt(KEY_MAILBOX_CHUNK_SIZE, DEFAULT_MAILBOX_CHUNK_SIZE);
+      conf.getLong(FDATASYNC_INTERVAL_MS_KEY, FDATASYNC_INTERVAL_MS_DEFAULT);
+    this.mailboxChunkSize = conf.getInt(MAILBOX_CHUNK_SIZE_KEY, MAILBOX_CHUNK_SIZE_DEFAULT);
     this.segmentSizeBytesOverride = -1L;
     validate();
   }
@@ -106,22 +112,22 @@ public final class LogStoreConfig {
 
   private void validate() {
     if (logDir == null) {
-      throw new IllegalArgumentException(KEY_LOG_DIR + " must not be null");
+      throw new IllegalArgumentException(LOG_DIR_KEY + " must not be null");
     }
     if (segmentSizeMb < 1) {
       throw new IllegalArgumentException(
-        KEY_SEGMENT_SIZE_MB + " must be >= 1, got " + segmentSizeMb);
+        SEGMENT_SIZE_MB_KEY + " must be >= 1, got " + segmentSizeMb);
     }
     if (batchMs < 1) {
-      throw new IllegalArgumentException(KEY_BATCH_MS + " must be >= 1, got " + batchMs);
+      throw new IllegalArgumentException(BATCH_MS_KEY + " must be >= 1, got " + batchMs);
     }
     if (fdatasyncIntervalMs < batchMs) {
-      throw new IllegalArgumentException(KEY_FDATASYNC_INTERVAL_MS + " (" + fdatasyncIntervalMs
-        + ") must be >= " + KEY_BATCH_MS + " (" + batchMs + ")");
+      throw new IllegalArgumentException(FDATASYNC_INTERVAL_MS_KEY + " (" + fdatasyncIntervalMs
+        + ") must be >= " + BATCH_MS_KEY + " (" + batchMs + ")");
     }
     if (mailboxChunkSize < 1) {
       throw new IllegalArgumentException(
-        KEY_MAILBOX_CHUNK_SIZE + " must be >= 1, got " + mailboxChunkSize);
+        MAILBOX_CHUNK_SIZE_KEY + " must be >= 1, got " + mailboxChunkSize);
     }
   }
 

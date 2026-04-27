@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft;
 
 import org.apache.hadoop.hbase.consensus.raft.exception.CannotReplicateException;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Contains the configuration parameters for the Raft implementation.
@@ -26,6 +27,7 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
  * RaftConfig is an immutable configuration class. You can use a RaftConfigBuilder to build a
  * RaftConfig object.
  */
+@InterfaceAudience.Private
 public final class RaftConfig {
   /** The default value for {@link #leaderElectionTimeoutMillis}. */
   public static final long DEFAULT_LEADER_ELECTION_TIMEOUT_MILLIS = 1000;

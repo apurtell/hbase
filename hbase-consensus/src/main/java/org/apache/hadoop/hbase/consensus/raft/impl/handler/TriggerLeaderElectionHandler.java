@@ -25,6 +25,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.LeaderElectionTask;
 import org.apache.hadoop.hbase.consensus.raft.model.log.BaseLogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,9 +35,10 @@ import org.slf4j.LoggerFactory;
  * Raft log.
  * @see TriggerLeaderElectionRequest
  */
+@InterfaceAudience.Private
 public class TriggerLeaderElectionHandler
   extends AbstractMessageHandler<TriggerLeaderElectionRequest> {
-  private static final Logger LOGGER = LoggerFactory.getLogger(TriggerLeaderElectionHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TriggerLeaderElectionHandler.class);
 
   public TriggerLeaderElectionHandler(RaftNodeImpl raftNode, TriggerLeaderElectionRequest request) {
     super(raftNode, request);
@@ -45,14 +47,14 @@ public class TriggerLeaderElectionHandler
   @Override
   protected void handle(@NonNull TriggerLeaderElectionRequest request) {
     requireNonNull(request);
-    LOGGER.debug("{} Received {}", localEndpointStr(), request);
+    LOG.debug("{} Received {}", localEndpointStr(), request);
     // Verify the term and the leader.
     // If the requesting leader is legit,
     // I will eventually accept it as the leader with a periodic append request.
     // Once I pass this if block, I know that I am follower and my log is same
     // with the leader's log.
     if (!(request.getTerm() == state.term() && request.getSender().equals(state.leader()))) {
-      LOGGER.debug("{} Ignoring {} since term: {} and leader: {}", localEndpointStr(), request,
+      LOG.debug("{} Ignoring {} since term: {} and leader: {}", localEndpointStr(), request,
         state.term(), state.leader() != null ? state.leader().getId() : "-");
       return;
     }
@@ -62,8 +64,8 @@ public class TriggerLeaderElectionHandler
       !(entry.getIndex() == request.getLastLogIndex()
         && entry.getTerm() == request.getLastLogTerm())
     ) {
-      if (LOGGER.isDebugEnabled()) {
-        LOGGER.debug(
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
           "{} Could not accept leadership transfer because local Raft log is not same with the current "
             + "leader. Last log entry: {}, request: {}",
           localEndpointStr(), entry, request);
@@ -72,13 +74,13 @@ public class TriggerLeaderElectionHandler
     }
     if (state.role() == LEARNER) {
       // this should not happen!
-      LOGGER.error(
+      LOG.error(
         "{} Could start leader election because the role is: {}. You should not see this log!",
         localEndpointStr(), LEARNER);
       return;
     }
     // I will send a non-sticky VoteRequest to bypass leader stickiness
-    LOGGER.info(
+    LOG.info(
       "{} Starting a new leader election since the current leader: {} in term: {} asked for a "
         + "leadership transfer!",
       localEndpointStr(), request.getSender().getId(), request.getTerm());

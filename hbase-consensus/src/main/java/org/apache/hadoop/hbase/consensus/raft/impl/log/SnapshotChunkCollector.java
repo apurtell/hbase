@@ -42,6 +42,7 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotEntry.SnapshotEn
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Collects received snapshot chunks during a snapshot installation process.
@@ -52,6 +53,7 @@ import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
  * @see InstallSnapshotRequestHandler
  * @see InstallSnapshotResponseHandler
  */
+@InterfaceAudience.Private
 public final class SnapshotChunkCollector {
   private final RaftStore store;
   private final long snapshotIndex;

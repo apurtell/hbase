@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.task;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Per-RaftNode self-rescheduling heartbeat task used by the default
@@ -31,6 +32,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
  * re-schedules itself on the node's own executor at {@code config.getLeaderHeartbeatPeriodMillis()}
  * cadence.
  */
+@InterfaceAudience.Private
 public class HeartbeatTask extends RaftNodeStatusAwareTask {
   public HeartbeatTask(RaftNodeImpl node) {
     super(node);

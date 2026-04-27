@@ -21,6 +21,7 @@ import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.PreVoteResponseHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftState;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,8 +35,9 @@ import org.slf4j.LoggerFactory;
  * {@link RaftNodeImpl#getLeaderElectionTimeoutMs()} delay to trigger another round of leader
  * election if a leader is not elected yet.
  */
+@InterfaceAudience.Private
 public final class LeaderElectionTask extends RaftNodeStatusAwareTask implements Runnable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(LeaderElectionTask.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LeaderElectionTask.class);
   private final boolean sticky;
 
   public LeaderElectionTask(RaftNodeImpl raftNode, boolean sticky) {
@@ -46,7 +48,7 @@ public final class LeaderElectionTask extends RaftNodeStatusAwareTask implements
   @Override
   protected void doRun() {
     if (state.leader() != null) {
-      LOGGER.warn("{} No new election round, we already have a LEADER: {}", localEndpointStr(),
+      LOG.warn("{} No new election round, we already have a LEADER: {}", localEndpointStr(),
         state.leader().getId());
       return;
     }
