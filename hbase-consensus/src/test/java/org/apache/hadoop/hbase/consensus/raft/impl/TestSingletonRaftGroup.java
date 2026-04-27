@@ -101,8 +101,7 @@ public class TestSingletonRaftGroup extends TestBase {
     Optional<Long> quorumTimestamp = reports.get(2).getQuorumHeartbeatTimestamp();
     assertThat(quorumTimestamp.get()).isGreaterThan(0).isLessThan(Long.MAX_VALUE);
     allTheTime(() -> assertThat(leader.getLeaderEndpoint()).isEqualTo(leader.getLocalEndpoint()),
-      2 * java.util.concurrent.TimeUnit.MILLISECONDS
-        .toSeconds(config.getLeaderHeartbeatTimeoutMillis()));
+      2 * TimeUnit.MILLISECONDS.toSeconds(config.getLeaderHeartbeatTimeoutMillis()));
   }
 
   @Test

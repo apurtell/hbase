@@ -4,25 +4,7 @@
  * Designed for daily TLC -simulate runs with a larger state space
  * than the exhaustive configuration (MCRaftRegionReplica).
  *
- * MaxSeqId = 5 enables richer scenarios than exhaustive (MaxSeqId=3):
- *   - write(1), write(2), flush(3), orphan commit, write(4), new-flush(5)
- *   - write(1), flush(2), crash, orphan commit, write(3), write(4), flush(5)
- *   - write(1), flush(2), log GC, crash, rejoin via InstallSnapshot,
- *     write(3), write(4), flush(5) (iteration 12 catch-up path)
- *   - write(1), flush(2), bootstrap new member via leader AppendEntries
- *     + HFile load, write(3), write(4), flush(5) (iteration 13 bootstrap)
- *   - write(1) with crash after RAFTCommitWrite, new leader promotion
- *     with orphan apply, write(2), write(3), flush(4), write(5)
- *     (iteration 14 promotion + in-flight write)
- *   - write(1), flush(2) crash at RAFTProposed, new leader promotion,
- *     orphan flush commit with leader apply, write(3), write(4),
- *     flush(5) (iteration 14 orphan flush marker + promotion)
- * These exercise multiple writes interleaved with orphan flush commitment,
- * new-leader flush, RAFT log GC + shared-storage catch-up, new member
- * bootstrap, and promotion MVCC continuity with in-flight writes,
- * providing deeper coverage of CatchUpDataIntegrity,
- * HFilesBeforeFlushMarker, FollowerFlushMemstoreDrop, and
- * PromotionMVCCContinuity interactions.
+ * MaxSeqId = 5 enables richer scenarios.
  *
  * No symmetry reduction: TLC simulation mode does not benefit
  * from symmetry and can produce spurious counterexamples with it.

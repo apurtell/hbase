@@ -31,6 +31,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -167,10 +168,12 @@ public class TestCoalescingTransportRaft extends TestBase {
     });
 
     // Leader-side linearizable query confirms last applied value.
-    Object xLast = xLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE,
-      java.util.Optional.empty(), java.util.Optional.empty()).join().getResult();
-    Object yLast = yLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE,
-      java.util.Optional.empty(), java.util.Optional.empty()).join().getResult();
+    Object xLast =
+      xLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, Optional.empty(), Optional.empty())
+        .join().getResult();
+    Object yLast =
+      yLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, Optional.empty(), Optional.empty())
+        .join().getResult();
     assertThat(new String((byte[]) xLast, StandardCharsets.UTF_8)).isEqualTo("x3");
     assertThat(new String((byte[]) yLast, StandardCharsets.UTF_8)).isEqualTo("y2");
 

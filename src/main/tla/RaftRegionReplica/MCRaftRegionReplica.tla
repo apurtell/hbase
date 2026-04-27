@@ -21,26 +21,7 @@
  * that differ only in absolute clock position.
  *
  * MaxSeqId = 3 bounds the total number of writes + markers across the
- * trace.  This is sufficient for the iteration 12 old-primary-rejoin
- * scenario: write(1), flush(2) with log GC, crash, rejoin via
- * InstallSnapshot, write(3).  It also covers the iteration 10 orphan
- * flush + re-flush scenario: write(1), flush(2) with crash at
- * RAFTProposed, new leader commits orphan marker(2), new leader
- * flush(3).  It also covers the iteration 13 new-member-bootstrap
- * scenario: write(1), flush(2), bootstrap new member via leader
- * AppendEntries + HFile load, write(3).  It also covers the
- * iteration 14 promotion + in-flight write scenario: write(1)
- * with crash after RAFTCommitWrite but before CompleteWrite,
- * new leader promotion with orphan apply, write(2), and the
- * orphan flush marker scenario: write(1), flush(2) with crash
- * at RAFTProposed, new leader promotion, orphan flush marker
- * commit with leader apply, write(3).  The per-member raftLog[m]
- * variable adds (2^3)^3 = 512 theoretical state combinations;
- * RaftLogGC reduces raftLog cardinality in later steps, partially
- * offsetting the state space growth from InstallSnapshot and
- * NewMemberBootstrap.  If exhaustive TLC time becomes prohibitive
- * (> 24 hours), consider falling back to a global
- * proposedFlushMarkers set.
+ * trace.
  *
  * For deeper coverage (MaxSeqId=5), use the simulation configuration
  * MCRaftRegionReplica_sim, which runs TLC in -simulate mode with no

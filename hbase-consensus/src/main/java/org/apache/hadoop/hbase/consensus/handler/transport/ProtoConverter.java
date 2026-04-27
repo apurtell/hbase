@@ -43,7 +43,6 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse;
-import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
@@ -147,18 +146,6 @@ final class ProtoConverter {
   SnapshotChunk fromSnapshotChunkPB(ConsensusProtos.SnapshotChunkPB pb) {
     try {
       return modelCodecs.fromSnapshotChunkPB(pb);
-    } catch (IllegalArgumentException e) {
-      throw new MalformedMessageException(e.getMessage());
-    }
-  }
-
-  static ConsensusProtos.CatchUpReferencePB toCatchUpPB(CatchUpReference ref) {
-    return RaftModelPbCodecs.toCatchUpPB(ref);
-  }
-
-  static CatchUpReference fromCatchUpPB(ConsensusProtos.CatchUpReferencePB pb) {
-    try {
-      return RaftModelPbCodecs.fromCatchUpPB(pb);
     } catch (IllegalArgumentException e) {
       throw new MalformedMessageException(e.getMessage());
     }
@@ -382,10 +369,6 @@ final class ProtoConverter {
     for (RaftEndpoint m : req.getSnapshottedMembers()) {
       builder.addSnapshottedMembers(toEndpointPB(m));
     }
-    CatchUpReference cur = req.getCatchUpReference();
-    if (cur != null) {
-      builder.setCatchUpReference(toCatchUpPB(cur));
-    }
     return builder.build();
   }
 
@@ -407,9 +390,6 @@ final class ProtoConverter {
     }
     @Nullable
     SnapshotChunk chunk = pb.hasSnapshotChunk() ? fromSnapshotChunkPB(pb.getSnapshotChunk()) : null;
-    @Nullable
-    CatchUpReference cur =
-      pb.hasCatchUpReference() ? fromCatchUpPB(pb.getCatchUpReference()) : null;
     return factory.createInstallSnapshotRequestBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
       .setSenderLeader(pb.getSenderLeader()).setSnapshotTerm(pb.getSnapshotTerm())
@@ -418,7 +398,7 @@ final class ProtoConverter {
       .setSnapshottedMembers(snapshotted)
       .setGroupMembersView(fromMembersViewPB(pb.getGroupMembersView()))
       .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
-      .setCatchUpReference(cur).build();
+      .build();
   }
 
   ConsensusProtos.InstallSnapshotResponsePB

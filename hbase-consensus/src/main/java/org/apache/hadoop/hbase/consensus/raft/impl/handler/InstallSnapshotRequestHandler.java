@@ -84,7 +84,6 @@ public class InstallSnapshotRequestHandler extends AbstractMessageHandler<Instal
   @SuppressWarnings({ "checkstyle:npathcomplexity", "checkstyle:cyclomaticcomplexity" })
   protected void handle(@NonNull InstallSnapshotRequest request) {
     requireNonNull(request);
-    // getCatchUpReference() is reserved for catch-up-by-reference; chunked path ignores it.
     RaftEndpoint sender = request.getSender();
     // Reply false if term < currentTerm (§5.1)
     if (request.getTerm() < state.term()) {

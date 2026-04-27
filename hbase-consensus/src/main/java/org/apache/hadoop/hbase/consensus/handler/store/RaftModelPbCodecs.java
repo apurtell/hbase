@@ -31,7 +31,6 @@ import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
-import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.yetus.audience.InterfaceAudience;
 
@@ -41,17 +40,17 @@ import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
  * Bidirectional helpers between Raft model interfaces and {@code ConsensusProtos.*PB} for the types
  * that both the wire codec ({@code ProtoConverter}) and the persistent codec
  * ({@link DefaultLogStoreSerializer}) need to understand the same way: {@link RaftEndpoint},
- * {@link RaftGroupMembersView}, {@link LogEntry}, {@link SnapshotChunk}, and
- * {@link CatchUpReference}. The remainder of the wire-only RPC types (votes, heartbeats, append /
- * install responses, etc.) stay private to {@code handler/transport/}.
+ * {@link RaftGroupMembersView}, {@link LogEntry}, and {@link SnapshotChunk}. The remainder of the
+ * wire-only RPC types (votes, heartbeats, append / install responses, etc.) stay private to
+ * {@code handler/transport/}.
  * <p>
  * The class is held as an immutable instance because {@link LogEntry} / {@link SnapshotChunk}
  * conversions need a {@link DefaultRaftModelFactory}, an {@link OperationCodec}, and a
  * {@link PayloadCompressor} (the latter two govern outbound compression and inbound algorithm
  * resolution from {@code LogEntryPB.op_payload_compression}). Pure-PB conversions
- * ({@link RaftEndpoint}, {@link RaftGroupMembersView}, {@link CatchUpReference}) are exposed as
- * {@code static} so callers that don't need a fully-initialised converter (the wire layer's inbound
- * pre-dispatch helpers) can reuse them.
+ * ({@link RaftEndpoint}, {@link RaftGroupMembersView}) are exposed as {@code static} so callers
+ * that don't need a fully-initialised converter (the wire layer's inbound pre-dispatch helpers) can
+ * reuse them.
  * <p>
  * Field-presence enforcement matches {@code ProtoConverter}'s policy: every field in
  * {@code ConsensusProtocol.proto} is declared {@code optional} for forward-compat, and the semantic
@@ -194,21 +193,5 @@ public final class RaftModelPbCodecs {
       .setSnapshotChunkIndex(pb.getChunkIndex()).setSnapshotChunkCount(pb.getChunkCount())
       .setGroupMembersView(fromMembersViewPB(pb.getMembersView()))
       .setOperation(pb.getPayload().toByteArray()).build();
-  }
-
-  @NonNull
-  public static ConsensusProtos.CatchUpReferencePB toCatchUpPB(@NonNull CatchUpReference ref) {
-    return ConsensusProtos.CatchUpReferencePB.newBuilder().setFlushOpSeqId(ref.getFlushOpSeqId())
-      .setSnapshotMaxSeqId(ref.getSnapshotMaxSeqId())
-      .setMetadata(ByteString.copyFrom(ref.getMetadata())).build();
-  }
-
-  @NonNull
-  public static CatchUpReference fromCatchUpPB(@NonNull ConsensusProtos.CatchUpReferencePB pb) {
-    requireField(pb.hasFlushOpSeqId(), "CatchUpReferencePB", "flush_op_seq_id");
-    requireField(pb.hasSnapshotMaxSeqId(), "CatchUpReferencePB", "snapshot_max_seq_id");
-    requireField(pb.hasMetadata(), "CatchUpReferencePB", "metadata");
-    return new CatchUpReference(pb.getFlushOpSeqId(), pb.getSnapshotMaxSeqId(),
-      pb.getMetadata().toByteArray());
   }
 }

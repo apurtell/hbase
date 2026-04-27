@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.hadoop.hbase.consensus.raft.statemachine;
+package org.apache.hadoop.hbase.consensus.handler.statemachine;
 
 import static java.util.Objects.requireNonNull;
 
@@ -23,17 +23,29 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Arrays;
 import org.apache.yetus.audience.InterfaceAudience;
 
-/** Lightweight catch-up metadata for state transfer by reference. */
+/**
+ * A consensus-level marker that delimits an application-side flush boundary inside the replicated
+ * log.
+ * <p>
+ * When an application proposes a {@code FlushMarker} as the operation of a Raft log entry, the
+ * {@link StateMachineAdapter} treats it specially: it drains any buffered {@link CommittedEntry}s
+ * via {@link ConsensusSpi#onCommit(Object, java.util.List) ConsensusSpi.onCommit}, then fires
+ * {@link ConsensusSpi#onFlushComplete(Object, FlushMarker) ConsensusSpi.onFlushComplete} with the
+ * marker, breaking the next batch.
+ * <p>
+ * The {@code metadata} bytes are opaque to the consensus layer.
+ */
 @InterfaceAudience.Private
-public final class CatchUpReference {
+public final class FlushMarker {
+
   private final long flushOpSeqId;
   private final long snapshotMaxSeqId;
   private final byte[] metadata;
 
-  public CatchUpReference(long flushOpSeqId, long snapshotMaxSeqId, @NonNull byte[] metadata) {
+  public FlushMarker(long flushOpSeqId, long snapshotMaxSeqId, @NonNull byte[] metadata) {
     this.flushOpSeqId = flushOpSeqId;
     this.snapshotMaxSeqId = snapshotMaxSeqId;
-    this.metadata = requireNonNull(metadata).clone();
+    this.metadata = requireNonNull(metadata, "metadata").clone();
   }
 
   public long getFlushOpSeqId() {
@@ -46,7 +58,7 @@ public final class CatchUpReference {
 
   @NonNull
   public byte[] getMetadata() {
-    return metadata.clone();
+    return metadata;
   }
 
   @Override
@@ -57,7 +69,7 @@ public final class CatchUpReference {
     if (o == null || getClass() != o.getClass()) {
       return false;
     }
-    CatchUpReference that = (CatchUpReference) o;
+    FlushMarker that = (FlushMarker) o;
     return flushOpSeqId == that.flushOpSeqId && snapshotMaxSeqId == that.snapshotMaxSeqId
       && Arrays.equals(metadata, that.metadata);
   }
@@ -72,7 +84,7 @@ public final class CatchUpReference {
 
   @Override
   public String toString() {
-    return "CatchUpReference{flushOpSeqId=" + flushOpSeqId + ", snapshotMaxSeqId="
-      + snapshotMaxSeqId + ", metadata.length=" + metadata.length + '}';
+    return "FlushMarker{flushOpSeqId=" + flushOpSeqId + ", snapshotMaxSeqId=" + snapshotMaxSeqId
+      + ", metadata.length=" + metadata.length + '}';
   }
 }

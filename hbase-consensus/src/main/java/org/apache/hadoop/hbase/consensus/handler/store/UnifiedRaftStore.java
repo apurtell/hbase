@@ -43,6 +43,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.consensus.raft.model.impl.log.DefaultSnapshotEntryOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
@@ -876,9 +877,9 @@ public class UnifiedRaftStore implements DurableLogStore {
       if (!isCompleted()) {
         return null;
       }
-      return new org.apache.hadoop.hbase.consensus.raft.model.impl.log.DefaultSnapshotEntryOrBuilder()
-        .setTerm(term).setIndex(snapshotIndex).setSnapshotChunks(new ArrayList<>(chunks.values()))
-        .setGroupMembersView(membersView).build();
+      return new DefaultSnapshotEntryOrBuilder().setTerm(term).setIndex(snapshotIndex)
+        .setSnapshotChunks(new ArrayList<>(chunks.values())).setGroupMembersView(membersView)
+        .build();
     }
   }
 

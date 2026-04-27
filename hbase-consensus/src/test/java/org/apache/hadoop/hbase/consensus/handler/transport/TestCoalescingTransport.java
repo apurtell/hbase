@@ -23,6 +23,8 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -61,7 +63,7 @@ public class TestCoalescingTransport extends TestBase {
 
   private static final String GROUP = "g1";
 
-  private final List<CoalescingTransport> transports = new java.util.ArrayList<>();
+  private final List<CoalescingTransport> transports = new ArrayList<>();
 
   @AfterEach
   public void teardown() {
@@ -414,7 +416,7 @@ public class TestCoalescingTransport extends TestBase {
   }
 
   private static int ephemeralPort() throws IOException {
-    try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+    try (ServerSocket s = new ServerSocket(0)) {
       s.setReuseAddress(true);
       return s.getLocalPort();
     }

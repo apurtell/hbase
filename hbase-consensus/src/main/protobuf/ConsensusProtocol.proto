@@ -55,12 +55,6 @@ message SnapshotChunkPB {
   optional bytes payload = 6;
 }
 
-message CatchUpReferencePB {
-  optional int64 flush_op_seq_id = 1;
-  optional int64 snapshot_max_seq_id = 2;
-  optional bytes metadata = 3;
-}
-
 // Wire form of an UpdateRaftGroupMembersOp. Carried as the LogEntryPB.op_payload
 // when the consensus core replicates a membership change.
 message UpdateRaftGroupMembersOpPB {
@@ -138,7 +132,6 @@ message InstallSnapshotRequestPB {
   optional RaftGroupMembersViewPB group_members_view = 10;
   optional int64 query_seq = 11;
   optional int64 flow_control_seq = 12;
-  optional CatchUpReferencePB catch_up_reference = 13;
 }
 
 message InstallSnapshotResponsePB {

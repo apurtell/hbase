@@ -48,7 +48,6 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.TriggerLeaderElectionRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteResponse;
-import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
@@ -212,13 +211,6 @@ public class TestProtoConverter extends TestBase {
     assertThat((byte[]) back.getOperation()).containsExactly(raw);
   }
 
-  @Test
-  public void testCatchUpReferenceRoundTrip() {
-    CatchUpReference ref = new CatchUpReference(123L, 456L, "meta".getBytes());
-    CatchUpReference back = ProtoConverter.fromCatchUpPB(ProtoConverter.toCatchUpPB(ref));
-    assertThat(back).isEqualTo(ref);
-  }
-
   // -------------------------------------------------------------------------------------------
   // AppendEntries (with entries + heartbeat)
   // -------------------------------------------------------------------------------------------
@@ -352,12 +344,11 @@ public class TestProtoConverter extends TestBase {
     SnapshotChunk chunk = factory.createSnapshotChunkBuilder().setIndex(5L).setTerm(2)
       .setSnapshotChunkIndex(0).setSnapshotChunkCount(1).setGroupMembersView(view)
       .setOperation(new byte[] { 9, 9, 9 }).build();
-    InstallSnapshotRequest req =
-      factory.createInstallSnapshotRequestBuilder().setGroupId(GID).setSender(a).setTerm(3)
-        .setSenderLeader(true).setSnapshotTerm(2).setSnapshotIndex(5L).setTotalSnapshotChunkCount(1)
-        .setSnapshotChunk(chunk).setSnapshottedMembers(Arrays.asList(a, b))
-        .setGroupMembersView(view).setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L)
-        .setCatchUpReference(new CatchUpReference(1, 2, new byte[] { 7 })).build();
+    InstallSnapshotRequest req = factory.createInstallSnapshotRequestBuilder().setGroupId(GID)
+      .setSender(a).setTerm(3).setSenderLeader(true).setSnapshotTerm(2).setSnapshotIndex(5L)
+      .setTotalSnapshotChunkCount(1).setSnapshotChunk(chunk)
+      .setSnapshottedMembers(Arrays.asList(a, b)).setGroupMembersView(view)
+      .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build();
     InstallSnapshotRequest back =
       converter.fromInstallSnapshotPB(converter.toInstallSnapshotPB(req));
     assertThat(back.getTerm()).isEqualTo(3);
@@ -369,7 +360,6 @@ public class TestProtoConverter extends TestBase {
     assertThat(back.getSnapshotChunk().getIndex()).isEqualTo(5L);
     assertThat(idsOf(back.getSnapshottedMembers()))
       .containsExactlyInAnyOrderElementsOf(idsOf(req.getSnapshottedMembers()));
-    assertThat(back.getCatchUpReference()).isEqualTo(req.getCatchUpReference());
   }
 
   @Test
@@ -380,11 +370,10 @@ public class TestProtoConverter extends TestBase {
       .setSender(a).setTerm(3).setSenderLeader(false).setSnapshotTerm(2).setSnapshotIndex(5L)
       .setTotalSnapshotChunkCount(0).setSnapshotChunk(null).setSnapshottedMembers(new ArrayList<>())
       .setGroupMembersView(view).setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L)
-      .setCatchUpReference(null).build();
+      .build();
     InstallSnapshotRequest back =
       converter.fromInstallSnapshotPB(converter.toInstallSnapshotPB(req));
     assertThat(back.getSnapshotChunk()).isNull();
-    assertThat(back.getCatchUpReference()).isNull();
     assertThat(back.getSnapshottedMembers()).isEmpty();
   }
 
@@ -475,19 +464,6 @@ public class TestProtoConverter extends TestBase {
     assertThatThrownBy(() -> converter
       .fromMembersViewPB(ConsensusProtos.RaftGroupMembersViewPB.newBuilder().build()))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'log_index'");
-  }
-
-  @Test
-  public void testFromCatchUpPBRejectsMissingFields() {
-    assertThatThrownBy(() -> ProtoConverter.fromCatchUpPB(ConsensusProtos.CatchUpReferencePB
-      .newBuilder().setSnapshotMaxSeqId(1L).setMetadata(ByteString.EMPTY).build()))
-      .hasMessageContaining("'flush_op_seq_id'");
-    assertThatThrownBy(() -> ProtoConverter.fromCatchUpPB(ConsensusProtos.CatchUpReferencePB
-      .newBuilder().setFlushOpSeqId(1L).setMetadata(ByteString.EMPTY).build()))
-      .hasMessageContaining("'snapshot_max_seq_id'");
-    assertThatThrownBy(() -> ProtoConverter.fromCatchUpPB(ConsensusProtos.CatchUpReferencePB
-      .newBuilder().setFlushOpSeqId(1L).setSnapshotMaxSeqId(1L).build()))
-      .hasMessageContaining("'metadata'");
   }
 
   @Test

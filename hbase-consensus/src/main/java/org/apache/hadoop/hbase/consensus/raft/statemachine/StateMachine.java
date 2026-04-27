@@ -75,6 +75,14 @@ public interface StateMachine {
   Object runOperation(long commitIndex, @NonNull Object operation);
 
   /**
+   * Invoked once after each contiguous batch of {@link #runOperation(long, Object)} calls that the
+   * Raft node applies in a single executor task. Implementations may use this hook to flush
+   * buffered work to downstream consumers exactly once per batch.
+   */
+  default void onApplyBatchEnd() {
+  }
+
+  /**
    * Takes a snapshot of the state machine for the given commit index which is the current commit
    * index at the local Raft node.
    * <p>
@@ -108,22 +116,7 @@ public interface StateMachine {
    */
   void installSnapshot(long commitIndex, @NonNull List<Object> snapshotChunks);
 
-  /**
-   * Installs catch-up state by reference (metadata only). State machines that support catch-up by
-   * reference must override this method; the default implementation throws
-   * {@link UnsupportedOperationException}.
-   * @param commitIndex snapshot / catch-up commit index
-   * @param reference   opaque catch-up metadata describing the location of the source data
-   */
-  default void installSnapshotReference(long commitIndex, @NonNull CatchUpReference reference) {
-    throw new UnsupportedOperationException(
-      "installSnapshotReference is not implemented by this StateMachine");
-  }
-
-  /**
-   * Returns the operation to be appended after a new leader is elected in a new term.
-   * @return the operation to be appended after a new leader is elected in a new term.
-   */
+  /** Returns the operation to be appended after a new leader is elected in a new term. */
   @NonNull
   Object getNewTermOperation();
 }

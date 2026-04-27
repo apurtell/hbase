@@ -7,7 +7,7 @@
  * -------
  * This module targets exhaustive verification of the data-path protocols:
  * write pipeline, flush protocol, RAFT log GC, shared-storage catch-up
- * (InstallSnapshot), and new member bootstrap.  It uses MaxSeqId = 3
+ * (FollowerLoadFlushedState), and new member bootstrap.  It uses MaxSeqId = 3
  * (same as the full exhaustive config) to exercise multi-operation
  * interleavings — write(1) + flush(2) + write(3), orphan flush + re-flush,
  * log GC + catch-up, and bootstrap + post-bootstrap writes.

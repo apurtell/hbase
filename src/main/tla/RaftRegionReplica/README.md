@@ -39,7 +39,7 @@ The specification intentionally abstracts several features of `hbase-consensus` 
 - `REMOVE_MEMBER` / `ADD_LEARNER` / `ADD_OR_PROMOTE_TO_FOLLOWER` `UpdateRaftGroupMembersOp` entries as replicated log entries, including leader self-removal that drives the node into `RaftNodeStatus.TERMINATED`. Membership in the spec is the static `CONSTANT Members` set.
 - `LEARNER` role / non-voting members. The spec's `role` ranges over `{Follower, Candidate, Leader}`.
 - `PreVote` as a distinct round; subsumed in the leader-stickiness guard on `RequestVote`.
-- Chunked `InstallSnapshot` transfer (`SnapshotChunkCollector`). The spec models the design-target shared-storage `CatchUpReference` path; both paths are observationally equivalent here (follower log truncated to snapshot index + data recoverable via HDFS HFiles or replayed chunks).
+- Chunked `InstallSnapshot` transfer (`SnapshotChunkCollector`). The consensus layer carries one snapshot wire path. The application payload it transports is opaque. The spec collapses chunk-transfer dynamics into a single atomic `FollowerLoadFlushedState` action whose effect is the design-target shared-storage catch-up. The follower log is truncated to the snapshot index and the application data is recoverable by loading HFiles on HDFS reached through the SPI-encoded metadata bytes.
 
 The specification defines 14 safety invariants and 5 liveness properties verified by TLC:
 

@@ -27,7 +27,6 @@ import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.log.SnapshotChunk;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest.InstallSnapshotRequestBuilder;
-import org.apache.hadoop.hbase.consensus.raft.statemachine.CatchUpReference;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -54,7 +53,6 @@ public class DefaultInstallSnapshotRequestOrBuilder
   private RaftGroupMembersView groupMembersView;
   private long querySequenceNumber;
   private long flowControlSequenceNumber;
-  private CatchUpReference catchUpReference;
   private DefaultInstallSnapshotRequestOrBuilder builder = this;
 
   @Override
@@ -119,12 +117,6 @@ public class DefaultInstallSnapshotRequestOrBuilder
   @Override
   public long getFlowControlSequenceNumber() {
     return flowControlSequenceNumber;
-  }
-
-  @Nullable
-  @Override
-  public CatchUpReference getCatchUpReference() {
-    return catchUpReference;
   }
 
   @NonNull
@@ -216,14 +208,6 @@ public class DefaultInstallSnapshotRequestOrBuilder
 
   @NonNull
   @Override
-  public InstallSnapshotRequestBuilder
-    setCatchUpReference(@Nullable CatchUpReference catchUpReference) {
-    builder.catchUpReference = catchUpReference;
-    return this;
-  }
-
-  @NonNull
-  @Override
   public InstallSnapshotRequest build() {
     requireNonNull(builder);
     builder = null;
@@ -238,6 +222,6 @@ public class DefaultInstallSnapshotRequestOrBuilder
       + ", chunkCount=" + totalSnapshotChunkCount + ", snapshotChunk=" + snapshotChunk
       + ", snapshottedMembers=" + snapshottedMembers + ", groupMembers=" + groupMembersView
       + ", querySequenceNumber=" + querySequenceNumber + ", flowControlSequenceNumber="
-      + flowControlSequenceNumber + ", catchUpReference=" + catchUpReference + '}';
+      + flowControlSequenceNumber + '}';
   }
 }

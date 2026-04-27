@@ -24,6 +24,8 @@ import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.ev
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -93,14 +95,13 @@ public final class LocalRaftGroup {
    * {@code "default"}-group adapter; the caller owns the underlying parent stores listed in
    * {@code stores} and must {@link UnifiedRaftStore#close()} them on test teardown.
    */
-  public static BiFunction<RaftEndpoint, RaftConfig, RaftStore> unifiedRaftStateStoreFactory(
-    java.io.File rootDir,
-    java.util.List<org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore> stores) {
+  public static BiFunction<RaftEndpoint, RaftConfig, RaftStore>
+    unifiedRaftStateStoreFactory(File rootDir, List<UnifiedRaftStore> stores) {
     return (endpoint, config) -> {
       try {
-        java.io.File subdir = new java.io.File(rootDir, String.valueOf(endpoint.getId()));
+        File subdir = new File(rootDir, String.valueOf(endpoint.getId()));
         if (!subdir.exists() && !subdir.mkdirs()) {
-          throw new java.io.IOException("Failed to create " + subdir);
+          throw new IOException("Failed to create " + subdir);
         }
         LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 64);
         OperationCodec codec = OperationCodecs.composite(OperationCodecs.defaultCodecs(),
@@ -111,8 +112,8 @@ public final class LocalRaftGroup {
         parent.load();
         stores.add(parent);
         return parent.newGroupStore("default".getBytes());
-      } catch (java.io.IOException ioe) {
-        throw new java.io.UncheckedIOException(ioe);
+      } catch (IOException ioe) {
+        throw new UncheckedIOException(ioe);
       }
     };
   }
@@ -299,7 +300,7 @@ public final class LocalRaftGroup {
    * so the test can {@code close()} it on teardown.
    */
   public RaftNodeImpl restoreNodeFromUnifiedStore(RaftEndpoint endpoint, File rootDir,
-    List<UnifiedRaftStore> stores) throws java.io.IOException {
+    List<UnifiedRaftStore> stores) throws IOException {
     boolean running =
       nodeContexts.values().stream().filter(ctx -> ctx.getLocalEndpoint().equals(endpoint))
         .anyMatch(RaftNodeContext::isExecutorRunning);
@@ -308,7 +309,7 @@ public final class LocalRaftGroup {
     }
     File subdir = new File(rootDir, String.valueOf(endpoint.getId()));
     if (!subdir.exists() && !subdir.mkdirs()) {
-      throw new java.io.IOException("Failed to create " + subdir);
+      throw new IOException("Failed to create " + subdir);
     }
     LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 64);
     OperationCodec codec =
@@ -328,7 +329,7 @@ public final class LocalRaftGroup {
         .setConfig(config).setTransport(transport).setStateMachine(stateMachine).setStore(store)
         .build();
     } else {
-      java.util.List<RaftEndpoint> votingMembers =
+      List<RaftEndpoint> votingMembers =
         initialMembers.subList(0, Math.min(initialMembers.size(), initialMembers.size()));
       node = (RaftNodeImpl) RaftNode.newBuilder().setGroupId("default").setLocalEndpoint(endpoint)
         .setInitialGroupMembers(initialMembers, votingMembers).setConfig(config)

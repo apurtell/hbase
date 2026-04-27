@@ -161,20 +161,21 @@
  * leader still has the needed entries in its log, normal AppendEntries
  * delivers them and the follower applies via FollowerBeginBatchApply /
  * FollowerApplyMarker (already modeled); (2) if the needed entries
- * have been GC'd from the leader's log, the leader sends a
- * CatchUpReference containing HFile paths and the flush seqId.  The
- * follower loads HFiles from HDFS and starts with an empty memstore
- * for post-flush entries.  InstallSnapshot models this second path:
- * the follower's memstore is set to the flush boundary (entries below
- * the flush seqId are dropped, the flush marker is added as an
- * mvcc.advanceTo point), and the follower's raftLog is truncated to
- * the snapshot point.  This replaces standard RAFT's snapshot chunk
- * transfer with the shared-storage catch-up described in the design
- * document.  The CatchUpDataIntegrity invariant allows entries
- * subsumed by a committed flush marker to be absent from a majority
- * of logs (they are in HFiles), and verifies that every committed
- * entry is recoverable through at least one path (RAFT logs or
- * HFiles on HDFS).
+ * have been GC'd from the leader's log, the leader sends a chunked
+ * InstallSnapshot whose application-snapshot bytes the region SPI
+ * decodes as HFile paths plus the flush seqId.  The follower loads
+ * the referenced HFiles from HDFS and starts with an empty memstore
+ * for post-flush entries.  FollowerLoadFlushedState models this
+ * second path. The follower's memstore is set to the flush boundary,
+ * and the follower's raftLog is truncated to the snapshot point. The
+ * chunk-transfer dynamics of the InstallSnapshot wire path are
+ * abstracted into a single atomic state transition, since the wire
+ * payload is opaque to the consensus layer and the safety/liveness
+ * story turns only on the resulting follower state. The CatchUpDataIntegrity
+ * invariant allows entries subsumed by a committed flush marker to be
+ * absent from a majority of logs (they are in HFiles), and verifies that
+ * every committed entry is recoverable through at least one path (RAFT
+ * logs or HFiles on HDFS).
  *
  * New member bootstrap: when a member's instance is replaced (e.g.,
  * a new Kubernetes pod with no persistent local state), all local
@@ -300,13 +301,15 @@
  *     the leader-stickiness guard on RequestVote (described in that
  *     action's comment).
  *
- *   - Chunked InstallSnapshot transfer (SnapshotChunkCollector).
- *     The spec models the design-target shared-storage CatchUpReference
- *     path as a single atomic action.  Both paths are observationally
- *     equivalent at this abstraction level: the follower's log is
- *     truncated to the snapshot index and the data is recoverable
- *     (HFiles on HDFS in the design-target path; replayed chunks plus
- *     locally-flushed HFiles in the chunked path).
+ *   - Chunked InstallSnapshot transfer (SnapshotChunkCollector).  The
+ *     consensus layer carries one snapshot wire path. The application
+ *     payload it transports is opaque to the consensus layer.  The
+ *     spec collapses chunk-transfer dynamics into a single atomic
+ *     FollowerLoadFlushedState action whose effect models the design-
+ *     target shared-storage catch-up. The follower's log is truncated
+ *     to the snapshot index and the application data is recoverable
+ *     by loading HFiles on HDFS reached through the SPI-encoded
+ *     metadata bytes.
  *
  *   - DurableLogStore on-disk files. The spec captures safety-relevant
  *     consequences via CrashRestartWithLogLoss.
@@ -385,9 +388,10 @@
  * out of date.  The RAFT log up-to-date check on RequestVote
  * prevents it from winning elections against peers with the full
  * committed log, and standard catchup paths refill the missing tail
- * (AppendEntries from a peer with intact log for small gaps,
- * InstallSnapshot via the shared-storage CatchUpReference for entries
- * below an applied flush marker).  CrashRestartWithLogLoss models
+ * (AppendEntries from a peer with intact log for small gaps; the
+ * chunked InstallSnapshot wire path with SPI-encoded HFile-pointer
+ * application bytes for entries below an applied flush marker, modeled
+ * here by FollowerLoadFlushedState).  CrashRestartWithLogLoss models
  * this behavior; see that action's header for details.
  *
  * HDFS WAL durability assumption:  the HBase WAL on HDFS is a
@@ -1193,24 +1197,25 @@ CrashRestart(m) ==
 \* and vote remain durable (sync-fsynced; see persistAndFlushTerm).
 \* m is treated by the RAFT protocol as a follower whose log is out
 \* of date; standard catchup paths (AppendEntries from a peer with
-\* intact log for small gaps, InstallSnapshot via the shared-storage
-\* CatchUpReference for entries below an applied flush marker) refill
-\* the missing tail.
+\* intact log for small gaps; the chunked InstallSnapshot wire path
+\* with SPI-encoded HFile-pointer application bytes for entries below
+\* an applied flush marker, modeled here by FollowerLoadFlushedState)
+\* refill the missing tail.
 \*
 \* Every entry in the lost suffix must remain recoverable either from
 \* a majority of OTHER members' raftLogs (RAFT AppendEntries) or from a
-\* flush marker with HFiles on HDFS (CatchUpReference). The check covers
-\* uncommitted-but-replicated entries as well as committed ones,
-\* because the spec models RAFT propose atomically. Once an entry has
-\* been placed in a majority of raftLogs the leader has the right to
-\* commit it.  Fsync-before-commit makes this guard an enforced property
-\* of the durability layer. a follower's AppendEntriesSuccessResponse
-\* is sent only after RaftStore.flush() returns and so reflects on-disk
-\* content, the leader's flushedLogIndex (its own contribution to the
-\* commit quorum) is set only after RaftStore.flush() returns, and
-\* commit-index advancement counts only on-disk acks.  Any entry that
-\* could be lost from m by suffix truncation is therefore present on
-\* disk on a majority of OTHER members.
+\* flush marker with HFiles on HDFS and uncommitted-but-replicated
+\* entries as well as committed ones. Once an entry has been placed in
+\* a majority of raftLogs the leader has the right to commit it. Fsync-
+\* before-commit makes this guard an enforced property of the durability
+\* layer.
+\* A follower's AppendEntriesSuccessResponse is sent only after
+\* RaftStore.flush() returns and so reflects on-disk content, the
+\* leader's flushedLogIndex (its own contribution to the commit quorum)
+\* is set only after RaftStore.flush() returns, and commit-index
+\* advancement counts only on-disk acks. Any entry that could be lost
+\* from m by suffix truncation is therefore present on disk on a
+\* majority of OTHER members.
 CrashRestartWithLogLossEffect(m) ==
     \E w \in 0..MaxSeqId :
         /\ \E e \in raftLog[m] : e > w
@@ -1882,15 +1887,18 @@ RaftLogGC(m) ==
                    writeVars, flushVars, flushDropBound,
                    promotionVars>>
 
-\* Leader sends a catch-up reference (CatchUpReference) to a lagging
-\* follower whose needed RAFT log entries have been garbage-collected.
-\* Instead of sending the entries via AppendEntries, the leader directs
-\* the follower to load HFiles from HDFS and start from the flush
-\* boundary with an empty memstore for post-flush entries.  This models
-\* the shared-storage catch-up path that replaces standard RAFT's
-\* InstallSnapshot RPC (design document: "the 'snapshot' for catch-up
-\* is a lightweight CatchUpReference message containing only the list
-\* of HFile paths on HDFS and the flush seqId").
+\* The leader catches up a lagging follower whose needed RAFT log
+\* entries have been garbage-collected by sending a chunked
+\* InstallSnapshot whose application-snapshot bytes the region SPI
+\* decodes as HFile paths plus the flush seqId.  The follower loads
+\* the referenced HFiles from HDFS and starts from the flush boundary
+\* with an empty memstore for post-flush entries.  This is the
+\* shared-storage catch-up path described in the design document. From
+\* the consensus layer's perspective it is the standard chunked
+\* InstallSnapshot wire path carrying opaque application bytes.
+\* The wire-level chunk transfer of opaque application bytes is
+\* abstracted into a single atomic state transition. The spec does
+\* not model intra-snapshot chunk dynamics.
 \*
 \* Guard: the leader can communicate with the follower, the follower
 \* has no batch apply in progress, there exists a committed flush
@@ -1908,13 +1916,7 @@ RaftLogGC(m) ==
 \* truncation at the snapshot point).  Post-flush entries above S
 \* remain in memstore/raftLog if already present and can be applied
 \* via normal FollowerBeginBatchApply / FollowerApplyMarker.
-\*
-\* Implementation: this action models the design-target shared-storage
-\* state-transfer path. The follower's log is truncated to the snapshot
-\* index, and the data that was below the snapshot is recoverable — via
-\* HFiles on HDFS in the design-target path, via replayed chunks plus
-\* locally-flushed HFiles in the chunked path.
-InstallSnapshot(leader, follower) ==
+FollowerLoadFlushedState(leader, follower) ==
     /\ role[leader] = "Leader"
     /\ follower # leader
     /\ CanCommunicate(leader, follower)
@@ -1979,7 +1981,7 @@ InstallSnapshot(leader, follower) ==
 \* inline to discover HFiles and drop pre-flush entries.
 \*
 \* Guard: a leader must exist and be reachable (the leader drives
-\* the bootstrap via AppendEntries / CatchUpReference).  The leader's
+\* the bootstrap via AppendEntries / InstallSnapshot).  The leader's
 \* term must be >= the member's current term to prevent a stale leader
 \* from resetting a member's term backward (which would allow the stale
 \* leader to refresh its lease via heartbeat, violating
@@ -2008,18 +2010,18 @@ InstallSnapshot(leader, follower) ==
 \* after a stale-log new leader (model abstraction omitting the log
 \* up-to-date check) bootstrapped a follower against its empty log.
 \*
-\* Implementation: this action abstracts both production catch-up paths
+\* Implementation: this action abstracts the production catch-up path
 \* into one atomic step.  sendAppendEntriesRequest() detects that the
 \* follower's nextIndex is 0 (or behind the leader's first available
 \* log entry) and either delivers the log tail via AppendEntries
 \* (sendCatchupAppendsIfNeeded) or transitions to chunked
 \* InstallSnapshot via SnapshotChunkCollector +
-\* InstallSnapshotRequestHandler (StateMachine.installSnapshot
-\* receives the chunk).  The design-target shared-storage path
-\* (CatchUpReference + StateMachine.installSnapshotReference) is
-\* defined in protobuf and handler scaffolding but is not populated
-\* or invoked in production today; both paths are observationally
-\* equivalent at this spec's abstraction level.
+\* InstallSnapshotRequestHandler.  The application-snapshot bytes the
+\* InstallSnapshot path carries are opaque to the consensus layer; the
+\* region-side ConsensusSpi encodes them as a metadata descriptor
+\* (HFile paths plus the flush seqId) and the receiving SPI loads the
+\* referenced HFiles from HDFS, so the spec's effect of starting the
+\* member at the flush boundary is the production behavior.
 NewMemberBootstrap(m) ==
     \E leader \in Members :
         /\ role[leader] = "Leader"
@@ -2098,8 +2100,8 @@ AtomicCompleteWriteAndAck(m) ==
 \* normal-operation actions that lifecycle composition modules gate with
 \* a state-level predicate) and "always-enabled" (FollowerApplyMarker,
 \* NewLeaderCommitOrphanEntry, and the two multi-member actions
-\* RequestVote and InstallSnapshot which are gated on the initiator by
-\* composition modules).
+\* RequestVote and FollowerLoadFlushedState which are gated on the
+\* initiator by composition modules).
 \*
 \* GatedMemberActions(m) collects all single-member-parameter normal-op
 \* actions into a single disjunction.  Composition modules call it with
@@ -2186,7 +2188,7 @@ GatedMemberDataPathActions(m) ==
 \* GroupDataPathNext.
 UngatedGroupActions ==
     \/ \E c, v \in Members  : RequestVote(c, v)
-    \/ \E l, f \in Members  : InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : FollowerApplyMarker(m)
     \/ NewLeaderCommitOrphanEntry
 

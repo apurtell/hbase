@@ -887,6 +887,7 @@ public final class RaftNodeImpl implements RaftNode {
         }
         applyLogEntry(entry);
       }
+      stateMachine.onApplyBatchEnd();
       if (state.lastApplied() % commitCountToTakeSnapshot == 0 && !isTerminal(status)) {
         // If the status is terminal, then there will be no new append or commit.
         takeSnapshot(log, state.lastApplied());

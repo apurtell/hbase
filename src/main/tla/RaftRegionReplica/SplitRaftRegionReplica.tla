@@ -34,7 +34,7 @@
  * the base spec's building-block operators (GatedMemberActions,
  * GatedMemberDataPathActions).  Single-member actions are guarded by
  * ParentGroupActive(m); multi-member actions (RequestVote,
- * InstallSnapshot) are guarded on the initiating member.
+ * FollowerLoadFlushedState) are guarded on the initiating member.
  * FollowerApplyMarker and NewLeaderCommitOrphanEntry remain ungated
  * so the split marker itself can be applied and committed.
  *
@@ -167,13 +167,13 @@ SplitCrashRestartWithLogLoss(m) ==
 
 \* Parent group actions with per-member lifecycle gating.
 \* GatedMemberActions are guarded by ParentGroupActive on the acting
-\* member.  RequestVote and InstallSnapshot are guarded on the
+\* member.  RequestVote and FollowerLoadFlushedState are guarded on the
 \* initiating member.  FollowerApplyMarker and NewLeaderCommitOrphanEntry
 \* remain ungated.
 SplitGroupNext ==
     \/ \E m \in Members     : ParentGroupActive(m) /\ Parent!GatedMemberActions(m)
     \/ \E c, v \in Members  : ParentGroupActive(c) /\ Parent!RequestVote(c, v)
-    \/ \E l, f \in Members  : ParentGroupActive(l) /\ Parent!InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : ParentGroupActive(l) /\ Parent!FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : Parent!FollowerApplyMarker(m)
     \/ Parent!NewLeaderCommitOrphanEntry
 
@@ -181,7 +181,7 @@ SplitGroupNext ==
 SplitGroupDataPathNext ==
     \/ \E m \in Members     : ParentGroupActive(m) /\ Parent!GatedMemberDataPathActions(m)
     \/ \E c, v \in Members  : ParentGroupActive(c) /\ Parent!RequestVote(c, v)
-    \/ \E l, f \in Members  : ParentGroupActive(l) /\ Parent!InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : ParentGroupActive(l) /\ Parent!FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : Parent!FollowerApplyMarker(m)
     \/ Parent!NewLeaderCommitOrphanEntry
 

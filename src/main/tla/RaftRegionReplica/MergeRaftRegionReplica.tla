@@ -25,7 +25,7 @@
  * using the base spec's building-block operators (GatedMemberActions,
  * GatedMemberDataPathActions).  Single-member actions are guarded by
  * G1ParentActive(m) / G2ParentActive(m); multi-member actions
- * (RequestVote, InstallSnapshot) are guarded on the initiating member.
+ * (RequestVote, FollowerLoadFlushedState) are guarded on the initiating member.
  * FollowerApplyMarker and NewLeaderCommitOrphanEntry remain ungated.
  *
  * The merged group is lightweight (per-member boolean) since its
@@ -277,28 +277,28 @@ MasterOpenMerged(m) ==
 MergeG1GroupNext ==
     \/ \E m \in Members     : G1ParentActive(m) /\ G1!GatedMemberActions(m)
     \/ \E c, v \in Members  : G1ParentActive(c) /\ G1!RequestVote(c, v)
-    \/ \E l, f \in Members  : G1ParentActive(l) /\ G1!InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : G1ParentActive(l) /\ G1!FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : G1!FollowerApplyMarker(m)
     \/ G1!NewLeaderCommitOrphanEntry
 
 MergeG2GroupNext ==
     \/ \E m \in Members     : G2ParentActive(m) /\ G2!GatedMemberActions(m)
     \/ \E c, v \in Members  : G2ParentActive(c) /\ G2!RequestVote(c, v)
-    \/ \E l, f \in Members  : G2ParentActive(l) /\ G2!InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : G2ParentActive(l) /\ G2!FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : G2!FollowerApplyMarker(m)
     \/ G2!NewLeaderCommitOrphanEntry
 
 MergeG1GroupDataPathNext ==
     \/ \E m \in Members     : G1ParentActive(m) /\ G1!GatedMemberDataPathActions(m)
     \/ \E c, v \in Members  : G1ParentActive(c) /\ G1!RequestVote(c, v)
-    \/ \E l, f \in Members  : G1ParentActive(l) /\ G1!InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : G1ParentActive(l) /\ G1!FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : G1!FollowerApplyMarker(m)
     \/ G1!NewLeaderCommitOrphanEntry
 
 MergeG2GroupDataPathNext ==
     \/ \E m \in Members     : G2ParentActive(m) /\ G2!GatedMemberDataPathActions(m)
     \/ \E c, v \in Members  : G2ParentActive(c) /\ G2!RequestVote(c, v)
-    \/ \E l, f \in Members  : G2ParentActive(l) /\ G2!InstallSnapshot(l, f)
+    \/ \E l, f \in Members  : G2ParentActive(l) /\ G2!FollowerLoadFlushedState(l, f)
     \/ \E m \in Members     : G2!FollowerApplyMarker(m)
     \/ G2!NewLeaderCommitOrphanEntry
 
