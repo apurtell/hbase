@@ -41,7 +41,7 @@ The specification intentionally abstracts several features of `hbase-consensus` 
 - `PreVote` as a distinct round; subsumed in the leader-stickiness guard on `RequestVote`.
 - Chunked `InstallSnapshot` transfer (`SnapshotChunkCollector`). The consensus layer carries one snapshot wire path. The application payload it transports is opaque. The spec collapses chunk-transfer dynamics into a single atomic `FollowerLoadFlushedState` action whose effect is the design-target shared-storage catch-up. The follower log is truncated to the snapshot index and the application data is recoverable by loading HFiles on HDFS reached through the SPI-encoded metadata bytes.
 
-The specification defines 14 safety invariants and 5 liveness properties verified by TLC:
+The specification defines 19 safety invariants and 6 liveness properties verified by TLC:
 
 | # | Invariant | Category |
 |---|-----------|----------|
@@ -59,8 +59,13 @@ The specification defines 14 safety invariants and 5 liveness properties verifie
 | 12 | `PromotionReadWriteGuard` | Promotion |
 | 13 | `PromotionMVCCContinuity` | Promotion |
 | 14 | `CatchUpCompleteness` | Catch-up |
+| 15 | `QuiesceImpliesAllAcked` | Quiescence |
+| 16 | `QuiesceImpliesNoPendingWrite` | Quiescence |
+| 17 | `QuiesceImpliesIdleFlush` | Quiescence |
+| 18 | `QuiesceImpliesTermConsistency` | Quiescence |
+| 19 | `WakeBeforePropose` | Quiescence |
 
-The specification also defines 5 liveness properties checked under fairness constraints:
+The specification also defines 6 liveness properties checked under fairness constraints:
 
 | # | Property | Fairness | Description |
 |---|----------|----------|-------------|
@@ -69,29 +74,46 @@ The specification also defines 5 liveness properties checked under fairness cons
 | 3 | `FlushCompletion` | `LiveSpecFlush` | A started flush eventually completes |
 | 4 | `PromotionCompletion` | `LiveSpecLocal` | A promoting member eventually leaves Promoting (via master confirmation) and AwaitingMaster (via local completion) |
 | 5 | `CatchUpCompletion` | `LiveSpecLocal` | A catching-up follower eventually finishes |
+| 6 | `EventualWake` | `LiveSpecLocal` | A quiescent leader eventually wakes (Wake fires) or transitions out of leadership |
 
-Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-5 are local and require only weak fairness (WF) on local actions — network instability cannot block them.
+Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-6 are local and require only weak fairness (WF) on local actions — network instability cannot block them.  `EventualWake` is in this category because `Wake` and `LeaderKeepalive` are local actions; `BaseFairness` includes `WF_vars(Wake(m))` and `WF_vars(LeaderKeepalive(m))`.
 
-Fairness is factored into `BaseFairness` (WF for all 17 local actions, including `MasterConfirmPromotion`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
+Fairness is factored into `BaseFairness` (WF for the 19 local actions, including `MasterConfirmPromotion`, `Wake`, and `LeaderKeepalive`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
+
+### Idle-group quiescence
+
+The specification models idle-group quiescence (see the `Quiesce`, `Wake`, and `LeaderKeepalive` actions in the spec header).  When a leader's group is fully caught up and the lease is valid, `Quiesce` atomically marks the leader and every reachable responder quiescent, the leader's lease is refreshed one final time, and per-group `LeaderHeartbeat` actions stop firing.  Per-tick failure detection switches to the per-server `LeaderKeepalive` action that refreshes the leader's lease and resets responders' election timers without touching per-group state.  Any leader-side propose action (`BeginWrite`, `ProposeMarker`, `FlushStart`, `ProposeSplitMarker`, `ProposeMergeMarker_*`) is gated on `~groupQuiescent[leader]` and the leader must explicitly `Wake` first; `Wake` is also the only path that clears `groupQuiescent` and `laggingOnQuiesce` in steady state.  Crash-restart, role transitions (`Timeout`, `RequestVote`, `BecomeLeader`, `StepDown`, `LeaderLeaseExpiry`), and partition healing all reset `groupQuiescent` to `FALSE` on the affected member.
+
+The five new safety invariants capture the implementation contract:
+- `QuiesceImpliesAllAcked` — for a quiescent leader, every quiescent responder agrees with the leader on the committed prefix of the RAFT log.
+- `QuiesceImpliesNoPendingWrite` — no in-flight write on a quiescent leader.
+- `QuiesceImpliesIdleFlush` — no in-flight flush on a quiescent leader.
+- `QuiesceImpliesTermConsistency` — every quiescent member agrees with the quiescent leader on `currentTerm`.
+- `WakeBeforePropose` — propose-pipeline state (write Pending/Applied, flush FlushStarted/HFilesCommitted/RAFTProposed/RAFTCommitted) is unreachable while the leader is quiescent; every propose path goes through `Wake` first.
+
+`EventualWake` (liveness) ensures a quiescent leader eventually unquiesces (via `Wake`, role transition, or lease expiry); without it, weak fairness on `Wake` would not exclude infinite-quiescence executions.
 
 ## Latest Results
 
+The table below reflects the most recent run on the merged spec (with idle-group quiescence integrated into the base spec and all five quiescence invariants wired into every safety configuration).  Numbers without an explicit timestamp note are pre-quiescence baselines retained for reference; quiescence runs are scheduled after the implementation lands.
+
 | # | Configuration | Module (+ config file) | States generated | Wall time | Result |
 |---|---|---|---|---|---|
-| 1 | Base simulation | `MCRaftRegionReplica_sim` | 1,167,284,500 | 15m | Pass |
-| 2 | Datapath domain | `MCRaftRegionReplica_datapath` | 1,226,965,995 | 15m | Pass |
-| 3 | Election domain | `MCRaftRegionReplica_election` | 1,278,598,301 | 15m | Pass |
-| 4 | Multi-group | `MCRaftRegionReplica_multigroup` | 254,440,915 | 15m | Pass |
-| 5 | Split lifecycle | `MCRaftRegionReplica_split` | 521,235,119 | 15m | Pass |
-| 6 | Merge lifecycle | `MCRaftRegionReplica_merge` | 236,765,899 | 15m | Pass |
-| 7 | Full cross-product | `MCRaftRegionReplica` | 1,176,078,499 | 15m | Pass |
-| 8 | Liveness: election | `MCRaftRegionReplica_liveness_election` (`_liveness_election.cfg`) | 3,397,323 | 18m 14s | Pass |
-| 9 | Liveness: write | `MCRaftRegionReplica_liveness` (`_liveness_write.cfg`) | 71,391,615 | 15m | Pass |
-| 10 | Liveness: flush | `MCRaftRegionReplica_liveness` (`_liveness_flush.cfg`) | 75,178,436 | 15m | Pass |
-| 11 | Liveness: promotion | `MCRaftRegionReplica_liveness` (`_liveness_promotion.cfg`) | 51,867,035 | 15m | Pass |
-| 12 | Liveness: catchup | `MCRaftRegionReplica_liveness` (`_liveness_catchup.cfg`) | 106,405,908 | 15m | Pass |
+| 1 | Base simulation | `MCRaftRegionReplica_sim` | 1,167,284,500 | 15m | Pass (pre-quiescence; smoke run on merged spec covers 119k states without invariant violation) |
+| 2 | Datapath domain | `MCRaftRegionReplica_datapath` | 1,226,965,995 | 15m | Pass (pre-quiescence) |
+| 3 | Election domain | `MCRaftRegionReplica_election` | 1,278,598,301 | 15m | Pass (pre-quiescence) |
+| 4 | Multi-group | `MCRaftRegionReplica_multigroup` | 254,440,915 | 15m | Pass (pre-quiescence) |
+| 5 | Split lifecycle | `MCRaftRegionReplica_split` | 521,235,119 | 15m | Pass (pre-quiescence) |
+| 6 | Merge lifecycle | `MCRaftRegionReplica_merge` | 236,765,899 | 15m | Pass (pre-quiescence) |
+| 7 | Full cross-product | `MCRaftRegionReplica` | 1,176,078,499 | 15m | Pass (pre-quiescence) |
+| 8 | Liveness: election | `MCRaftRegionReplica_liveness_election` (`_liveness_election.cfg`) | 3,397,323 | 18m 14s | Pass (pre-quiescence) |
+| 9 | Liveness: write | `MCRaftRegionReplica_liveness` (`_liveness_write.cfg`) | 71,391,615 | 15m | Pass (pre-quiescence) |
+| 10 | Liveness: flush | `MCRaftRegionReplica_liveness` (`_liveness_flush.cfg`) | 75,178,436 | 15m | Pass (pre-quiescence) |
+| 11 | Liveness: promotion | `MCRaftRegionReplica_liveness` (`_liveness_promotion.cfg`) | 51,867,035 | 15m | Pass (pre-quiescence) |
+| 12 | Liveness: catchup | `MCRaftRegionReplica_liveness` (`_liveness_catchup.cfg`) | 106,405,908 | 15m | Pass (pre-quiescence) |
+| 13 | Liveness: quiescence | `MCRaftRegionReplica_liveness` (`_liveness_quiescence.cfg`) | TBD | TBD | TBD (`EventualWake`) |
 
-Across the twelve configurations, approximately 5.17 billion distinct states were explored with no invariant violations and no liveness counterexamples.  Each safety configuration checks the full invariant list for its spec and each liveness configuration checks exactly the `~>` property wired to its `SPECIFICATION`.
+Across the twelve pre-quiescence configurations, approximately 5.17 billion distinct states were explored with no invariant violations and no liveness counterexamples.  After merging the quiescence model the merged spec passes SANY parsing on every module and a 3-second simulation smoke run on `MCRaftRegionReplica.cfg` (≈119k states) without any invariant violation.  Full re-runs of all 12+1 configurations are scheduled as part of the build-verify task; results will be back-filled into this table when complete.
 
 ## Verification Strategy
 

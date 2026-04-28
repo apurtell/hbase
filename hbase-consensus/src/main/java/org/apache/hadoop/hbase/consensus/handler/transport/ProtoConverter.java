@@ -186,9 +186,13 @@ final class ProtoConverter {
   }
 
   ConsensusProtos.GroupHeartbeatPB toGroupHeartbeatPB(LeaderHeartbeat hb) {
-    return ConsensusProtos.GroupHeartbeatPB.newBuilder().setGroupId(groupIdToBytes(hb.getGroupId()))
-      .setSender(toEndpointPB(hb.getSender())).setTerm(hb.getTerm())
-      .setCommitIndex(hb.getCommitIndex()).build();
+    ConsensusProtos.GroupHeartbeatPB.Builder b = ConsensusProtos.GroupHeartbeatPB.newBuilder()
+      .setGroupId(groupIdToBytes(hb.getGroupId())).setSender(toEndpointPB(hb.getSender()))
+      .setTerm(hb.getTerm()).setCommitIndex(hb.getCommitIndex());
+    if (hb.isQuiesced()) {
+      b.setQuiesced(true);
+    }
+    return b.build();
   }
 
   LeaderHeartbeat fromGroupHeartbeatPB(ConsensusProtos.GroupHeartbeatPB pb) {
@@ -198,7 +202,7 @@ final class ProtoConverter {
     requireField(pb.hasCommitIndex(), "GroupHeartbeatPB", "commit_index");
     return factory.createLeaderHeartbeatBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
-      .setCommitIndex(pb.getCommitIndex()).build();
+      .setCommitIndex(pb.getCommitIndex()).setQuiesced(pb.getQuiesced()).build();
   }
 
   ConsensusProtos.GroupHeartbeatAckPB toGroupHeartbeatAckPB(LeaderHeartbeatAck ack) {

@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
@@ -40,7 +41,9 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.hadoop.hbase.consensus.raft.transport.PeerKeepaliveTracker;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.JVM;
 import org.apache.hadoop.hbase.util.ReflectionUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -99,6 +102,25 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   private final AtomicBoolean started = new AtomicBoolean(false);
   private final AtomicBoolean stopped = new AtomicBoolean(false);
   private final ConcurrentMap<RaftEndpoint, OutboundChannel> peers = new ConcurrentHashMap<>();
+  /**
+   * Process-wide tracker of per-RS keepalive observations carried by inbound
+   * {@code HeartbeatBatchPB} envelopes. Updated by {@link InboundHandler} on every observed
+   * envelope; consulted by quiescent followers in place of the per-group election timer.
+   */
+  private final PeerKeepaliveTrackerImpl peerKeepaliveTracker = new PeerKeepaliveTrackerImpl();
+
+  /**
+   * Per-process boot epoch carried as the {@code epoch} field on every {@code HeartbeatBatchPB}
+   * envelope. Differing epochs from the same {@code sender} indicate the peer process restarted, so
+   * the receiver can flush stale per-RS keepalive state.
+   */
+  private final long keepaliveEpochMillis = EnvironmentEdgeManager.currentTime();
+  /**
+   * Monotonic per-tick counter carried as the {@code tick} field on every {@code HeartbeatBatchPB}
+   * envelope. Bumped on every {@link #tick()} (the periodic flush runnable). The receiver uses
+   * {@code (epoch, tick)} to detect duplicate or out-of-order envelopes.
+   */
+  private final AtomicLong keepaliveTick = new AtomicLong();
 
   private EventLoopGroup eventLoopGroup;
   private Class<? extends ServerChannel> serverChannelClass;
@@ -149,6 +171,16 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
 
   public RaftEndpoint getLocalEndpoint() {
     return localEndpoint;
+  }
+
+  /**
+   * Returns the per-RS keepalive tracker fed by inbound {@code HeartbeatBatchPB} envelopes.
+   * Quiescent followers query this to decide whether their leader is still alive without paying the
+   * per-group heartbeat traffic.
+   */
+  @NonNull
+  public PeerKeepaliveTracker getPeerKeepaliveTracker() {
+    return peerKeepaliveTracker;
   }
 
   /**
@@ -220,7 +252,7 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       clientChannelClass = NioSocketChannel.class;
     }
 
-    InboundHandler inboundHandler = new InboundHandler(registry, converter);
+    InboundHandler inboundHandler = new InboundHandler(registry, converter, peerKeepaliveTracker);
     ConsensusFrameEncoder frameEncoder = new ConsensusFrameEncoder();
     WriteBufferWaterMark watermarks = new WriteBufferWaterMark(config.getWriteLowWatermarkBytes(),
       config.getWriteHighWatermarkBytes());
@@ -343,8 +375,8 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       return existing;
     }
     InetSocketAddress address = resolver.resolve(target);
-    OutboundChannel created =
-      new OutboundChannel(target, address, clientBootstrap, converter, config);
+    OutboundChannel created = new OutboundChannel(target, address, clientBootstrap, converter,
+      config, localEndpoint, keepaliveEpochMillis, keepaliveTick);
     OutboundChannel previous = peers.putIfAbsent(target, created);
     return previous == null ? created : previous;
   }
@@ -353,6 +385,7 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
     if (stopped.get()) {
       return;
     }
+    keepaliveTick.incrementAndGet();
     for (OutboundChannel ch : peers.values()) {
       try {
         ch.flushTick();

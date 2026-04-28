@@ -79,6 +79,10 @@ public final class ReplicateTask implements Runnable {
         future.fail(raftNode.newCannotReplicateException());
         return;
       }
+      // Every leader-side propose action wakes the group if quiescent
+      // and refreshes the activity timestamp the grace gate uses. Maps to the spec's
+      // WakeBeforePropose invariant.
+      raftNode.wake();
       RaftLog log = state.log();
       if (!log.checkAvailableCapacity(1)) {
         future.fail(new IllegalStateException("Not enough capacity in RaftLog!"));

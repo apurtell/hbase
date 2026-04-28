@@ -262,6 +262,28 @@
  * collapsing functionally equivalent states that differ only in
  * absolute clock position.
  *
+ * When a leader's group is caught up, has no in-flight proposals, and
+ * holds a valid lease, the leader transitions the group to a Quiescent
+ * state. The transition is broadcast as a one-shot quiesce notice
+ * (modeled atomically), after which the leader emits no further
+ * per-group heartbeats for this group.  Per-tick failure detection
+ * relies on a per-server LeaderKeepalive action that refreshes the
+ * leader's lease and resets responders' election timers without
+ * touching per-group state — the implementation piggybacks this on
+ * the always-emitted HEARTBEAT_BATCH envelope's top-level sender /
+ * epoch / tick fields, so quiescent groups consume zero per-group
+ * bytes per tick.  Quiescence is cleared (Wake) atomically by any
+ * leader-side propose action (BeginWrite, ProposeMarker,
+ * FlushStart, FlushRAFTPropose, etc.) or by any non-heartbeat
+ * follower-side action (FollowerBeginBatchApply,
+ * FollowerCompleteBatchApply, FollowerApplyMarker, election-related
+ * actions).  The laggingOnQuiesce[leader] set records members that
+ * the leader proceeded to quiesce in spite of (members not in
+ * Responders(leader) at quiesce time); in the implementation,
+ * follower-side shouldFollowerQuiesceOnNotify cross-checks this
+ * set against the follower's own liveness view to reject
+ * stale-liveness quiesce notices.
+ *
  * Implementation features intentionally abstracted (not modeled):
  *
  *   - The wire-level distinction between LeaderHeartbeat (lightweight,
@@ -403,7 +425,7 @@
  * an additional system-level safety net for catastrophic correlated
  * faults that simultaneously destroy a majority's RAFT logs.
  *
- * Safety properties (15 invariants):
+ * Safety properties (18 invariants):
  *   RAFT consensus:
  *   - LeaderUniqueness: at most one leader per term
  *   - LeaseImpliesLeadership: a valid lease implies the Leader role
@@ -444,6 +466,19 @@
  *     entries (ApplicableEntries = {}, fApplyBatch = {}), its memstore
  *     is consistent — every committed entry is in memstore or covered
  *     by an applied flush marker (data is in HFiles on HDFS)
+ *   Quiescence:
+ *   - QuiesceImpliesAllAcked: while the leader is quiescent, every
+ *     reachable responder that is also quiescent has the same RAFT
+ *     log as the leader
+ *   - QuiesceImpliesNoPendingWrite: no in-flight write on a quiescent
+ *     leader; every propose action atomically clears quiescence
+ *   - QuiesceImpliesIdleFlush: no in-flight flush on a quiescent
+ *     leader; symmetric to QuiesceImpliesNoPendingWrite for the flush
+ *     pipeline
+ *   - QuiesceImpliesTermConsistency: while the leader is quiescent,
+ *     every quiescent responder agrees with the leader on currentTerm
+ *     (catches a stale follower latching onto a dead leader's quiesce
+ *     notice and never re-electing)
  *
  * BecomeLeader is modeled as atomic with the initial heartbeat round.
  * In the real protocol, a candidate that wins the election immediately
@@ -519,7 +554,10 @@ VARIABLES
     flushDropBound,     \* flushDropBound[s]: maps flush marker seqId s to its HFile coverage boundary (snapshotMaxSeqId)
     \* ---- Promotion pipeline ----
     promotionPhase,     \* promotionPhase[m]: promotion state (None | Promoting | AwaitingMaster | Complete)
-    masterConfirmedTerm \* masterConfirmedTerm: highest RAFT term confirmed by master for this group (0 = none)
+    masterConfirmedTerm,\* masterConfirmedTerm: highest RAFT term confirmed by master for this group (0 = none)
+    \* ---- Group quiescence ----
+    groupQuiescent,     \* groupQuiescent[m]: TRUE if member m thinks the group is currently quiescent (per-member view)
+    laggingOnQuiesce    \* laggingOnQuiesce[m]: SUBSET Members; on the leader, members the leader proceeded to quiesce in spite of (lagging or unreachable)
 
 vars == <<role, currentTerm, votedFor, votesGranted, raftLog,
           clock, leaseRemaining, timerRemaining, partition,
@@ -527,7 +565,8 @@ vars == <<role, currentTerm, votedFor, votesGranted, raftLog,
           hdfsHFiles, memstore, fApplyBatch,
           writePhase, walSync, raftCommitted, writeSeqId,
           flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
-          promotionPhase, masterConfirmedTerm>>
+          promotionPhase, masterConfirmedTerm,
+          groupQuiescent, laggingOnQuiesce>>
 
 writeVars == <<writePhase, walSync, raftCommitted, writeSeqId>>
 
@@ -536,6 +575,8 @@ flushVars == <<flushPhase, flushSeqId, snapshotMaxSeqId>>
 timerVars == <<clock, leaseRemaining, timerRemaining>>
 
 promotionVars == <<promotionPhase, masterConfirmedTerm>>
+
+quiesceVars == <<groupQuiescent, laggingOnQuiesce>>
 
 globalCommitVars == <<nextSeqId, committedEntries, markerEntries,
                       flushMarkerEntries, hdfsHFiles>>
@@ -570,6 +611,8 @@ TypeOK ==
     /\ flushDropBound \in [1..MaxSeqId -> 0..MaxSeqId]
     /\ promotionPhase \in [Members -> {"None", "Promoting", "AwaitingMaster", "Complete"}]
     /\ masterConfirmedTerm \in 0..MaxTerm
+    /\ groupQuiescent \in [Members -> BOOLEAN]
+    /\ laggingOnQuiesce \in [Members -> SUBSET Members]
 
 ----
 (* ---- Helper definitions ---- *)
@@ -709,6 +752,9 @@ Init ==
     \* Promotion pipeline
     /\ promotionPhase  = [m \in Members |-> "None"]
     /\ masterConfirmedTerm = 0
+    \* Group quiescence
+    /\ groupQuiescent  = [m \in Members |-> FALSE]
+    /\ laggingOnQuiesce = [m \in Members |-> {}]
 
 ----
 (* ---- Actions ---- *)
@@ -731,13 +777,15 @@ Timeout(m) ==
     /\ role[m] \in {"Follower", "Candidate"}
     /\ currentTerm[m] < MaxTerm
     /\ timerRemaining[m] = 0
-    /\ currentTerm'    = [currentTerm    EXCEPT ![m] = @ + 1]
-    /\ role'           = [role           EXCEPT ![m] = "Candidate"]
-    /\ votedFor'       = [votedFor       EXCEPT ![m] = m]
-    /\ votesGranted'   = [votesGranted   EXCEPT ![m] = {m}]
-    /\ timerRemaining' = [timerRemaining EXCEPT ![m] = ElectionTimeoutMin]
-    /\ leaseRemaining' = [leaseRemaining EXCEPT ![m] = 0]
-    /\ fApplyBatch'    = [fApplyBatch    EXCEPT ![m] = {}]
+    /\ currentTerm'      = [currentTerm    EXCEPT ![m] = @ + 1]
+    /\ role'             = [role           EXCEPT ![m] = "Candidate"]
+    /\ votedFor'         = [votedFor       EXCEPT ![m] = m]
+    /\ votesGranted'     = [votesGranted   EXCEPT ![m] = {m}]
+    /\ timerRemaining'   = [timerRemaining EXCEPT ![m] = ElectionTimeoutMin]
+    /\ leaseRemaining'   = [leaseRemaining EXCEPT ![m] = 0]
+    /\ fApplyBatch'      = [fApplyBatch    EXCEPT ![m] = {}]
+    /\ groupQuiescent'   = [groupQuiescent EXCEPT ![m] = FALSE]
+    /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
     /\ UNCHANGED <<raftLog, clock, partition,
                    globalCommitVars, memstore,
                    writeVars, flushVars, flushDropBound,
@@ -816,6 +864,8 @@ RequestVote(candidate, voter) ==
                                   IF steppingDown THEN 0 ELSE @]
           /\ promotionPhase' = [promotionPhase EXCEPT ![voter] =
                                   IF steppingDown THEN "None" ELSE @]
+          /\ groupQuiescent' = [groupQuiescent EXCEPT ![voter] = FALSE]
+          /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![voter] = {}]
     /\ UNCHANGED <<raftLog, clock, timerRemaining, partition,
                    globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
@@ -897,6 +947,12 @@ BecomeLeader(m) ==
               IF r = m THEN "Promoting"
               ELSE IF r \in responders THEN "None"
               ELSE promotionPhase[r]]
+        /\ groupQuiescent' = [r \in Members |->
+              IF r = m \/ r \in responders THEN FALSE
+              ELSE groupQuiescent[r]]
+        /\ laggingOnQuiesce' = [r \in Members |->
+              IF r = m \/ r \in responders THEN {}
+              ELSE laggingOnQuiesce[r]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        globalCommitVars, fApplyBatch,
                        flushDropBound, masterConfirmedTerm>>
@@ -954,6 +1010,7 @@ BecomeLeader(m) ==
 \* preparation (sendCatchupAppendsIfNeeded).
 LeaderHeartbeat(leader) ==
     /\ role[leader] = "Leader"
+    /\ ~groupQuiescent[leader]
     /\ QuorumReachable(leader)
     /\ LET responders == Responders(leader)
        IN
@@ -995,7 +1052,149 @@ LeaderHeartbeat(leader) ==
                 IF m \in responders THEN "None" ELSE promotionPhase[m]]
         /\ UNCHANGED <<raftLog, clock, partition,
                        globalCommitVars, fApplyBatch,
-                       flushDropBound, masterConfirmedTerm>>
+                       flushDropBound, masterConfirmedTerm,
+                       quiesceVars>>
+
+\* Leader transitions the group to a Quiescent state. The leader holds a
+\* valid lease, has completed promotion, has no in-flight write or
+\* flush, has no unapplied committed entries on itself or any reachable
+\* responder, and every reachable responder's RAFT log matches the
+\* leader's.  After Quiesce fires, no further per-group LeaderHeartbeat
+\* fires for this leader (the action is gated on ~groupQuiescent), and
+\* per-tick failure detection is carried by LeaderKeepalive.
+\*
+\* The transition is modeled atomically — the leader marks itself and
+\* every reachable responder quiescent in one step.  In the
+\* implementation this is one outbound HEARTBEAT_BATCH frame carrying
+\* GroupHeartbeatPB{quiesce=true} per follower, fired-and-forget; a
+\* missed notice just leaves that follower running its own election
+\* timer until the next non-quiesce signal arrives.  The atomic model
+\* is an over-approximation of the implementation's per-follower
+\* delivery: the spec covers the case where every follower correctly
+\* receives and acts on the notice; followers that miss it are safe
+\* by construction (they simply do not transition to quiescent).
+\*
+\* laggingOnQuiesce[leader] is set to the members the leader proceeded
+\* to quiesce in spite of (members not in Responders(leader) at quiesce
+\* time, e.g., partitioned).  In the implementation, follower-side
+\* shouldFollowerQuiesceOnNotify cross-checks this set against the
+\* follower's own liveness view to reject stale-liveness notices.
+\*
+\* Lease and election-timer effects mirror LeaderHeartbeat's atomic
+\* round-trip: the leader's lease is refreshed as the same logical
+\* round-trip that resets responders' election timers, preserving the
+\* causal binding required by LeaseExpiresBeforeElection.  Per-group
+\* state on responders (memstore, write/flush pipelines, votedFor,
+\* role, currentTerm) is unchanged — the responders are already
+\* caught up, and Quiesce does not reset their per-group state the
+\* way LeaderHeartbeat does (which is harmless since the precondition
+\* required them to be in a quiet state matching the leader).
+Quiesce(leader) ==
+    /\ role[leader] = "Leader"
+    /\ ~groupQuiescent[leader]
+    /\ leaseRemaining[leader] > 0
+    /\ promotionPhase[leader] = "Complete"
+    /\ writePhase[leader] = "Idle"
+    /\ flushPhase[leader] = "Idle"
+    /\ ApplicableEntries(leader) = {}
+    /\ fApplyBatch[leader] = {}
+    \* No entry remains pending commit (no NewLeaderCommitOrphanEntry
+    \* would currently fire).  This requires the leader has drained
+    \* its initial AdvanceCommitIndex round before quiescing. Stale-only
+    \* entries are tolerated; AppendEntries log-truncation would
+    \* purge them in a real wire protocol but is abstracted here.
+    /\ ~\E s \in 1..MaxSeqId :
+            s \notin committedEntries
+            /\ Cardinality({n \in Members : s \in raftLog[n]}) >= Majority
+    /\ QuorumReachable(leader)
+    /\ \A f \in Responders(leader) :
+         /\ committedEntries \cap raftLog[f] = committedEntries \cap raftLog[leader]
+         /\ ApplicableEntries(f) = {}
+         /\ fApplyBatch[f] = {}
+    /\ LET responders == Responders(leader)
+       IN
+        /\ groupQuiescent' = [m \in Members |->
+              IF m = leader \/ m \in responders THEN TRUE
+              ELSE groupQuiescent[m]]
+        /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT
+              ![leader] = Members \ ({leader} \cup responders)]
+        /\ leaseRemaining' = [leaseRemaining EXCEPT ![leader] = LeaderLeaseDuration]
+        /\ timerRemaining' = [m \in Members |->
+              IF m \in responders THEN ElectionTimeoutMin
+              ELSE timerRemaining[m]]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog, clock,
+                   partition, globalCommitVars, memstore, fApplyBatch,
+                   writeVars, flushVars, flushDropBound, promotionVars>>
+
+\* Per-tick leader-side keepalive that the SweepingHeartbeatScheduler
+\* emits via the always-emitted HEARTBEAT_BATCH envelope (top-level
+\* sender / epoch / tick fields populated, groups[] possibly empty).
+\* While the leader is quiescent and per-group LeaderHeartbeat is
+\* suppressed, the keepalive refreshes the lease and the responders'
+\* election timers, providing the per-server-level failure detection
+\* substrate that survives quiescence.  In the implementation, the
+\* receiving follower updates the shared
+\* ConsensusServer.lastPeerKeepaliveMillis map under the sender's
+\* endpoint, and every quiescent group on the receiver that has the
+\* sender as leader uses that map for its election-timer gate.
+\*
+\* Modeled atomically alongside LeaderHeartbeat / Quiesce to keep the
+\* abstraction level consistent.  The keepalive does NOT touch
+\* per-group state (no memstore / write / flush / promotion effects)
+\* — it carries only the top-level liveness fields.  It is gated on
+\* groupQuiescent[leader] to avoid redundant exploration with
+\* LeaderHeartbeat; in the implementation, the keepalive fields are
+\* on every HEARTBEAT_BATCH envelope regardless of group state, but
+\* the timer-reset and lease-refresh effects are subsumed by
+\* LeaderHeartbeat when the group is active.
+LeaderKeepalive(leader) ==
+    /\ role[leader] = "Leader"
+    /\ groupQuiescent[leader]
+    /\ leaseRemaining[leader] > 0
+    /\ QuorumReachable(leader)
+    /\ leaseRemaining' = [leaseRemaining EXCEPT ![leader] = LeaderLeaseDuration]
+    /\ timerRemaining' = [m \in Members |->
+            IF m \in Responders(leader)
+            THEN ElectionTimeoutMin
+            ELSE timerRemaining[m]]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog, clock,
+                   partition, globalCommitVars, memstore, fApplyBatch,
+                   writeVars, flushVars, flushDropBound, promotionVars,
+                   quiesceVars>>
+
+\* Leader transitions the group out of the Quiescent state. Clears
+\* groupQuiescent on the leader and on every reachable responder
+\* (in the implementation, the leader's next outbound non-quiesce
+\* heartbeat or AppendEntries implicitly wakes all responders that
+\* receive it).  laggingOnQuiesce[leader] is also reset.
+\*
+\* Wake is enabled whenever the leader is currently quiescent and
+\* still holds Leader role.  In the model, Wake fires nondetermin-
+\* istically; in the implementation it fires at concrete trigger
+\* points (ReplicateTask, MembershipChangeTask, TransferLeadership,
+\* lease-expiry detection, observing a higher-term ack), each of
+\* which corresponds in the spec to a separate action that already
+\* clears groupQuiescent (StepDown, LeaderLeaseExpiry, etc.) or
+\* requires the propose-style guard ~groupQuiescent[leader] which
+\* this Wake step satisfies.
+\*
+\* Adding WF on Wake to the fairness bundle ensures that, given any
+\* sequence of propose attempts at a quiescent leader, the leader
+\* eventually unquiesces and the proposes can fire.  Without the
+\* Wake action, leader-side propose actions would all be blocked
+\* by the ~groupQuiescent[leader] guard, breaking WriteCompletion
+\* and FlushCompletion liveness.
+Wake(leader) ==
+    /\ role[leader] = "Leader"
+    /\ groupQuiescent[leader]
+    /\ groupQuiescent' = [m \in Members |->
+            IF m = leader \/ m \in Responders(leader) THEN FALSE
+            ELSE groupQuiescent[m]]
+    /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![leader] = {}]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   timerVars, partition,
+                   globalCommitVars, memstore, fApplyBatch,
+                   writeVars, flushVars, flushDropBound, promotionVars>>
 
 \* A member discovers a higher term and steps down to Follower.
 \* Abstracts receiving any RPC carrying a higher term.
@@ -1023,21 +1222,23 @@ StepDown(m) ==
         /\ other # m
         /\ currentTerm[other] > currentTerm[m]
         /\ CanCommunicate(m, other)
-        /\ currentTerm' = [currentTerm EXCEPT ![m] = currentTerm[other]]
-    /\ role'          = [role          EXCEPT ![m] = "Follower"]
-    /\ votedFor'      = [votedFor      EXCEPT ![m] = None]
-    /\ votesGranted'  = [votesGranted  EXCEPT ![m] = {}]
-    /\ leaseRemaining'  = [leaseRemaining  EXCEPT ![m] = 0]
-    /\ timerRemaining'  = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
-    /\ memstore'        = [memstore        EXCEPT ![m] = PhaseAwareMemstoreDrop(m)]
-    /\ writePhase'      = [writePhase      EXCEPT ![m] = "Idle"]
-    /\ walSync'         = [walSync         EXCEPT ![m] = "Pending"]
-    /\ raftCommitted'   = [raftCommitted   EXCEPT ![m] = FALSE]
-    /\ writeSeqId'      = [writeSeqId      EXCEPT ![m] = 0]
-    /\ flushPhase'      = [flushPhase      EXCEPT ![m] = "Idle"]
-    /\ flushSeqId'      = [flushSeqId      EXCEPT ![m] = 0]
+        /\ currentTerm'  = [currentTerm EXCEPT ![m] = currentTerm[other]]
+    /\ role'             = [role          EXCEPT ![m] = "Follower"]
+    /\ votedFor'         = [votedFor      EXCEPT ![m] = None]
+    /\ votesGranted'     = [votesGranted  EXCEPT ![m] = {}]
+    /\ leaseRemaining'   = [leaseRemaining  EXCEPT ![m] = 0]
+    /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
+    /\ memstore'         = [memstore        EXCEPT ![m] = PhaseAwareMemstoreDrop(m)]
+    /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
+    /\ walSync'          = [walSync         EXCEPT ![m] = "Pending"]
+    /\ raftCommitted'    = [raftCommitted   EXCEPT ![m] = FALSE]
+    /\ writeSeqId'       = [writeSeqId      EXCEPT ![m] = 0]
+    /\ flushPhase'       = [flushPhase      EXCEPT ![m] = "Idle"]
+    /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
     /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
-    /\ promotionPhase'  = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ groupQuiescent'   = [groupQuiescent  EXCEPT ![m] = FALSE]
+    /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
     /\ UNCHANGED <<raftLog, clock, partition,
                    globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
@@ -1085,6 +1286,8 @@ LeaderLeaseExpiry(m) ==
     /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
     /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
+    /\ groupQuiescent'   = [groupQuiescent  EXCEPT ![m] = FALSE]
+    /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
     /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock,
                    leaseRemaining, partition,
                    globalCommitVars,
@@ -1133,7 +1336,7 @@ ClockTick(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    partition, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* ---- Crash recovery actions ----
 
@@ -1181,6 +1384,8 @@ CrashRestartEffect(m) ==
     /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
     /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
     /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
+    /\ groupQuiescent'   = [groupQuiescent  EXCEPT ![m] = FALSE]
+    /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
 
 CrashRestart(m) ==
     /\ CrashRestartGuard(m)
@@ -1246,7 +1451,7 @@ CreatePartition ==
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                        timerVars, globalCommitVars, memstore, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
-                       promotionVars>>
+                       promotionVars, quiesceVars>>
 
 \* Nondeterministically heal a partition between two members.
 \* Models individual network link recovery.
@@ -1257,7 +1462,7 @@ HealPartition ==
         /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                        timerVars, globalCommitVars, memstore, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
-                       promotionVars>>
+                       promotionVars, quiesceVars>>
 
 \* Heal ALL partitions at once — full network recovery.
 \* This action is deterministic (no internal nondeterminism) so
@@ -1272,7 +1477,7 @@ HealAllPartitions ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    timerVars, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* ---- Leader write path actions ----
 
@@ -1295,6 +1500,7 @@ HealAllPartitions ==
 \* snapshotMaxSeqId) never discards data from concurrent writes.
 BeginWrite(m) ==
     /\ IsLeader(m)
+    /\ ~groupQuiescent[m]
     /\ promotionPhase[m] = "Complete"
     /\ writePhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
@@ -1307,7 +1513,7 @@ BeginWrite(m) ==
                    timerVars, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, flushVars,
-                   flushDropBound, promotionVars>>
+                   flushDropBound, promotionVars, quiesceVars>>
 
 \* WAL sync to HDFS completes successfully.  Models wal.sync(txid)
 \* returning without error (HRegion.doMiniBatchMutate step 4a).
@@ -1320,7 +1526,7 @@ WALSyncComplete(m) ==
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   flushDropBound, promotionVars>>
+                   flushDropBound, promotionVars, quiesceVars>>
 
 \* WAL sync to HDFS fails (HDFS pipeline broken, DataNode failure,
 \* network timeout).  Nondeterministic.  Models wal.sync(txid) throwing
@@ -1334,7 +1540,7 @@ WALSyncFail(m) ==
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
-                   flushDropBound, promotionVars>>
+                   flushDropBound, promotionVars, quiesceVars>>
 
 \* RAFT propose succeeds: the entry is committed by majority ack.
 \* Models consensus.propose(stampedWALEdit, seqId) completing
@@ -1366,7 +1572,7 @@ RAFTCommitWrite(m) ==
                    nextSeqId, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch,
                    writePhase, walSync, writeSeqId, flushVars,
-                   flushDropBound, promotionVars>>
+                   flushDropBound, promotionVars, quiesceVars>>
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
 \* commit have completed, so the barrier passes.  Models
@@ -1388,7 +1594,7 @@ CompleteWrite(m) ==
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    walSync, raftCommitted, writeSeqId, flushVars,
-                   flushDropBound, promotionVars>>
+                   flushDropBound, promotionVars, quiesceVars>>
 
 \* Write acknowledged to client, pipeline reset.  Models the return from
 \* doMiniBatchMutate (step 9) and resets the write pipeline for the
@@ -1400,7 +1606,7 @@ AckWrite(m) ==
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Leader aborts the RegionServer process because WAL sync failed.
 \* This is the mandated response when the WAL is broken: the RS cannot
@@ -1434,6 +1640,7 @@ WALFailureAbort(m) ==
 \* in progress, the seqId counter not exhausted, and a majority reachable.
 ProposeMarker(m) ==
     /\ IsLeader(m)
+    /\ ~groupQuiescent[m]
     /\ promotionPhase[m] = "Complete"
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
@@ -1454,7 +1661,7 @@ ProposeMarker(m) ==
                    timerVars, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* ---- Flush protocol actions ----
 \*
@@ -1531,6 +1738,7 @@ ProposeMarker(m) ==
 \* or below `flushDropBound[flushSeqId]`.
 FlushStart(m) ==
     /\ IsLeader(m)
+    /\ ~groupQuiescent[m]
     /\ promotionPhase[m] = "Complete"
     /\ flushPhase[m] = "Idle"
     /\ nextSeqId <= MaxSeqId
@@ -1546,7 +1754,7 @@ FlushStart(m) ==
                    timerVars, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, writeVars,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* HFiles are moved from the tmp directory to the store directory
 \* (sfc.commit()).  After this step, the HFiles are durable on HDFS
@@ -1564,7 +1772,7 @@ FlushCommitHFiles(m) ==
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, memstore, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Leader proposes the FLUSH_COMPLETE marker through RAFT.  The marker
 \* is proposed but not yet committed; FlushRAFTCommit handles the
@@ -1587,7 +1795,7 @@ FlushRAFTPropose(m) ==
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Majority acknowledges the FLUSH_COMPLETE marker.  The marker is now
 \* RAFT-committed: its seqId is added to committedEntries and
@@ -1609,7 +1817,7 @@ FlushRAFTCommit(m) ==
                    timerVars, partition,
                    nextSeqId, hdfsHFiles, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Flush completion: drop memstore entries at or below snapshotMaxSeqId
 \* (the actual HFile coverage boundary), write COMMIT_FLUSH to WAL,
@@ -1632,7 +1840,7 @@ FlushComplete(m) ==
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    writeVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* ---- Follower batch apply actions ----
 
@@ -1667,7 +1875,7 @@ FollowerBeginBatchApply(m) ==
                    timerVars, partition, globalCommitVars,
                    memstore,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Follower completes applying a batch of committed mutation entries:
 \* stamp cells with the leader's sequence IDs, add all cells to the
@@ -1686,7 +1894,7 @@ FollowerCompleteBatchApply(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    timerVars, partition, globalCommitVars,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Follower applies a committed marker entry.  When the next unapplied
 \* committed entry is a marker (flush-complete, compaction-complete),
@@ -1730,7 +1938,7 @@ FollowerApplyMarker(m) ==
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* ---- Promotion protocol actions ----
 
@@ -1764,7 +1972,8 @@ MasterConfirmPromotion(m) ==
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
-                   writeVars, flushVars, flushDropBound>>
+                   writeVars, flushVars, flushDropBound,
+                   quiesceVars>>
 
 \* A leader that has received master confirmation completes the
 \* local promotion steps: setReadOnly(false) and acquire WAL
@@ -1794,7 +2003,7 @@ PromotionComplete(m) ==
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   masterConfirmedTerm>>
+                   masterConfirmedTerm, quiesceVars>>
 
 \* ---- Orphan entry commitment ----
 
@@ -1837,6 +2046,7 @@ NewLeaderCommitOrphanEntry ==
         /\ Cardinality({m \in Members : s \in raftLog[m]}) >= Majority
         /\ \E leader \in Members :
             /\ IsLeader(leader)
+            /\ ~groupQuiescent[leader]
             /\ IF s \in hdfsHFiles
                THEN /\ committedEntries' = committedEntries \union {s}
                     /\ markerEntries' = markerEntries \union {s}
@@ -1850,7 +2060,7 @@ NewLeaderCommitOrphanEntry ==
                        timerVars, partition,
                        nextSeqId, hdfsHFiles, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
-                       promotionVars>>
+                       promotionVars, quiesceVars>>
 
 \* ---- RAFT log GC and catch-up actions ----
 
@@ -1879,13 +2089,14 @@ RaftLogGCEffect(m) ==
         /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e > flushDropBound[s]}]
 
 RaftLogGC(m) ==
+    /\ ~groupQuiescent[m]
     /\ RaftLogGCGuard(m)
     /\ RaftLogGCEffect(m)
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* The leader catches up a lagging follower whose needed RAFT log
 \* entries have been garbage-collected by sending a chunked
@@ -1918,6 +2129,8 @@ RaftLogGC(m) ==
 \* via normal FollowerBeginBatchApply / FollowerApplyMarker.
 FollowerLoadFlushedState(leader, follower) ==
     /\ role[leader] = "Leader"
+    /\ ~groupQuiescent[follower]
+    /\ ~groupQuiescent[leader]
     /\ follower # leader
     /\ CanCommunicate(leader, follower)
     /\ FollowerOrPromoting(follower)
@@ -1933,7 +2146,7 @@ FollowerLoadFlushedState(leader, follower) ==
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* A new member bootstraps into the RAFT group, replacing a member
 \* whose instance has been terminated (e.g., a new Kubernetes pod with
@@ -2058,6 +2271,8 @@ NewMemberBootstrap(m) ==
             /\ flushSeqId'       = [flushSeqId      EXCEPT ![m] = 0]
             /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
             /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
+            /\ groupQuiescent'   = [groupQuiescent  EXCEPT ![m] = FALSE]
+            /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
         /\ UNCHANGED <<clock, partition, globalCommitVars,
                        flushDropBound, masterConfirmedTerm>>
 
@@ -2078,7 +2293,7 @@ AtomicFollowerBatchApply(m) ==
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 \* Atomic write completion and ack: applies the write to memstore and
 \* resets the write pipeline in a single step.  Merges CompleteWrite +
@@ -2091,7 +2306,7 @@ AtomicCompleteWriteAndAck(m) ==
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    flushVars, flushDropBound,
-                   promotionVars>>
+                   promotionVars, quiesceVars>>
 
 ----
 (* ---- Next-state relation and specification ---- *)
@@ -2133,6 +2348,9 @@ ElectionAndLeadershipActions(m) ==
     \/ LeaderHeartbeat(m)
     \/ StepDown(m)
     \/ LeaderLeaseExpiry(m)
+    \/ Quiesce(m)
+    \/ Wake(m)
+    \/ LeaderKeepalive(m)
 
 WritePathCommonActions(m) ==
     \/ BeginWrite(m)
@@ -2498,6 +2716,76 @@ CatchUpCompleteness ==
             \/ s \in memstore[m]
             \/ \E f \in flushMarkerEntries \cap memstore[m] : s <= flushDropBound[f]
 
+\* ---- Quiescence invariants  ----
+
+\* While the leader is quiescent, every reachable responder that is
+\* also quiescent agrees with the leader on the set of committed
+\* entries present in the RAFT log.  At quiesce time the Quiesce
+\* action committed to the snapshot that committedEntries \cap raftLog[f]
+\* matches the leader's view.  The only quiescent-compatible actions
+\* that modify raftLog are RaftLogGC and FollowerLoadFlushedState; both
+\* are gated on ~groupQuiescent[m], so the equality is preserved while
+\* a member remains quiescent.  Members that have woken (e.g., via the
+\* Wake action triggered by a propose attempt, or via Timeout / StepDown
+\* / CrashRestart) are excluded by the groupQuiescent[f] => antecedent.
+\*
+\* The leader only quiesces when every progress entry has Match ==
+\* lastIndex, and the quiesced state is preserved by gating log
+\* truncation on the non-quiesced state.
+QuiesceImpliesAllAcked ==
+    \A leader \in Members :
+        (role[leader] = "Leader" /\ groupQuiescent[leader]) =>
+            \A f \in Responders(leader) :
+                groupQuiescent[f] =>
+                    committedEntries \cap raftLog[f]
+                        = committedEntries \cap raftLog[leader]
+
+\* No in-flight write on a quiescent leader.  Quiesce required
+\* writePhase[leader] = "Idle"; every leader-side propose action
+\* (BeginWrite) is gated on ~groupQuiescent[leader], so the leader's
+\* write pipeline cannot leave Idle while quiescent.  Once a write is
+\* in flight (Pending or Applied), groupQuiescent[leader] is FALSE.
+QuiesceImpliesNoPendingWrite ==
+    \A leader \in Members :
+        (role[leader] = "Leader" /\ groupQuiescent[leader]) =>
+            writePhase[leader] = "Idle"
+
+\* No in-flight flush on a quiescent leader.  Symmetric to
+\* QuiesceImpliesNoPendingWrite for the flush pipeline.  FlushStart is
+\* gated on ~groupQuiescent[leader]; the rest of the flush phase chain
+\* is transitively gated by flushPhase != "Idle" implying ~Quiesce.
+QuiesceImpliesIdleFlush ==
+    \A leader \in Members :
+        (role[leader] = "Leader" /\ groupQuiescent[leader]) =>
+            flushPhase[leader] = "Idle"
+
+\* While the leader is quiescent, every quiescent responder agrees with
+\* the leader on currentTerm.  Catches the case where a stale follower
+\* could latch onto a dead leader's quiesce notice and never re-elect.
+\* In the model, every action that bumps a member's currentTerm
+\* (Timeout, RequestVote, BecomeLeader, LeaderHeartbeat, StepDown)
+\* atomically clears groupQuiescent on the affected member, so the
+\* invariant trivially holds.
+QuiesceImpliesTermConsistency ==
+    \A leader \in Members :
+        (role[leader] = "Leader" /\ groupQuiescent[leader]) =>
+            \A f \in Members :
+                groupQuiescent[f] => currentTerm[f] = currentTerm[leader]
+
+\* No propose-action effect is visible while the leader is quiescent.
+\* Captures the explicit invariant from the design that every propose
+\* action must atomically clear groupQuiescent (the spec models this as
+\* a separate Wake action gated by ~groupQuiescent on each propose).
+\* Together with QuiesceImpliesNoPendingWrite and QuiesceImpliesIdleFlush
+\* this rules out any reachable state where a quiescent leader has
+\* observable propose-pipeline progress.
+WakeBeforePropose ==
+    \A leader \in Members :
+        (role[leader] = "Leader" /\ groupQuiescent[leader]) =>
+            /\ writePhase[leader] = "Idle"
+            /\ flushPhase[leader] \notin {"FlushStarted", "HFilesCommitted",
+                                           "RAFTProposed", "RAFTCommitted"}
+
 THEOREM SafetyTHM ==
     Spec => [](/\ LeaderUniqueness
                /\ LeaseImpliesLeadership
@@ -2512,7 +2800,12 @@ THEOREM SafetyTHM ==
                /\ HFilesBeforeFlushMarker
                /\ PromotionReadWriteGuard
                /\ PromotionMVCCContinuity
-               /\ CatchUpCompleteness)
+               /\ CatchUpCompleteness
+               /\ QuiesceImpliesAllAcked
+               /\ QuiesceImpliesNoPendingWrite
+               /\ QuiesceImpliesIdleFlush
+               /\ QuiesceImpliesTermConsistency
+               /\ WakeBeforePropose)
 
 ----
 (* ---- Fairness and liveness properties ---- *)
@@ -2570,6 +2863,9 @@ BaseFairness ==
     /\ WF_vars(NewLeaderCommitOrphanEntry)
     \* Log GC (local)
     /\ \A m \in Members     : WF_vars(RaftLogGC(m))
+    \* Quiescence
+    /\ \A m \in Members     : WF_vars(Wake(m))
+    /\ \A m \in Members     : WF_vars(LeaderKeepalive(m))
 
 \* SF additions for ElectionProgress.
 \* RequestVote + BecomeLeader + StepDown all require CanCommunicate;
@@ -2661,10 +2957,24 @@ CatchUpCompletion ==
             ~> (role[m] # "Follower"
                 \/ (ApplicableEntries(m) = {} /\ fApplyBatch[m] = {}))
 
+\* Every quiescent leader eventually exits the quiescent state — either
+\* via Wake (which WF on Wake guarantees is taken in any infinite
+\* execution where it remains enabled), or via lease expiry, role
+\* transition, or crash-restart.  This rules out a leader stuck
+\* permanently quiescent and unable to fire propose actions, which
+\* would break WriteCompletion and FlushCompletion liveness.
+EventualWake ==
+    \A leader \in Members :
+        (role[leader] = "Leader" /\ groupQuiescent[leader])
+            ~> (~groupQuiescent[leader]
+                \/ role[leader] # "Leader"
+                \/ leaseRemaining[leader] = 0)
+
 THEOREM ElectionProgressTHM    == LiveSpecElection => ElectionProgress
 THEOREM WriteCompletionTHM     == LiveSpecWrite    => WriteCompletion
 THEOREM FlushCompletionTHM     == LiveSpecFlush    => FlushCompletion
 THEOREM PromotionCompletionTHM == LiveSpecLocal    => PromotionCompletion
 THEOREM CatchUpCompletionTHM   == LiveSpecLocal    => CatchUpCompletion
+THEOREM EventualWakeTHM        == LiveSpecLocal    => EventualWake
 
 ====

@@ -83,11 +83,21 @@ message GroupAppendEntriesPB {
 }
 
 // Dataless heartbeat for one group. Carries only what LeaderHeartbeat needs.
+//
+// quiesced: set by the leader on the active->quiescent transition heartbeat
+// After this field is sent on a GroupHeartbeatPB the leader emits zero per-
+// group heartbeats for that group until a Wake event clears it. A follower
+// that receives a quiesced-tagged heartbeat applies the
+// shouldFollowerQuiesceOnNotify checks (term match, commit match, expected
+// leader, no pending local proposals) before transitioning. A missed
+// notice just leaves that follower running its own election timer until
+// the next non-quiesced signal arrives, which is safe.
 message GroupHeartbeatPB {
   optional bytes group_id = 1;
   optional RaftEndpointPB sender = 2;
   optional int32 term = 3;
   optional int64 commit_index = 4;
+  optional bool quiesced = 5;
 }
 
 // Acknowledgment of one LeaderHeartbeat. The follower also reports the highest
@@ -189,8 +199,20 @@ message BatchAppendEntriesPB {
   repeated GroupAppendEntriesPB groups = 1;
 }
 
+// Top-level fields sender / epoch / tick carry the per-RS keepalive that
+// backs idle-group failure detection. Every HeartbeatBatchPB envelope
+// (including the empty-groups envelope synthesized by
+// SweepingHeartbeatScheduler when every group on this peer is quiescent)
+// populates them. The receiving ConsensusServer dispatches them to
+// onPeerKeepalive(sender, epoch, tick), which updates a process-wide
+// Map<RaftEndpoint, Long> lastPeerKeepaliveMillis. Quiescent groups on
+// the receiving RS that have `sender` as leader use this map for their
+// election-timer gate.
 message HeartbeatBatchPB {
-  repeated GroupHeartbeatPB groups = 1;
+  repeated GroupHeartbeatPB groups  = 1;
+  optional RaftEndpointPB   sender  = 2;
+  optional int64            epoch   = 3;
+  optional int64            tick    = 4;
 }
 
 message BatchHeartbeatAckPB {

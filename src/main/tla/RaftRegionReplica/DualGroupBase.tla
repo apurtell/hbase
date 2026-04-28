@@ -22,7 +22,7 @@ CONSTANTS
 \* ---- Shared state ----
 VARIABLES clock, partition
 
-\* ---- Group 1 per-group state (24 variables) ----
+\* ---- Group 1 per-group state (26 variables) ----
 VARIABLES
     role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
     leaseRemaining_1, timerRemaining_1,
@@ -31,9 +31,10 @@ VARIABLES
     memstore_1, fApplyBatch_1,
     writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
     flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
-    promotionPhase_1, masterConfirmedTerm_1
+    promotionPhase_1, masterConfirmedTerm_1,
+    groupQuiescent_1, laggingOnQuiesce_1
 
-\* ---- Group 2 per-group state (24 variables) ----
+\* ---- Group 2 per-group state (26 variables) ----
 VARIABLES
     role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
     leaseRemaining_2, timerRemaining_2,
@@ -42,7 +43,8 @@ VARIABLES
     memstore_2, fApplyBatch_2,
     writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
     flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
-    promotionPhase_2, masterConfirmedTerm_2
+    promotionPhase_2, masterConfirmedTerm_2,
+    groupQuiescent_2, laggingOnQuiesce_2
 
 \* ---- Variable tuples ----
 
@@ -53,7 +55,8 @@ g1_vars == <<role_1, currentTerm_1, votedFor_1, votesGranted_1, raftLog_1,
              memstore_1, fApplyBatch_1,
              writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
              flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
-             promotionPhase_1, masterConfirmedTerm_1>>
+             promotionPhase_1, masterConfirmedTerm_1,
+             groupQuiescent_1, laggingOnQuiesce_1>>
 
 g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              leaseRemaining_2, timerRemaining_2,
@@ -62,7 +65,8 @@ g2_vars == <<role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
              memstore_2, fApplyBatch_2,
              writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
              flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
-             promotionPhase_2, masterConfirmedTerm_2>>
+             promotionPhase_2, masterConfirmedTerm_2,
+             groupQuiescent_2, laggingOnQuiesce_2>>
 
 ----
 (* ---- INSTANCE declarations ---- *)
@@ -93,7 +97,9 @@ G1 == INSTANCE RaftRegionReplica WITH
     snapshotMaxSeqId <- snapshotMaxSeqId_1,
     flushDropBound  <- flushDropBound_1,
     promotionPhase  <- promotionPhase_1,
-    masterConfirmedTerm <- masterConfirmedTerm_1
+    masterConfirmedTerm <- masterConfirmedTerm_1,
+    groupQuiescent  <- groupQuiescent_1,
+    laggingOnQuiesce <- laggingOnQuiesce_1
 
 G2 == INSTANCE RaftRegionReplica WITH
     role            <- role_2,
@@ -121,7 +127,9 @@ G2 == INSTANCE RaftRegionReplica WITH
     snapshotMaxSeqId <- snapshotMaxSeqId_2,
     flushDropBound  <- flushDropBound_2,
     promotionPhase  <- promotionPhase_2,
-    masterConfirmedTerm <- masterConfirmedTerm_2
+    masterConfirmedTerm <- masterConfirmedTerm_2,
+    groupQuiescent  <- groupQuiescent_2,
+    laggingOnQuiesce <- laggingOnQuiesce_2
 
 Majority == (Cardinality(Members) \div 2) + 1
 
@@ -129,19 +137,24 @@ Majority == (Cardinality(Members) \div 2) + 1
 (* ---- Per-group safety invariants ---- *)
 
 PerGroupSafety ==
-    /\ G1!LeaderUniqueness           /\ G2!LeaderUniqueness
-    /\ G1!LeaseImpliesLeadership     /\ G2!LeaseImpliesLeadership
-    /\ G1!LeaseExpiresBeforeElection /\ G2!LeaseExpiresBeforeElection
-    /\ G1!CatchUpDataIntegrity       /\ G2!CatchUpDataIntegrity
-    /\ G1!NoFollowerExposureRollback /\ G2!NoFollowerExposureRollback
-    /\ G1!WriteBarrierSafety         /\ G2!WriteBarrierSafety
-    /\ G1!FollowerSeqIdConsistency   /\ G2!FollowerSeqIdConsistency
-    /\ G1!NoOrphanMemstoreDrop       /\ G2!NoOrphanMemstoreDrop
-    /\ G1!FlushDropBoundary          /\ G2!FlushDropBoundary
-    /\ G1!FollowerFlushMemstoreDrop  /\ G2!FollowerFlushMemstoreDrop
-    /\ G1!HFilesBeforeFlushMarker    /\ G2!HFilesBeforeFlushMarker
-    /\ G1!PromotionReadWriteGuard    /\ G2!PromotionReadWriteGuard
-    /\ G1!PromotionMVCCContinuity    /\ G2!PromotionMVCCContinuity
-    /\ G1!CatchUpCompleteness        /\ G2!CatchUpCompleteness
+    /\ G1!LeaderUniqueness              /\ G2!LeaderUniqueness
+    /\ G1!LeaseImpliesLeadership        /\ G2!LeaseImpliesLeadership
+    /\ G1!LeaseExpiresBeforeElection    /\ G2!LeaseExpiresBeforeElection
+    /\ G1!CatchUpDataIntegrity          /\ G2!CatchUpDataIntegrity
+    /\ G1!NoFollowerExposureRollback    /\ G2!NoFollowerExposureRollback
+    /\ G1!WriteBarrierSafety            /\ G2!WriteBarrierSafety
+    /\ G1!FollowerSeqIdConsistency      /\ G2!FollowerSeqIdConsistency
+    /\ G1!NoOrphanMemstoreDrop          /\ G2!NoOrphanMemstoreDrop
+    /\ G1!FlushDropBoundary             /\ G2!FlushDropBoundary
+    /\ G1!FollowerFlushMemstoreDrop     /\ G2!FollowerFlushMemstoreDrop
+    /\ G1!HFilesBeforeFlushMarker       /\ G2!HFilesBeforeFlushMarker
+    /\ G1!PromotionReadWriteGuard       /\ G2!PromotionReadWriteGuard
+    /\ G1!PromotionMVCCContinuity       /\ G2!PromotionMVCCContinuity
+    /\ G1!CatchUpCompleteness           /\ G2!CatchUpCompleteness
+    /\ G1!QuiesceImpliesAllAcked        /\ G2!QuiesceImpliesAllAcked
+    /\ G1!QuiesceImpliesNoPendingWrite  /\ G2!QuiesceImpliesNoPendingWrite
+    /\ G1!QuiesceImpliesIdleFlush       /\ G2!QuiesceImpliesIdleFlush
+    /\ G1!QuiesceImpliesTermConsistency /\ G2!QuiesceImpliesTermConsistency
+    /\ G1!WakeBeforePropose             /\ G2!WakeBeforePropose
 
 ====

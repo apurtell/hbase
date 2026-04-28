@@ -41,6 +41,20 @@ public interface LeaderHeartbeat extends RaftMessage {
    */
   long getCommitIndex();
 
+  /**
+   * Returns whether this heartbeat carries the leader's active-to-quiescent transition notice.
+   * <p>
+   * Set by the leader exactly once per quiesce transition. A follower that receives a heartbeat
+   * with this flag set applies the {@code shouldFollowerQuiesceOnNotify} checks before
+   * transitioning to {@code Quiescent}. On any check failure it silently ignores the flag and
+   * continues to run its own election timer. After the leader has quiesced it stops emitting
+   * per-group heartbeats for this group. Failure detection runs on the top-level keepalive carried
+   * by every {@code HeartbeatBatchPB} envelope.
+   */
+  default boolean isQuiesced() {
+    return false;
+  }
+
   /** The builder interface for {@link LeaderHeartbeat}. */
   interface LeaderHeartbeatBuilder extends RaftMessageBuilder<LeaderHeartbeat> {
     @NonNull
@@ -54,5 +68,11 @@ public interface LeaderHeartbeat extends RaftMessage {
 
     @NonNull
     LeaderHeartbeatBuilder setCommitIndex(long commitIndex);
+
+    /** Sets the {@code quiesced} flag on the heartbeat. */
+    @NonNull
+    default LeaderHeartbeatBuilder setQuiesced(boolean quiesced) {
+      return this;
+    }
   }
 }

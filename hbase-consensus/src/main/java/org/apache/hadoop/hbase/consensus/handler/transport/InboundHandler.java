@@ -19,8 +19,10 @@ package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
+import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.NettyFutureUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -47,10 +49,17 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
 
   private final InboundDispatcher dispatcher;
   private final ProtoConverter converter;
+  private final PeerKeepaliveTrackerImpl peerKeepaliveTracker;
 
   InboundHandler(@NonNull InboundDispatcher dispatcher, @NonNull ProtoConverter converter) {
+    this(dispatcher, converter, null);
+  }
+
+  InboundHandler(@NonNull InboundDispatcher dispatcher, @NonNull ProtoConverter converter,
+    PeerKeepaliveTrackerImpl peerKeepaliveTracker) {
     this.dispatcher = dispatcher;
     this.converter = converter;
+    this.peerKeepaliveTracker = peerKeepaliveTracker;
   }
 
   @Override
@@ -79,7 +88,18 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
         break;
       case HEARTBEAT_BATCH:
         requirePayload(frame.hasHeartbeatBatch(), frame.getKind(), "heartbeat_batch");
-        for (ConsensusProtos.GroupHeartbeatPB pb : frame.getHeartbeatBatch().getGroupsList()) {
+        ConsensusProtos.HeartbeatBatchPB hbBatch = frame.getHeartbeatBatch();
+        // Per-RS keepalive: every HEARTBEAT_BATCH envelope carries sender / epoch / tick.
+        // Quiescent followers consult this map in lieu of the per-group election timer.
+        if (
+          peerKeepaliveTracker != null && hbBatch.hasSender() && hbBatch.hasEpoch()
+            && hbBatch.hasTick()
+        ) {
+          RaftEndpoint sender = ProtoConverter.fromEndpointPB(hbBatch.getSender());
+          peerKeepaliveTracker.onPeerKeepalive(sender, hbBatch.getEpoch(), hbBatch.getTick(),
+            EnvironmentEdgeManager.currentTime());
+        }
+        for (ConsensusProtos.GroupHeartbeatPB pb : hbBatch.getGroupsList()) {
           dispatch(pb.getGroupId(), converter.fromGroupHeartbeatPB(pb));
         }
         break;

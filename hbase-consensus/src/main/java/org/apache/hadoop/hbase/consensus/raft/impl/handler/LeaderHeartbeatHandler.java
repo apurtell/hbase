@@ -49,6 +49,12 @@ public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbe
   }
 
   @Override
+  protected boolean wakesQuiescentFollower() {
+    // Heartbeats interpret the quiesce bit explicitly in handle(); do not pre-wake.
+    return false;
+  }
+
+  @Override
   protected void handle(@NonNull LeaderHeartbeat request) {
     requireNonNull(request);
     if (LOG.isDebugEnabled()) {
@@ -91,6 +97,19 @@ public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbe
         node.tryRunScheduledQueries();
       }
     }
+    // Apply the fire-and-forget quiesce notice if all the local consistency checks pass. The
+    // follower must (a) be in the same term and commit position as the leader, (b) have no
+    // in-flight local proposal, and (c) recognize the sender as the current leader. On any check
+    // fail, ignore the flag silently and let the next inbound non-heartbeat signal re-enable
+    // normal operation.
+    if (request.isQuiesced()) {
+      maybeQuiesceFromNotice(request, leader);
+    } else if (state.groupQuiescent()) {
+      // Any non-quiesce heartbeat from the current leader implicitly leaves the quiescent state;
+      // the leader must have woken (e.g. a propose ran) and we should resume normal failure
+      // detection on the per-group timer.
+      state.groupQuiescent(false);
+    }
     // Report the follower's lastVerifiedLogIndex so the leader can detect runtime verification
     // lag (e.g. after a follower restart where the leader's matchIndex still references
     // pre-restart entries but the follower has reset its lastVerifiedLogIndex on recovery) and
@@ -100,5 +119,28 @@ public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbe
       .setSender(localEndpoint()).setTerm(state.term())
       .setLastVerifiedLogIndex(state.lastVerifiedLogIndex()).build();
     node.send(leader, ack);
+  }
+
+  private void maybeQuiesceFromNotice(LeaderHeartbeat request, RaftEndpoint leader) {
+    if (state.role() != FOLLOWER && state.role() != LEARNER) {
+      return;
+    }
+    if (request.getTerm() != state.term()) {
+      return;
+    }
+    if (!leader.equals(state.leader())) {
+      return;
+    }
+    if (request.getCommitIndex() != state.commitIndex()) {
+      return;
+    }
+    if (state.commitIndex() != state.log().lastLogOrSnapshotIndex()) {
+      return;
+    }
+    state.groupQuiescent(true);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("{} entering Quiescent (notice from leader {})", localEndpointStr(),
+        leader.getId());
+    }
   }
 }

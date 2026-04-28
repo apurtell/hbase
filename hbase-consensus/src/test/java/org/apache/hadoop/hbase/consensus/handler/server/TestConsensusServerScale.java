@@ -39,8 +39,10 @@ import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.consensus.handler.server.util.CountingConsensusSpi;
 import org.apache.hadoop.hbase.consensus.handler.server.util.InJvmConsensusServerTopology;
@@ -216,11 +218,9 @@ public class TestConsensusServerScale extends TestBase {
 
     // Cache one leader RaftNode handle per group (lazy, refreshed on NotLeaderException).
     @SuppressWarnings("unchecked")
-    final java.util.concurrent.atomic.AtomicReference<GroupHandle>[] leaderRef =
-      new java.util.concurrent.atomic.AtomicReference[groups];
+    final AtomicReference<GroupHandle>[] leaderRef = new AtomicReference[groups];
     for (int g = 0; g < groups; g++) {
-      leaderRef[g] =
-        new java.util.concurrent.atomic.AtomicReference<>(findLeader(handlesByGroup.get(g)));
+      leaderRef[g] = new AtomicReference<>(findLeader(handlesByGroup.get(g)));
     }
 
     // Per-group inflight semaphore.
@@ -487,8 +487,8 @@ public class TestConsensusServerScale extends TestBase {
    * {@link CannotReplicateException}.
    */
   private static void replicateOnce(List<List<GroupHandle>> handlesByGroup,
-    java.util.concurrent.atomic.AtomicReference<GroupHandle>[] leaderRef, int groupIdx,
-    byte[] payload) throws InterruptedException, ExecutionException {
+    AtomicReference<GroupHandle>[] leaderRef, int groupIdx, byte[] payload)
+    throws InterruptedException, ExecutionException {
     GroupHandle leader = leaderRef[groupIdx].get();
     if (leader == null) {
       leader = findLeader(handlesByGroup.get(groupIdx));
@@ -499,7 +499,7 @@ public class TestConsensusServerScale extends TestBase {
     }
     try {
       leader.getRaftNode().replicate(payload).get(10, TimeUnit.SECONDS);
-    } catch (java.util.concurrent.TimeoutException e) {
+    } catch (TimeoutException e) {
       throw new ExecutionException(e);
     } catch (ExecutionException e) {
       Throwable cause =

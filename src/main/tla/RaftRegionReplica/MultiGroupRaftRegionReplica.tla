@@ -81,16 +81,22 @@ MultiGroupClockTick(m) ==
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
                    promotionPhase_1, masterConfirmedTerm_1,
+                   groupQuiescent_1, laggingOnQuiesce_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
-                   promotionPhase_2, masterConfirmedTerm_2>>
+                   promotionPhase_2, masterConfirmedTerm_2,
+                   groupQuiescent_2, laggingOnQuiesce_2>>
 
 \* Server crash resets volatile state for BOTH groups on the crashed
 \* member.  Durable state (currentTerm, votedFor, raftLog) survives.
+\* CrashRestartEffect (per-group) already resets groupQuiescent[m]
+\* to FALSE and laggingOnQuiesce[m] to {} for each group.  Quiescence
+\* is purely volatile in the implementation (RaftNodeImpl re-creates
+\* LeaderState on restart with groupQuiescent = false).
 \* Guard: at least one group has volatile state worth resetting.
 MultiGroupCrashRestart(m) ==
     /\ G1!CrashRestartGuard(m) \/ G2!CrashRestartGuard(m)
@@ -159,7 +165,18 @@ MultiGroupHealPartition ==
 \* append-only consensus log.  Both groups must have an applied flush
 \* marker on member m, and entries below each group's chosen flush
 \* watermark are removed from both groups' raftLogs simultaneously.
+\*
+\* Quiescence gate: per-group RaftLogGC is gated on ~groupQuiescent[m]
+\* to preserve QuiesceImpliesAllAcked (a quiescent member that GCs
+\* committed log entries while its leader has not yet GC'd would
+\* break the leader/responder log-equality the leader committed to
+\* at quiesce time).  UnifiedLogGC inherits the same gate per-group:
+\* the GC fires only on members where the relevant group is not
+\* quiescent.  Quiescence does not otherwise affect log truncation
+\* semantics; the gate is a safety/invariant-preservation requirement.
 UnifiedLogGC(m) ==
+    /\ ~groupQuiescent_1[m]
+    /\ ~groupQuiescent_2[m]
     /\ \E s1 \in flushMarkerEntries_1 \cap memstore_1[m] :
        \E s2 \in flushMarkerEntries_2 \cap memstore_2[m] :
             /\ (\E e \in raftLog_1[m] : e < s1)
@@ -177,6 +194,7 @@ UnifiedLogGC(m) ==
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
                    promotionPhase_1, masterConfirmedTerm_1,
+                   groupQuiescent_1, laggingOnQuiesce_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2,
                    leaseRemaining_2, timerRemaining_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
@@ -184,7 +202,8 @@ UnifiedLogGC(m) ==
                    memstore_2, fApplyBatch_2,
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
-                   promotionPhase_2, masterConfirmedTerm_2>>
+                   promotionPhase_2, masterConfirmedTerm_2,
+                   groupQuiescent_2, laggingOnQuiesce_2>>
 
 ----
 (* ---- META availability ordering ---- *)

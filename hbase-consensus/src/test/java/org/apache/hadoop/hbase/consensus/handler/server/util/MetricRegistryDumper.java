@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import org.apache.hadoop.hbase.metrics.Counter;
@@ -216,6 +217,6 @@ public final class MetricRegistryDumper {
     if (Double.isInfinite(v)) {
       return v > 0 ? "Infinity" : "-Infinity";
     }
-    return String.format(java.util.Locale.ROOT, "%.6f", v);
+    return String.format(Locale.ROOT, "%.6f", v);
   }
 }

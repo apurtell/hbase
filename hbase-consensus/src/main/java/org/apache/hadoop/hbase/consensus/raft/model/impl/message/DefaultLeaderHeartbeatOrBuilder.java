@@ -36,6 +36,7 @@ public class DefaultLeaderHeartbeatOrBuilder implements LeaderHeartbeat, LeaderH
   private RaftEndpoint sender;
   private int term;
   private long commitIndex;
+  private boolean quiesced;
   private DefaultLeaderHeartbeatOrBuilder builder = this;
 
   public DefaultLeaderHeartbeatOrBuilder() {
@@ -61,6 +62,11 @@ public class DefaultLeaderHeartbeatOrBuilder implements LeaderHeartbeat, LeaderH
   @Override
   public long getCommitIndex() {
     return commitIndex;
+  }
+
+  @Override
+  public boolean isQuiesced() {
+    return quiesced;
   }
 
   @NonNull
@@ -93,6 +99,13 @@ public class DefaultLeaderHeartbeatOrBuilder implements LeaderHeartbeat, LeaderH
 
   @NonNull
   @Override
+  public LeaderHeartbeatBuilder setQuiesced(boolean quiesced) {
+    builder.quiesced = quiesced;
+    return this;
+  }
+
+  @NonNull
+  @Override
   public LeaderHeartbeat build() {
     requireNonNull(builder);
     builder = null;
@@ -103,6 +116,6 @@ public class DefaultLeaderHeartbeatOrBuilder implements LeaderHeartbeat, LeaderH
   public String toString() {
     String header = builder != null ? "LeaderHeartbeatBuilder" : "LeaderHeartbeat";
     return header + "{groupId=" + groupId + ", sender=" + sender + ", term=" + term
-      + ", commitIndex=" + commitIndex + '}';
+      + ", commitIndex=" + commitIndex + ", quiesced=" + quiesced + '}';
   }
 }

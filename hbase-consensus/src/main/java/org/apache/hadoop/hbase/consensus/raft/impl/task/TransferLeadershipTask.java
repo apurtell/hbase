@@ -69,6 +69,9 @@ public class TransferLeadershipTask implements Runnable {
       future.completeNull(state.commitIndex());
       return;
     }
+    // A transfer must always wake a quiescent group so the departing leader can drive
+    // AppendEntries / TriggerLeaderElection traffic to the target.
+    node.wake();
     if (state.initLeadershipTransfer(targetEndpoint, future)) {
       transferLeadership(state);
     }

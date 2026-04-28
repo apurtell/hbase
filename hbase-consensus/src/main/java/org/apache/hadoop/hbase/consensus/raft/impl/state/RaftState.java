@@ -161,6 +161,18 @@ public final class RaftState {
    * State maintained by followers to keep received snapshot chunks during snapshot installation.
    */
   private SnapshotChunkCollector snapshotChunkCollector;
+  /**
+   * Whether this node's local view of the group is quiescent. On a leader, set by
+   * {@code RaftNodeImpl.quiesce} (in lockstep with {@code LeaderState.groupQuiescent}). On a
+   * follower, set by {@code LeaderHeartbeatHandler} after a {@code GroupHeartbeatPB.quiesced=true}
+   * notice passes the {@code shouldFollowerQuiesceOnNotify} checks. Cleared by any role transition
+   * ({@link #toFollower(int)}, {@link #toCandidate()}, {@link #toLeader(long)}), by
+   * {@code RaftNodeImpl.wake} on the leader, and by any inbound non-heartbeat Raft message on the
+   * follower.
+   * <p>
+   * Maps to the spec's per-member {@code groupQuiescent[m]}.
+   */
+  private volatile boolean groupQuiescent;
 
   private RaftState(Object groupId, RaftEndpoint localEndpoint,
     RaftGroupMembersView initialGroupMembers, int logCapacity, RaftStore store,
@@ -406,6 +418,7 @@ public final class RaftState {
     candidateState = null;
     completeLeadershipTransfer(null);
     termState = newTermState;
+    groupQuiescent = false;
     if (currentLeaderState != null) {
       // this is done here to read the updated leader field
       currentLeaderState.queryState().fail(new NotLeaderException(localEndpoint, leader()));
@@ -467,6 +480,7 @@ public final class RaftState {
     role = CANDIDATE;
     candidateState = new CandidateState(leaderElectionQuorumSize());
     candidateState.grantVote(localEndpoint);
+    groupQuiescent = false;
   }
 
   private void promoteToVotingMember() throws IOException {
@@ -530,6 +544,7 @@ public final class RaftState {
     candidateState = null;
     leaderState = new LeaderState(effectiveGroupMembers.remoteMembers(),
       log.lastLogOrSnapshotIndex(), currentTimeMillis);
+    groupQuiescent = false;
   }
 
   /** Updates the known leader to the given endpoint. */
@@ -719,6 +734,31 @@ public final class RaftState {
 
   public RaftStore store() {
     return store;
+  }
+
+  /**
+   * Returns this node's local quiescence flag. On a leader, mirrors
+   * {@link LeaderState#groupQuiescent()}. On a follower, set after a fire-and-forget
+   * {@code GroupHeartbeatPB.quiesced=true} notice passed the local consistency checks.
+   * <p>
+   * While true, the per-group sweep emits zero {@code GroupHeartbeatPB} bytes for this group;
+   * failure detection runs on the per-RS keepalive carried on every {@code HeartbeatBatchPB}
+   * envelope. Cleared by any Wake event (role change, propose, lease expiry, observed higher-term
+   * message, or any inbound non-heartbeat Raft message on the follower).
+   */
+  public boolean groupQuiescent() {
+    return groupQuiescent;
+  }
+
+  /**
+   * Sets this node's local quiescence flag. The leader path sets it via
+   * {@code RaftNodeImpl.quiesce}/{@code wake}, in lockstep with
+   * {@link LeaderState#groupQuiescent(boolean)}; the follower path sets it from
+   * {@code LeaderHeartbeatHandler} on a quiesce notice that passes
+   * {@code shouldFollowerQuiesceOnNotify}.
+   */
+  public void groupQuiescent(boolean quiescent) {
+    this.groupQuiescent = quiescent;
   }
 
   /**

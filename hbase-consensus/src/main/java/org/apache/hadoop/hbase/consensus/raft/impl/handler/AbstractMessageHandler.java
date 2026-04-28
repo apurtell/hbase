@@ -38,7 +38,22 @@ public abstract class AbstractMessageHandler<T extends RaftMessage>
 
   @Override
   protected final void doRun() {
+    // Any inbound non-heartbeat Raft message implicitly wakes the local view of the group on a
+    // follower. Heartbeats opt out via {@link #wakesQuiescentFollower()}.
+    if (wakesQuiescentFollower() && state.groupQuiescent()) {
+      state.groupQuiescent(false);
+    }
     handle(message);
+  }
+
+  /**
+   * Whether dispatching this message should clear the follower's local quiescence flag before the
+   * typed handler runs. Defaults to {@code true}. {@link LeaderHeartbeatHandler} overrides it to
+   * {@code false} because it is the path that interprets the {@code quiesced} bit and decides
+   * quiescence transitions explicitly.
+   */
+  protected boolean wakesQuiescentFollower() {
+    return true;
   }
 
   protected abstract void handle(@NonNull T message);

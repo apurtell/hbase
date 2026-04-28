@@ -62,7 +62,8 @@ VARIABLES
     memstore, fApplyBatch,
     writePhase, walSync, raftCommitted, writeSeqId,
     flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
-    promotionPhase, masterConfirmedTerm
+    promotionPhase, masterConfirmedTerm,
+    groupQuiescent, laggingOnQuiesce
 
 (* ---- Split lifecycle state ---- *)
 VARIABLES
@@ -77,7 +78,8 @@ parentVars == <<role, currentTerm, votedFor, votesGranted, raftLog,
                hdfsHFiles, memstore, fApplyBatch,
                writePhase, walSync, raftCommitted, writeSeqId,
                flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
-               promotionPhase, masterConfirmedTerm>>
+               promotionPhase, masterConfirmedTerm,
+               groupQuiescent, laggingOnQuiesce>>
 
 vars == <<parentVars, splitVars>>
 
@@ -110,9 +112,18 @@ Init ==
 (* ---- Split lifecycle actions ---- *)
 
 \* Leader proposes a "region-close / split" marker through RAFT.
+\* Gated on ~groupQuiescent[m] like every other leader-side propose
+\* action; the leader must Wake first if quiescent.  After this fires
+\* the parent's per-member ParentGroupActive(m) becomes FALSE on the
+\* leader (the marker is in memstore[m]), so the parent's per-group
+\* propose actions are subsequently gated to the empty disjunction
+\* on m.  In that "naturally write-closed" state Quiesce(leader)
+\* becomes enabled and Wake(leader) is unreachable — exactly the
+\* design intent for a write-closed parent.
 ProposeSplitMarker(m) ==
     /\ splitMarkerSeqId = 0
     /\ Parent!IsLeader(m)
+    /\ ~groupQuiescent[m]
     /\ promotionPhase[m] = "Complete"
     /\ writePhase[m] = "Idle"
     /\ flushPhase[m] = "Idle"
@@ -136,6 +147,7 @@ ProposeSplitMarker(m) ==
                    writePhase, walSync, raftCommitted, writeSeqId,
                    flushPhase, flushSeqId, snapshotMaxSeqId, flushDropBound,
                    promotionPhase, masterConfirmedTerm,
+                   groupQuiescent, laggingOnQuiesce,
                    daughterGroupsActive>>
 
 \* Master opens daughter groups on member m after the split marker
@@ -248,6 +260,11 @@ ParentGroupSafety ==
     /\ Parent!PromotionReadWriteGuard
     /\ Parent!PromotionMVCCContinuity
     /\ Parent!CatchUpCompleteness
+    /\ Parent!QuiesceImpliesAllAcked
+    /\ Parent!QuiesceImpliesNoPendingWrite
+    /\ Parent!QuiesceImpliesIdleFlush
+    /\ Parent!QuiesceImpliesTermConsistency
+    /\ Parent!WakeBeforePropose
 
 NoKeyRangeOverlap ==
     \A m \in Members :

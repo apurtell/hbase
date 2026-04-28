@@ -97,6 +97,7 @@ MergeClockTick(m) ==
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
                    promotionPhase_1, masterConfirmedTerm_1,
+                   groupQuiescent_1, laggingOnQuiesce_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2, raftLog_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
                    flushMarkerEntries_2, hdfsHFiles_2,
@@ -104,6 +105,7 @@ MergeClockTick(m) ==
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
                    promotionPhase_2, masterConfirmedTerm_2,
+                   groupQuiescent_2, laggingOnQuiesce_2,
                    mergeVars>>
 
 \* Server crash resets volatile state for BOTH groups and the merged
@@ -167,8 +169,13 @@ MergeHealPartition ==
         /\ UNCHANGED <<clock, g1_vars, g2_vars, mergeVars>>
 
 \* Unified log GC: both groups must have an applied flush marker
-\* before entries below the watermark are removed.
+\* before entries below the watermark are removed.  Quiescence gate
+\* is identical to MultiGroupRaftRegionReplica's UnifiedLogGC: a
+\* quiescent member's log cannot be truncated independently of its
+\* leader without breaking QuiesceImpliesAllAcked.
 MergeUnifiedLogGC(m) ==
+    /\ ~groupQuiescent_1[m]
+    /\ ~groupQuiescent_2[m]
     /\ \E s1 \in flushMarkerEntries_1 \cap memstore_1[m] :
        \E s2 \in flushMarkerEntries_2 \cap memstore_2[m] :
             /\ (\E e \in raftLog_1[m] : e < s1)
@@ -186,6 +193,7 @@ MergeUnifiedLogGC(m) ==
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
                    promotionPhase_1, masterConfirmedTerm_1,
+                   groupQuiescent_1, laggingOnQuiesce_1,
                    role_2, currentTerm_2, votedFor_2, votesGranted_2,
                    leaseRemaining_2, timerRemaining_2,
                    nextSeqId_2, committedEntries_2, markerEntries_2,
@@ -194,15 +202,19 @@ MergeUnifiedLogGC(m) ==
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
                    promotionPhase_2, masterConfirmedTerm_2,
+                   groupQuiescent_2, laggingOnQuiesce_2,
                    mergeVars>>
 
 ----
 (* ---- Merge lifecycle actions ---- *)
 
 \* G1's leader proposes a "region-close / merge" marker through RAFT.
+\* Gated on ~groupQuiescent_1[m] like every other leader-side propose
+\* action; the leader must Wake first if quiescent.
 ProposeMergeMarker_1(m) ==
     /\ mergeMarkerSeqId_1 = 0
     /\ G1!IsLeader(m)
+    /\ ~groupQuiescent_1[m]
     /\ promotionPhase_1[m] = "Complete"
     /\ writePhase_1[m] = "Idle"
     /\ flushPhase_1[m] = "Idle"
@@ -226,12 +238,16 @@ ProposeMergeMarker_1(m) ==
                    writePhase_1, walSync_1, raftCommitted_1, writeSeqId_1,
                    flushPhase_1, flushSeqId_1, snapshotMaxSeqId_1, flushDropBound_1,
                    promotionPhase_1, masterConfirmedTerm_1,
+                   groupQuiescent_1, laggingOnQuiesce_1,
                    g2_vars, mergeMarkerSeqId_2, mergedGroupActive>>
 
 \* G2's leader proposes a "region-close / merge" marker through RAFT.
+\* Gated on ~groupQuiescent_2[m] like every other leader-side propose
+\* action; the leader must Wake first if quiescent.
 ProposeMergeMarker_2(m) ==
     /\ mergeMarkerSeqId_2 = 0
     /\ G2!IsLeader(m)
+    /\ ~groupQuiescent_2[m]
     /\ promotionPhase_2[m] = "Complete"
     /\ writePhase_2[m] = "Idle"
     /\ flushPhase_2[m] = "Idle"
@@ -255,6 +271,7 @@ ProposeMergeMarker_2(m) ==
                    writePhase_2, walSync_2, raftCommitted_2, writeSeqId_2,
                    flushPhase_2, flushSeqId_2, snapshotMaxSeqId_2, flushDropBound_2,
                    promotionPhase_2, masterConfirmedTerm_2,
+                   groupQuiescent_2, laggingOnQuiesce_2,
                    g1_vars, mergeMarkerSeqId_1, mergedGroupActive>>
 
 \* Master opens the merged group on member m after BOTH parent groups'

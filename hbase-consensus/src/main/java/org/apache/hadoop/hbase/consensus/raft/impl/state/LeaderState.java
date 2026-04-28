@@ -19,8 +19,11 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -46,12 +49,43 @@ public final class LeaderState {
    * step-down. Refreshed from replication quorum ack timestamps.
    */
   private long leaseExpiryMillis;
+  /**
+   * Wall-clock time (ms) of the last leader-side activity that should reset the idle-group
+   * quiescence grace timer. Updated whenever {@code ReplicateTask} runs, a membership change is
+   * appended, or a leadership transfer is initiated. Compared against
+   * {@code now() - quiescenceGraceMs} by the quiescence sweep to decide whether the group has been
+   * idle long enough to enter the {@code Quiescent} state. Initialized to construction time so a
+   * freshly elected leader does not immediately quiesce.
+   * <p>
+   * Maps to the spec's grace gate on {@code Quiesce(leader)}.
+   */
+  private long lastReplicateActivityMillis;
+  /**
+   * Set on the active-to-quiescent transition by {@code RaftNodeImpl.quiesce}. While true, the
+   * per-group sweep emits zero {@code GroupHeartbeatPB} bytes for this group; failure detection
+   * runs on the per-RS keepalive on every {@code HeartbeatBatchPB} envelope. Cleared by
+   * {@code RaftNodeImpl.wake} or by {@code toFollower} via {@code RaftState.toFollower}.
+   * <p>
+   * Maps to the spec's {@code groupQuiescent[leader]}.
+   */
+  private boolean groupQuiescent;
+  /**
+   * Followers the leader believes are not live at the moment of {@code Quiesce} (master's most
+   * recent live-server view did not include them, or {@code matchIndex < lastLogOrSnapshotIndex}
+   * after recent replication). Carried into the quiesce notice so receiving followers can refuse to
+   * quiesce if they believe themselves live.
+   * <p>
+   * Maps to the spec's {@code laggingOnQuiesce[leader]}.
+   */
+  private Set<RaftEndpoint> laggingOnQuiesce = Collections.emptySet();
 
   LeaderState(Collection<RaftEndpoint> remoteMembers, long lastLogIndex, long currentTimeMillis) {
     remoteMembers.forEach(follower -> followerStates.put(follower,
       new FollowerState(0L, lastLogIndex + 1, currentTimeMillis)));
     flushedLogIndex = lastLogIndex;
     leaseExpiryMillis = 0L;
+    lastReplicateActivityMillis = currentTimeMillis;
+    groupQuiescent = false;
   }
 
   /**
@@ -176,5 +210,56 @@ public final class LeaderState {
   public Map<RaftEndpoint, Long> responseTimestamps() {
     return followerStates.entrySet().stream()
       .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().responseTimestamp()));
+  }
+
+  /**
+   * Returns the wall-clock time (ms) of the last leader-side activity that should reset the
+   * idle-group quiescence grace timer.
+   */
+  public long lastReplicateActivityMillis() {
+    return lastReplicateActivityMillis;
+  }
+
+  /**
+   * Updates the last replicate-activity timestamp. The quiescence sweep gates the
+   * active-to-quiescent transition on
+   * {@code currentTimeMillis - lastReplicateActivityMillis >= quiescenceGraceMs}; bumping this
+   * timestamp on every {@code ReplicateTask} or membership change run is what makes the gate track
+   * real activity rather than the wall clock.
+   */
+  public void lastReplicateActivityMillis(long currentTimeMillis) {
+    if (currentTimeMillis > this.lastReplicateActivityMillis) {
+      this.lastReplicateActivityMillis = currentTimeMillis;
+    }
+  }
+
+  /** Returns whether the leader-side quiescent flag is set for this group. */
+  public boolean groupQuiescent() {
+    return groupQuiescent;
+  }
+
+  /**
+   * Sets the leader-side quiescent flag for this group. {@code RaftNodeImpl.quiesce} sets it to
+   * {@code true} on the active-to-quiescent transition; {@code RaftNodeImpl.wake} sets it back to
+   * {@code false} and clears {@link #laggingOnQuiesce()}.
+   */
+  public void groupQuiescent(boolean quiescent) {
+    this.groupQuiescent = quiescent;
+    if (!quiescent) {
+      this.laggingOnQuiesce = Collections.emptySet();
+    }
+  }
+
+  /**
+   * Returns the followers the leader believed were lagging at the moment it entered
+   * {@code Quiescent}. Empty unless {@link #groupQuiescent()} is true.
+   */
+  public Set<RaftEndpoint> laggingOnQuiesce() {
+    return laggingOnQuiesce;
+  }
+
+  /** Records the lagging-on-quiesce set captured at the {@code Quiesce} transition. */
+  public void laggingOnQuiesce(Collection<RaftEndpoint> lagging) {
+    this.laggingOnQuiesce = lagging.isEmpty() ? Collections.emptySet() : new HashSet<>(lagging);
   }
 }

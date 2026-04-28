@@ -1295,14 +1295,83 @@ public final class RaftNodeImpl implements RaftNode {
    * {@code lastLogOrSnapshotIndex}) and reply with a {@link LeaderHeartbeatAck}. Match-index
    * discovery, log catch-up, and snapshot triggering are handled separately by
    * {@link #sendCatchupAppendsIfNeeded()}.
+   * <p>
+   * If this group is quiescent ({@link RaftState#groupQuiescent()} is {@code true}) the per-group
+   * heartbeat is skipped. Failure detection runs on the per-RS keepalive carried on every
+   * {@code HeartbeatBatchPB} envelope, see {@code SweepingHeartbeatScheduler}.
    */
   public void broadcastLeaderHeartbeat() {
+    if (state.groupQuiescent()) {
+      return;
+    }
     for (RaftEndpoint follower : state.remoteMembers()) {
       LeaderHeartbeat hb = modelFactory.createLeaderHeartbeatBuilder().setGroupId(getGroupId())
         .setSender(getLocalEndpoint()).setTerm(state.term()).setCommitIndex(state.commitIndex())
         .build();
       send(follower, hb);
     }
+  }
+
+  /**
+   * Marks this group quiescent on the leader and emits one fire-and-forget {@link LeaderHeartbeat}
+   * per follower with {@code quiesced = true}. The leader stops emitting per-group heartbeats for
+   * this group until {@link #wake()} is called or the role changes. Failure detection thereafter
+   * runs on the per-RS keepalive carried on every {@code HeartbeatBatchPB} envelope.
+   * <p>
+   * Caller must have established that the eligibility checks pass: leader role, valid lease, grace
+   * elapsed, no in-flight propose, no leadership transfer, all reachable voting followers caught
+   * up. Followers the leader believes are not live may be passed in {@code lagging}; they are
+   * recorded in {@link LeaderState#laggingOnQuiesce()} so the receiving follower can refuse to
+   * quiesce if it believes itself live (see {@code LeaderHeartbeatHandler}).
+   */
+  public void quiesce(Collection<RaftEndpoint> lagging) {
+    if (state.role() != LEADER || state.groupQuiescent()) {
+      return;
+    }
+    LeaderState ls = state.leaderState();
+    if (ls == null) {
+      return;
+    }
+    ls.groupQuiescent(true);
+    ls.laggingOnQuiesce(lagging == null ? Collections.emptyList() : lagging);
+    state.groupQuiescent(true);
+    LOG.debug("{} entering Quiescent (lagging={})", localEndpointStr, ls.laggingOnQuiesce());
+    for (RaftEndpoint follower : state.remoteMembers()) {
+      LeaderHeartbeat hb = modelFactory.createLeaderHeartbeatBuilder().setGroupId(getGroupId())
+        .setSender(getLocalEndpoint()).setTerm(state.term()).setCommitIndex(state.commitIndex())
+        .setQuiesced(true).build();
+      send(follower, hb);
+    }
+  }
+
+  /**
+   * Wakes this group from {@code Quiescent} on the leader. Idempotent. Safe to call from any
+   * propose path, membership change, leadership transfer, observed-higher-term, lease-expiry, or
+   * heartbeat-tick observation. Clears {@link RaftState#groupQuiescent()},
+   * {@link LeaderState#groupQuiescent()}, and {@link LeaderState#laggingOnQuiesce()}, and bumps the
+   * leader's activity timestamp so the grace gate restarts.
+   * <p>
+   * Followers are not pinged here; the next normal heartbeat broadcast will reach them and the
+   * receiving handler will call {@link RaftState#groupQuiescent(boolean)} {@code (false)} on any
+   * non-quiesce signal.
+   */
+  public void wake() {
+    if (state.role() != LEADER) {
+      // Non-leader paths clear groupQuiescent directly via state.groupQuiescent(false).
+      state.groupQuiescent(false);
+      return;
+    }
+    LeaderState ls = state.leaderState();
+    if (ls == null) {
+      return;
+    }
+    ls.lastReplicateActivityMillis(clock.millis());
+    if (!state.groupQuiescent()) {
+      return;
+    }
+    LOG.debug("{} leaving Quiescent (wake)", localEndpointStr);
+    ls.groupQuiescent(false);
+    state.groupQuiescent(false);
   }
 
   /**

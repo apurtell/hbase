@@ -50,6 +50,18 @@ public final class RaftConfig {
   public static final boolean DEFAULT_TRANSFER_SNAPSHOTS_FROM_FOLLOWERS_ENABLED = true;
   /** The default value for {@link #raftNodeReportPublishPeriodSecs}. */
   public static final int DEFAULT_RAFT_NODE_REPORT_PUBLISH_PERIOD_SECS = 10;
+  /**
+   * The default value for {@link #quiescenceEnabled}. Off in MVP; flips to true after
+   * {@code TestConsensusServerScaleQuiescence} validates the byte-rate reduction at 10k idle
+   * groups.
+   */
+  public static final boolean DEFAULT_QUIESCENCE_ENABLED = false;
+  /**
+   * The default value for {@link #quiescenceGraceMillis}. Picked to be safely above one heartbeat
+   * sweep tick so that a brief pause (e.g. the gap between two Phoenix UPSERTs) does not trigger
+   * oscillation.
+   */
+  public static final long DEFAULT_QUIESCENCE_GRACE_MILLIS = 1000;
   /** The config object with default configuration. */
   public static final RaftConfig DEFAULT_RAFT_CONFIG = new RaftConfigBuilder().build();
   /**
@@ -122,12 +134,26 @@ public final class RaftConfig {
    * {@link RaftNodeReport} objects can be used for monitoring a running Raft group.
    */
   private final int raftNodeReportPublishPeriodSecs;
+  /**
+   * Whether idle-group quiescence is enabled. When true, a leader that has held its lease and seen
+   * no proposals for {@link #quiescenceGraceMillis} ms transitions to the {@code Quiescent} state,
+   * emits a fire-and-forget {@code GroupHeartbeatPB.quiesced=true} notice once, and then emits zero
+   * per-group heartbeat bytes until a Wake event clears the state. Failure detection runs on the
+   * per-RS keepalive carried on every {@code HeartbeatBatchPB} envelope.
+   */
+  private final boolean quiescenceEnabled;
+  /**
+   * Grace period (ms) the leader must hold its lease and see no propose-side activity before the
+   * {@code SweepingHeartbeatScheduler} is allowed to call {@code RaftNodeImpl.quiesce}.
+   */
+  private final long quiescenceGraceMillis;
 
   /** Creates a config object with the given parameters. */
   public RaftConfig(long leaderElectionTimeoutMillis, long leaderHeartbeatPeriodMillis,
     long leaderHeartbeatTimeoutMillis, long maxClockDriftMillis, int appendEntriesRequestBatchSize,
     int commitCountToTakeSnapshot, int maxPendingLogEntryCount,
-    boolean transferSnapshotsFromFollowersEnabled, int raftNodeReportPublishPeriodSecs) {
+    boolean transferSnapshotsFromFollowersEnabled, int raftNodeReportPublishPeriodSecs,
+    boolean quiescenceEnabled, long quiescenceGraceMillis) {
     this.leaderElectionTimeoutMillis = leaderElectionTimeoutMillis;
     this.leaderHeartbeatPeriodMillis = leaderHeartbeatPeriodMillis;
     this.leaderHeartbeatTimeoutMillis = leaderHeartbeatTimeoutMillis;
@@ -137,6 +163,8 @@ public final class RaftConfig {
     this.maxPendingLogEntryCount = maxPendingLogEntryCount;
     this.transferSnapshotsFromFollowersEnabled = transferSnapshotsFromFollowersEnabled;
     this.raftNodeReportPublishPeriodSecs = raftNodeReportPublishPeriodSecs;
+    this.quiescenceEnabled = quiescenceEnabled;
+    this.quiescenceGraceMillis = quiescenceGraceMillis;
   }
 
   /**
@@ -234,6 +262,22 @@ public final class RaftConfig {
     return raftNodeReportPublishPeriodSecs;
   }
 
+  /**
+   * @return whether idle-group quiescence is enabled
+   * @see #quiescenceEnabled
+   */
+  public boolean isQuiescenceEnabled() {
+    return quiescenceEnabled;
+  }
+
+  /**
+   * @return the quiescence grace period in milliseconds
+   * @see #quiescenceGraceMillis
+   */
+  public long getQuiescenceGraceMillis() {
+    return quiescenceGraceMillis;
+  }
+
   @Override
   public String toString() {
     return "RaftConfig{" + "leaderElectionTimeoutMillis=" + leaderElectionTimeoutMillis
@@ -242,7 +286,9 @@ public final class RaftConfig {
       + ", maxPendingLogEntryCount=" + maxPendingLogEntryCount + ", appendEntriesRequestBatchSize="
       + appendEntriesRequestBatchSize + ", commitCountToTakeSnapshot=" + commitCountToTakeSnapshot
       + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
-      + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs + '}';
+      + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs
+      + ", quiescenceEnabled=" + quiescenceEnabled + ", quiescenceGraceMillis="
+      + quiescenceGraceMillis + '}';
   }
 
   /** Builder for Raft config. */
@@ -257,6 +303,8 @@ public final class RaftConfig {
     private boolean transferSnapshotsFromFollowersEnabled =
       DEFAULT_TRANSFER_SNAPSHOTS_FROM_FOLLOWERS_ENABLED;
     private int raftNodeReportPublishPeriodSecs = DEFAULT_RAFT_NODE_REPORT_PUBLISH_PERIOD_SECS;
+    private boolean quiescenceEnabled = DEFAULT_QUIESCENCE_ENABLED;
+    private long quiescenceGraceMillis = DEFAULT_QUIESCENCE_GRACE_MILLIS;
 
     private RaftConfigBuilder() {
     }
@@ -370,6 +418,27 @@ public final class RaftConfig {
     }
 
     /**
+     * Toggles idle-group quiescence.
+     * @return the builder object for fluent calls
+     * @see RaftConfig#quiescenceEnabled
+     */
+    public RaftConfigBuilder setQuiescenceEnabled(boolean quiescenceEnabled) {
+      this.quiescenceEnabled = quiescenceEnabled;
+      return this;
+    }
+
+    /**
+     * Sets the idle-group quiescence grace period in milliseconds.
+     * @return the builder object for fluent calls
+     * @see RaftConfig#quiescenceGraceMillis
+     */
+    public RaftConfigBuilder setQuiescenceGraceMillis(long quiescenceGraceMillis) {
+      checkPositive(quiescenceGraceMillis, "quiescence grace millis must be positive!");
+      this.quiescenceGraceMillis = quiescenceGraceMillis;
+      return this;
+    }
+
+    /**
      * Builds the RaftConfig object.
      * @return the RaftConfig object.
      */
@@ -389,7 +458,7 @@ public final class RaftConfig {
       return new RaftConfig(leaderElectionTimeoutMillis, leaderHeartbeatPeriodMillis,
         leaderHeartbeatTimeoutMillis, maxClockDriftMillis, appendEntriesRequestBatchSize,
         commitCountToTakeSnapshot, maxPendingLogEntryCount, transferSnapshotsFromFollowersEnabled,
-        raftNodeReportPublishPeriodSecs);
+        raftNodeReportPublishPeriodSecs, quiescenceEnabled, quiescenceGraceMillis);
     }
 
     @Override
@@ -401,7 +470,9 @@ public final class RaftConfig {
         + appendEntriesRequestBatchSize + ", commitCountToTakeSnapshot=" + commitCountToTakeSnapshot
         + ", maxPendingLogEntryCount=" + maxPendingLogEntryCount
         + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
-        + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs + '}';
+        + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs
+        + ", quiescenceEnabled=" + quiescenceEnabled + ", quiescenceGraceMillis="
+        + quiescenceGraceMillis + '}';
     }
   }
 }

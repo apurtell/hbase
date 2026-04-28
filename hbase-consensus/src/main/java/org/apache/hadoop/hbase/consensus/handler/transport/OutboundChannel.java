@@ -83,6 +83,12 @@ final class OutboundChannel {
   private final AtomicReference<Channel> channelRef = new AtomicReference<>();
   private final AtomicBoolean connecting = new AtomicBoolean(false);
   private final AtomicBoolean closed = new AtomicBoolean(false);
+  /** Local endpoint stamped on the {@code sender} field of every HEARTBEAT_BATCH envelope. */
+  private final RaftEndpoint localEndpoint;
+  /** Boot epoch stamped on every HEARTBEAT_BATCH envelope. */
+  private final long keepaliveEpochMillis;
+  /** Live reference to the transport's monotonic per-tick counter. Read on every drain. */
+  private final AtomicLong keepaliveTick;
 
   // Producer-visible head-of-line timestamp for the deadline wake-up. The AtomicLong holds the
   // approximate enqueue time (in millis from {@link EnvironmentEdgeManager}) of the oldest message
@@ -107,7 +113,8 @@ final class OutboundChannel {
 
   OutboundChannel(@NonNull RaftEndpoint peer, @NonNull InetSocketAddress address,
     @NonNull Bootstrap bootstrap, @NonNull ProtoConverter converter,
-    @NonNull TransportConfig config) {
+    @NonNull TransportConfig config, @NonNull RaftEndpoint localEndpoint, long keepaliveEpochMillis,
+    @NonNull AtomicLong keepaliveTick) {
     this.peer = peer;
     this.address = address;
     this.bootstrap = bootstrap;
@@ -116,6 +123,9 @@ final class OutboundChannel {
     this.flushDeadlineMs = config.getFlushDeadlineMs();
     this.mailbox = new MpscUnboundedArrayQueue<>(config.getMailboxChunkSize());
     this.currentBackoffMs = config.getReconnectBackoffMinMs();
+    this.localEndpoint = localEndpoint;
+    this.keepaliveEpochMillis = keepaliveEpochMillis;
+    this.keepaliveTick = keepaliveTick;
   }
 
   /** Returns the peer this channel serves (debug / equality key in the registry) */
@@ -366,9 +376,7 @@ final class OutboundChannel {
     if (!heartbeatBucket.isEmpty()) {
       ConsensusProtos.ConsensusFrame frame = ConsensusProtos.ConsensusFrame.newBuilder()
         .setKind(ConsensusProtos.ConsensusFrame.Kind.HEARTBEAT_BATCH)
-        .setHeartbeatBatch(
-          ConsensusProtos.HeartbeatBatchPB.newBuilder().addAllGroups(heartbeatBucket).build())
-        .build();
+        .setHeartbeatBatch(buildHeartbeatBatch(heartbeatBucket)).build();
       NettyFutureUtils.safeWrite(ch, frame);
       heartbeatFrames.incrementAndGet();
     }
@@ -391,6 +399,20 @@ final class OutboundChannel {
     ) {
       ch.flush();
     }
+  }
+
+  /**
+   * Builds a {@code HeartbeatBatchPB} with the per-RS keepalive header (sender / epoch / tick)
+   * populated. Followers' {@code lastPeerKeepaliveMillis} updates from these fields, which is what
+   * backs failure detection for groups whose per-group heartbeat has been suppressed by idle-group
+   * quiescence.
+   */
+  private ConsensusProtos.HeartbeatBatchPB
+    buildHeartbeatBatch(List<ConsensusProtos.GroupHeartbeatPB> bucket) {
+    ConsensusProtos.HeartbeatBatchPB.Builder b = ConsensusProtos.HeartbeatBatchPB.newBuilder()
+      .addAllGroups(bucket).setSender(ProtoConverter.toEndpointPB(localEndpoint))
+      .setEpoch(keepaliveEpochMillis).setTick(keepaliveTick.get());
+    return b.build();
   }
 
   /** Returns a point-in-time snapshot of this channel's outbound frame counters. */
