@@ -21,7 +21,6 @@ import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.ev
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
-import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
@@ -81,9 +80,9 @@ public class TestRaftLeaderFailure extends TestBase {
     RaftNode newLeader = group.waitUntilLeaderElected();
     // we replicate our operation again
     newLeader.replicate(SimpleStateMachine.applyValue(value)).join();
-    Ordered<List<String>> queryResult =
-      newLeader.<List<String>> query(SimpleStateMachine.queryAllValues(), QueryPolicy.LEADER_LEASE,
-        Optional.empty(), Optional.empty()).join();
+    Ordered<List<String>> queryResult = newLeader
+      .<List<String>> query(SimpleStateMachine.queryAllValues(), QueryPolicy.LEADER_LEASE, 0L, 0L)
+      .join();
     // it turns out that our operation is committed twice
     assertThat(queryResult.getResult()).hasSize(2);
   }
@@ -91,9 +90,7 @@ public class TestRaftLeaderFailure extends TestBase {
   @Test
   public void testDefaultLeaseInsideTimeout() {
     RaftConfig c = RaftConfig.DEFAULT_RAFT_CONFIG;
-    assertThat(c.getLeaderLeaseDurationMillis()).isLessThan(c.getLeaderHeartbeatTimeoutMillis());
-    assertThat(c.getLeaderHeartbeatTimeoutMillis()).isGreaterThan(2 * c.getMaxClockDriftMillis());
-    assertThat(c.getLeaderLeaseDurationMillis() + 2 * c.getMaxClockDriftMillis())
-      .isEqualTo(c.getLeaderHeartbeatTimeoutMillis());
+    assertThat(c.getLeaderLeaseDurationMillis()).isPositive()
+      .isLessThan(c.getLeaderHeartbeatTimeoutMillis());
   }
 }

@@ -17,35 +17,38 @@
  */
 package org.apache.hadoop.hbase.consensus.handler.transport;
 
+import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
-/** Point-in-time snapshot of one peer's outbound transport counters. */
-@InterfaceAudience.LimitedPrivate("test")
+/**
+ * Point-in-time snapshot of one peer's outbound transport counters.
+ * <p>
+ * Per-kind frame counters are exposed alongside the {@code AppendEntriesRequest} enqueue counter
+ * for the bulk lane. Heartbeat traffic does not flow through the per-message mailbox: the
+ * per-server timing wheel hands one pre-aggregated bulk envelope per (peer, tick) straight to the
+ * channel via the bulk-heartbeat send path, which increments {@link #getHeartbeatFrames()} once per
+ * emission. Heartbeat acks emitted by the inbound bulk handler increment
+ * {@link #getHeartbeatAckFrames()} once per emission.
+ */
+@InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.UNITTEST })
 @InterfaceStability.Evolving
 public final class OutboundChannelStats {
 
   private final long heartbeatFrames;
   private final long appendFrames;
   private final long heartbeatAckFrames;
-  private final long immediateFrames;
-  private final long messagesEnqueued;
-  private final int pendingMailboxDepth;
-  private final long forcedFlushesByDeadline;
+  private final long appendsEnqueued;
 
   public OutboundChannelStats(long heartbeatFrames, long appendFrames, long heartbeatAckFrames,
-    long immediateFrames, long messagesEnqueued, int pendingMailboxDepth,
-    long forcedFlushesByDeadline) {
+    long appendsEnqueued) {
     this.heartbeatFrames = heartbeatFrames;
     this.appendFrames = appendFrames;
     this.heartbeatAckFrames = heartbeatAckFrames;
-    this.immediateFrames = immediateFrames;
-    this.messagesEnqueued = messagesEnqueued;
-    this.pendingMailboxDepth = pendingMailboxDepth;
-    this.forcedFlushesByDeadline = forcedFlushesByDeadline;
+    this.appendsEnqueued = appendsEnqueued;
   }
 
-  /** Number of {@code HEARTBEAT_BATCH} frames this channel has flushed. */
+  /** Number of {@code BULK_HEARTBEAT} frames this channel has flushed. */
   public long getHeartbeatFrames() {
     return heartbeatFrames;
   }
@@ -55,45 +58,19 @@ public final class OutboundChannelStats {
     return appendFrames;
   }
 
-  /** Number of {@code HEARTBEAT_ACK_BATCH} frames this channel has flushed. */
+  /** Number of {@code BULK_HEARTBEAT_ACK} frames this channel has flushed. */
   public long getHeartbeatAckFrames() {
     return heartbeatAckFrames;
   }
 
-  /** Number of immediately-sent (non-coalesced) frames this channel has flushed. */
-  public long getImmediateFrames() {
-    return immediateFrames;
-  }
-
-  /** Total {@link #getHeartbeatFrames()} + {@link #getAppendFrames()} + ack + immediate frames. */
-  public long getTotalFrames() {
-    return heartbeatFrames + appendFrames + heartbeatAckFrames + immediateFrames;
-  }
-
-  /** Number of individual messages this channel has enqueued for batching. */
-  public long getMessagesEnqueued() {
-    return messagesEnqueued;
-  }
-
-  /** Approximate mailbox depth at the moment this snapshot was taken. */
-  public int getPendingMailboxDepth() {
-    return pendingMailboxDepth;
-  }
-
-  /**
-   * Number of times the deadline-based fail-safe wakeup fired (head of mailbox aged past
-   * {@code hbase.consensus.transport.flush.deadline.ms}). A persistently non-zero value indicates
-   * the periodic batch tick is being starved by event-loop contention; a tail-latency regression
-   * test in {@code TestConsensusServerScale} alarms when this happens at scale.
-   */
-  public long getForcedFlushesByDeadline() {
-    return forcedFlushesByDeadline;
+  /** Number of individual {@code AppendEntriesRequest} messages this channel has enqueued. */
+  public long getAppendsEnqueued() {
+    return appendsEnqueued;
   }
 
   @Override
   public String toString() {
     return "OutboundChannelStats{" + "hb=" + heartbeatFrames + ", app=" + appendFrames + ", ack="
-      + heartbeatAckFrames + ", imm=" + immediateFrames + ", enq=" + messagesEnqueued + ", depth="
-      + pendingMailboxDepth + ", deadlineFlushes=" + forcedFlushesByDeadline + '}';
+      + heartbeatAckFrames + ", appEnq=" + appendsEnqueued + '}';
   }
 }

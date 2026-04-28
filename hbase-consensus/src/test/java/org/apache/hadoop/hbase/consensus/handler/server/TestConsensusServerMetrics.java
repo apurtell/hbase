@@ -27,12 +27,15 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.consensus.handler.server.util.CountingConsensusSpi;
 import org.apache.hadoop.hbase.consensus.handler.server.util.InJvmConsensusServerTopology;
 import org.apache.hadoop.hbase.consensus.handler.server.util.MetricRegistryDumper;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.hadoop.hbase.consensus.raft.RaftRole;
+import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.metrics.MetricRegistries;
@@ -273,6 +276,27 @@ public class TestConsensusServerMetrics extends TestBase {
     assertThat(dump).contains("timer.flushCompleteTime.count=2");
   }
 
+  /**
+   * Polls each node's {@link RaftNodeReport#getRole()} and returns the {@link GroupHandle} owned by
+   * the current {@link RaftRole#LEADER}. Retries until a leader is reported or the deadline elapses
+   * because {@code getReport()} on a node that is in the middle of an election may briefly return
+   * {@link RaftRole#CANDIDATE} or {@link RaftRole#FOLLOWER} on every node.
+   */
+  private static GroupHandle resolveLeaderHandle(List<GroupHandle> handles) throws Exception {
+    AtomicReference<GroupHandle> leaderRef = new AtomicReference<>();
+    AssertionUtils.eventually(() -> {
+      for (GroupHandle h : handles) {
+        RaftNodeReport report = h.getRaftNode().getReport().join().getResult();
+        if (report.getRole() == RaftRole.LEADER) {
+          leaderRef.set(h);
+          return;
+        }
+      }
+      throw new AssertionError("no node reported RaftRole.LEADER yet");
+    }, 15);
+    return leaderRef.get();
+  }
+
   @Test
   @Timeout(value = 60, unit = TimeUnit.SECONDS)
   public void testEndToEndCommitWiringPopulatesHistograms() throws Exception {
@@ -286,29 +310,28 @@ public class TestConsensusServerMetrics extends TestBase {
     List<RaftEndpoint> members = topo.endpoints();
     Object groupId = "g-e2e";
 
-    // addGroup on every node and pick the elected leader's GroupHandle.
-    GroupHandle leaderHandle = null;
+    // addGroup on every node and wait for any node to observe a leader-elected event.
+    final List<GroupHandle> handles = new ArrayList<>(topo.nodes().size());
+    boolean anyLeaderObserved = false;
     for (InJvmConsensusServerTopology.Node n : topo.nodes()) {
       CountingConsensusSpi spi = new CountingConsensusSpi();
-      GroupHandle h = n.server().addGroup(groupId, members, spi);
-      if (spi.stats(groupId).awaitLeaderElected(15, TimeUnit.SECONDS) && leaderHandle == null) {
-        leaderHandle = h;
+      handles.add(n.server().addGroup(groupId, members, spi));
+      if (spi.stats(groupId).awaitLeaderElected(15, TimeUnit.SECONDS)) {
+        anyLeaderObserved = true;
       }
     }
-    assertThat(leaderHandle).as("at least one node must have observed a leader").isNotNull();
+    assertThat(anyLeaderObserved).as("at least one node must have observed a leader").isTrue();
 
     // Drive a few commits on the leader so the StateMachineAdapter records commitApply samples.
-    // (FlushMarker requires a registered OperationCodec entry that this fixture does not install;
-    // {@link TestStateMachineAdapter#testFlushCompleteMetricsRecorded} covers the flushComplete
-    // wiring directly.)
+    // Resolve the leader handle per attempt.
     for (int i = 0; i < 5; i++) {
+      GroupHandle leaderHandle = resolveLeaderHandle(handles);
       leaderHandle.getRaftNode().replicate(("payload-" + i).getBytes(StandardCharsets.UTF_8))
         .get(10, TimeUnit.SECONDS);
     }
 
-    // The StateMachineAdapter samples are immediate (commit-apply path), so they should be visible
-    // on at least one node's metrics. The lag histograms are sampled on the next periodic
-    // RaftNodeReport tick (1s), so we wait for them via `eventually`.
+    // StateMachineAdapter samples are immediate so they should be visible on at least one
+    // node's metrics.
     AssertionUtils.eventually(() -> {
       boolean anyCommitApply = false;
       boolean anyCommitBacklog = false;

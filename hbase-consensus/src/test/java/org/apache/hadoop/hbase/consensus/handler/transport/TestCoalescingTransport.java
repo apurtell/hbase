@@ -18,31 +18,48 @@
 package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.when;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.consensus.raft.GroupId;
+import org.apache.hadoop.hbase.consensus.raft.MembershipChangeMode;
+import org.apache.hadoop.hbase.consensus.raft.Ordered;
+import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
+import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
+import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
+import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.hadoop.hbase.consensus.raft.model.message.VoteRequest;
+import org.apache.hadoop.hbase.consensus.raft.report.RaftGroupMembers;
+import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
+import org.apache.hadoop.hbase.consensus.raft.report.RaftTerm;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
@@ -165,9 +182,10 @@ public class TestCoalescingTransport extends TestBase {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
 
-    // Big batch window so many enqueues land on the same flush tick.
+    // Lazy coalescing groups concurrent enqueues into one BATCH_APPEND frame per peer per drain
+    // pass. The total number of received messages and per-message ordering is what we check, not
+    // the wire-frame count.
     Configuration conf = baseConf();
-    conf.setLong(TransportConfig.BATCH_MS_KEY, 200L);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
@@ -210,12 +228,11 @@ public class TestCoalescingTransport extends TestBase {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
 
-    // Tiny watermarks force the channel unwritable quickly under load; the drain bails until
-    // the kernel buffer drains and the next flush tick re-arms.
+    // Tiny watermarks force the channel unwritable quickly under load. The drain bails until
+    // back-pressure clears and the next channelWritabilityChanged event picks up the leftover.
     Configuration conf = baseConf();
     conf.setInt(TransportConfig.WRITE_LOW_WM_BYTES_KEY, 256);
     conf.setInt(TransportConfig.WRITE_HIGH_WM_BYTES_KEY, 1024);
-    conf.setLong(TransportConfig.BATCH_MS_KEY, 1L);
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
@@ -259,7 +276,6 @@ public class TestCoalescingTransport extends TestBase {
     Configuration conf = baseConf();
     conf.setLong(TransportConfig.RECONNECT_BACKOFF_MIN_MS_KEY, 10L);
     conf.setLong(TransportConfig.RECONNECT_BACKOFF_MAX_MS_KEY, 50L);
-    conf.setLong(TransportConfig.BATCH_MS_KEY, 5L);
 
     int port = ephemeralPort();
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
@@ -361,22 +377,15 @@ public class TestCoalescingTransport extends TestBase {
   }
 
   /**
-   * The deadline-based fail-safe wakeup must drain a stale head between two periodic flush ticks.
-   * The test sets BATCH_MS deliberately wider than (FLUSH_DEADLINE + sleep window) so the only
-   * thing that can drain the head before the next tick is the producer-side deadline check.
+   * After a single AppendEntries, the receiver should observe the frame within the event-loop
+   * scheduling window.
    */
   @Test
-  public void testDeadlineWakeupForcesFlush() {
+  public void testLoneEnqueueDrainsWithoutTimer() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
 
-    // BATCH_MS wide enough to dwarf (deadline + inter-send sleep), so any drain that fires
-    // inside the test window came from the deadline mechanism, not the periodic tick. BATCH_MS
-    // still has to be small enough that OutboundChannel.flushTick (the only connection-trigger)
-    // fires in time. 1500 ms is well below the 10 s test budget.
     Configuration conf = baseConf();
-    conf.setLong(TransportConfig.BATCH_MS_KEY, 1_500L);
-    conf.setLong(TransportConfig.FLUSH_DEADLINE_MS_KEY, 50L);
 
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
@@ -397,56 +406,51 @@ public class TestCoalescingTransport extends TestBase {
 
     DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
 
-    // Warm-up to register the peer channel and bootstrap the connection.
+    // Warm up the channel.
     a.send(epB, factory.createVoteRequestBuilder().setGroupId(GROUP).setSender(epA).setTerm(1)
       .setLastLogTerm(0).setLastLogIndex(0L).setSticky(false).build());
     await().atMost(10, TimeUnit.SECONDS).until(() -> a.isReachable(epB));
     await().atMost(5, TimeUnit.SECONDS).until(() -> seenAtB.size() >= 1);
     seenAtB.clear();
 
-    long forcedBefore = a.getOutboundStats().get(epB).getForcedFlushesByDeadline();
-
-    // First coalescible enqueue on a known-connected channel.
-    AppendEntriesRequest first = factory.createAppendEntriesRequestBuilder().setGroupId(GROUP)
+    // Lazy coalescing schedules a drain on enqueue, so the receiver should observe the
+    // AppendEntries
+    // within the event-loop scheduling window.
+    AppendEntriesRequest req = factory.createAppendEntriesRequestBuilder().setGroupId(GROUP)
       .setSender(epA).setTerm(1).setPreviousLogTerm(1).setPreviousLogIndex(0L).setCommitIndex(0L)
       .setLogEntries(List.of(factory.createLogEntryBuilder().setIndex(1L).setTerm(1)
         .setOperation(new byte[] { 0x01 }).build()))
       .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build();
-    a.send(epB, first);
-
-    // Sleep past the deadline, then enqueue a second coalescible whose post-offer head-age check
-    // observes the first message older than FLUSH_DEADLINE_MS_KEY and forces a drain.
-    sleepFor(150);
-    AppendEntriesRequest second = factory.createAppendEntriesRequestBuilder().setGroupId(GROUP)
-      .setSender(epA).setTerm(1).setPreviousLogTerm(1).setPreviousLogIndex(1L).setCommitIndex(0L)
-      .setLogEntries(List.of(factory.createLogEntryBuilder().setIndex(2L).setTerm(1)
-        .setOperation(new byte[] { 0x02 }).build()))
-      .setQuerySequenceNumber(1L).setFlowControlSequenceNumber(1L).build();
-    a.send(epB, second);
-
-    await().atMost(5, TimeUnit.SECONDS).until(() -> seenAtB.size() >= 2);
-
-    OutboundChannelStats statsForB = a.getOutboundStats().get(epB);
-    assertThat(statsForB).as("outbound stats for peer B").isNotNull();
-    assertThat(statsForB.getForcedFlushesByDeadline() - forcedBefore)
-      .as("the second enqueue must trigger the deadline wakeup at least once")
-      .isGreaterThanOrEqualTo(1L);
+    long t0 = System.nanoTime();
+    a.send(epB, req);
+    await().atMost(2, TimeUnit.SECONDS).until(() -> seenAtB.size() >= 1);
+    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+    assertThat(elapsedMillis)
+      .as("lone enqueue must drain within event-loop scheduling latency, not a fixed timer "
+        + "interval")
+      .isLessThan(1_000L);
   }
 
   /**
-   * Under healthy load the deadline wakeup must NOT fire, since the periodic tick keeps the head
-   * fresh. Guards against an over-eager deadline-trigger regression that would defeat the O(peers)
-   * coalescing property.
+   * Inbound dispatcher classifies decoded {@link RaftMessage}s into the dual executor lanes:
+   * {@code AppendEntries*}, {@code InstallSnapshot*}, and {@code TriggerLeaderElection} on the bulk
+   * lane ({@link RaftNodeExecutor#execute(Runnable)}); votes, pre-votes, leader heartbeats, and
+   * heartbeat-acks on the control lane ({@link RaftNodeExecutor#executeControl(Runnable)}).
+   * <p>
+   * The test sends one wire frame of every supported {@link RaftMessage} type from A to B over a
+   * real transport pair. The receiver registers a {@link ClassifyingRaftNode} that mirrors the
+   * production routing in {@link RaftNodeImpl#handle(RaftMessage)} via the public classifier
+   * {@link RaftNodeImpl#isControlLaneMessage(RaftMessage)} and forwards each task to a
+   * {@link RecordingExecutor} which logs the lane each Java message class landed on. The
+   * expected-lane mapping is hard-coded in the test so a regression in the production classifier
+   * (e.g. demoting a heartbeat to bulk) breaks the test by design.
    */
   @Test
-  public void testDeadlineWakeupQuietUnderHealthyLoad() {
+  public void testInboundDualLaneClassification() {
     LocalRaftEndpoint epA = LocalRaftEndpoint.newEndpoint();
     LocalRaftEndpoint epB = LocalRaftEndpoint.newEndpoint();
 
     Configuration conf = baseConf();
-    conf.setLong(TransportConfig.BATCH_MS_KEY, 5L);
-    conf.setLong(TransportConfig.FLUSH_DEADLINE_MS_KEY, 250L);
-
     Map<RaftEndpoint, InetSocketAddress> addrs = new HashMap<>();
     EndpointResolver resolver = ep -> {
       InetSocketAddress addr = addrs.get(ep);
@@ -461,36 +465,306 @@ public class TestCoalescingTransport extends TestBase {
     addrs.put(epA, a.getBindAddress());
     addrs.put(epB, b.getBindAddress());
 
-    ConcurrentLinkedQueue<RaftMessage> seenAtB = new ConcurrentLinkedQueue<>();
-    b.discoverNode(mockNode(GROUP, seenAtB));
+    RecordingExecutor exec = new RecordingExecutor();
+    b.discoverNode(new ClassifyingRaftNode(GROUP, exec));
 
     DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
-    int total = 50;
-    for (int i = 0; i < total; i++) {
-      LogEntry e = factory.createLogEntryBuilder().setIndex(i + 1).setTerm(1)
-        .setOperation(new byte[] { (byte) i }).build();
-      AppendEntriesRequest req =
-        factory.createAppendEntriesRequestBuilder().setGroupId(GROUP).setSender(epA).setTerm(1)
-          .setPreviousLogTerm(1).setPreviousLogIndex(i).setCommitIndex(0L).setLogEntries(List.of(e))
-          .setQuerySequenceNumber(i).setFlowControlSequenceNumber(i).build();
-      a.send(epB, req);
+    LogEntry entry = factory.createLogEntryBuilder().setIndex(1L).setTerm(1)
+      .setOperation(new byte[] { 0x7f }).build();
+    RaftGroupMembersView membersView = factory.createRaftGroupMembersViewBuilder().setLogIndex(1L)
+      .setMembers(List.of(epA, epB)).setVotingMembers(List.of(epA, epB)).build();
+
+    // One of every Raft message type the inbound dispatcher decodes. Each is paired with the
+    // expected executor lane the receiver must dispatch the handler on.
+    List<MessageWithLane> messages = new ArrayList<>();
+    messages
+      .add(new MessageWithLane(factory.createVoteRequestBuilder().setGroupId(GROUP).setSender(epA)
+        .setTerm(2).setLastLogTerm(1).setLastLogIndex(1L).setSticky(false).build(), Lane.CONTROL));
+    messages.add(new MessageWithLane(factory.createVoteResponseBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(2).setGranted(true).build(), Lane.CONTROL));
+    messages.add(new MessageWithLane(factory.createPreVoteRequestBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(3).setLastLogTerm(1).setLastLogIndex(1L).build(), Lane.CONTROL));
+    messages.add(new MessageWithLane(factory.createPreVoteResponseBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(3).setGranted(true).build(), Lane.CONTROL));
+    messages.add(new MessageWithLane(factory.createAppendEntriesRequestBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(2).setPreviousLogTerm(1).setPreviousLogIndex(0L).setCommitIndex(0L)
+      .setLogEntries(List.of(entry)).setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L)
+      .build(), Lane.BULK));
+    messages.add(new MessageWithLane(factory.createAppendEntriesSuccessResponseBuilder()
+      .setGroupId(GROUP).setSender(epA).setTerm(2).setLastLogIndex(1L).setQuerySequenceNumber(0L)
+      .setFlowControlSequenceNumber(0L).build(), Lane.BULK));
+    messages.add(new MessageWithLane(factory.createAppendEntriesFailureResponseBuilder()
+      .setGroupId(GROUP).setSender(epA).setTerm(2).setExpectedNextIndex(1L)
+      .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build(), Lane.BULK));
+    messages.add(new MessageWithLane(factory.createInstallSnapshotRequestBuilder().setGroupId(GROUP)
+      .setSender(epA).setTerm(2).setSenderLeader(true).setSnapshotTerm(1).setSnapshotIndex(1L)
+      .setTotalSnapshotChunkCount(0).setSnapshotChunk(null).setSnapshottedMembers(List.of(epA, epB))
+      .setGroupMembersView(membersView).setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L)
+      .build(), Lane.BULK));
+    messages
+      .add(new MessageWithLane(factory.createInstallSnapshotResponseBuilder().setGroupId(GROUP)
+        .setSender(epA).setTerm(2).setSnapshotIndex(1L).setRequestedSnapshotChunkIndex(0)
+        .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build(), Lane.BULK));
+    messages
+      .add(new MessageWithLane(factory.createTriggerLeaderElectionRequestBuilder().setGroupId(GROUP)
+        .setSender(epA).setTerm(2).setLastLogTerm(1).setLastLogIndex(1L).build(), Lane.CONTROL));
+
+    for (MessageWithLane mwl : messages) {
+      a.send(epB, mwl.message);
     }
 
-    await().atMost(10, TimeUnit.SECONDS).until(() -> seenAtB.size() >= total);
+    await().atMost(15, TimeUnit.SECONDS).until(() -> exec.totalDispatches() >= messages.size());
 
-    OutboundChannelStats statsForB = a.getOutboundStats().get(epB);
-    assertThat(statsForB).as("outbound stats for peer B").isNotNull();
-    assertThat(statsForB.getForcedFlushesByDeadline())
-      .as("the deadline wakeup must stay silent under healthy load (BATCH_MS << deadline)")
-      .isZero();
+    // For each Java message type sent, exactly one dispatch on the expected lane must have been
+    // recorded; no message must have crossed lanes.
+    for (MessageWithLane mwl : messages) {
+      Class<? extends RaftMessage> cls = mwl.message.getClass();
+      long control = exec.countDispatches(Lane.CONTROL, cls);
+      long bulk = exec.countDispatches(Lane.BULK, cls);
+      assertThat(control + bulk)
+        .as("exactly one dispatch must be recorded for %s", cls.getSimpleName()).isEqualTo(1L);
+      switch (mwl.expected) {
+        case CONTROL:
+          assertThat(control).as("%s must route through executeControl", cls.getSimpleName())
+            .isEqualTo(1L);
+          break;
+        case BULK:
+          assertThat(bulk).as("%s must route through execute", cls.getSimpleName()).isEqualTo(1L);
+          break;
+        default:
+          throw new AssertionError("unreachable");
+      }
+    }
+
+    // Tighter end-to-end count check: the two lanes between them carry exactly the messages we
+    // sent, no duplicates and nothing extra.
+    assertThat(exec.totalDispatches()).isEqualTo(messages.size());
+    assertThat(exec.countLane(Lane.CONTROL))
+      .isEqualTo(messages.stream().filter(m -> m.expected == Lane.CONTROL).count());
+    assertThat(exec.countLane(Lane.BULK))
+      .isEqualTo(messages.stream().filter(m -> m.expected == Lane.BULK).count());
   }
 
-  private static void sleepFor(long ms) {
-    try {
-      Thread.sleep(ms);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new RuntimeException(e);
+  private enum Lane {
+    CONTROL,
+    BULK
+  }
+
+  private static final class MessageWithLane {
+    final RaftMessage message;
+    final Lane expected;
+
+    MessageWithLane(RaftMessage message, Lane expected) {
+      this.message = message;
+      this.expected = expected;
+    }
+  }
+
+  /**
+   * Records, per (lane, message-class) pair, how many tasks the producing {@link RaftNode} has
+   * forwarded. Only {@link #execute(Runnable)} and {@link #executeControl(Runnable)} are wired —
+   * the other {@link RaftNodeExecutor} methods are unreachable in this test path.
+   */
+  private static final class RecordingExecutor implements RaftNodeExecutor {
+    private final ConcurrentHashMap<Class<? extends RaftMessage>, AtomicInteger> controlCounts =
+      new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Class<? extends RaftMessage>, AtomicInteger> bulkCounts =
+      new ConcurrentHashMap<>();
+    private final AtomicInteger total = new AtomicInteger();
+
+    void recordDispatch(Lane lane, Class<? extends RaftMessage> cls) {
+      ConcurrentHashMap<Class<? extends RaftMessage>, AtomicInteger> map =
+        lane == Lane.CONTROL ? controlCounts : bulkCounts;
+      map.computeIfAbsent(cls, k -> new AtomicInteger()).incrementAndGet();
+      total.incrementAndGet();
+    }
+
+    long countDispatches(Lane lane, Class<? extends RaftMessage> cls) {
+      ConcurrentHashMap<Class<? extends RaftMessage>, AtomicInteger> map =
+        lane == Lane.CONTROL ? controlCounts : bulkCounts;
+      AtomicInteger c = map.get(cls);
+      return c == null ? 0L : c.get();
+    }
+
+    long countLane(Lane lane) {
+      ConcurrentHashMap<Class<? extends RaftMessage>, AtomicInteger> map =
+        lane == Lane.CONTROL ? controlCounts : bulkCounts;
+      long sum = 0L;
+      for (AtomicInteger c : map.values()) {
+        sum += c.get();
+      }
+      return sum;
+    }
+
+    int totalDispatches() {
+      return total.get();
+    }
+
+    @Override
+    public void execute(@NonNull Runnable task) {
+      task.run();
+    }
+
+    @Override
+    public void executeControl(@NonNull Runnable task) {
+      task.run();
+    }
+
+    @Override
+    public void submit(@NonNull Runnable task) {
+      task.run();
+    }
+
+    @Override
+    public void schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit) {
+      throw new UnsupportedOperationException("schedule is not used by this test");
+    }
+  }
+
+  /**
+   * Minimal {@link RaftNode} stub used by {@link #testInboundDualLaneClassification()}: exposes
+   * {@code groupId} / {@link RaftNodeStatus#ACTIVE} status to the inbound dispatcher and forwards
+   * every received message to a {@link RecordingExecutor} via the production
+   * {@link RaftNodeImpl#isControlLaneMessage(RaftMessage)} classifier.
+   */
+  private static final class ClassifyingRaftNode implements RaftNode {
+    private final GroupId groupId;
+    private final RecordingExecutor executor;
+
+    ClassifyingRaftNode(@NonNull String groupId, @NonNull RecordingExecutor executor) {
+      this.groupId = GroupId.of(groupId);
+      this.executor = executor;
+    }
+
+    @Override
+    public void handle(@NonNull RaftMessage message) {
+      Lane lane = RaftNodeImpl.isControlLaneMessage(message) ? Lane.CONTROL : Lane.BULK;
+      Runnable record = () -> executor.recordDispatch(lane, message.getClass());
+      if (lane == Lane.CONTROL) {
+        executor.executeControl(record);
+      } else {
+        executor.execute(record);
+      }
+    }
+
+    @NonNull
+    @Override
+    public Object getGroupId() {
+      return groupId;
+    }
+
+    @NonNull
+    @Override
+    public RaftNodeStatus getStatus() {
+      return RaftNodeStatus.ACTIVE;
+    }
+
+    @NonNull
+    @Override
+    public RaftEndpoint getLocalEndpoint() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public RaftConfig getConfig() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public RaftTerm getTerm() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public RaftGroupMembers getInitialMembers() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public RaftGroupMembers getCommittedMembers() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public RaftGroupMembers getEffectiveMembers() {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public boolean isLeaderWithValidLease(long nowMillis) {
+      return false;
+    }
+
+    @Override
+    public boolean isLeaderHeartbeatTimeoutElapsed() {
+      return false;
+    }
+
+    @Override
+    public boolean demoteToFollowerIfLeaseExpired() {
+      return false;
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<Object>> start() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<Object>> terminate() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public <T> CompletableFuture<Ordered<T>> replicate(@NonNull Object operation) {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public <T> CompletableFuture<Ordered<T>> query(@NonNull Object operation,
+      @NonNull QueryPolicy queryPolicy, long minCommitIndex, long timeoutMillis) {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<Object>> waitFor(long minCommitIndex, Duration timeout) {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<RaftGroupMembers>> changeMembership(
+      @NonNull RaftEndpoint endpoint, @NonNull MembershipChangeMode mode,
+      long expectedGroupMembersCommitIndex) {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<Object>> transferLeadership(@NonNull RaftEndpoint endpoint) {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<RaftNodeReport>> getReport() {
+      throw new UnsupportedOperationException();
+    }
+
+    @NonNull
+    @Override
+    public CompletableFuture<Ordered<RaftNodeReport>> takeSnapshot() {
+      throw new UnsupportedOperationException();
     }
   }
 
@@ -508,8 +782,8 @@ public class TestCoalescingTransport extends TestBase {
     AppendEntriesSuccessResponse ok = factory.createAppendEntriesSuccessResponseBuilder()
       .setGroupId(GROUP).setSender(epA).setTerm(1).setLastLogIndex(0L).setQuerySequenceNumber(0L)
       .setFlowControlSequenceNumber(0L).build();
-    org.assertj.core.api.Assertions.assertThatThrownBy(() -> a.send(epA, ok))
-      .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("itself");
+    assertThatThrownBy(() -> a.send(epA, ok)).isInstanceOf(IllegalArgumentException.class)
+      .hasMessageContaining("itself");
     a.send(epUnknown, ok);
     assertThat(a.isReachable(epUnknown)).isFalse();
   }
@@ -530,7 +804,10 @@ public class TestCoalescingTransport extends TestBase {
 
   private static RaftNode mockNode(String groupId, ConcurrentLinkedQueue<RaftMessage> sink) {
     RaftNode node = Mockito.mock(RaftNode.class);
-    when(node.getGroupId()).thenReturn(groupId);
+    // The dispatcher requires a {@link GroupId} value-class instance so it can key its registry on
+    // the wire ByteString (zero-copy) instead of decoding inbound bytes back to a String per
+    // message.
+    when(node.getGroupId()).thenReturn(GroupId.of(groupId));
     when(node.getStatus()).thenReturn(RaftNodeStatus.ACTIVE);
     Mockito.doAnswer((InvocationOnMock inv) -> {
       sink.add(inv.getArgument(0));
@@ -541,9 +818,7 @@ public class TestCoalescingTransport extends TestBase {
 
   private static Configuration baseConf() {
     Configuration c = HBaseConfiguration.create();
-    // Keep tests Linux-portable: don't try to load Epoll JNI on macOS CI where it's missing.
     c.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
-    c.setLong(TransportConfig.BATCH_MS_KEY, 5L);
     c.setInt(TransportConfig.IO_THREADS_KEY, 2);
     return c;
   }

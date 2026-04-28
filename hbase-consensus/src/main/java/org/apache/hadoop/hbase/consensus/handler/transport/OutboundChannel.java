@@ -18,7 +18,6 @@
 package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import edu.umd.cs.findbugs.annotations.Nullable;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
@@ -26,11 +25,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
-import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.hadoop.hbase.consensus.raft.transport.BulkHeartbeatAckFrame;
+import org.apache.hadoop.hbase.consensus.raft.transport.BulkHeartbeatFrame;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.NettyFutureUtils;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -45,97 +45,68 @@ import org.apache.hbase.thirdparty.io.netty.channel.ChannelFuture;
 /**
  * Per-peer outbound side of {@link CoalescingTransport}.
  * <p>
- * Owns a {@link MpscUnboundedArrayQueue} of pending messages, a current Netty {@link Channel}
- * reference, and a tiny reconnect state machine. The transport's flush scheduler pings
- * {@link #flushTick()} at {@code hbase.consensus.log.sync.batch.ms}; producers call
+ * Owns one {@link MpscUnboundedArrayQueue} for the bulk lane (append-entries plus immediates), a
+ * current Netty {@link Channel} reference, and a tiny reconnect state machine. Producers call
  * {@link #enqueue} from any thread.
  * <p>
- * Single-consumer drain is enforced by an {@link AtomicBoolean} latch. Producers pile messages into
- * the MPSC, the first arrival CASes the latch on, and only the drain runnable polls the queue. The
- * drain is always run on the channel's event loop so per-peer FIFO holds even across reconnects.
+ * <b>Bulk lane drain.</b> {@link AppendEntriesRequest}, {@link LeaderHeartbeatAck} (if any future
+ * caller produces them through {@link #enqueue}), and every {@code immediate} message (vote /
+ * pre-vote / install-snapshot / append responses) ride the bulk mailbox. Enqueue calls
+ * {@link #scheduleDrainOn(Channel)}, so the message hits the wire on the next event-loop turn with
+ * no wall-clock floor. This preserves the strict {@code RaftNode.replicate(...)} round-trip budget.
+ * <p>
+ * <b>Bulk heartbeat path.</b> {@link #sendBulkHeartbeat(BulkHeartbeatFrame)} and
+ * {@link #sendBulkHeartbeatAck(BulkHeartbeatAckFrame)} bypass the mailbox entirely: the per-server
+ * timing wheel has already aggregated every relevant group into a single envelope, so there is
+ * nothing to coalesce. The encoded envelope is handed straight to the channel's event loop with a
+ * single write+flush per call. One bulk frame per (server, peer) per tick is the design's target
+ * steady-state heartbeat fanout.
+ * <p>
+ * Single-consumer drain on the bulk mailbox is enforced by an {@link AtomicBoolean} latch.
+ * Producers pile messages into the MPSC. Only the first arrival of a fresh batch CASes the latch on
+ * and submits a drain task; subsequent enqueues whose CAS loses are absorbed by the in-flight
+ * drain's poll loop. The drain runs on the channel's event loop, so per-peer FIFO holds within the
+ * lane even across reconnects.
  */
 @InterfaceAudience.Private
 final class OutboundChannel {
 
   private static final Logger LOG = LoggerFactory.getLogger(OutboundChannel.class);
 
-  /** Lightweight enqueue record. */
-  private static final class Pending {
-    final RaftMessage message;
-    final boolean immediate;
-    final long enqueueTimeMillis;
-
-    Pending(RaftMessage message, boolean immediate, long enqueueTimeMillis) {
-      this.message = message;
-      this.immediate = immediate;
-      this.enqueueTimeMillis = enqueueTimeMillis;
-    }
-  }
-
-  private final RaftEndpoint peer;
   private final InetSocketAddress address;
   private final Bootstrap bootstrap;
   private final ProtoConverter converter;
   private final TransportConfig config;
-  private final long flushDeadlineMs;
-  private final MpscUnboundedArrayQueue<Pending> mailbox;
+  private final MpscUnboundedArrayQueue<RaftMessage> mailbox;
   private final AtomicBoolean draining = new AtomicBoolean(false);
   private final AtomicReference<Channel> channelRef = new AtomicReference<>();
   private final AtomicBoolean connecting = new AtomicBoolean(false);
   private final AtomicBoolean closed = new AtomicBoolean(false);
-  /** Local endpoint stamped on the {@code sender} field of every HEARTBEAT_BATCH envelope. */
-  private final RaftEndpoint localEndpoint;
-  /** Boot epoch stamped on every HEARTBEAT_BATCH envelope. */
-  private final long keepaliveEpochMillis;
-  /** Live reference to the transport's monotonic per-tick counter. Read on every drain. */
-  private final AtomicLong keepaliveTick;
-
-  // Producer-visible head-of-line timestamp for the deadline wake-up. The AtomicLong holds the
-  // approximate enqueue time (in millis from {@link EnvironmentEdgeManager}) of the oldest message
-  // not yet observed by a drain pass, or 0L when "no untracked message". Producers do
-  // {@code compareAndSet(0L, now)} after their offer so the *first* message of a fresh batch wins
-  // the slot. Later producers in the same batch read the existing value to compare against. The
-  // drain runnable resets the slot to 0L before its poll loop so producers that enqueue during
-  // the drain start a fresh batch's tracking and can re-arm the wakeup.
-  private final AtomicLong oldestUndrainedEnqueueMs = new AtomicLong();
 
   private volatile long nextConnectAtMillis = 0L;
+  // Read and written from netty future callbacks scheduled by bootstrap.connect(). Multiple
+  // connect attempts can land on different event-loop threads (the bootstrap event-loop group is
+  // multi-threaded), so the doubled-backoff updates and the read on the next failed-connect path
+  // must be visible across threads. Keep volatile.
   private volatile long currentBackoffMs;
 
-  // Lightweight counters powering {@link #stats()}. Single-writer for frame counters. Multi-writer
-  // for the enqueue counter and the deadline-flush counter.
   private final AtomicLong heartbeatFrames = new AtomicLong();
   private final AtomicLong appendFrames = new AtomicLong();
   private final AtomicLong heartbeatAckFrames = new AtomicLong();
-  private final AtomicLong immediateFrames = new AtomicLong();
-  private final AtomicLong messagesEnqueued = new AtomicLong();
-  private final AtomicLong forcedFlushesByDeadline = new AtomicLong();
+  private final AtomicLong appendsEnqueued = new AtomicLong();
 
-  OutboundChannel(@NonNull RaftEndpoint peer, @NonNull InetSocketAddress address,
-    @NonNull Bootstrap bootstrap, @NonNull ProtoConverter converter,
-    @NonNull TransportConfig config, @NonNull RaftEndpoint localEndpoint, long keepaliveEpochMillis,
-    @NonNull AtomicLong keepaliveTick) {
-    this.peer = peer;
+  // Per-drain scratch buckets reused across {@link #drainOnce(Channel)} invocations.
+  private final List<ConsensusProtos.GroupAppendEntriesPB> appendBucket = new ArrayList<>();
+  private final List<ConsensusProtos.ConsensusFrame> immediateBucket = new ArrayList<>();
+
+  OutboundChannel(@NonNull InetSocketAddress address, @NonNull Bootstrap bootstrap,
+    @NonNull ProtoConverter converter, @NonNull TransportConfig config) {
     this.address = address;
     this.bootstrap = bootstrap;
     this.converter = converter;
     this.config = config;
-    this.flushDeadlineMs = config.getFlushDeadlineMs();
     this.mailbox = new MpscUnboundedArrayQueue<>(config.getMailboxChunkSize());
     this.currentBackoffMs = config.getReconnectBackoffMinMs();
-    this.localEndpoint = localEndpoint;
-    this.keepaliveEpochMillis = keepaliveEpochMillis;
-    this.keepaliveTick = keepaliveTick;
-  }
-
-  /** Returns the peer this channel serves (debug / equality key in the registry) */
-  RaftEndpoint peer() {
-    return peer;
-  }
-
-  /** Returns the resolved remote address (cached at construction) */
-  InetSocketAddress address() {
-    return address;
   }
 
   /** Returns whether this channel is currently connected to its peer */
@@ -148,59 +119,39 @@ final class OutboundChannel {
    * Enqueues {@code message} for the peer. Non-blocking.
    * <p>
    * {@code immediate=true} flushes this message in its own {@link ConsensusProtos.ConsensusFrame}
-   * (used for vote / install-snapshot / response messages) <i>and</i> wakes the event-loop drain
-   * synchronously so latency-sensitive control messages do not pay for the
-   * {@link TransportConfig#BATCH_MS_KEY batch interval}. Coalescible messages
-   * ({@link LeaderHeartbeat}, {@link AppendEntriesRequest}, {@link LeaderHeartbeatAck}) deposit to
-   * the mailbox and rely on {@link CoalescingTransport}'s periodic
-   * {@link OutboundChannel#flushTick() flushTick} to drain &mdash; this is what gives the design
-   * its O(peers) heartbeat-frame collapse: a single drain pass on the event loop coalesces every
-   * per-group beat enqueued during the previous {@code BATCH_MS_KEY} window into one
-   * {@code HEARTBEAT_BATCH} (or {@code BATCH_APPEND}) frame per peer per tick. Unconditional
-   * producer-side wakeups from coalescible enqueues would defeat that coalescing by causing the
-   * drain to ping-pong with the producer at sub-tick rate.
-   * <p>
-   * As a fail-safe, however, this method <i>does</i> wake the drain when the head of the mailbox
-   * has aged past {@link TransportConfig#FLUSH_DEADLINE_MS_KEY}. That bounds the head-of-line
-   * latency a single peer's queue can accumulate when the periodic flush tick is starved by
-   * event-loop contention (e.g. another channel running a long {@code drainOnce}). The wakeup is
-   * latch-protected exactly like the immediate path: if a drain is already in flight the in-flight
-   * drain absorbs the message via its unbounded poll loop. The resulting head-of-line latency is
-   * bounded by {@code BATCH_MS_KEY + drain wall time} when the tick fires on schedule, and by
-   * {@code FLUSH_DEADLINE_MS_KEY + drain wall time} when it does not.
+   * (used for vote / install-snapshot / response messages); coalescible append-entries join the
+   * {@code BATCH_APPEND} envelope. Bulk heartbeats and bulk heartbeat acks do not flow through this
+   * path; see {@link #sendBulkHeartbeat(BulkHeartbeatFrame)} and
+   * {@link #sendBulkHeartbeatAck(BulkHeartbeatAckFrame)}.
    */
   void enqueue(@NonNull RaftMessage message, boolean immediate) {
     if (closed.get()) {
       return;
     }
-    long now = EnvironmentEdgeManager.currentTime();
-    mailbox.offer(new Pending(message, immediate, now));
-    messagesEnqueued.incrementAndGet();
-    // Try to claim the head-of-line timestamp slot. Only one producer per batch wins; later
-    // producers see the older timestamp and may trigger the deadline wakeup below. The slot is
-    // reset to 0L by drainOnce() before its poll loop so the next batch starts tracking afresh.
-    oldestUndrainedEnqueueMs.compareAndSet(0L, now);
+    mailbox.offer(message);
+    if (!immediate) {
+      appendsEnqueued.incrementAndGet();
+    }
     Channel ch = channelRef.get();
-    if (ch == null || !ch.isActive() || !ch.isWritable()) {
+    if (ch == null || !ch.isActive()) {
+      // No connection yet (or dropped). Probe the reconnect state machine. The message stays on
+      // the mailbox and is drained once the channel comes up.
+      maybeConnect();
       return;
     }
-    if (immediate) {
-      scheduleDrainOn(ch);
+    if (!ch.isWritable()) {
+      // Writable watermark exceeded. Skip scheduling. The next channelWritabilityChanged or enqueue
+      // will pick up this message.
       return;
     }
-    long oldest = oldestUndrainedEnqueueMs.get();
-    if (oldest != 0L && now - oldest >= flushDeadlineMs) {
-      forcedFlushesByDeadline.incrementAndGet();
-      scheduleDrainOn(ch);
-    }
+    scheduleDrainOn(ch);
   }
 
   /**
-   * Called by the transport's scheduled flush tick. Drains everything that is currently queued and
-   * flushes one channel write. May trigger a reconnect attempt if the channel is down and the
-   * backoff window has elapsed.
+   * Direct bulk-heartbeat send. Encodes the envelope on the caller thread, schedules a single
+   * write-and-flush onto this peer's event loop, and returns.
    */
-  void flushTick() {
+  void sendBulkHeartbeat(@NonNull BulkHeartbeatFrame frame) {
     if (closed.get()) {
       return;
     }
@@ -209,8 +160,83 @@ final class OutboundChannel {
       maybeConnect();
       return;
     }
-    if (mailbox.peek() != null) {
-      scheduleDrainOn(ch);
+    if (!ch.isWritable()) {
+      return;
+    }
+    ConsensusProtos.ConsensusFrame envelope;
+    try {
+      List<ConsensusProtos.GroupBulkHeartbeatPB> entries =
+        new ArrayList<>(frame.getEntries().size());
+      for (LeaderHeartbeat hb : frame.getEntries()) {
+        entries.add(converter.toGroupBulkHeartbeatPB(hb));
+      }
+      envelope = ConsensusProtos.ConsensusFrame.newBuilder()
+        .setKind(ConsensusProtos.ConsensusFrame.Kind.BULK_HEARTBEAT).setBulkHeartbeat(ProtoConverter
+          .buildBulkHeartbeatPB(frame.getSender(), frame.getEpoch(), frame.getTick(), entries))
+        .build();
+    } catch (RuntimeException ex) {
+      LOG.warn("Failed to encode bulk heartbeat for {}; dropping", address, ex);
+      return;
+    }
+    Channel target = ch;
+    try {
+      target.eventLoop().execute(() -> {
+        if (!target.isActive() || !target.isWritable()) {
+          return;
+        }
+        NettyFutureUtils.safeWrite(target, envelope);
+        heartbeatFrames.incrementAndGet();
+        target.flush();
+      });
+    } catch (Throwable t) {
+      LOG.debug("bulk heartbeat submission rejected for {}", address, t);
+    }
+  }
+
+  /**
+   * Direct bulk-heartbeat-ack send. Mirrors {@link #sendBulkHeartbeat(BulkHeartbeatFrame)} on the
+   * reverse path.
+   */
+  void sendBulkHeartbeatAck(@NonNull BulkHeartbeatAckFrame frame) {
+    if (closed.get()) {
+      return;
+    }
+    Channel ch = channelRef.get();
+    if (ch == null || !ch.isActive()) {
+      maybeConnect();
+      return;
+    }
+    if (!ch.isWritable()) {
+      return;
+    }
+    ConsensusProtos.ConsensusFrame envelope;
+    try {
+      List<ConsensusProtos.GroupBulkHeartbeatAckPB> entries =
+        new ArrayList<>(frame.getEntries().size());
+      for (LeaderHeartbeatAck ack : frame.getEntries()) {
+        entries.add(converter.toGroupBulkHeartbeatAckPB(ack));
+      }
+      envelope = ConsensusProtos.ConsensusFrame.newBuilder()
+        .setKind(ConsensusProtos.ConsensusFrame.Kind.BULK_HEARTBEAT_ACK)
+        .setBulkHeartbeatAck(ProtoConverter.buildBulkHeartbeatAckPB(frame.getSender(),
+          frame.getEpoch(), frame.getTick(), entries))
+        .build();
+    } catch (RuntimeException ex) {
+      LOG.warn("Failed to encode bulk heartbeat ack for {}; dropping", address, ex);
+      return;
+    }
+    Channel target = ch;
+    try {
+      target.eventLoop().execute(() -> {
+        if (!target.isActive() || !target.isWritable()) {
+          return;
+        }
+        NettyFutureUtils.safeWrite(target, envelope);
+        heartbeatAckFrames.incrementAndGet();
+        target.flush();
+      });
+    } catch (Throwable t) {
+      LOG.debug("bulk heartbeat ack submission rejected for {}", address, t);
     }
   }
 
@@ -224,9 +250,7 @@ final class OutboundChannel {
       NettyFutureUtils.safeClose(ch);
     }
     // Intentionally do not call mailbox.clear(). AbstractQueue.clear() polls the unbounded MPSC
-    // one element at a time on the caller's thread. The OutboundChannel is now
-    // unreachable from CoalescingTransport.peers via the close-side teardown, so the mailbox and
-    // its still-undelivered Pendings become eligible for normal GC reclamation.
+    // one element at a time on the caller's thread. All becomes eligible for GC reclamation.
   }
 
   /**
@@ -255,9 +279,26 @@ final class OutboundChannel {
           NettyFutureUtils.addListener(ch.closeFuture(), closeFuture -> {
             channelRef.compareAndSet(ch, null);
             // Schedule next connect attempt at min backoff.
-            nextConnectAtMillis =
-              EnvironmentEdgeManager.currentTime() + config.getReconnectBackoffMinMs();
+            long backoff = config.getReconnectBackoffMinMs();
+            nextConnectAtMillis = EnvironmentEdgeManager.currentTime() + backoff;
+            // Self-arm a probe so reconnect makes progress without depending on enqueue cadence.
+            scheduleReconnectProbe(backoff);
           });
+          // Add a writability handler that re-arms the drain when back-pressure clears.
+          ch.pipeline().addLast("outbound-writability",
+            new org.apache.hbase.thirdparty.io.netty.channel.ChannelInboundHandlerAdapter() {
+              @Override
+              public void channelWritabilityChanged(
+                org.apache.hbase.thirdparty.io.netty.channel.ChannelHandlerContext ctx) {
+                Channel writableCh = ctx.channel();
+                if (writableCh.isWritable()) {
+                  if (mailbox.peek() != null) {
+                    scheduleDrainOn(writableCh);
+                  }
+                }
+                ctx.fireChannelWritabilityChanged();
+              }
+            });
           // Drain whatever was queued while we were down.
           scheduleDrainOn(ch);
         } else {
@@ -269,6 +310,7 @@ final class OutboundChannel {
             LOG.debug("connect to {} failed; next attempt in {}ms", address, backoff,
               future.cause());
           }
+          scheduleReconnectProbe(backoff);
         }
       });
     } catch (Throwable t) {
@@ -278,9 +320,25 @@ final class OutboundChannel {
   }
 
   /**
-   * Schedule a drain pass on {@code ch}'s event loop. Lost-wakeup-safe via {@link #draining}
-   * (mirrors the {@code GroupExecutor.scheduled} pattern). The drain itself runs single-threaded on
-   * the event loop, satisfying the MPSC's single-consumer invariant.
+   * Schedule a {@link #maybeConnect()} probe on the bootstrap's event loop after {@code delayMs}.
+   * Idempotent because {@link #maybeConnect()}'s {@link #connecting} guard absorbs concurrent or
+   * already-in-flight connect attempts.
+   */
+  private void scheduleReconnectProbe(long delayMs) {
+    if (closed.get()) {
+      return;
+    }
+    try {
+      bootstrap.config().group().schedule((Runnable) this::maybeConnect, Math.max(1L, delayMs),
+        java.util.concurrent.TimeUnit.MILLISECONDS);
+    } catch (Throwable t) {
+      LOG.debug("reconnect probe scheduling rejected for {}", address, t);
+    }
+  }
+
+  /**
+   * Schedule a bulk-lane drain pass on {@code ch}'s event loop. Lost-wakeup-safe via the
+   * {@link #draining} latch.
    */
   private void scheduleDrainOn(Channel ch) {
     if (closed.get()) {
@@ -294,153 +352,72 @@ final class OutboundChannel {
           } finally {
             draining.set(false);
           }
-          // Lost-wakeup-safe re-arm. Three cases close the window between our last poll and the
-          // latch clear:
-          // (a) An IMMEDIATE message arrived (vote / install-snapshot / response): re-arm
-          // so the latency-sensitive frame does not wait for the next batch tick.
-          // (b) The head of the mailbox has aged past flushDeadlineMs: re-arm with the
-          // deadline counter bumped, so the head-of-line latency a single peer can
-          // accumulate is bounded by FLUSH_DEADLINE_MS_KEY even when the periodic
-          // tick is starved by event-loop contention.
-          // (c) Otherwise the leftover messages are coalescible and within the deadline; they
-          // wait for the next CoalescingTransport.tick(), which is the periodic flush
-          // window that gives the transport its O(peers) coalescing property. Re-arming
-          // here for fresh coalescibles would let a fast producer ping-pong the drain at
-          // sub-tick rate.
-          Pending head = mailbox.peek();
-          if (head != null && ch.isActive() && ch.isWritable()) {
-            long now = EnvironmentEdgeManager.currentTime();
-            boolean staleHead = !head.immediate && now - head.enqueueTimeMillis >= flushDeadlineMs;
-            if (head.immediate || staleHead) {
-              if (staleHead) {
-                forcedFlushesByDeadline.incrementAndGet();
-              }
-              scheduleDrainOn(ch);
-            }
+          if (mailbox.peek() != null && ch.isActive() && ch.isWritable()) {
+            scheduleDrainOn(ch);
           }
         });
       } catch (Throwable t) {
-        // Event loop rejected, e.g. shutting down.
         draining.set(false);
-        LOG.debug("drain submission rejected for {}", address, t);
+        LOG.debug("bulk drain submission rejected for {}", address, t);
       }
     }
   }
 
   /**
-   * Single-pass drain on the event loop thread. Bails when the writable watermark is exceeded
-   * (back-pressure) and re-arms on the next flush tick.
+   * Single-pass bulk-lane drain on the event loop thread. Bails when the writable watermark is
+   * exceeded and re-arms when the channel becomes writable again.
    */
   private void drainOnce(Channel ch) {
     if (!ch.isActive() || !ch.isWritable()) {
       return;
     }
-    // Reset the head-of-line timestamp slot before polling.
-    oldestUndrainedEnqueueMs.set(0L);
-    List<ConsensusProtos.GroupAppendEntriesPB> appendBucket = new ArrayList<>();
-    List<ConsensusProtos.GroupHeartbeatPB> heartbeatBucket = new ArrayList<>();
-    List<ConsensusProtos.GroupHeartbeatAckPB> heartbeatAckBucket = new ArrayList<>();
-    List<ConsensusProtos.ConsensusFrame> immediates = new ArrayList<>();
+    appendBucket.clear();
+    immediateBucket.clear();
 
-    Pending p;
-    while ((p = mailbox.relaxedPoll()) != null) {
-      try {
-        if (p.immediate) {
-          immediates.add(converter.toFrame(p.message));
-        } else if (p.message instanceof LeaderHeartbeat) {
-          heartbeatBucket.add(converter.toGroupHeartbeatPB((LeaderHeartbeat) p.message));
-        } else if (p.message instanceof LeaderHeartbeatAck) {
-          heartbeatAckBucket.add(converter.toGroupHeartbeatAckPB((LeaderHeartbeatAck) p.message));
-        } else if (p.message instanceof AppendEntriesRequest) {
-          appendBucket.add(converter.toGroupAppendPB((AppendEntriesRequest) p.message));
-        } else {
-          immediates.add(converter.toFrame(p.message));
+    try {
+      RaftMessage m;
+      while ((m = mailbox.relaxedPoll()) != null) {
+        try {
+          if (m instanceof AppendEntriesRequest) {
+            appendBucket.add(converter.toGroupAppendPB((AppendEntriesRequest) m));
+          } else {
+            immediateBucket.add(converter.toFrame(m));
+          }
+        } catch (RuntimeException ex) {
+          // If conversion fails (e.g. compression, unknown op type), drop just this message and
+          // keep draining the rest.
+          LOG.warn("Failed to encode {} for {}; dropping", m.getClass().getName(), address, ex);
         }
-      } catch (RuntimeException ex) {
-        // If conversion fails (e.g. compression, unknown op type), drop just this message and
-        // keep draining the rest.
-        LOG.warn("Failed to encode {} for {}; dropping", p.message.getClass().getName(), address,
-          ex);
       }
-    }
 
-    if (!appendBucket.isEmpty()) {
-      ConsensusProtos.ConsensusFrame frame = ConsensusProtos.ConsensusFrame.newBuilder()
-        .setKind(ConsensusProtos.ConsensusFrame.Kind.BATCH_APPEND)
-        .setBatchAppend(
-          ConsensusProtos.BatchAppendEntriesPB.newBuilder().addAllGroups(appendBucket).build())
-        .build();
-      NettyFutureUtils.safeWrite(ch, frame);
-      appendFrames.incrementAndGet();
+      boolean wrote = false;
+      if (!appendBucket.isEmpty()) {
+        ConsensusProtos.ConsensusFrame frame = ConsensusProtos.ConsensusFrame.newBuilder()
+          .setKind(ConsensusProtos.ConsensusFrame.Kind.BATCH_APPEND)
+          .setBatchAppend(
+            ConsensusProtos.BatchAppendEntriesPB.newBuilder().addAllGroups(appendBucket).build())
+          .build();
+        NettyFutureUtils.safeWrite(ch, frame);
+        appendFrames.incrementAndGet();
+        wrote = true;
+      }
+      for (ConsensusProtos.ConsensusFrame frame : immediateBucket) {
+        NettyFutureUtils.safeWrite(ch, frame);
+        wrote = true;
+      }
+      if (wrote) {
+        ch.flush();
+      }
+    } finally {
+      appendBucket.clear();
+      immediateBucket.clear();
     }
-    if (!heartbeatBucket.isEmpty()) {
-      ConsensusProtos.ConsensusFrame frame = ConsensusProtos.ConsensusFrame.newBuilder()
-        .setKind(ConsensusProtos.ConsensusFrame.Kind.HEARTBEAT_BATCH)
-        .setHeartbeatBatch(buildHeartbeatBatch(heartbeatBucket)).build();
-      NettyFutureUtils.safeWrite(ch, frame);
-      heartbeatFrames.incrementAndGet();
-    }
-    if (!heartbeatAckBucket.isEmpty()) {
-      ConsensusProtos.ConsensusFrame frame = ConsensusProtos.ConsensusFrame.newBuilder()
-        .setKind(ConsensusProtos.ConsensusFrame.Kind.HEARTBEAT_ACK_BATCH)
-        .setHeartbeatAckBatch(
-          ConsensusProtos.BatchHeartbeatAckPB.newBuilder().addAllGroups(heartbeatAckBucket).build())
-        .build();
-      NettyFutureUtils.safeWrite(ch, frame);
-      heartbeatAckFrames.incrementAndGet();
-    }
-    for (ConsensusProtos.ConsensusFrame frame : immediates) {
-      NettyFutureUtils.safeWrite(ch, frame);
-      immediateFrames.incrementAndGet();
-    }
-    if (
-      !appendBucket.isEmpty() || !heartbeatBucket.isEmpty() || !heartbeatAckBucket.isEmpty()
-        || !immediates.isEmpty()
-    ) {
-      ch.flush();
-    }
-  }
-
-  /**
-   * Builds a {@code HeartbeatBatchPB} with the per-RS keepalive header (sender / epoch / tick)
-   * populated. Followers' {@code lastPeerKeepaliveMillis} updates from these fields, which is what
-   * backs failure detection for groups whose per-group heartbeat has been suppressed by idle-group
-   * quiescence.
-   */
-  private ConsensusProtos.HeartbeatBatchPB
-    buildHeartbeatBatch(List<ConsensusProtos.GroupHeartbeatPB> bucket) {
-    ConsensusProtos.HeartbeatBatchPB.Builder b = ConsensusProtos.HeartbeatBatchPB.newBuilder()
-      .addAllGroups(bucket).setSender(ProtoConverter.toEndpointPB(localEndpoint))
-      .setEpoch(keepaliveEpochMillis).setTick(keepaliveTick.get());
-    return b.build();
   }
 
   /** Returns a point-in-time snapshot of this channel's outbound frame counters. */
   @NonNull
   OutboundChannelStats stats() {
     return new OutboundChannelStats(heartbeatFrames.get(), appendFrames.get(),
-      heartbeatAckFrames.get(), immediateFrames.get(), messagesEnqueued.get(), mailbox.size(),
-      forcedFlushesByDeadline.get());
-  }
-
-  /** Visible for tests. */
-  long nextConnectAtMillis() {
-    return nextConnectAtMillis;
-  }
-
-  /** Visible for tests. */
-  long currentBackoffMs() {
-    return currentBackoffMs;
-  }
-
-  /** Visible for tests. */
-  int pendingMailboxSize() {
-    return mailbox.size();
-  }
-
-  /** Visible for tests. */
-  @Nullable
-  Channel currentChannel() {
-    return channelRef.get();
+      heartbeatAckFrames.get(), appendsEnqueued.get());
   }
 }

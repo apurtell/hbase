@@ -150,6 +150,7 @@ public final class RaftTestUtils {
     return readRaftState(node, task);
   }
 
+  @SuppressWarnings("unchecked")
   public static <T extends RaftStore> T getRaftStore(RaftNode node) {
     Callable<RaftStore> task = () -> ((RaftNodeImpl) node).state().store();
     return (T) readRaftState((RaftNodeImpl) node, task);

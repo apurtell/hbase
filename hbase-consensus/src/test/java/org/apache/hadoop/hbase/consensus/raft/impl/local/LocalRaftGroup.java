@@ -103,7 +103,8 @@ public final class LocalRaftGroup {
         if (!subdir.exists() && !subdir.mkdirs()) {
           throw new IOException("Failed to create " + subdir);
         }
-        LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 64);
+        LogStoreConfig cfg =
+          LogStoreConfig.newBuilder(subdir).setSegmentSizeMb(8).setMailboxChunkSize(64).build();
         OperationCodec codec = OperationCodecs.composite(OperationCodecs.defaultCodecs(),
           new SimpleStateMachineOpCodec());
         LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),
@@ -311,7 +312,8 @@ public final class LocalRaftGroup {
     if (!subdir.exists() && !subdir.mkdirs()) {
       throw new IOException("Failed to create " + subdir);
     }
-    LogStoreConfig cfg = new LogStoreConfig(subdir, 8, 5L, 64);
+    LogStoreConfig cfg =
+      LogStoreConfig.newBuilder(subdir).setSegmentSizeMb(8).setMailboxChunkSize(64).build();
     OperationCodec codec =
       OperationCodecs.composite(OperationCodecs.defaultCodecs(), new SimpleStateMachineOpCodec());
     LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),
@@ -356,6 +358,7 @@ public final class LocalRaftGroup {
    * @return all Raft nodes currently running in this local Raft group except the given Raft
    *         endpoint
    */
+  @SuppressWarnings("unchecked")
   public <T extends RaftNode> List<T> getNodesExcept(RaftEndpoint endpoint) {
     requireNonNull(endpoint);
     List<RaftNodeImpl> nodes = nodeContexts.values().stream().map(ctx -> ctx.node)
@@ -367,6 +370,7 @@ public final class LocalRaftGroup {
   }
 
   /** Returns the currently running Raft node of the given Raft endpoint. */
+  @SuppressWarnings("unchecked")
   public <T extends RaftNode> T getNode(RaftEndpoint endpoint) {
     requireNonNull(endpoint);
     return (T) nodeContexts.get(endpoint).node;
@@ -422,6 +426,7 @@ public final class LocalRaftGroup {
    * {@link AssertionUtils#EVENTUAL_ASSERTION_TIMEOUT_SECS}.
    * @return the leader Raft node
    */
+  @SuppressWarnings("unchecked")
   public <T extends RaftNode> T waitUntilLeaderElected() {
     RaftNodeImpl[] leaderRef = new RaftNodeImpl[1];
     eventually(() -> {
@@ -441,6 +446,7 @@ public final class LocalRaftGroup {
    *         leader if different Raft nodes see different leaders or the Raft node of the leader
    *         Raft endpoint is not found
    */
+  @SuppressWarnings("unchecked")
   public <T extends RaftNode> T getLeaderNode() {
     RaftEndpoint leaderEndpoint = getLeaderEndpoint();
     if (leaderEndpoint == null) {
@@ -462,6 +468,7 @@ public final class LocalRaftGroup {
    * @return a random Raft node other than the given Raft endpoint if no running Raft node is found
    *         for given Raft endpoint
    */
+  @SuppressWarnings("unchecked")
   public <T extends RaftNode> T getAnyNodeExcept(RaftEndpoint endpoint) {
     requireNonNull(endpoint);
     requireNonNull(nodeContexts.get(endpoint));
@@ -503,12 +510,8 @@ public final class LocalRaftGroup {
    */
   public void slowDownNode(RaftEndpoint endpoint, int seconds) {
     nodeContexts.get(endpoint).executor.submit(() -> {
-      try {
-        LOG.info(endpoint.getId() + " is under high load for " + seconds + " seconds.");
-        Thread.sleep(TimeUnit.SECONDS.toMillis(seconds));
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
+      LOG.info(endpoint.getId() + " is under high load for " + seconds + " seconds.");
+      AssertionUtils.sleepMillis(TimeUnit.SECONDS.toMillis(seconds));
     });
   }
 
@@ -639,42 +642,46 @@ public final class LocalRaftGroup {
   }
 
   /**
-   * Drops both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the source to
-   * the target Raft endpoint.
+   * Drops {@link AppendEntriesRequest}, {@link LeaderHeartbeat}, and bulk-heartbeat envelopes from
+   * the source to the target Raft endpoint.
    */
   public void dropAppendsAndHeartbeatsTo(RaftEndpoint source, RaftEndpoint target) {
     getFirewall(source).dropMessagesTo(target, AppendEntriesRequest.class);
     getFirewall(source).dropMessagesTo(target, LeaderHeartbeat.class);
+    getFirewall(source).dropBulkHeartbeatsTo(target);
   }
 
   /**
-   * Re-allows both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the
-   * source to the target Raft endpoint, undoing a prior call to
+   * Re-allows {@link AppendEntriesRequest}, {@link LeaderHeartbeat}, and bulk-heartbeat envelopes
+   * from the source to the target Raft endpoint, undoing a prior call to
    * {@link #dropAppendsAndHeartbeatsTo(RaftEndpoint, RaftEndpoint)}.
    */
   public void allowAppendsAndHeartbeatsTo(RaftEndpoint source, RaftEndpoint target) {
     getFirewall(source).allowMessagesTo(target, AppendEntriesRequest.class);
     getFirewall(source).allowMessagesTo(target, LeaderHeartbeat.class);
+    getFirewall(source).allowBulkHeartbeatsTo(target);
   }
 
   /**
-   * Drops both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the source
-   * Raft endpoint to all other Raft endpoints. See
+   * Drops {@link AppendEntriesRequest}, {@link LeaderHeartbeat}, and bulk-heartbeat envelopes from
+   * the source Raft endpoint to all other Raft endpoints. See
    * {@link #dropAppendsAndHeartbeatsTo(RaftEndpoint, RaftEndpoint)} for rationale.
    */
   public void dropAppendsAndHeartbeatsToAll(RaftEndpoint source) {
     getFirewall(source).dropMessagesToAll(AppendEntriesRequest.class);
     getFirewall(source).dropMessagesToAll(LeaderHeartbeat.class);
+    getFirewall(source).dropBulkHeartbeatsToAll();
   }
 
   /**
-   * Re-allows both {@link AppendEntriesRequest} and {@link LeaderHeartbeat} messages from the
-   * source Raft endpoint to all other Raft endpoints, undoing a prior call to
+   * Re-allows {@link AppendEntriesRequest}, {@link LeaderHeartbeat}, and bulk-heartbeat envelopes
+   * from the source Raft endpoint to all other Raft endpoints, undoing a prior call to
    * {@link #dropAppendsAndHeartbeatsToAll(RaftEndpoint)}.
    */
   public void allowAppendsAndHeartbeatsToAll(RaftEndpoint source) {
     getFirewall(source).allowMessagesToAll(AppendEntriesRequest.class);
     getFirewall(source).allowMessagesToAll(LeaderHeartbeat.class);
+    getFirewall(source).allowBulkHeartbeatsToAll();
   }
 
   /** Resets all drop rules from the source Raft endpoint. */

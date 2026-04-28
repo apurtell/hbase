@@ -20,16 +20,13 @@ package org.apache.hadoop.hbase.consensus.handler.transport;
 import static java.util.Objects.requireNonNull;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import edu.umd.cs.findbugs.annotations.Nullable;
 import java.net.InetSocketAddress;
 import java.util.Collections;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
@@ -38,10 +35,9 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest;
-import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
-import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
-import org.apache.hadoop.hbase.consensus.raft.transport.PeerKeepaliveTracker;
+import org.apache.hadoop.hbase.consensus.raft.transport.BulkHeartbeatAckFrame;
+import org.apache.hadoop.hbase.consensus.raft.transport.BulkHeartbeatFrame;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.JVM;
@@ -69,7 +65,6 @@ import org.apache.hbase.thirdparty.io.netty.channel.nio.NioEventLoopGroup;
 import org.apache.hbase.thirdparty.io.netty.channel.socket.nio.NioServerSocketChannel;
 import org.apache.hbase.thirdparty.io.netty.channel.socket.nio.NioSocketChannel;
 import org.apache.hbase.thirdparty.io.netty.util.concurrent.DefaultThreadFactory;
-import org.apache.hbase.thirdparty.io.netty.util.concurrent.ScheduledFuture;
 
 /**
  * Netty + Protobuf coalescing {@link Transport} implementation.
@@ -82,7 +77,17 @@ import org.apache.hbase.thirdparty.io.netty.util.concurrent.ScheduledFuture;
  * both accept and IO.</li>
  * <li>A {@link RegistryDispatcher} that the user populates with local {@link RaftNode}s via
  * {@link #discoverNode(RaftNode)} / {@link #undiscoverNode(RaftNode)}.</li>
- * <li>A scheduled flush tick driving the outbound coalescing window.</li>
+ * </ul>
+ * <p>
+ * The transport drives two distinct outbound paths:
+ * <ul>
+ * <li><b>Bulk lane.</b> {@link #send(RaftEndpoint, RaftMessage)} enqueues append-entries and
+ * immediate frames into a per-peer mailbox. The mailbox drains immediately on enqueue so the
+ * {@code RaftNode.replicate(...)} round-trip pays no coalescing costs.</li>
+ * <li><b>Bulk heartbeat path.</b> {@link #sendBulkHeartbeat} and {@link #sendBulkHeartbeatAck}
+ * bypass the mailbox. The per-server timing wheel hands each call a fully aggregated bulk envelope,
+ * the transport encodes it on the caller thread, and the per-peer event loop performs one
+ * write+flush.</li>
  * </ul>
  */
 @InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.CONFIG })
@@ -94,7 +99,6 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   private final RaftEndpoint localEndpoint;
   private final InetSocketAddress bindAddress;
   private final EndpointResolver resolver;
-  private final OperationCodec operationCodec;
   private final TransportConfig config;
   private final PayloadCompressor compressor;
   private final ProtoConverter converter;
@@ -103,24 +107,11 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   private final AtomicBoolean stopped = new AtomicBoolean(false);
   private final ConcurrentMap<RaftEndpoint, OutboundChannel> peers = new ConcurrentHashMap<>();
   /**
-   * Process-wide tracker of per-RS keepalive observations carried by inbound
-   * {@code HeartbeatBatchPB} envelopes. Updated by {@link InboundHandler} on every observed
-   * envelope; consulted by quiescent followers in place of the per-group election timer.
+   * Wall-clock time (ms) at which this server booted. Owned by the enclosing {@code
+   * ConsensusServer} (or supplied by tests) so the transport, the bulk-heartbeat scheduler, and any
+   * other component that stamps an envelope-level keepalive header all agree on a single value.
    */
-  private final PeerKeepaliveTrackerImpl peerKeepaliveTracker = new PeerKeepaliveTrackerImpl();
-
-  /**
-   * Per-process boot epoch carried as the {@code epoch} field on every {@code HeartbeatBatchPB}
-   * envelope. Differing epochs from the same {@code sender} indicate the peer process restarted, so
-   * the receiver can flush stale per-RS keepalive state.
-   */
-  private final long keepaliveEpochMillis = EnvironmentEdgeManager.currentTime();
-  /**
-   * Monotonic per-tick counter carried as the {@code tick} field on every {@code HeartbeatBatchPB}
-   * envelope. Bumped on every {@link #tick()} (the periodic flush runnable). The receiver uses
-   * {@code (epoch, tick)} to detect duplicate or out-of-order envelopes.
-   */
-  private final AtomicLong keepaliveTick = new AtomicLong();
+  private final long bootEpochMillis;
 
   private EventLoopGroup eventLoopGroup;
   private Class<? extends ServerChannel> serverChannelClass;
@@ -128,37 +119,34 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   private ServerBootstrap serverBootstrap;
   private Bootstrap clientBootstrap;
   private Channel serverChannel;
-  private ScheduledFuture<?> flushTickFuture;
 
-  /**
-   * Builds a transport instance. The constructor does not start the Netty event loops. Call
-   * {@link #start()} when ready.
-   * @param localEndpoint  this node's endpoint (used by {@link #send} to reject self-targeting)
-   * @param bindAddress    address the server will bind on; set the port to {@code 0} for an
-   *                       ephemeral port (tests)
-   * @param resolver       resolves remote endpoints to socket addresses
-   * @param operationCodec encodes/decodes the opaque operation in each
-   *                       {@link org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry}
-   * @param hadoopConf     hadoop {@link Configuration}; all knobs are namespaced under
-   *                       {@code hbase.consensus.*} (see {@link TransportConfig})
-   */
   public CoalescingTransport(@NonNull RaftEndpoint localEndpoint,
     @NonNull InetSocketAddress bindAddress, @NonNull EndpointResolver resolver,
     @NonNull OperationCodec operationCodec, @NonNull Configuration hadoopConf) {
+    this(localEndpoint, bindAddress, resolver, operationCodec, hadoopConf,
+      EnvironmentEdgeManager.currentTime());
+  }
+
+  public CoalescingTransport(@NonNull RaftEndpoint localEndpoint,
+    @NonNull InetSocketAddress bindAddress, @NonNull EndpointResolver resolver,
+    @NonNull OperationCodec operationCodec, @NonNull Configuration hadoopConf,
+    long bootEpochMillis) {
     this(localEndpoint, bindAddress, resolver, operationCodec, new TransportConfig(hadoopConf),
-      new DefaultRaftModelFactory());
+      new DefaultRaftModelFactory(), bootEpochMillis);
   }
 
   CoalescingTransport(@NonNull RaftEndpoint localEndpoint, @NonNull InetSocketAddress bindAddress,
     @NonNull EndpointResolver resolver, @NonNull OperationCodec operationCodec,
-    @NonNull TransportConfig config, @NonNull DefaultRaftModelFactory modelFactory) {
+    @NonNull TransportConfig config, @NonNull DefaultRaftModelFactory modelFactory,
+    long bootEpochMillis) {
+    requireNonNull(operationCodec, "operationCodec");
     this.localEndpoint = requireNonNull(localEndpoint);
     this.bindAddress = requireNonNull(bindAddress);
     this.resolver = requireNonNull(resolver);
-    this.operationCodec = requireNonNull(operationCodec);
     this.config = requireNonNull(config);
     this.compressor = new PayloadCompressor(config.getCompression());
     this.converter = new ProtoConverter(modelFactory, operationCodec, compressor);
+    this.bootEpochMillis = bootEpochMillis;
   }
 
   public InetSocketAddress getBindAddress() {
@@ -171,16 +159,6 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
 
   public RaftEndpoint getLocalEndpoint() {
     return localEndpoint;
-  }
-
-  /**
-   * Returns the per-RS keepalive tracker fed by inbound {@code HeartbeatBatchPB} envelopes.
-   * Quiescent followers query this to decide whether their leader is still alive without paying the
-   * per-group heartbeat traffic.
-   */
-  @NonNull
-  public PeerKeepaliveTracker getPeerKeepaliveTracker() {
-    return peerKeepaliveTracker;
   }
 
   /**
@@ -222,6 +200,45 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   }
 
   @Override
+  public void sendBulkHeartbeat(@NonNull RaftEndpoint target, @NonNull BulkHeartbeatFrame frame) {
+    if (stopped.get()) {
+      return;
+    }
+    if (localEndpoint.equals(target)) {
+      throw new IllegalArgumentException(
+        localEndpoint.getId() + " cannot send a bulk heartbeat to itself");
+    }
+    OutboundChannel ch;
+    try {
+      ch = peerChannel(target);
+    } catch (UnknownEndpointException e) {
+      LOG.debug("Dropping bulk heartbeat to unknown endpoint {}", target.getId());
+      return;
+    }
+    ch.sendBulkHeartbeat(frame);
+  }
+
+  @Override
+  public void sendBulkHeartbeatAck(@NonNull RaftEndpoint target,
+    @NonNull BulkHeartbeatAckFrame frame) {
+    if (stopped.get()) {
+      return;
+    }
+    if (localEndpoint.equals(target)) {
+      throw new IllegalArgumentException(
+        localEndpoint.getId() + " cannot send a bulk heartbeat ack to itself");
+    }
+    OutboundChannel ch;
+    try {
+      ch = peerChannel(target);
+    } catch (UnknownEndpointException e) {
+      LOG.debug("Dropping bulk heartbeat ack to unknown endpoint {}", target.getId());
+      return;
+    }
+    ch.sendBulkHeartbeatAck(frame);
+  }
+
+  @Override
   public void onRaftNodeStart() {
     // Transport lifecycle is managed at the ConsensusServer level
   }
@@ -252,7 +269,8 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       clientChannelClass = NioSocketChannel.class;
     }
 
-    InboundHandler inboundHandler = new InboundHandler(registry, converter, peerKeepaliveTracker);
+    InboundHandler inboundHandler =
+      new InboundHandler(registry, converter, this, localEndpoint, bootEpochMillis);
     ConsensusFrameEncoder frameEncoder = new ConsensusFrameEncoder();
     WriteBufferWaterMark watermarks = new WriteBufferWaterMark(config.getWriteLowWatermarkBytes(),
       config.getWriteHighWatermarkBytes());
@@ -296,9 +314,6 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       throw new IllegalStateException("Failed to bind " + bindAddress, e);
     }
 
-    flushTickFuture = eventLoopGroup.next().scheduleWithFixedDelay(this::tick, config.getBatchMs(),
-      config.getBatchMs(), TimeUnit.MILLISECONDS);
-
     LOG.info("CoalescingTransport for {} bound at {} (transport={}, allocator={})",
       localEndpoint.getId(), serverChannel.localAddress(), useEpoll ? "epoll" : "nio",
       config.getAllocator());
@@ -308,10 +323,6 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
   public synchronized void stop() {
     if (!stopped.compareAndSet(false, true)) {
       return;
-    }
-    if (flushTickFuture != null) {
-      flushTickFuture.cancel(false);
-      flushTickFuture = null;
     }
     for (OutboundChannel ch : peers.values()) {
       ch.close();
@@ -375,43 +386,19 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
       return existing;
     }
     InetSocketAddress address = resolver.resolve(target);
-    OutboundChannel created = new OutboundChannel(target, address, clientBootstrap, converter,
-      config, localEndpoint, keepaliveEpochMillis, keepaliveTick);
+    OutboundChannel created = new OutboundChannel(address, clientBootstrap, converter, config);
     OutboundChannel previous = peers.putIfAbsent(target, created);
     return previous == null ? created : previous;
   }
 
-  private void tick() {
-    if (stopped.get()) {
-      return;
-    }
-    keepaliveTick.incrementAndGet();
-    for (OutboundChannel ch : peers.values()) {
-      try {
-        ch.flushTick();
-      } catch (RuntimeException e) {
-        LOG.debug("flushTick failed for {}", ch.address(), e);
-      }
-    }
-  }
-
   /**
-   * Decide whether the given message must be sent in its own {@link ConsensusProtos.ConsensusFrame}
-   * or may be coalesced into a batch envelope. {@link LeaderHeartbeat}s coalesce into the heartbeat
-   * batch and {@link LeaderHeartbeatAck}s coalesce into the heartbeat-ack batch;
-   * {@link AppendEntriesRequest}s coalesce into the append batch.
+   * Decide whether {@code message} rides as its own {@link ConsensusProtos.ConsensusFrame} or
+   * coalesces into a batch envelope. Append-entries coalesce into the append batch. Bulk heartbeats
+   * and bulk heartbeat acks do not flow through this path (see {@link Transport#sendBulkHeartbeat}
+   * and {@link Transport#sendBulkHeartbeatAck}).
    */
   private static boolean isImmediate(RaftMessage message) {
-    if (message instanceof LeaderHeartbeat) {
-      return false;
-    }
-    if (message instanceof LeaderHeartbeatAck) {
-      return false;
-    }
-    if (message instanceof AppendEntriesRequest) {
-      return false;
-    }
-    return true;
+    return !(message instanceof AppendEntriesRequest);
   }
 
   /**
@@ -423,31 +410,11 @@ public final class CoalescingTransport implements Transport, RaftNodeLifecycleAw
     if (peers.isEmpty()) {
       return Collections.emptyMap();
     }
-    Map<RaftEndpoint, OutboundChannelStats> out = new LinkedHashMap<>(peers.size());
+    Map<RaftEndpoint, OutboundChannelStats> out = new HashMap<>(peers.size());
     for (Map.Entry<RaftEndpoint, OutboundChannel> e : peers.entrySet()) {
       out.put(e.getKey(), e.getValue().stats());
     }
     return Collections.unmodifiableMap(out);
   }
 
-  /** Visible for tests. */
-  RegistryDispatcher registry() {
-    return registry;
-  }
-
-  /** Visible for tests. */
-  TransportConfig transportConfig() {
-    return config;
-  }
-
-  /** Visible for tests. */
-  ProtoConverter converter() {
-    return converter;
-  }
-
-  /** Visible for tests. */
-  @Nullable
-  OutboundChannel peerChannelOrNull(RaftEndpoint endpoint) {
-    return peers.get(endpoint);
-  }
 }

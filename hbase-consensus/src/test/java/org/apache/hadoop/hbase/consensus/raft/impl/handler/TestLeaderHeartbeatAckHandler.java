@@ -45,6 +45,15 @@ import org.junit.jupiter.api.Timeout;
 public class TestLeaderHeartbeatAckHandler extends TestBase {
   private LocalRaftGroup group;
 
+  /**
+   * Dispatches the given {@link LeaderHeartbeatAck} to {@code target} on the per-group control
+   * lane, mirroring how the production transport delivers heartbeat ack envelopes (see
+   * {@code LocalTransport.sendBulkHeartbeatAck}).
+   */
+  private static void deliverAck(RaftNodeImpl target, LeaderHeartbeatAck ack) {
+    target.getExecutor().executeControl(new LeaderHeartbeatAckHandler(target, ack));
+  }
+
   @AfterEach
   public void tearDown() {
     if (group != null) {
@@ -62,7 +71,7 @@ public class TestLeaderHeartbeatAckHandler extends TestBase {
     LeaderHeartbeatAck ack =
       leader.getModelFactory().createLeaderHeartbeatAckBuilder().setGroupId(leader.getGroupId())
         .setSender(followers.get(0).getLocalEndpoint()).setTerm(currentTerm + 5).build();
-    leader.handle(ack);
+    deliverAck(leader, ack);
     eventually(() -> assertThat(getTerm(leader)).isEqualTo(currentTerm + 5));
     assertThat(getRole(leader)).isEqualTo(RaftRole.FOLLOWER);
   }
@@ -84,7 +93,7 @@ public class TestLeaderHeartbeatAckHandler extends TestBase {
       readRaftState(leader, () -> leader.state().leaderState().leaseExpiryMillis());
     LeaderHeartbeatAck ack = leader.getModelFactory().createLeaderHeartbeatAckBuilder()
       .setGroupId(leader.getGroupId()).setSender(followerEndpoint).setTerm(currentTerm).build();
-    leader.handle(ack);
+    deliverAck(leader, ack);
     eventually(() -> {
       long postTs = readRaftState(leader, () -> {
         LeaderState ls = leader.state().leaderState();
@@ -108,7 +117,7 @@ public class TestLeaderHeartbeatAckHandler extends TestBase {
     RaftEndpoint unknown = LocalRaftEndpoint.newEndpoint();
     LeaderHeartbeatAck ack = leader.getModelFactory().createLeaderHeartbeatAckBuilder()
       .setGroupId(leader.getGroupId()).setSender(unknown).setTerm(currentTerm).build();
-    leader.handle(ack);
+    deliverAck(leader, ack);
     assertThat(getRole(leader)).isEqualTo(RaftRole.LEADER);
     assertThat(getTerm(leader)).isEqualTo(currentTerm);
   }

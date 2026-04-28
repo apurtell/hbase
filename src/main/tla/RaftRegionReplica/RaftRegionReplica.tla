@@ -1,363 +1,406 @@
 ---- MODULE RaftRegionReplica ----
 (*
- * Formal model of hbase-consensus leader election, leases,
- * crash-restart, network partitions, leader write path,
- * follower batch apply, flush and compaction marker handling,
- * flush protocol, flush crash recovery, follower flush-complete
- * handling, per-member RAFT log, orphan entry commitment by new
- * leader, promotion protocol with master confirmation and
- * leader-primary gap, RAFT log GC, old primary rejoin via
- * shared-storage catch-up, new member bootstrap via leader-based
- * network catch-up, promotion MVCC continuity with in-flight
- * writes, catch-up completeness with concurrent flush, and
- * and crash recovery.
- *
- * Models RAFT member roles (Leader, Follower, Candidate), term fencing,
- * leader lease acquisition via majority heartbeat acknowledgement, bounded
- * clock drift, crash-restart with durable votes (hard requirement), and
+ * Formal model of hbase-consensus region replication.  Covers leader
+ * election with bounded clock-drift leases, the parallel WAL/RAFT
+ * write pipeline, follower batch apply, the 14-step flush protocol
+ * (with crash recovery at every phase), compaction-marker handling,
+ * promotion with master confirmation, log GC and catch-up via both
+ * RAFT replay and shared-storage snapshot install, new-member
+ * bootstrap, quiescence, crash-restart with durable votes, and
  * nondeterministic network partitions with heal.
  *
- * The leader write path models the parallel WAL sync + RAFT propose
- * pipeline.  The write proceeds as: mvcc.begin (atomic with WAL ring
- * buffer publish) -> fork(WAL sync to HDFS, RAFT propose to followers)
- * -> barrier join -> memstore.add -> mvcc.completeAndWait.  WAL sync
- * failure is modeled as a nondeterministic event; the mandated response
- * is leader crash (WALFailureAbort), consistent with HBase's existing
- * behavior on WAL sync failure.
+ * ============================================================
+ * Core RAFT
+ * ============================================================
  *
- * The follower apply callback models how committed RAFT entries are
- * applied to follower memstores using batch semantics.  The apply
- * pipeline collects consecutive mutation entries into a batch with a
- * single MVCC bracket: mvcc.beginAt(maxBatchSeqId) (advance
- * writePoint) -> stamp cells from all entries -> memstore.add
- * (combined cell set) -> mvcc.completeAndWait (advance readPoint).
- * This reduces MVCC overhead from N begin/complete cycles to 1 per
- * batch.  Marker entries (flush, compaction) break the batch boundary:
- * preceding mutations are applied as a batch, then the marker is
- * processed via mvcc.advanceTo(markerSeqId).
+ * Roles {Follower, Candidate, Leader}, term fencing, durable votes
+ * (hard requirement; hbase-consensus always uses a durable RaftStore),
+ * majority-heartbeat lease acquisition, bounded clock drift.  Timers
+ * and leases use a relative countdown representation (ticks remaining)
+ * rather than absolute deadlines, collapsing functionally equivalent
+ * states that differ only in absolute clock position.
  *
- * Compaction markers are modeled via ProposeMarker, which atomically
- * commits a compaction-complete marker entry.  Flush markers use the
- * multi-step flush protocol described below.  The two marker types
- * are tracked separately: markerEntries contains all markers, while
- * flushMarkerEntries contains only flush markers.  This distinction
- * drives differential follower handling: flush markers trigger a
- * memstore drop (entries below the marker's seqId are now in HFiles),
- * while compaction markers only advance the MVCC point.
+ * raftLog[m] is a per-member SET of seqIds — following the canonical
+ * TLA+ RAFT modeling practice (Ongaro's raft.tla, CCF's ccfraft.tla),
+ * the log is a first-class variable that survives crashes
+ * (CrashRestart preserves raftLog).  A set suffices because the spec
+ * needs only membership and majority counting, not log ordering.
+ * Entries are added when proposed through RAFT (RAFTCommitWrite,
+ * FlushRAFTPropose, ProposeMarker) for the leader and all reachable
+ * responders.
  *
- * The flush protocol models the 14-step primary flush sequence from the
- * design document, collapsed into safety-critical phases:
- *   FlushStart       (steps 1-7):  consume flushOpSeqId, record
- *                     snapshotMaxSeqId, take snapshot, write HFiles
- *   FlushCommitHFiles (step 8):    sfc.commit() — HFiles durable on HDFS
- *   FlushRAFTPropose  (step 9):    propose FLUSH_COMPLETE through RAFT
- *   FlushRAFTCommit   (step 10):   majority acknowledge — marker committed
- *   FlushComplete     (steps 11-14): drop memstore, COMMIT_FLUSH, GC log
+ * BecomeLeader is modeled as atomic with the initial heartbeat round:
+ * in the real protocol the gap between winning the election and
+ * heartbeating is microseconds, far below a clock tick.  Atomicity
+ * ensures the lease and all followers' election timers are set in the
+ * same logical instant as the role transition — the prerequisite for
+ * the timing analysis relating LeaderLeaseDuration to
+ * ElectionTimeoutMin.  LeaderHeartbeat models subsequent periodic
+ * rounds atomically for the same reason: the lease-safety argument
+ * requires the leader's lease refresh and the quorum of follower
+ * election-timer resets to be causally bound by the same round-trip.
  *
- * Snapshot-boundary flush: the write and flush pipelines run concurrently.
- * At FlushStart, snapshotMaxSeqId captures the highest seqId currently in
- * the leader's memstore — the true HFile coverage boundary.  Concurrent
- * in-flight writes receive seqIds above snapshotMaxSeqId (from the
- * monotonic nextSeqId counter) and are NOT included in the HFile
- * snapshot.  The memstore drop (FlushComplete) removes entries at or
- * below snapshotMaxSeqId, preserving concurrent writes.  This
- * eliminates the flush-induced write pause that mutual exclusion would
- * cause.  The FlushDropBoundary invariant verifies that the HFile
- * coverage boundary is always strictly below the flush marker seqId,
- * ensuring in-flight writes survive the drop.
+ * With network partitions, unreachable followers are excluded from
+ * the responder set, naturally modeling partial heartbeat rounds
+ * where a partitioned leader cannot refresh its lease once it loses
+ * a majority.
  *
- * Flush crash recovery is modeled by the existing CrashRestart action
- * firing at each of the 4 non-terminal flush phases (FlushStarted,
- * HFilesCommitted, RAFTProposed, RAFTCommitted).  CrashRestart resets
- * volatile state (flushPhase, flushSeqId, memstore) while preserving
- * RAFT-committed state (committedEntries, markerEntries).  The
- * NoOrphanMemstoreDrop invariant verifies that no member reaches the
- * memstore-drop gate (RAFTCommitted) without the flush marker being
- * classified as a committed marker.  Phase ordering (FlushStarted ->
- * HFilesCommitted -> RAFTProposed -> RAFTCommitted -> Idle) is
- * enforced by action guards and verified by TLC's exhaustive
- * exploration of all reachable states.
+ * ============================================================
+ * Leader write path
+ * ============================================================
  *
- * Follower flush-complete handling models the 6-step protocol from
- * the design document.  When a follower encounters a committed flush
- * marker, it: (1) completes any preceding mutation batch, (2) calls
- * mvcc.advanceTo(flushOpSeqId), (3) refreshes store file lists from
- * HDFS, (4) confirms HFiles are accessible (modeled as a guard on
- * hdfsHFiles), (5) drops memstore entries below flushOpSeqId, and
- * (6) GCs RAFT log entries.  HDFS visibility delay is modeled via
- * hdfsHFiles (a global set tracking flush seqIds whose HFiles are
- * durable on HDFS, populated by FlushCommitHFiles).  The
- * HFilesBeforeFlushMarker invariant verifies that the phase ordering
- * guarantees HFiles are on HDFS before the flush marker is committed.
+ * Models HRegion.doMiniBatchMutate() for RAFT-enabled regions as a
+ * parallel WAL sync + RAFT propose pipeline:
  *
- * Phase-aware step-down: when a leader or responder steps down while
- * in RAFTCommitted flush phase, the memstore drop is completed
- * atomically (rather than aborted).  The flush marker is irrevocably
- * committed through RAFT; aborting would leave the member's memstore
- * inconsistent.  This is modeled in StepDown, BecomeLeader,
- * LeaderHeartbeat, and RequestVote.  The FollowerFlushMemstoreDrop
- * invariant verifies that after any follower has applied a flush
- * marker, no non-marker entry below it remains in the memstore.
+ *   BeginWrite          mvcc.begin (atomic with WAL ring-buffer
+ *                       publish), then fork {WAL sync, RAFT propose}
+ *   WALSyncComplete     wal.sync OK
+ *   WALSyncFail         wal.sync failure (nondeterministic event)
+ *   RAFTCommitWrite     majority ack on consensus.propose
+ *   CompleteWrite       barrier join + memstore.add +
+ *                       mvcc.completeAndWait
+ *   AckWrite            return to client
+ *   WALFailureAbort     mandated RS abort on WAL sync failure
+ *                       (matches HBase's existing behavior)
  *
- * Per-member RAFT log: raftLog[m] is a per-member set of seqIds
- * representing the durable RAFT log on each member.  Following the
- * canonical TLA+ RAFT modeling practice (Ongaro's raft.tla, Microsoft
- * CCF's ccfraft.tla), the log is a first-class variable that survives
- * crashes (CrashRestart preserves raftLog).  We use a set rather than
- * a sequence because our spec needs only membership and majority
- * counting, not log ordering.  Entries are added to raftLog when
- * proposed through RAFT (RAFTCommitWrite, FlushRAFTPropose,
- * ProposeMarker) for the leader and all reachable responders.
+ * ============================================================
+ * Follower batch apply
+ * ============================================================
  *
- * Orphan entry commitment by new leader: when a leader crashes after
+ * The apply callback collects consecutive mutation entries into a
+ * batch with a single MVCC bracket — mvcc.beginAt(maxBatchSeqId)
+ * advances writePoint, cells from all entries are stamped and added
+ * via memstore.add, then mvcc.completeAndWait advances readPoint —
+ * reducing MVCC overhead from N begin/complete cycles to 1 per batch.
+ * Marker entries break the batch boundary: preceding mutations apply
+ * as a batch, then the marker is processed via
+ * mvcc.advanceTo(markerSeqId).
+ *
+ *   FollowerBeginBatchApply     collect entries up to the next
+ *                               marker, mvcc.beginAt(maxBatchSeqId)
+ *   FollowerCompleteBatchApply  stamp + memstore.add +
+ *                               mvcc.completeAndWait
+ *   FollowerApplyMarker         mvcc.advanceTo(markerSeqId)
+ *
+ * ============================================================
+ * Flush protocol
+ * ============================================================
+ *
+ * The 14-step primary flush sequence, collapsed into safety-critical
+ * phases:
+ *
+ *   FlushStart        (steps 1-7):   consume flushOpSeqId, record
+ *                                    snapshotMaxSeqId, take snapshot,
+ *                                    write HFiles
+ *   FlushCommitHFiles (step 8):      sfc.commit() — HFiles durable
+ *                                    on HDFS
+ *   FlushRAFTPropose  (step 9):      propose FLUSH_COMPLETE through
+ *                                    RAFT
+ *   FlushRAFTCommit   (step 10):     majority ack — marker committed
+ *   FlushComplete     (steps 11-14): drop memstore, COMMIT_FLUSH,
+ *                                    GC log
+ *
+ * Snapshot-boundary flush.  Write and flush pipelines run
+ * concurrently.  snapshotMaxSeqId, recorded at FlushStart, is the
+ * highest seqId in the memstore at flush time — the true HFile
+ * coverage boundary.  Concurrent in-flight writes receive seqIds
+ * above this from the monotonic nextSeqId counter and are NOT
+ * included in the HFile snapshot; the FlushComplete drop removes
+ * only entries at or below snapshotMaxSeqId.  This eliminates the
+ * flush-induced write pause that mutual exclusion would cause.
+ * FlushDropBoundary verifies the boundary is strictly below the
+ * marker seqId, ensuring in-flight writes survive the drop.
+ *
+ * Marker types are tracked separately: markerEntries holds all
+ * markers, flushMarkerEntries holds only flush markers.  This drives
+ * differential follower handling — flush markers trigger a memstore
+ * drop (entries below the marker are now in HFiles), while compaction
+ * markers (modeled by ProposeMarker, which atomically commits a
+ * compaction-complete marker) only advance the MVCC point.
+ *
+ * Follower flush-complete (6-step protocol).  On a committed flush
+ * marker the follower (1) completes the preceding mutation batch,
+ * (2) calls mvcc.advanceTo(flushOpSeqId), (3) refreshes store file
+ * lists from HDFS, (4) confirms HFiles are accessible (modeled as a
+ * guard on hdfsHFiles — the global set of flush seqIds whose HFiles
+ * are durable on HDFS, populated by FlushCommitHFiles), (5) drops
+ * memstore entries below flushOpSeqId, and (6) GCs RAFT log entries.
+ * HFilesBeforeFlushMarker verifies the phase ordering guarantees
+ * HFiles are on HDFS before the flush marker is committed.
+ *
+ * Crash recovery.  CrashRestart can fire at any of the 4 non-terminal
+ * flush phases (FlushStarted, HFilesCommitted, RAFTProposed,
+ * RAFTCommitted), resetting volatile state (flushPhase, flushSeqId,
+ * memstore) while preserving RAFT-committed state (committedEntries,
+ * markerEntries).  Phase ordering (FlushStarted -> HFilesCommitted ->
+ * RAFTProposed -> RAFTCommitted -> Idle) is enforced by action guards
+ * and exhaustively explored by TLC.  NoOrphanMemstoreDrop verifies no
+ * member reaches the memstore-drop gate without the flush marker
+ * appearing in markerEntries.
+ *
+ * Phase-aware step-down.  When a leader or responder steps down while
+ * in RAFTCommitted phase the memstore drop is completed atomically
+ * rather than aborted: the marker is irrevocably committed through
+ * RAFT, so aborting would leave the memstore inconsistent.  Modeled
+ * in StepDown, BecomeLeader, LeaderHeartbeat, and RequestVote.
+ * FollowerFlushMemstoreDrop verifies that after a follower applies a
+ * flush marker no non-marker entry at or below it remains in the
+ * memstore.
+ *
+ * ============================================================
+ * Promotion protocol
+ * ============================================================
+ *
+ * When a candidate wins the election (BecomeLeader) it enters the
+ * Promoting phase: isLeader() returns true (the member holds the
+ * Leader role and a valid lease), but the region has not yet acquired
+ * a WAL reference, so writes must be rejected during this gap.  Three
+ * promotionPhase transitions:
+ *
+ *   Promoting -> AwaitingMaster
+ *     MasterConfirmPromotion fires when the leader has consumed all
+ *     applicable RAFT log entries (ApplicableEntries(m) = {}), holds
+ *     a valid lease, and the master has not already confirmed a
+ *     higher term for this group (currentTerm[m] >
+ *     masterConfirmedTerm).  Models the master's
+ *     ReportLeaderElection validation and META update.
+ *
+ *   AwaitingMaster -> Complete
+ *     PromotionComplete fires once master confirmation has been
+ *     received, the lease is still valid, and ApplicableEntries(m) =
+ *     {}.  Models the local promotion steps: setReadOnly(false) and
+ *     WAL reference acquisition.
+ *
+ * The master is a nondeterministic oracle with a term-fencing guard
+ * (masterConfirmedTerm), consistent with how it appears in the split
+ * and merge lifecycle modules (MasterOpenDaughter, MasterOpenMerged).
+ * BeginWrite, FlushStart, and ProposeMarker all guard on
+ * promotionPhase[m] = "Complete".  PromotionReadWriteGuard verifies
+ * that no write pipeline is active without promotion completion.
+ *
+ * MVCC continuity across promotion.  When the old leader crashes with
+ * a write past mvcc.begin but short of barrier join, the write's
+ * seqId may already be RAFT-committed (RAFTCommitWrite fired) but not
+ * yet applied to the old leader's memstore (CompleteWrite did not).
+ * The new leader picks the entry up during promotion step 1 (follower
+ * apply actions during the Promoting phase), and because
+ * PromotionComplete requires ApplicableEntries(m) = {} all committed
+ * entries are in the memstore before the new leader accepts writes.
+ * Entries committed after promotion (e.g., orphan flush markers
+ * committed by NewLeaderCommitOrphanEntry when a partition heals) are
+ * atomically applied to the leader's memstore within the same action,
+ * mirroring the consensus core's single-threaded
+ * AdvanceCommitIndexTask + runOperation() callback (one
+ * RaftNodeExecutor per group).  PromotionMVCCContinuity verifies no
+ * committed entry is unapplied outside the leader's active write
+ * pipeline.
+ *
+ * ============================================================
+ * Catch-up, log GC, and bootstrap
+ * ============================================================
+ *
+ * Crash recovery flows through RAFT, not local repair.  A node that
+ * comes back with a shorter log is treated by the protocol as out of
+ * date; the RAFT log up-to-date check on RequestVote prevents it from
+ * winning elections against peers with the full committed log.  Two
+ * catch-up paths refill the missing tail:
+ *
+ *   AppendEntries replay
+ *     The leader still has the needed entries in its log; the follower
+ *     applies them through FollowerBeginBatchApply /
+ *     FollowerApplyMarker.
+ *
+ *   Snapshot install (FollowerLoadFlushedState)
+ *     The needed entries have been GC'd from the leader's log
+ *     (RaftLogGC removes entries below an applied flush marker, since
+ *     the data is now in HFiles on HDFS).  The leader sends a chunked
+ *     InstallSnapshot whose application bytes the region SPI decodes
+ *     as HFile paths plus the flush seqId; the follower loads HFiles
+ *     from HDFS and starts with an empty memstore for post-flush
+ *     entries.  Modeled as a single atomic state transition — the
+ *     wire payload is opaque to the consensus layer and the
+ *     safety/liveness story turns only on the resulting follower
+ *     state (memstore set to the flush boundary, raftLog truncated to
+ *     the snapshot point).  CrashRestartWithLogLoss models the same
+ *     class of recovery for log-loss crashes.
+ *
+ * Orphan entry commitment by new leader.  When a leader crashes after
  * proposing an entry (e.g., mid-flush at RAFTProposed) but before the
  * entry is committed, the entry may exist in a majority of members'
- * durable logs.  The NewLeaderCommitOrphanEntry action models the new
- * leader's AdvanceCommitIndex: any entry present in a majority of
- * raftLogs but not yet in committedEntries is nondeterministically
- * committed.  Entry type (flush marker vs. mutation) is classified by
- * checking s \in hdfsHFiles.  The CatchUpDataIntegrity invariant
- * verifies that every committed entry is recoverable (majority of
- * logs or covered by a flush marker with HFiles on HDFS).  The
- * HFilesBeforeFlushMarker invariant verifies that overlapping
- * committed flush markers (orphan + new leader's) both have HFiles.
+ * durable logs.  NewLeaderCommitOrphanEntry models the new leader's
+ * AdvanceCommitIndex: any entry present in a majority of raftLogs but
+ * not yet in committedEntries is nondeterministically committed
+ * (entry type — flush marker vs. mutation — is classified by checking
+ * s \in hdfsHFiles).
  *
- * Promotion protocol and leader-primary gap: when a candidate wins the
- * RAFT election and becomes Leader (BecomeLeader), it enters the
- * "Promoting" phase.  During this phase, isLeader() returns true (the
- * member holds the Leader role and a valid lease), but the region has
- * not yet acquired a WAL reference.  Writes must be rejected during
- * this gap.  The promotion protocol proceeds in three phases modeled
- * by three promotionPhase transitions:
+ * New member bootstrap (NewMemberBootstrap).  When a member's
+ * instance is replaced (e.g., a new Kubernetes pod with no persistent
+ * local state), all local state is lost — raftLog, currentTerm,
+ * votedFor, memstore.  Unlike CrashRestart (which preserves durable
+ * local state), bootstrap models total state loss: it atomically
+ * resets all state and recovers raftLog from the leader (set to the
+ * leader's raftLog union all committed entries not covered by a flush
+ * marker; the union compensates for this model's omission of the RAFT
+ * log up-to-date election check, which in the real system guarantees
+ * the leader has all committed entries).  The member starts with an
+ * empty memstore; existing HFiles are discovered by processing
+ * committed flush markers through FollowerApplyMarker, which
+ * refreshes store files and drops memstore entries below the flush
+ * watermark.  This lets TLC verify safety under all interleavings of
+ * catch-up entry application with concurrent leader flush.
  *
- *   Promoting -> AwaitingMaster:  MasterConfirmPromotion fires when
- *     the leader has consumed all applicable RAFT log entries
- *     (ApplicableEntries(m) = {}), holds a valid lease, and the
- *     master has not already confirmed a higher term for this group
- *     (currentTerm[m] > masterConfirmedTerm).  This models the
- *     master's ReportLeaderElection validation and META update.
+ * Catch-up invariants.  CatchUpDataIntegrity allows entries subsumed
+ * by a committed flush marker to be absent from a majority of logs
+ * (they are in HFiles) and verifies every committed entry is
+ * recoverable through at least one path.  CatchUpCompleteness
+ * verifies that once a follower has applied all committed entries
+ * (ApplicableEntries = {}, fApplyBatch = {}), every committed entry
+ * is in the memstore or covered by an applied flush marker.
  *
- *   AwaitingMaster -> Complete:  PromotionComplete fires when master
- *     confirmation has been received (promotionPhase = AwaitingMaster),
- *     the leader still holds a valid lease, and no new committed entries
- *     need applying (ApplicableEntries(m) = {}).  This models the
- *     local promotion steps: setReadOnly(false) and WAL reference
- *     acquisition.
- *
- * The master is modeled as a nondeterministic oracle with a term-fencing
- * guard (masterConfirmedTerm), consistent with how the master is modeled
- * in the split and merge lifecycle modules (MasterOpenDaughter,
- * MasterOpenMerged).  BeginWrite, FlushStart, and ProposeMarker all
- * guard on promotionPhase[m] = "Complete".  The PromotionReadWriteGuard
- * invariant verifies that no write pipeline is active without
- * promotion completion, now with master confirmation included in the
- * definition of completion.
- *
- * RAFT log GC and old primary rejoin: after a flush completes, log
- * entries below the flush seqId are GC-eligible because the data they
- * contain is now in HFiles on HDFS.  RaftLogGC models this by removing
- * entries below an applied flush marker from raftLog[m].  When a
- * crashed primary recovers, it has two catch-up paths: (1) if the
- * leader still has the needed entries in its log, normal AppendEntries
- * delivers them and the follower applies via FollowerBeginBatchApply /
- * FollowerApplyMarker (already modeled); (2) if the needed entries
- * have been GC'd from the leader's log, the leader sends a chunked
- * InstallSnapshot whose application-snapshot bytes the region SPI
- * decodes as HFile paths plus the flush seqId.  The follower loads
- * the referenced HFiles from HDFS and starts with an empty memstore
- * for post-flush entries.  FollowerLoadFlushedState models this
- * second path. The follower's memstore is set to the flush boundary,
- * and the follower's raftLog is truncated to the snapshot point. The
- * chunk-transfer dynamics of the InstallSnapshot wire path are
- * abstracted into a single atomic state transition, since the wire
- * payload is opaque to the consensus layer and the safety/liveness
- * story turns only on the resulting follower state. The CatchUpDataIntegrity
- * invariant allows entries subsumed by a committed flush marker to be
- * absent from a majority of logs (they are in HFiles), and verifies that
- * every committed entry is recoverable through at least one path (RAFT
- * logs or HFiles on HDFS).
- *
- * New member bootstrap: when a member's instance is replaced (e.g.,
- * a new Kubernetes pod with no persistent local state), all local
- * state is lost — raftLog, currentTerm, votedFor, memstore.  Unlike
- * CrashRestart (which preserves durable local state), bootstrap
- * models total state loss.  NewMemberBootstrap atomically resets all
- * state and recovers the raftLog via RAFT log entries from the leader
- * (modeled by setting raftLog to the leader's raftLog union all
- * committed entries not covered by a flush marker; the union
- * compensates for this model's omission of the RAFT log up-to-date
- * election check, which in the real system guarantees the leader
- * has all committed entries).  The member starts with an empty
- * memstore; existing HFiles are discovered by processing committed
- * flush markers through the normal follower apply path
- * (FollowerApplyMarker), which refreshes store files and drops
- * memstore entries below the flush watermark.  This enables TLC to
- * verify safety under all interleavings of catch-up entry
- * application with concurrent leader flush.  After bootstrap, normal
- * follower apply actions rebuild the memstore from all committed
- * entries, including flush markers.
- *
- * Promotion MVCC continuity with in-flight writes: when the old
- * leader crashes with a write in the WAL pipeline (after
- * mvcc.begin, before barrier join), the write's seqId may already
- * be RAFT-committed (RAFTCommitWrite fired) but not yet applied
- * to the old leader's memstore (CompleteWrite did not fire).
- * The new leader picks up this entry during promotion step 1
- * (finish consuming RAFT log entries, modeled by follower apply
- * actions during the Promoting phase).  PromotionComplete
- * requires ApplicableEntries(m) = {}, ensuring all committed
- * entries are in memstore before the new leader accepts writes.
- * Entries committed after promotion (e.g., orphan flush markers
- * committed by NewLeaderCommitOrphanEntry when a partition heals)
- * are atomically applied to the leader's memstore within the same
- * action, mirroring the consensus core's single-threaded
- * AdvanceCommitIndexTask + runOperation() callback (one
- * RaftNodeExecutor per group).  The PromotionMVCCContinuity
- * invariant verifies that no committed entry is unapplied outside
- * the leader's active write pipeline, ensuring no MVCC sequence
- * gaps after promotion.
- *
- * Sequence IDs and MVCC state: nextSeqId is a global monotonic counter,
- * writeSeqId tracks the leader's current write seqId, flushSeqId tracks
- * the leader's current flush seqId (flushOpSeqId), snapshotMaxSeqId
- * tracks the leader's current flush HFile coverage boundary (the max
- * seqId in the memstore at FlushStart time), committedEntries is the
- * set of RAFT-committed seqIds, markerEntries is the subset of
- * committedEntries that are markers (vs mutations), memstore is a
- * per-member set of applied/processed seqIds (including marker seqIds,
- * which represent mvcc.advanceTo points), fApplyBatch is per-member
- * follower batch apply state (set of mutation seqIds being applied),
- * and flushDropBound is a global function mapping flush marker seqIds
- * to their HFile coverage boundaries (snapshotMaxSeqId recorded at
- * FlushStart time, persisted for follower marker application).
- * The MVCC writePoint is derived (not tracked as state) via
- * MVCCWritePoint(m), which computes the max of all active seqIds
- * (memstore + in-flight write + in-flight batch apply).  This reduces
- * the state space by eliminating a per-member variable without
- * compromising the invariant: in all reachable states, the derivation
- * matches the value that explicit tracking would produce.
- *
- * Implementation grounding:  This spec models hbase-consensus's
- * election protocol with clock-drift-compensated lease extension.
- * Each spec action maps onto a code path in the consensus core
- * (the consensus core is the single-threaded actor in
- * hbase-consensus/src/main/java/org/apache/hadoop/hbase/consensus
- * derived from the MicroRaft baseline; one RaftNodeExecutor per
- * group serializes all state mutations).  The lease itself is
- * represented in the implementation by the explicit
- * LeaderState.leaseExpiryMillis field, refreshed monotonically on
- * each ack from a voting follower (LeaderHeartbeatAckHandler and
- * AppendEntriesSuccessResponseHandler) and re-evaluated on every
- * heartbeat tick by RaftNodeImpl.demoteToFollowerIfLeaseExpired,
- * which steps the leader down to Follower if leaseExpiryMillis <= now.
- * The spec collapses this absolute-deadline representation to a
- * relative countdown (leaseRemaining as ticks remaining), which
- * collapses functionally equivalent states that differ only in
- * absolute clock position; the LeaderHeartbeat action atomically
- * refreshes the leader's lease as part of the same heartbeat round
- * that resets responder election timers.
- *
- * Timers and leases in the spec use relative countdown
- * representation (ticks remaining) rather than absolute deadlines,
- * collapsing functionally equivalent states that differ only in
- * absolute clock position.
+ * ============================================================
+ * Quiescence
+ * ============================================================
  *
  * When a leader's group is caught up, has no in-flight proposals, and
- * holds a valid lease, the leader transitions the group to a Quiescent
- * state. The transition is broadcast as a one-shot quiesce notice
- * (modeled atomically), after which the leader emits no further
- * per-group heartbeats for this group.  Per-tick failure detection
- * relies on a per-server LeaderKeepalive action that refreshes the
- * leader's lease and resets responders' election timers without
- * touching per-group state — the implementation piggybacks this on
- * the always-emitted HEARTBEAT_BATCH envelope's top-level sender /
- * epoch / tick fields, so quiescent groups consume zero per-group
- * bytes per tick.  Quiescence is cleared (Wake) atomically by any
- * leader-side propose action (BeginWrite, ProposeMarker,
- * FlushStart, FlushRAFTPropose, etc.) or by any non-heartbeat
- * follower-side action (FollowerBeginBatchApply,
- * FollowerCompleteBatchApply, FollowerApplyMarker, election-related
- * actions).  The laggingOnQuiesce[leader] set records members that
- * the leader proceeded to quiesce in spite of (members not in
- * Responders(leader) at quiesce time); in the implementation,
- * follower-side shouldFollowerQuiesceOnNotify cross-checks this
- * set against the follower's own liveness view to reject
- * stale-liveness quiesce notices.
+ * holds a valid lease, the leader transitions the group to a
+ * Quiescent state.  The transition is broadcast as a one-shot
+ * quiesce notice (modeled atomically), after which the leader emits
+ * no further per-group heartbeats for this group.  Per-tick failure
+ * detection relies on a per-server LeaderKeepalive action that
+ * refreshes the leader's lease and resets responders' election timers
+ * without touching per-group state — the implementation piggybacks
+ * this on the always-emitted bulk-heartbeat envelope's top-level
+ * sender / epoch / tick fields, so quiescent groups consume zero
+ * per-group bytes per tick.
  *
- * Implementation features intentionally abstracted (not modeled):
+ * Quiescence is cleared (Wake) atomically by any leader-side propose
+ * action (BeginWrite, ProposeMarker, FlushStart, FlushRAFTPropose,
+ * etc.) or by any non-heartbeat follower-side action
+ * (FollowerBeginBatchApply, FollowerCompleteBatchApply,
+ * FollowerApplyMarker, election-related actions).  The
+ * laggingOnQuiesce[leader] set records members that the leader
+ * proceeded to quiesce in spite of (members not in Responders(leader)
+ * at quiesce time); follower-side shouldFollowerQuiesceOnNotify
+ * cross-checks this set against the follower's own liveness view to
+ * reject stale-liveness quiesce notices.
  *
- *   - The wire-level distinction between LeaderHeartbeat (lightweight,
- *     steady-state liveness) and AppendEntriesRequest (log replication,
- *     snapshot trigger, matchIndex discovery, membership-op preparation).
- *     The spec has a single atomic LeaderHeartbeat action that captures
- *     both the liveness effect on followers (election-timer reset) and
- *     the leader's lease refresh; the implementation splits this round
- *     on the wire into a LeaderHeartbeat broadcast plus per-follower
- *     LeaderHeartbeatAck responses (see SweepingHeartbeatScheduler),
- *     but the round must be modeled atomically because the lease-safety
- *     argument requires the lease refresh and the quorum of follower
- *     election-timer resets to be causally bound by the same round-trip.
- *     Log replication is abstracted into atomic raftLog updates inside
- *     RAFTCommitWrite / FlushRAFTPropose / ProposeMarker.
+ * ============================================================
+ * Durable log store
+ * ============================================================
  *
- *   - The lastVerifiedLogIndex clamp on commit-index advancement from
- *     heartbeats (LeaderHeartbeatHandler / AppendEntriesRequestHandler
- *     and LeaderState.lastVerifiedLogIndex).  The spec's atomic
- *     RAFTCommitWrite makes a per-follower verified watermark
- *     unnecessary at this abstraction level.
+ * The consensus log is a single multiplexed append-only log per
+ * RegionServer shared by every RAFT group on the server.  Each
+ * RaftNode receives a per-group adapter (GroupRaftStore) that
+ * forwards every RaftStore call to the shared store under its bound
+ * group id; records are tagged with their group id so a single
+ * sequential write stream serves every group at once.
  *
- *   - Linearizable queries (QueryState, querySequenceNumber, the
- *     fail-pending + bump-QSN-on-leader-self-removal handling).  Reads
- *     do not flow through the consensus layer in the spec (see README).
+ * Durability tiers:
  *
- *   - REMOVE_MEMBER / ADD_LEARNER / ADD_OR_PROMOTE_TO_FOLLOWER
- *     UpdateRaftGroupMembersOp entries as replicated log entries,
- *     including leader self-removal that drives the node into
- *     RaftNodeStatus.TERMINATED.  Membership in the spec is the static
- *     CONSTANT Members set.
+ *   Tier A (synchronous, mandatory)
+ *     Term and vote (persistAndFlushTerm), local endpoint
+ *     (persistAndFlushLocalEndpoint), and initial members
+ *     (persistAndFlushInitialGroupMembers) are sync-fsynced before
+ *     the calling thread proceeds.  Always durable across any crash;
+ *     the spec treats currentTerm and votedFor as durable across
+ *     CrashRestart, matching this tier.
  *
- *   - LEARNER role / non-voting members.  The spec's role variable
- *     ranges over {Follower, Candidate, Leader}.
+ *   Tier B (default, segment-roll + periodic)
+ *     Log entries, snapshot chunks, and truncation markers are
+ *     page-cache durable on writev.  The data fsync runs (i) when the
+ *     active segment rolls and (ii) every
+ *     hbase.consensus.log.fsync.interval.ms (the periodic safety-net
+ *     timer; default 10 s) iff the writer has appended bytes since
+ *     the last fsync.  RaftStore.flush() barriers complete after the
+ *     batch's writev returns (in-memory commit ack), not after fsync;
+ *     the leader's flushedLogIndex (its own contribution to the
+ *     commit quorum, in FlushTask) and the follower's
+ *     AppendEntriesSuccessResponse therefore reflect page-cache
+ *     content rather than disk content.  The on-disk extent of the
+ *     log is modeled by fsyncedIdx[m], advanced by the Fsync(m)
+ *     action (which abstracts both the segment-roll and periodic-
+ *     timer fsync).  CrashRestartWithLogLoss truncates raftLog[m] to
+ *     {e : e <= fsyncedIdx[m]}.  Safety in this tier rests on the
+ *     no-correlated-loss assumption — no majority of replicas
+ *     simultaneously loses its unfsynced tail — captured as the
+ *     NoCorrelatedUnfsyncedMajorityLoss state constraint in the .cfg.
  *
- *   - PreVote as a distinct round.  The spec subsumes PreVote into
- *     the leader-stickiness guard on RequestVote (described in that
- *     action's comment).
+ *   Tier C (opt-in strict, per-commit)
+ *     hbase.consensus.log.fsync.on.commit=true restores per-flush()
+ *     fsync: every barrier blocks on FileChannel.force, the leader's
+ *     flushedLogIndex and the follower's AER advance only after disk
+ *     durability.  Use when deployment guarantees do not cover Tier
+ *     B's no-correlated-loss assumption.  The model captures Tier C
+ *     by interleaving Fsync(m) immediately around commit; the
+ *     no-correlated-loss state constraint then trivially holds in
+ *     every reachable state.
  *
- *   - Chunked InstallSnapshot transfer (SnapshotChunkCollector).  The
- *     consensus layer carries one snapshot wire path. The application
- *     payload it transports is opaque to the consensus layer.  The
- *     spec collapses chunk-transfer dynamics into a single atomic
- *     FollowerLoadFlushedState action whose effect models the design-
- *     target shared-storage catch-up. The follower's log is truncated
- *     to the snapshot index and the application data is recoverable
- *     by loading HFiles on HDFS reached through the SPI-encoded
- *     metadata bytes.
+ * CRC-tail recovery on load().  On the first non-OK read result
+ * anywhere in the on-disk log, DurableLogStore.load() truncates the
+ * offending segment at the bad offset and deletes every segment with
+ * a higher id.  CRC failures and torn-tail truncations are treated
+ * identically.  Pre-allocated segment files extend the same
+ * mechanism: the trailing zero region of a pre-allocated active
+ * segment that crashed mid-write is detected by LogRecord.Reader
+ * (zero frame_len fails the frameLen >= CRC_BYTES + 1 check), the
+ * segment is truncated at that offset, and replay continues from the
+ * surviving prefix.
  *
- *   - DurableLogStore on-disk files. The spec captures safety-relevant
- *     consequences via CrashRestartWithLogLoss.
+ * HDFS WAL durability.  The HBase WAL on HDFS is a system-level
+ * safety net for the leader's mutations.  Combined with
+ * NoCorrelatedUnfsyncedMajorityLoss on the consensus log, every
+ * RAFT-committed mutation is recoverable through
+ * CatchUpDataIntegrity's majority-raftLog or HFiles-on-HDFS recovery
+ * paths.  The WAL provides additional protection for catastrophic
+ * correlated faults that simultaneously destroy a majority's RAFT
+ * logs.
  *
- * Write path actions model the leader's HRegion.doMiniBatchMutate()
- * pipeline for RAFT-enabled regions: BeginWrite (doWALAppend, step 3),
- * WALSyncComplete/WALSyncFail (wal.sync, step 4a), RAFTCommitWrite
- * (consensus.propose, step 4b), CompleteWrite (barrier + memstore.add +
- * mvcc.completeAndWait, steps 5-8), AckWrite (return to client, step 9),
- * WALFailureAbort (RS abort on WAL sync failure).
+ * ============================================================
+ * State variables
+ * ============================================================
  *
- * Follower batch apply actions model the consensus apply callback on
- * followers: FollowerBeginBatchApply (collect consecutive mutation
- * entries up to the next marker boundary, mvcc.beginAt(maxBatchSeqId),
- * advancing writePoint), FollowerCompleteBatchApply (stamp cells from
- * all entries + memstore.add + mvcc.completeAndWait, advancing
- * readPoint), FollowerApplyMarker (mvcc.advanceTo(markerSeqId) when
- * the next unapplied entry is a marker, advancing writePoint and
- * readPoint past the marker's seqId).
+ * nextSeqId is a global monotonic counter; writeSeqId tracks the
+ * leader's current write seqId; flushSeqId tracks the leader's
+ * current flush seqId (flushOpSeqId); snapshotMaxSeqId tracks the
+ * leader's current flush HFile coverage boundary (the max seqId in
+ * the memstore at FlushStart time); committedEntries is the set of
+ * RAFT-committed seqIds; markerEntries is its marker subset (vs
+ * mutations); memstore[m] is per-member applied/processed seqIds
+ * (including marker seqIds, which represent mvcc.advanceTo points);
+ * fApplyBatch[m] is per-member follower batch apply state (set of
+ * mutation seqIds being applied); flushDropBound maps flush marker
+ * seqIds to their HFile coverage boundaries (snapshotMaxSeqId
+ * recorded at FlushStart time, persisted for follower marker
+ * application).
  *
- * Spec constant to RaftConfig mapping:
+ * The MVCC writePoint is derived (not tracked as state) via
+ * MVCCWritePoint(m), which computes the max of all active seqIds
+ * (memstore + in-flight write + in-flight batch apply).  This
+ * eliminates a per-member variable without compromising the
+ * invariant: in all reachable states the derivation matches the
+ * value explicit tracking would produce.
  *
- *   Spec constant        RaftConfig parameter
- *   -------------------- -----------------------------------------
+ * ============================================================
+ * Implementation grounding
+ * ============================================================
+ *
+ * The consensus core is the single-threaded actor in
+ * hbase-consensus/src/main/java/org/apache/hadoop/hbase/consensus,
+ * derived from the MicroRaft baseline; one RaftNodeExecutor per group
+ * serializes all state mutations.  Each spec action maps onto a code
+ * path in that core.  The lease itself is the explicit
+ * LeaderState.leaseExpiryMillis field, refreshed monotonically on
+ * each ack from a voting follower (LeaderHeartbeatAckHandler,
+ * AppendEntriesSuccessResponseHandler) and re-evaluated on every
+ * heartbeat tick by RaftNodeImpl.demoteToFollowerIfLeaseExpired
+ * (steps the leader down to Follower if leaseExpiryMillis <= now).
+ * The spec's relative-countdown leaseRemaining collapses absolute-
+ * deadline state that differs only in clock position.
+ *
+ * Spec constant -> RaftConfig parameter:
+ *
  *   ElectionTimeoutMin   leaderHeartbeatTimeoutMillis (follower
- *                        failure detection, the timing-critical
+ *                        failure detection; the timing-critical
  *                        parameter for lease safety)
  *   LeaderLeaseDuration  leaderLeaseDurationMillis =
  *                          leaderHeartbeatTimeoutMillis
@@ -367,134 +410,147 @@
  * Vote durability is a hard requirement, not configurable;
  * hbase-consensus always uses a durable RaftStore.
  *
- * Durable log store: The consensus log is a single multiplexed append-only
- * log per RegionServer shared by every RAFT group on the server.
- * Each RaftNode receives a per-group adapter (GroupRaftStore) that
- * forwards every RaftStore call to the shared store under its bound
- * group id.  Records are tagged with their group id so a single
- * sequential write stream serves every group at once.
+ * ============================================================
+ * Implementation features intentionally abstracted
+ * ============================================================
  *
- * Durability tiering on the consensus log:
+ *   - Wire-level distinction between LeaderHeartbeat (lightweight
+ *     steady-state liveness) and AppendEntriesRequest (log
+ *     replication, snapshot trigger, matchIndex discovery,
+ *     membership-op preparation).  The implementation splits a round
+ *     on the wire into a LeaderHeartbeat broadcast plus per-follower
+ *     LeaderHeartbeatAck responses carried as per-group entries inside
+ *     a per-server bulk-heartbeat envelope emitted by the timing wheel.
+ *     The spec collapses this to a single atomic LeaderHeartbeat
+ *     action because the lease-safety argument requires the lease
+ *     refresh and the quorum of follower election-timer resets to be
+ *     causally bound by the same round-trip.  Log replication is
+ *     similarly abstracted into atomic raftLog updates inside
+ *     RAFTCommitWrite / FlushRAFTPropose / ProposeMarker.
  *
- *   - Sync-fsynced before the corresponding RPC response: term and
- *     vote (persistAndFlushTerm), local endpoint
- *     (persistAndFlushLocalEndpoint), and initial members
- *     (persistAndFlushInitialGroupMembers).  These are always durable
- *     across any crash.  The spec already treats currentTerm and
- *     votedFor as durable across CrashRestart, matching this tier.
+ *   - The lastVerifiedLogIndex clamp on commit-index advancement from
+ *     heartbeats (LeaderHeartbeatHandler /
+ *     AppendEntriesRequestHandler and LeaderState.lastVerifiedLogIndex).
+ *     The atomic RAFTCommitWrite makes a per-follower verified
+ *     watermark unnecessary at this abstraction level.
  *
- *   - Coalesced fsync before commit: log entries, snapshot chunks,
- *     and truncation markers are enqueued without a per-record fsync,
- *     but every coalescing window of the writer thread that contains a
- *     RaftStore.flush() barrier ends with a single FileChannel.force
- *     covering the whole batch (see UnifiedRaftStore.flushBarrier).
- *     A follower's AppendEntriesSuccessResponse is sent only after
- *     RaftStore.flush() returns, and the leader's flushedLogIndex (its
- *     own contribution to the commit quorum, in FlushTask) is set only
- *     after RaftStore.flush() returns; the leader counts only on-disk
- *     acks toward commit-index advancement.  In other words, the
- *     implementation enforces fsync-before-commit.
+ *   - Linearizable queries (QueryState, querySequenceNumber,
+ *     fail-pending + bump-QSN-on-leader-self-removal handling).
+ *     Reads do not flow through the consensus layer in the spec
+ *     (see README).
  *
- *   - CRC-tail recovery on load(): on the first non-OK read result
- *     anywhere in the on-disk log, DurableLogStore.load() truncates
- *     the offending segment at the bad offset and deletes every
- *     segment with a higher id.  CRC failures and torn-tail
- *     truncations are treated identically.  The surviving log is a
- *     prefix of the pre-crash log.  Because every committed entry is
- *     fsynced before it can contribute to commit quorum, the suffix
- *     a single member loses to CRC-tail truncation never includes
- *     a committed entry that was not also majority-on-disk.
+ *   - REMOVE_MEMBER / ADD_LEARNER / ADD_OR_PROMOTE_TO_FOLLOWER
+ *     UpdateRaftGroupMembersOp entries as replicated log entries,
+ *     including leader self-removal that drives the node into
+ *     RaftNodeStatus.TERMINATED.  Membership in the spec is the
+ *     static CONSTANT Members set.
  *
- * Crash recovery flows through RAFT, not local repair: a node that
- * comes back with a shorter log is treated by the protocol simply as
- * out of date.  The RAFT log up-to-date check on RequestVote
- * prevents it from winning elections against peers with the full
- * committed log, and standard catchup paths refill the missing tail
- * (AppendEntries from a peer with intact log for small gaps; the
- * chunked InstallSnapshot wire path with SPI-encoded HFile-pointer
- * application bytes for entries below an applied flush marker, modeled
- * here by FollowerLoadFlushedState).  CrashRestartWithLogLoss models
- * this behavior; see that action's header for details.
+ *   - LEARNER role / non-voting members.  The spec's role variable
+ *     ranges over {Follower, Candidate, Leader}.
  *
- * HDFS WAL durability assumption:  the HBase WAL on HDFS is a
- * system-level durability mechanism for the leader's mutations.
- * With fsync-before-commit on the consensus log, a RAFT-committed
- * mutation is on a majority of disks the moment it is committed, so
- * CatchUpDataIntegrity's majority-raftLog or HFiles-on-HDFS recovery
- * paths are the primary durability guarantee. The HDFS WAL is
- * an additional system-level safety net for catastrophic correlated
- * faults that simultaneously destroy a majority's RAFT logs.
+ *   - PreVote as a distinct round.  Subsumed into the leader-
+ *     stickiness guard on RequestVote (see that action's comment).
  *
- * Safety properties (18 invariants):
+ *   - Chunked InstallSnapshot transfer (SnapshotChunkCollector).
+ *     Collapsed into the atomic FollowerLoadFlushedState described
+ *     above; the application payload is opaque to the consensus
+ *     layer and the follower-state effect is what matters for
+ *     safety/liveness.
+ *
+ *   - DurableLogStore on-disk files.  Safety-relevant consequences
+ *     captured via CrashRestartWithLogLoss.
+ *
+ * ============================================================
+ * Safety properties (18 invariants)
+ * ============================================================
+ *
  *   RAFT consensus:
- *   - LeaderUniqueness: at most one leader per term
- *   - LeaseImpliesLeadership: a valid lease implies the Leader role
- *   - LeaseExpiresBeforeElection: at most one member holds a valid
- *     lease at any time, preventing stale reads across leader transitions
- *   - CatchUpDataIntegrity: every committed entry is recoverable via
- *     RAFT log replay (majority) or HFiles on HDFS (flush with durable
- *     HFiles); subsumes the weaker RaftLogConsistency
- *   - NoFollowerExposureRollback: every memstore-exposed seqId is
- *     recoverable via majority raftLogs or HFiles on HDFS, so an
- *     entry once visible to a Timeline-consistency reader cannot be
- *     rolled back by any combination of crashes
+ *     LeaderUniqueness               at most one leader per term
+ *     LeaseImpliesLeadership         a valid lease implies the
+ *                                    Leader role
+ *     LeaseExpiresBeforeElection     at most one member holds a valid
+ *                                    lease at any time, preventing
+ *                                    stale reads across leader
+ *                                    transitions
+ *     CatchUpDataIntegrity           every committed entry is
+ *                                    recoverable via RAFT log replay
+ *                                    (majority) or HFiles on HDFS;
+ *                                    subsumes the weaker
+ *                                    RaftLogConsistency
+ *     NoFollowerExposureRollback     every memstore-exposed seqId is
+ *                                    recoverable via majority raftLogs
+ *                                    or HFiles on HDFS, so an entry
+ *                                    once visible to a Timeline-
+ *                                    consistency reader cannot be
+ *                                    rolled back by any combination
+ *                                    of crashes
+ *
  *   Write path:
- *   - WriteBarrierSafety: a write is visible (Applied) only after
- *     both WAL sync and RAFT commit have completed; subsumes
- *     WALSyncFailureSafety (implied by contraposition)
- *   - FollowerSeqIdConsistency: every memstore entry is RAFT-committed
+ *     WriteBarrierSafety             a write is visible (Applied)
+ *                                    only after both WAL sync and
+ *                                    RAFT commit have completed;
+ *                                    subsumes WALSyncFailureSafety
+ *     FollowerSeqIdConsistency       every memstore entry is
+ *                                    RAFT-committed
+ *
  *   Flush protocol:
- *   - NoOrphanMemstoreDrop: no member reaches the memstore-drop gate
- *     (RAFTCommitted phase) without the flush marker in markerEntries;
- *     subsumes FlushAtomicity (markerEntries ⊆ committedEntries)
- *   - FlushDropBoundary: every committed flush marker's HFile coverage
- *     boundary (flushDropBound) is strictly below its seqId, ensuring
- *     concurrent in-flight writes survive the memstore drop
- *   - FollowerFlushMemstoreDrop: after a follower applies a flush
- *     marker, no non-marker entry at or below flushDropBound remains
- *     in the memstore
- *   - HFilesBeforeFlushMarker: HFiles are on HDFS before the flush
- *     marker is committed through RAFT; subsumes NoFlushDuplication
+ *     NoOrphanMemstoreDrop           no member reaches the memstore-
+ *                                    drop gate (RAFTCommitted) without
+ *                                    the flush marker in markerEntries;
+ *                                    subsumes FlushAtomicity
+ *                                    (markerEntries ⊆ committedEntries)
+ *     FlushDropBoundary              every committed flush marker's
+ *                                    HFile coverage boundary
+ *                                    (flushDropBound) is strictly
+ *                                    below its seqId, ensuring
+ *                                    in-flight writes survive the drop
+ *     FollowerFlushMemstoreDrop      after a follower applies a flush
+ *                                    marker, no non-marker entry at
+ *                                    or below flushDropBound remains
+ *                                    in the memstore
+ *     HFilesBeforeFlushMarker        HFiles are on HDFS before the
+ *                                    flush marker is committed through
+ *                                    RAFT; subsumes NoFlushDuplication
+ *
  *   Promotion protocol:
- *   - PromotionReadWriteGuard: a write pipeline is active only when the
- *     member has completed promotion (master confirmation + WAL reference)
- *   - PromotionMVCCContinuity: for an active leader (valid lease) that
- *     has completed promotion, no committed entry is unapplied except
- *     the leader's own in-flight write
+ *     PromotionReadWriteGuard        a write pipeline is active only
+ *                                    when promotion has completed
+ *                                    (master confirmation + WAL
+ *                                    reference)
+ *     PromotionMVCCContinuity        for an active leader (valid
+ *                                    lease) that has completed
+ *                                    promotion, no committed entry is
+ *                                    unapplied except the leader's
+ *                                    own in-flight write
+ *
  *   Catch-up:
- *   - CatchUpCompleteness: once a follower has applied all committed
- *     entries (ApplicableEntries = {}, fApplyBatch = {}), its memstore
- *     is consistent — every committed entry is in memstore or covered
- *     by an applied flush marker (data is in HFiles on HDFS)
+ *     CatchUpCompleteness            once a follower has applied all
+ *                                    committed entries
+ *                                    (ApplicableEntries = {},
+ *                                    fApplyBatch = {}), every
+ *                                    committed entry is in the
+ *                                    memstore or covered by an
+ *                                    applied flush marker
+ *
  *   Quiescence:
- *   - QuiesceImpliesAllAcked: while the leader is quiescent, every
- *     reachable responder that is also quiescent has the same RAFT
- *     log as the leader
- *   - QuiesceImpliesNoPendingWrite: no in-flight write on a quiescent
- *     leader; every propose action atomically clears quiescence
- *   - QuiesceImpliesIdleFlush: no in-flight flush on a quiescent
- *     leader; symmetric to QuiesceImpliesNoPendingWrite for the flush
- *     pipeline
- *   - QuiesceImpliesTermConsistency: while the leader is quiescent,
- *     every quiescent responder agrees with the leader on currentTerm
- *     (catches a stale follower latching onto a dead leader's quiesce
- *     notice and never re-electing)
- *
- * BecomeLeader is modeled as atomic with the initial heartbeat round.
- * In the real protocol, a candidate that wins the election immediately
- * sends heartbeats to all reachable followers — the gap between winning
- * and heartbeating is microseconds, far below a clock tick.  This atomic
- * model ensures the lease and all followers' election timers are set in
- * the same logical instant as the role transition, which is the
- * prerequisite for the timing analysis that relates LeaderLeaseDuration
- * to ElectionTimeoutMin.  The LeaderHeartbeat action models subsequent
- * periodic heartbeats and lease renewal as a single atomic round (see
- * the LeaderHeartbeat action header for why the broadcast and lease
- * refresh must be modeled atomically).
- *
- * With network partitions, unreachable followers are excluded from the
- * responder set, naturally modeling partial heartbeat rounds where a
- * partitioned leader cannot refresh its lease once it loses a majority.
+ *     QuiesceImpliesAllAcked         while the leader is quiescent,
+ *                                    every reachable responder that
+ *                                    is also quiescent has the same
+ *                                    RAFT log as the leader
+ *     QuiesceImpliesNoPendingWrite   no in-flight write on a quiescent
+ *                                    leader; every propose action
+ *                                    atomically clears quiescence
+ *     QuiesceImpliesIdleFlush        no in-flight flush on a quiescent
+ *                                    leader (symmetric to
+ *                                    NoPendingWrite for the flush
+ *                                    pipeline)
+ *     QuiesceImpliesTermConsistency  while the leader is quiescent,
+ *                                    every quiescent responder agrees
+ *                                    with the leader on currentTerm
+ *                                    (catches a stale follower
+ *                                    latching onto a dead leader's
+ *                                    quiesce notice and never
+ *                                    re-electing)
  *)
 EXTENDS Naturals, FiniteSets
 
@@ -525,7 +581,8 @@ VARIABLES
     currentTerm,        \* currentTerm[m]: monotonically increasing term
     votedFor,           \* votedFor[m]: who m voted for in this term, or None
     votesGranted,       \* votesGranted[m]: set of members who voted for m
-    raftLog,            \* raftLog[m]: per-member set of seqIds in durable RAFT log (survives crashes)
+    raftLog,            \* raftLog[m]: per-member set of seqIds in the in-memory (page-cache) RAFT log; under Tier B may extend past the on-disk extent
+    fsyncedIdx,         \* fsyncedIdx[m]: highest seqId in raftLog[m] known to be on disk; advanced by Fsync(m)
     \* ---- Timing and leases ----
     clock,              \* clock[m]: local monotonic clock (bounded integer)
     leaseRemaining,     \* leaseRemaining[m]: countdown ticks until lease expires (0 = expired/none)
@@ -559,7 +616,12 @@ VARIABLES
     groupQuiescent,     \* groupQuiescent[m]: TRUE if member m thinks the group is currently quiescent (per-member view)
     laggingOnQuiesce    \* laggingOnQuiesce[m]: SUBSET Members; on the leader, members the leader proceeded to quiesce in spite of (lagging or unreachable)
 
-vars == <<role, currentTerm, votedFor, votesGranted, raftLog,
+\* Aggregated tuple for the in-memory log and the on-disk extent. Used in
+\* UNCHANGED clauses so any action that does not mutate the log automatically
+\* leaves both raftLog and fsyncedIdx alone.
+logVars == <<raftLog, fsyncedIdx>>
+
+vars == <<role, currentTerm, votedFor, votesGranted, logVars,
           clock, leaseRemaining, timerRemaining, partition,
           nextSeqId, committedEntries, markerEntries, flushMarkerEntries,
           hdfsHFiles, memstore, fApplyBatch,
@@ -590,6 +652,7 @@ TypeOK ==
     /\ votedFor \in [Members -> Members \union {None}]
     /\ votesGranted \in [Members -> SUBSET Members]
     /\ raftLog \in [Members -> SUBSET (1..MaxSeqId)]
+    /\ fsyncedIdx \in [Members -> 0..MaxSeqId]
     /\ clock \in [Members -> 0..MaxClock]
     /\ leaseRemaining \in [Members -> 0..LeaderLeaseDuration]
     /\ timerRemaining \in [Members -> 0..ElectionTimeoutMin]
@@ -723,6 +786,7 @@ Init ==
     /\ votedFor        = [m \in Members |-> None]
     /\ votesGranted    = [m \in Members |-> {}]
     /\ raftLog         = [m \in Members |-> {}]
+    /\ fsyncedIdx      = [m \in Members |-> 0]
     \* Timing and leases
     /\ clock           = [m \in Members |-> 0]
     /\ leaseRemaining  = [m \in Members |-> 0]
@@ -786,10 +850,8 @@ Timeout(m) ==
     /\ fApplyBatch'      = [fApplyBatch    EXCEPT ![m] = {}]
     /\ groupQuiescent'   = [groupQuiescent EXCEPT ![m] = FALSE]
     /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
-    /\ UNCHANGED <<raftLog, clock, partition,
-                   globalCommitVars, memstore,
-                   writeVars, flushVars, flushDropBound,
-                   promotionVars>>
+    /\ UNCHANGED <<logVars, clock, partition, globalCommitVars, memstore,
+                   writeVars, flushVars, flushDropBound, promotionVars>>
 
 \* A candidate requests and receives a vote from another member (atomic).
 \* Requires that candidate and voter can communicate (not partitioned).
@@ -866,7 +928,7 @@ RequestVote(candidate, voter) ==
                                   IF steppingDown THEN "None" ELSE @]
           /\ groupQuiescent' = [groupQuiescent EXCEPT ![voter] = FALSE]
           /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![voter] = {}]
-    /\ UNCHANGED <<raftLog, clock, timerRemaining, partition,
+    /\ UNCHANGED <<logVars, clock, timerRemaining, partition,
                    globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
 
@@ -953,7 +1015,7 @@ BecomeLeader(m) ==
         /\ laggingOnQuiesce' = [r \in Members |->
               IF r = m \/ r \in responders THEN {}
               ELSE laggingOnQuiesce[r]]
-        /\ UNCHANGED <<raftLog, clock, partition,
+        /\ UNCHANGED <<logVars, clock, partition,
                        globalCommitVars, fApplyBatch,
                        flushDropBound, masterConfirmedTerm>>
 
@@ -969,7 +1031,8 @@ BecomeLeader(m) ==
 \* The action is modeled atomically even though the implementation
 \* splits the round on the wire into two distinct messages
 \* (LeaderHeartbeat broadcast + LeaderHeartbeatAck per-follower
-\* response, see SweepingHeartbeatScheduler).  The split is an
+\* response, carried as per-group entries inside the per-server
+\* bulk-heartbeat envelope emitted by the timing wheel. The split is an
 \* implementation optimization (smaller, independent messages, finer
 \* scheduling); at the spec abstraction level the round must be atomic
 \* because the lease-safety argument requires the leader's lease
@@ -994,9 +1057,15 @@ BecomeLeader(m) ==
 \* Responders that were leaders in a lower term (possible during
 \* partition-heal scenarios) have their write pipelines reset.
 \*
-\* Implementation: models RaftNodeImpl.broadcastLeaderHeartbeat() called
-\* from runHeartbeatTick (HeartbeatScheduler -> SweepingHeartbeatScheduler
-\* or DefaultHeartbeatScheduler), composed with the cumulative effect of
+\* Implementation: models the leader-side liveness round emitted by the
+\* per-server bulk-heartbeat timing wheel.  On every wheel tick the
+\* scheduler walks every registered group, accumulates one per-group
+\* entry per remote peer, and sends a single bulk-heartbeat envelope
+\* per (server, peer).  Followers process each entry on the receive
+\* event-loop, reset their election timer
+\* (leaderHeartbeatReceived()), and produce per-group acks that are
+\* coalesced into the next outbound bulk-heartbeat-ack envelope.  The
+\* leader's lease is refreshed by the cumulative effect of
 \* LeaderHeartbeatAckHandler (per-follower) updating
 \* FollowerState.responseTimestamp on each ack and recomputing
 \* leaseExpiryMillis = quorumResponseTimestamp(quorumSize, now) +
@@ -1050,7 +1119,7 @@ LeaderHeartbeat(leader) ==
                 IF m \in responders THEN 0 ELSE snapshotMaxSeqId[m]]
         /\ promotionPhase' = [m \in Members |->
                 IF m \in responders THEN "None" ELSE promotionPhase[m]]
-        /\ UNCHANGED <<raftLog, clock, partition,
+        /\ UNCHANGED <<logVars, clock, partition,
                        globalCommitVars, fApplyBatch,
                        flushDropBound, masterConfirmedTerm,
                        quiesceVars>>
@@ -1065,8 +1134,9 @@ LeaderHeartbeat(leader) ==
 \*
 \* The transition is modeled atomically — the leader marks itself and
 \* every reachable responder quiescent in one step.  In the
-\* implementation this is one outbound HEARTBEAT_BATCH frame carrying
-\* GroupHeartbeatPB{quiesce=true} per follower, fired-and-forget; a
+\* implementation this is the next bulk-heartbeat envelope emitted by
+\* the timing wheel carrying a per-group entry with the quiesced bit
+\* set per follower, fired-and-forget. A
 \* missed notice just leaves that follower running its own election
 \* timer until the next non-quiesce signal arrives.  The atomic model
 \* is an over-approximation of the implementation's per-follower
@@ -1080,15 +1150,33 @@ LeaderHeartbeat(leader) ==
 \* shouldFollowerQuiesceOnNotify cross-checks this set against the
 \* follower's own liveness view to reject stale-liveness notices.
 \*
-\* Lease and election-timer effects mirror LeaderHeartbeat's atomic
-\* round-trip: the leader's lease is refreshed as the same logical
-\* round-trip that resets responders' election timers, preserving the
-\* causal binding required by LeaseExpiresBeforeElection.  Per-group
-\* state on responders (memstore, write/flush pipelines, votedFor,
-\* role, currentTerm) is unchanged — the responders are already
-\* caught up, and Quiesce does not reset their per-group state the
-\* way LeaderHeartbeat does (which is harmless since the precondition
-\* required them to be in a quiet state matching the leader).
+\* Lease, election-timer, and per-group state effects mirror
+\* LeaderHeartbeat's atomic round-trip: the leader's lease is refreshed
+\* as the same logical round-trip that resets responders' election
+\* timers (preserving the causal binding required by
+\* LeaseExpiresBeforeElection); responders' currentTerm is advanced to
+\* the leader's term, votedFor is cleared on a term bump, votesGranted
+\* is cleared, role is set to Follower (a stale Leader-in-lower-term
+\* responder steps down), and the responder's write / flush /
+\* promotion pipelines are reset.  This shared shape with
+\* LeaderHeartbeat is faithful to the implementation: the QUIESCE
+\* notice rides on the same bulk-heartbeat envelope and the
+\* follower-side handler runs the same heartbeat-driven receive code
+\* path.  Without these effects, QuiesceImpliesTermConsistency (a
+\* stale lower-term responder marked quiescent) and LeaderUniqueness
+\* (a stale Leader-in-lower-term responder having only its term bumped
+\* without stepping down to Follower) would both be falsifiable on
+\* partition-heal traces.
+\*
+\* groupQuiescent is set to TRUE for the leader and every responder it
+\* could reach, and EXPLICITLY to FALSE for every other member.  The
+\* explicit clear matters: leaving a non-responder's groupQuiescent
+\* UNCHANGED admits the trace where a member m was in-sync at an
+\* earlier Quiesce, then partitioned out, then writes commit on the
+\* surviving quorum, and finally the partition heals — at which point
+\* m re-enters Responders(leader) carrying a stale groupQuiescent=TRUE
+\* while raftLog[m] no longer matches committedEntries \cap
+\* raftLog[leader], falsifying QuiesceImpliesAllAcked.
 Quiesce(leader) ==
     /\ role[leader] = "Leader"
     /\ ~groupQuiescent[leader]
@@ -1113,22 +1201,83 @@ Quiesce(leader) ==
          /\ fApplyBatch[f] = {}
     /\ LET responders == Responders(leader)
        IN
+        \* Bring responders into full alignment with the leader.  The
+        \* QUIESCE notice rides on the same bulk-heartbeat envelope as
+        \* a normal heartbeat, and follower-side handlers process it the
+        \* same way. A responder in a lower term advances its
+        \* currentTerm and clears votedFor / votesGranted; a responder
+        \* that is itself a stale Leader-in-lower-term steps down to
+        \* Follower and resets its write / flush / promotion pipelines;
+        \* every responder's election timer is refreshed and its lease
+        \* (if any) is cleared.  This mirrors LeaderHeartbeat's
+        \* responder-side effects exactly, because the heartbeat-driven
+        \* receive code path is shared.  Without these updates,
+        \* QuiesceImpliesTermConsistency (a stale lower-term responder
+        \* marked quiescent) and LeaderUniqueness (a stale lower-term
+        \* Leader-responder having its term bumped without stepping
+        \* down) are both falsifiable.
+        /\ currentTerm' = [m \in Members |->
+              IF m \in responders THEN currentTerm[leader] ELSE currentTerm[m]]
+        /\ role' = [m \in Members |->
+              IF m \in responders THEN "Follower" ELSE role[m]]
+        /\ votedFor' = [m \in Members |->
+              IF m \in responders /\ currentTerm[leader] > currentTerm[m]
+              THEN None ELSE votedFor[m]]
+        /\ votesGranted' = [m \in Members |->
+              IF m \in responders THEN {} ELSE votesGranted[m]]
+        /\ memstore' = [m \in Members |->
+              IF m \in responders THEN PhaseAwareMemstoreDrop(m)
+              ELSE memstore[m]]
+        /\ writePhase' = [m \in Members |->
+              IF m \in responders THEN "Idle" ELSE writePhase[m]]
+        /\ walSync' = [m \in Members |->
+              IF m \in responders THEN "Pending" ELSE walSync[m]]
+        /\ raftCommitted' = [m \in Members |->
+              IF m \in responders THEN FALSE ELSE raftCommitted[m]]
+        /\ writeSeqId' = [m \in Members |->
+              IF m \in responders THEN 0 ELSE writeSeqId[m]]
+        /\ flushPhase' = [m \in Members |->
+              IF m \in responders THEN "Idle" ELSE flushPhase[m]]
+        /\ flushSeqId' = [m \in Members |->
+              IF m \in responders THEN 0 ELSE flushSeqId[m]]
+        /\ snapshotMaxSeqId' = [m \in Members |->
+              IF m \in responders THEN 0 ELSE snapshotMaxSeqId[m]]
+        /\ promotionPhase' = [m \in Members |->
+              IF m \in responders THEN "None" ELSE promotionPhase[m]]
+        \* Set groupQuiescent: TRUE for the leader and every responder it
+        \* could reach with this Quiesce notice, EXPLICITLY FALSE for
+        \* every other member.  Leaving stale TRUE on a non-responder
+        \* admits the trace where a member m was in-sync at an earlier
+        \* Quiesce, then partitioned out, then writes commit on the
+        \* surviving quorum, and finally the partition heals — at which
+        \* point m re-enters Responders(leader) carrying a stale
+        \* groupQuiescent=TRUE while raftLog[m] no longer matches
+        \* committedEntries \cap raftLog[leader], falsifying
+        \* QuiesceImpliesAllAcked.  In the implementation, the QUIESCE
+        \* notice does not reach m (no link), so m is not actively
+        \* re-quiesced; the leader-side bookkeeping records m in
+        \* laggingOnQuiesce[leader], and follower-side
+        \* shouldFollowerQuiesceOnNotify rejects the next stale-liveness
+        \* notice from any leader.  Modeling this as an atomic
+        \* clear-on-Quiesce captures the same effect at the spec
+        \* abstraction level.
         /\ groupQuiescent' = [m \in Members |->
               IF m = leader \/ m \in responders THEN TRUE
-              ELSE groupQuiescent[m]]
+              ELSE FALSE]
         /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT
               ![leader] = Members \ ({leader} \cup responders)]
-        /\ leaseRemaining' = [leaseRemaining EXCEPT ![leader] = LeaderLeaseDuration]
+        /\ leaseRemaining' = [m \in Members |->
+              IF m = leader THEN LeaderLeaseDuration
+              ELSE IF m \in responders THEN 0
+              ELSE leaseRemaining[m]]
         /\ timerRemaining' = [m \in Members |->
               IF m \in responders THEN ElectionTimeoutMin
               ELSE timerRemaining[m]]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog, clock,
-                   partition, globalCommitVars, memstore, fApplyBatch,
-                   writeVars, flushVars, flushDropBound, promotionVars>>
+    /\ UNCHANGED <<logVars, clock, partition, globalCommitVars, fApplyBatch,
+                   flushDropBound, masterConfirmedTerm>>
 
-\* Per-tick leader-side keepalive that the SweepingHeartbeatScheduler
-\* emits via the always-emitted HEARTBEAT_BATCH envelope (top-level
-\* sender / epoch / tick fields populated, groups[] possibly empty).
+\* Per-tick leader-side keepalive that the bulk-heartbeat timing wheel
+\* emits via the always-emitted bulk-heartbeat envelope.
 \* While the leader is quiescent and per-group LeaderHeartbeat is
 \* suppressed, the keepalive refreshes the lease and the responders'
 \* election timers, providing the per-server-level failure detection
@@ -1144,7 +1293,7 @@ Quiesce(leader) ==
 \* — it carries only the top-level liveness fields.  It is gated on
 \* groupQuiescent[leader] to avoid redundant exploration with
 \* LeaderHeartbeat; in the implementation, the keepalive fields are
-\* on every HEARTBEAT_BATCH envelope regardless of group state, but
+\* on every bulk-heartbeat envelope regardless of group state, but
 \* the timer-reset and lease-refresh effects are subsumed by
 \* LeaderHeartbeat when the group is active.
 LeaderKeepalive(leader) ==
@@ -1157,7 +1306,7 @@ LeaderKeepalive(leader) ==
             IF m \in Responders(leader)
             THEN ElectionTimeoutMin
             ELSE timerRemaining[m]]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog, clock,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars, clock,
                    partition, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound, promotionVars,
                    quiesceVars>>
@@ -1191,7 +1340,7 @@ Wake(leader) ==
             IF m = leader \/ m \in Responders(leader) THEN FALSE
             ELSE groupQuiescent[m]]
     /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![leader] = {}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition,
                    globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound, promotionVars>>
@@ -1239,7 +1388,7 @@ StepDown(m) ==
     /\ promotionPhase'   = [promotionPhase  EXCEPT ![m] = "None"]
     /\ groupQuiescent'   = [groupQuiescent  EXCEPT ![m] = FALSE]
     /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
-    /\ UNCHANGED <<raftLog, clock, partition,
+    /\ UNCHANGED <<logVars, clock, partition,
                    globalCommitVars, fApplyBatch,
                    flushDropBound, masterConfirmedTerm>>
 
@@ -1288,7 +1437,7 @@ LeaderLeaseExpiry(m) ==
     /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
     /\ groupQuiescent'   = [groupQuiescent  EXCEPT ![m] = FALSE]
     /\ laggingOnQuiesce' = [laggingOnQuiesce EXCEPT ![m] = {}]
-    /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock,
+    /\ UNCHANGED <<currentTerm, votedFor, logVars, clock,
                    leaseRemaining, partition,
                    globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
@@ -1333,7 +1482,7 @@ ClockTickEffect(m) ==
 ClockTick(m) ==
     /\ ClockTickGuard(m)
     /\ ClockTickEffect(m)
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    partition, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
                    promotionVars, quiesceVars>>
@@ -1390,9 +1539,8 @@ CrashRestartEffect(m) ==
 CrashRestart(m) ==
     /\ CrashRestartGuard(m)
     /\ CrashRestartEffect(m)
-    /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
-                   globalCommitVars,
-                   flushDropBound, masterConfirmedTerm>>
+    /\ UNCHANGED <<currentTerm, votedFor, logVars, clock, partition,
+                   globalCommitVars, flushDropBound, masterConfirmedTerm>>
 
 \* Models a crash-restart in which the durable RAFT log on m loses a
 \* suffix relative to its pre-crash state.  Per the implementation, the
@@ -1400,6 +1548,9 @@ CrashRestart(m) ==
 \* possibly truncated further at a CRC failure or torn-write boundary.
 \* The torn-write boundary is detected during DurableLogStore.load().  Term
 \* and vote remain durable (sync-fsynced; see persistAndFlushTerm).
+\* fsyncedIdx[m] is itself durable: once the OS reports a successful
+\* force(false) the leading prefix of raftLog[m] up to that index is on
+\* disk and survives any subsequent crash.
 \* m is treated by the RAFT protocol as a follower whose log is out
 \* of date; standard catchup paths (AppendEntries from a peer with
 \* intact log for small gaps; the chunked InstallSnapshot wire path
@@ -1407,30 +1558,30 @@ CrashRestart(m) ==
 \* an applied flush marker, modeled here by FollowerLoadFlushedState)
 \* refill the missing tail.
 \*
-\* Every entry in the lost suffix must remain recoverable either from
-\* a majority of OTHER members' raftLogs (RAFT AppendEntries) or from a
-\* flush marker with HFiles on HDFS and uncommitted-but-replicated
-\* entries as well as committed ones. Once an entry has been placed in
-\* a majority of raftLogs the leader has the right to commit it. Fsync-
-\* before-commit makes this guard an enforced property of the durability
-\* layer.
-\* A follower's AppendEntriesSuccessResponse is sent only after
-\* RaftStore.flush() returns and so reflects on-disk content, the
-\* leader's flushedLogIndex (its own contribution to the commit quorum)
-\* is set only after RaftStore.flush() returns, and commit-index
-\* advancement counts only on-disk acks. Any entry that could be lost
-\* from m by suffix truncation is therefore present on disk on a
-\* majority of OTHER members.
+\* Truncation point: raftLog[m] is truncated to {e : e <= fsyncedIdx[m]}.
+\* Everything past the last successful Fsync is gone; everything at or
+\* below it survives.  This matches Tier B durability semantics: writev
+\* puts entries into raftLog[m], Fsync(m) bumps fsyncedIdx[m] to the
+\* current log max, and a crash discards the unfsynced tail.
+\*
+\* Safety in the lost-suffix region rests on the
+\* NoCorrelatedUnfsyncedMajorityLoss state constraint (see .cfg): the
+\* model only explores traces where every committed entry is fsynced on
+\* a quorum of replicas.  The per-action guard below additionally
+\* requires every entry being lost by m to be either (a) covered by a
+\* flush with HFiles on HDFS, or (b) present on a majority of OTHER
+\* members' raftLogs, so a leader catch-up path always exists.
 CrashRestartWithLogLossEffect(m) ==
-    \E w \in 0..MaxSeqId :
-        /\ \E e \in raftLog[m] : e > w
-        /\ \A e \in raftLog[m] :
-              e > w =>
-                  \/ \E f \in flushMarkerEntries \cap hdfsHFiles :
-                        e <= flushDropBound[f]
-                  \/ Cardinality({n \in Members \ {m} : e \in raftLog[n]})
-                       >= Majority
-        /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e <= w}]
+    /\ \E e \in raftLog[m] : e > fsyncedIdx[m]
+    /\ \A e \in raftLog[m] :
+          e > fsyncedIdx[m] =>
+              \/ \E f \in flushMarkerEntries \cap hdfsHFiles :
+                    e <= flushDropBound[f]
+              \/ Cardinality({n \in Members \ {m} : e \in raftLog[n]})
+                   >= Majority
+    /\ raftLog' = [raftLog EXCEPT ![m] = {e \in @ : e <= fsyncedIdx[m]}]
+    \* fsyncedIdx[m] is itself durable; it survives the crash unchanged.
+    /\ UNCHANGED fsyncedIdx
 
 CrashRestartWithLogLoss(m) ==
     /\ CrashRestartWithLogLossEffect(m)
@@ -1438,6 +1589,37 @@ CrashRestartWithLogLoss(m) ==
     /\ UNCHANGED <<currentTerm, votedFor, clock, partition,
                    globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
+
+\* ---- Tier B durability action ----
+\*
+\* Models the segment-roll fsync AND the periodic-fsync-timer fsync as a
+\* single non-deterministic action.  Bumps fsyncedIdx[s] to the current
+\* high-water mark of raftLog[s], reflecting the post-fsync on-disk extent.
+\* Strong fairness on this action encodes the operator-level guarantee that
+\* SOME fsync trigger (segment-roll under load OR periodic safety net under
+\* idle) eventually fires; without that fairness the model could trivially
+\* avoid all Fsync transitions and the
+\* NoCorrelatedUnfsyncedMajorityLoss state constraint would prevent
+\* commit indefinitely.
+\*
+\* In the implementation, term and vote (Tier A) are sync-fsynced inline
+\* with the persistAndFlushTerm call; the spec already treats currentTerm
+\* and votedFor as durable across crashes, matching that tier.  Tier C
+\* strict mode (FSYNC_ON_COMMIT_KEY=true) is captured by interleaving
+\* Fsync(m) immediately around RAFTCommitWrite / FlushRAFTPropose /
+\* ProposeMarker; in Tier B the interleaving is delayed but the
+\* no-correlated-loss state constraint bounds how far it can drift.
+FsyncGuard(m) ==
+    \E e \in raftLog[m] : e > fsyncedIdx[m]
+
+Fsync(m) ==
+    /\ FsyncGuard(m)
+    /\ fsyncedIdx' = [fsyncedIdx EXCEPT ![m] =
+          LET hi == SetMax(raftLog[m])
+          IN IF hi > @ THEN hi ELSE @]
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+                   timerVars, partition, globalCommitVars, memstore, fApplyBatch,
+                   writeVars, flushVars, flushDropBound, promotionVars, quiesceVars>>
 
 \* ---- Network partition actions ----
 
@@ -1448,7 +1630,7 @@ CreatePartition ==
         /\ m1 # m2
         /\ <<m1, m2>> \notin partition
         /\ partition' = partition \union {<<m1, m2>>, <<m2, m1>>}
-        /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+        /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                        timerVars, globalCommitVars, memstore, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
                        promotionVars, quiesceVars>>
@@ -1459,7 +1641,7 @@ HealPartition ==
     \E m1, m2 \in Members :
         /\ <<m1, m2>> \in partition
         /\ partition' = partition \ {<<m1, m2>>, <<m2, m1>>}
-        /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+        /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                        timerVars, globalCommitVars, memstore, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
                        promotionVars, quiesceVars>>
@@ -1474,7 +1656,7 @@ HealPartition ==
 HealAllPartitions ==
     /\ partition # {}
     /\ partition' = {}
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, globalCommitVars, memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
                    promotionVars, quiesceVars>>
@@ -1509,7 +1691,7 @@ BeginWrite(m) ==
     /\ raftCommitted' = [raftCommitted EXCEPT ![m] = FALSE]
     /\ writeSeqId'    = [writeSeqId    EXCEPT ![m] = nextSeqId]
     /\ nextSeqId' = nextSeqId + 1
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, flushVars,
@@ -1522,7 +1704,7 @@ WALSyncComplete(m) ==
     /\ writePhase[m] = "Pending"
     /\ walSync[m] = "Pending"
     /\ walSync' = [walSync EXCEPT ![m] = "Done"]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
@@ -1536,7 +1718,7 @@ WALSyncFail(m) ==
     /\ writePhase[m] = "Pending"
     /\ walSync[m] = "Pending"
     /\ walSync' = [walSync EXCEPT ![m] = "Failed"]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writePhase, raftCommitted, writeSeqId, flushVars,
@@ -1567,11 +1749,11 @@ RAFTCommitWrite(m) ==
               ELSE raftLog[r]]
     /\ raftCommitted' = [raftCommitted EXCEPT ![m] = TRUE]
     /\ committedEntries' = committedEntries \union {writeSeqId[m]}
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
-                   timerVars, partition,
-                   nextSeqId, markerEntries, flushMarkerEntries,
-                   hdfsHFiles, memstore, fApplyBatch,
-                   writePhase, walSync, writeSeqId, flushVars,
+    \* Tier B: writev advances raftLog but not fsyncedIdx; durability is
+    \* covered by the next Fsync(m) action interleaved by the model.
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, fsyncedIdx,
+                   timerVars, partition, nextSeqId, markerEntries, flushMarkerEntries,
+                   hdfsHFiles, memstore, fApplyBatch, writePhase, walSync, writeSeqId, flushVars,
                    flushDropBound, promotionVars, quiesceVars>>
 
 \* Barrier join + memstore apply + visibility.  Both WAL sync and RAFT
@@ -1590,7 +1772,7 @@ CompleteWrite(m) ==
     /\ WriteBarrierPassed(m)
     /\ writePhase' = [writePhase EXCEPT ![m] = "Applied"]
     /\ memstore' = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    walSync, raftCommitted, writeSeqId, flushVars,
@@ -1602,7 +1784,7 @@ CompleteWrite(m) ==
 AckWrite(m) ==
     /\ writePhase[m] = "Applied"
     /\ WritePipelineReset(m)
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    flushVars, flushDropBound,
@@ -1624,7 +1806,7 @@ WALFailureAbort(m) ==
     /\ writePhase[m] = "Pending"
     /\ walSync[m] = "Failed"
     /\ CrashRestartEffect(m)
-    /\ UNCHANGED <<currentTerm, votedFor, raftLog, clock, partition,
+    /\ UNCHANGED <<currentTerm, votedFor, logVars, clock, partition,
                    globalCommitVars,
                    flushDropBound, masterConfirmedTerm>>
 
@@ -1657,7 +1839,8 @@ ProposeMarker(m) ==
               IF r = m \/ r \in responders
               THEN raftLog[r] \union {seqId}
               ELSE raftLog[r]]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
+    \* Tier B: writev advances raftLog but not fsyncedIdx.
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, fsyncedIdx,
                    timerVars, partition,
                    flushMarkerEntries, hdfsHFiles, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
@@ -1750,7 +1933,7 @@ FlushStart(m) ==
           /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = snapBound]
           /\ flushDropBound' = [flushDropBound EXCEPT ![nextSeqId] = snapBound]
     /\ nextSeqId'  = nextSeqId + 1
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition,
                    committedEntries, markerEntries, flushMarkerEntries,
                    hdfsHFiles, memstore, fApplyBatch, writeVars,
@@ -1767,7 +1950,7 @@ FlushCommitHFiles(m) ==
     /\ flushPhase[m] = "FlushStarted"
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "HFilesCommitted"]
     /\ hdfsHFiles' = hdfsHFiles \union {flushSeqId[m]}
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition,
                    nextSeqId, committedEntries, markerEntries,
                    flushMarkerEntries, memstore, fApplyBatch,
@@ -1791,7 +1974,8 @@ FlushRAFTPropose(m) ==
               THEN raftLog[r] \union {flushSeqId[m]}
               ELSE raftLog[r]]
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "RAFTProposed"]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
+    \* Tier B: writev advances raftLog but not fsyncedIdx.
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, fsyncedIdx,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
@@ -1813,7 +1997,7 @@ FlushRAFTCommit(m) ==
     /\ markerEntries' = markerEntries \union {flushSeqId[m]}
     /\ flushMarkerEntries' = flushMarkerEntries \union {flushSeqId[m]}
     /\ memstore' = [memstore EXCEPT ![m] = @ \union {flushSeqId[m]}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition,
                    nextSeqId, hdfsHFiles, fApplyBatch,
                    writeVars, flushSeqId, snapshotMaxSeqId, flushDropBound,
@@ -1836,7 +2020,7 @@ FlushComplete(m) ==
     /\ flushPhase' = [flushPhase EXCEPT ![m] = "Idle"]
     /\ flushSeqId' = [flushSeqId EXCEPT ![m] = 0]
     /\ snapshotMaxSeqId' = [snapshotMaxSeqId EXCEPT ![m] = 0]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    writeVars, flushDropBound,
@@ -1871,7 +2055,7 @@ FlushComplete(m) ==
 FollowerBeginBatchApply(m) ==
     /\ MutationBatchReady(m)
     /\ fApplyBatch' = [fApplyBatch EXCEPT ![m] = MutationBatch(m)]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    memstore,
                    writeVars, flushVars, flushDropBound,
@@ -1891,7 +2075,7 @@ FollowerCompleteBatchApply(m) ==
     /\ fApplyBatch[m] # {}
     /\ memstore' = [memstore EXCEPT ![m] = @ \union fApplyBatch[m]]
     /\ fApplyBatch' = [fApplyBatch EXCEPT ![m] = {}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    writeVars, flushVars, flushDropBound,
                    promotionVars, quiesceVars>>
@@ -1934,7 +2118,7 @@ FollowerApplyMarker(m) ==
                         /\ memstore' = [memstore EXCEPT ![m] =
                             {s \in @ : s > flushDropBound[nextEntry]} \union {nextEntry}]
                    ELSE /\ memstore' = [memstore EXCEPT ![m] = @ \union {nextEntry}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
                    writeVars, flushVars, flushDropBound,
@@ -1969,7 +2153,7 @@ MasterConfirmPromotion(m) ==
     /\ currentTerm[m] > masterConfirmedTerm
     /\ masterConfirmedTerm' = currentTerm[m]
     /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "AwaitingMaster"]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
@@ -1999,7 +2183,7 @@ PromotionComplete(m) ==
     /\ promotionPhase[m] = "AwaitingMaster"
     /\ ApplicableEntries(m) = {}
     /\ promotionPhase' = [promotionPhase EXCEPT ![m] = "Complete"]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
@@ -2056,7 +2240,7 @@ NewLeaderCommitOrphanEntry ==
                ELSE /\ committedEntries' = committedEntries \union {s}
                     /\ memstore' = [memstore EXCEPT ![leader] = @ \union {s}]
                     /\ UNCHANGED <<markerEntries, flushMarkerEntries>>
-        /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
+        /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
                        timerVars, partition,
                        nextSeqId, hdfsHFiles, fApplyBatch,
                        writeVars, flushVars, flushDropBound,
@@ -2092,7 +2276,11 @@ RaftLogGC(m) ==
     /\ ~groupQuiescent[m]
     /\ RaftLogGCGuard(m)
     /\ RaftLogGCEffect(m)
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
+    \* Removed entries were already on disk (fsyncedIdx is the high-water mark
+    \* of durable seqIds; entries below flushDropBound[s] are guaranteed
+    \* fsynced by the no-correlated-loss state constraint). The high-water
+    \* mark itself is unchanged by the GC.
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, fsyncedIdx,
                    timerVars, partition, globalCommitVars,
                    memstore, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
@@ -2142,6 +2330,11 @@ FollowerLoadFlushedState(leader, follower) ==
               {e \in @ : e > flushDropBound[s]} \union {s}]
         /\ raftLog' = [raftLog EXCEPT ![follower] =
               {e \in @ : e > flushDropBound[s]} \union {s}]
+        \* The chunked InstallSnapshot wire path persists the snapshot to
+        \* the durable log on the follower before sending the success
+        \* response, so the post-install raftLog[follower] is on disk.
+        /\ fsyncedIdx' = [fsyncedIdx EXCEPT ![follower] =
+              IF fsyncedIdx[follower] >= s THEN fsyncedIdx[follower] ELSE s]
     /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted,
                    timerVars, partition, globalCommitVars,
                    fApplyBatch,
@@ -2261,6 +2454,12 @@ NewMemberBootstrap(m) ==
             /\ timerRemaining'   = [timerRemaining  EXCEPT ![m] = ElectionTimeoutMin]
             /\ raftLog'          = [raftLog         EXCEPT ![m] =
                   raftLog[leader] \union uncoveredCommitted]
+            \* Bootstrap installs entries to the new member's durable log via
+            \* AppendEntries / chunked InstallSnapshot, which fsync before
+            \* acknowledging.  The post-bootstrap log is on disk.
+            /\ fsyncedIdx'       = [fsyncedIdx      EXCEPT ![m] =
+                  LET full == raftLog[leader] \union uncoveredCommitted
+                  IN IF full = {} THEN 0 ELSE SetMax(full)]
             /\ memstore'         = [memstore        EXCEPT ![m] = {}]
             /\ fApplyBatch'      = [fApplyBatch     EXCEPT ![m] = {}]
             /\ writePhase'       = [writePhase      EXCEPT ![m] = "Idle"]
@@ -2289,9 +2488,8 @@ NewMemberBootstrap(m) ==
 AtomicFollowerBatchApply(m) ==
     /\ MutationBatchReady(m)
     /\ memstore' = [memstore EXCEPT ![m] = @ \union MutationBatch(m)]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   timerVars, partition, globalCommitVars,
-                   fApplyBatch,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
+                   timerVars, partition, globalCommitVars, fApplyBatch,
                    writeVars, flushVars, flushDropBound,
                    promotionVars, quiesceVars>>
 
@@ -2302,9 +2500,8 @@ AtomicCompleteWriteAndAck(m) ==
     /\ WriteBarrierPassed(m)
     /\ WritePipelineReset(m)
     /\ memstore'      = [memstore EXCEPT ![m] = @ \union {writeSeqId[m]}]
-    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, raftLog,
-                   timerVars, partition, globalCommitVars,
-                   fApplyBatch,
+    /\ UNCHANGED <<role, currentTerm, votedFor, votesGranted, logVars,
+                   timerVars, partition, globalCommitVars, fApplyBatch,
                    flushVars, flushDropBound,
                    promotionVars, quiesceVars>>
 
@@ -2432,6 +2629,8 @@ Next ==
     \* Crash recovery
     \/ \E m \in Members     : CrashRestart(m)
     \/ \E m \in Members     : CrashRestartWithLogLoss(m)
+    \* Tier B durability fsync (segment-roll OR periodic-timer abstraction)
+    \/ \E m \in Members     : Fsync(m)
     \* Network
     \/ CreatePartition
     \/ HealPartition
@@ -2490,6 +2689,27 @@ CatchUpDataIntegrity ==
     \A s \in committedEntries :
         \/ Cardinality({m \in Members : s \in raftLog[m]}) >= Majority
         \/ \E f \in flushMarkerEntries \cap hdfsHFiles : s <= flushDropBound[f]
+
+\* Tier B no-correlated-loss assumption: every committed entry is fsynced
+\* on a quorum of replicas at all times.  This is the operator-level
+\* deployment guarantee that makes lazy commit-ack safe: a crash of a
+\* minority can lose its unfsynced tail (CrashRestartWithLogLoss with the
+\* truncation point at fsyncedIdx), but a quorum is always durable
+\* enough to recover every committed entry.
+\*
+\* In Tier C (FSYNC_ON_COMMIT_KEY=true) this holds trivially: every
+\* RaftStore.flush() barrier blocks on fsync, so commit ack is gated on
+\* on-disk acks from a majority.  In Tier B it is enforced by the model
+\* via this state CONSTRAINT (in the .cfg sense, not as a verifiable
+\* INVARIANT): TLC restricts exploration to traces where enough Fsync(m)
+\* actions interleave around RAFTCommitWrite / FlushRAFTPropose /
+\* ProposeMarker that the constraint is preserved at every reachable
+\* state.  Within that constrained state space, every other safety
+\* invariant (LeaderUniqueness, CatchUpDataIntegrity, ...) must still
+\* hold; that is what the verification job actually checks.
+NoCorrelatedUnfsyncedMajorityLoss ==
+    \A s \in committedEntries :
+        Cardinality({m \in Members : fsyncedIdx[m] >= s}) >= Majority
 
 \* Every seqId that is exposed to clients via any member's memstore is
 \* recoverable from the durable surface. It is on a majority's raftLogs,
@@ -2866,6 +3086,12 @@ BaseFairness ==
     \* Quiescence
     /\ \A m \in Members     : WF_vars(Wake(m))
     /\ \A m \in Members     : WF_vars(LeaderKeepalive(m))
+    \* Tier B durability: Fsync(m) abstracts segment-roll + periodic-timer
+    \* fsync.  Strong fairness encodes the operator-level guarantee that
+    \* SOME fsync trigger eventually fires (segment roll under load OR
+    \* periodic safety net under idle).  Required to make commit progress
+    \* under the NoCorrelatedUnfsyncedMajorityLoss state constraint.
+    /\ \A m \in Members     : SF_vars(Fsync(m))
 
 \* SF additions for ElectionProgress.
 \* RequestVote + BecomeLeader + StepDown all require CanCommunicate;

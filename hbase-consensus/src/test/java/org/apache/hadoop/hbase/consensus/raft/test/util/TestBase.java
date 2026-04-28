@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.consensus.raft.test.util;
 
 import java.util.Optional;
 import org.apache.hadoop.hbase.HBaseJupiterExtension;
+import org.junit.jupiter.api.extension.BeforeTestExecutionCallback;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
@@ -41,8 +42,7 @@ public class TestBase {
   static final ExtensionContext.Namespace NS =
     ExtensionContext.Namespace.create(TimingTestWatcher.class);
 
-  public static class TimingTestWatcher
-    implements TestWatcher, org.junit.jupiter.api.extension.BeforeTestExecutionCallback {
+  public static class TimingTestWatcher implements TestWatcher, BeforeTestExecutionCallback {
     @Override
     public void beforeTestExecution(ExtensionContext context) {
       context.getStore(NS).put("start", System.nanoTime());

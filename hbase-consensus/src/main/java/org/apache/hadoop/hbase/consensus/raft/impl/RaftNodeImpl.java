@@ -24,7 +24,6 @@ import static java.util.Collections.emptyMap;
 import static java.util.Collections.shuffle;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
@@ -50,14 +49,19 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.IntSupplier;
 import org.apache.hadoop.hbase.consensus.raft.MembershipChangeMode;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
+import org.apache.hadoop.hbase.consensus.raft.PendingBytesBudget;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
@@ -75,8 +79,6 @@ import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesRequestH
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.AppendEntriesSuccessResponseHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.InstallSnapshotRequestHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.InstallSnapshotResponseHandler;
-import org.apache.hadoop.hbase.consensus.raft.impl.handler.LeaderHeartbeatAckHandler;
-import org.apache.hadoop.hbase.consensus.raft.impl.handler.LeaderHeartbeatHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.PreVoteRequestHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.PreVoteResponseHandler;
 import org.apache.hadoop.hbase.consensus.raft.impl.handler.TriggerLeaderElectionHandler;
@@ -95,7 +97,6 @@ import org.apache.hadoop.hbase.consensus.raft.impl.state.RaftTermState;
 import org.apache.hadoop.hbase.consensus.raft.impl.statemachine.InternalCommitAware;
 import org.apache.hadoop.hbase.consensus.raft.impl.statemachine.NoOp;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.FlushTask;
-import org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.LeaderBackoffResetTask;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.LeaderElectionTimeoutTask;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.MembershipChangeTask;
@@ -121,8 +122,6 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse;
-import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
-import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
@@ -170,24 +169,65 @@ public final class RaftNodeImpl implements RaftNode {
   private final Random random;
   private final Clock clock;
   private final HeartbeatScheduler heartbeatScheduler;
+  private final IntSupplier activeGroupCountSupplier;
+  private final double electionRandomizationGroupScale;
   private final long leaderHeartbeatTimeoutMillis;
   private final int commitCountToTakeSnapshot;
   private final int appendEntriesRequestBatchSize;
   private final int maxPendingLogEntryCount;
+  private final PendingBytesBudget pendingBytesBudget;
+  /**
+   * Per-node bookkeeping of pending-bytes credits this node has acquired from
+   * {@link #pendingBytesBudget} and not yet released. Keys are leader-side log indices for which a
+   * {@code byte[]} payload was admitted; values are the byte counts reserved for those indices.
+   * Mutated only on the per-group executor thread so a plain {@link HashMap} suffices.
+   * <p>
+   * Used to:
+   * <ul>
+   * <li>Release the precise number of credits per entry as it is committed in the apply path.</li>
+   * <li>Wholesale-release outstanding credits when the leader steps down or terminates without
+   * having committed every reserved entry.</li>
+   * </ul>
+   * Bounded above by {@link #maxPendingLogEntryCount}.
+   */
+  private final HashMap<Long, Long> reservedBytesByIndex = new HashMap<>();
   private final int maxLogEntryCountToKeepAfterSnapshot;
   private final int maxBackoffRounds;
   private Runnable leaderBackoffResetTask;
   private Runnable leaderFlushTask;
   private final List<RaftNodeLifecycleAware> lifecycleAwareComponents = new ArrayList<>();
   private final List<RaftNodeLifecycleAware> startedLifecycleAwareComponents = new ArrayList<>();
-  private long lastLeaderHeartbeatTimestamp;
+  // Cached slow-path control-lane Runnables submitted by the bulk-heartbeat wheel and the
+  // election-timer follower walk. Held as fields so {@code submitControl} does not allocate a
+  // capturing lambda per dispatch.
+  private final Runnable demoteToFollowerIfLeaseExpiredTask = this::demoteToFollowerIfLeaseExpired;
+  private final Runnable sendCatchupAppendsIfNeededTask = this::sendCatchupAppendsIfNeeded;
+  private final Runnable resetLeaderAndTryTriggerPreVoteTask =
+    () -> resetLeaderAndTryTriggerPreVote(true);
+  // Volatile + AtomicLongFieldUpdater for monotonic-max updates so the bulk inbound handler can
+  // refresh this field on the netty event-loop thread without entering the per-group executor.
+  // Lost updates are harmless. A stale write loses to a fresher concurrent write.
+  private volatile long lastLeaderHeartbeatTimestamp;
   // Updated whenever the local follower has a reason to defer starting its own
   // election: a real leader heartbeat (AppendEntries/InstallSnapshot) or a vote
   // grant. Kept distinct from {@link #lastLeaderHeartbeatTimestamp} so that
   // sticky-leader checks in (Pre)VoteRequestHandler continue to reflect lease
   // safety (only true leader heartbeats refresh the lease), while the
-  // HeartbeatTask still avoids preempting a candidate it just voted for.
-  private long lastElectionTimerResetTimestamp;
+  // election scheduler still avoids preempting a candidate it just voted for.
+  // Volatile for the same reason as {@link #lastLeaderHeartbeatTimestamp}.
+  private volatile long lastElectionTimerResetTimestamp;
+  // Per-follower randomized election timeout, re-rolled on every reset (leader heartbeat
+  // observed, vote grant) so simultaneous followers de-correlate on the wall clock and avoid
+  // election storms at high group counts. Floor stays at leaderHeartbeatTimeoutMillis. Upper end
+  // is widened with the active group count via electionRandomizationGroupScale. Volatile so the
+  // bulk inbound handler can publish a fresh sample on the netty event-loop thread.
+  private volatile long currentElectionTimeoutMillis;
+  private static final java.util.concurrent.atomic.AtomicLongFieldUpdater<RaftNodeImpl> LAST_HB =
+    java.util.concurrent.atomic.AtomicLongFieldUpdater.newUpdater(RaftNodeImpl.class,
+      "lastLeaderHeartbeatTimestamp");
+  private static final java.util.concurrent.atomic.AtomicLongFieldUpdater<RaftNodeImpl> LAST_ER =
+    java.util.concurrent.atomic.AtomicLongFieldUpdater.newUpdater(RaftNodeImpl.class,
+      "lastElectionTimerResetTimestamp");
   private volatile RaftNodeStatus status = INITIAL;
   private int takeSnapshotCount;
   private int installSnapshotCount;
@@ -196,7 +236,8 @@ public final class RaftNodeImpl implements RaftNode {
   RaftNodeImpl(Object groupId, RaftEndpoint localEndpoint, RaftGroupMembersView initialGroupMembers,
     RaftConfig config, RaftNodeExecutor executor, StateMachine stateMachine, Transport transport,
     RaftModelFactory modelFactory, RaftStore store, RaftNodeReportListener raftNodeReportListener,
-    Random random, Clock clock, HeartbeatScheduler heartbeatScheduler) {
+    Random random, Clock clock, HeartbeatScheduler heartbeatScheduler,
+    IntSupplier activeGroupCountSupplier, PendingBytesBudget pendingBytesBudget) {
     requireNonNull(localEndpoint);
     this.groupId = requireNonNull(groupId);
     this.transport = requireNonNull(transport);
@@ -208,9 +249,11 @@ public final class RaftNodeImpl implements RaftNode {
     this.config = requireNonNull(config);
     this.localEndpointStr = localEndpoint.getId() + "<" + groupId + ">";
     this.leaderHeartbeatTimeoutMillis = config.getLeaderHeartbeatTimeoutMillis();
+    this.electionRandomizationGroupScale = config.getElectionRandomizationGroupScale();
     this.commitCountToTakeSnapshot = config.getCommitCountToTakeSnapshot();
     this.appendEntriesRequestBatchSize = config.getAppendEntriesRequestBatchSize();
     this.maxPendingLogEntryCount = config.getMaxPendingLogEntryCount();
+    this.pendingBytesBudget = requireNonNull(pendingBytesBudget);
     this.maxLogEntryCountToKeepAfterSnapshot =
       getMaxLogEntryCountToKeepAfterSnapshot(commitCountToTakeSnapshot);
     int logCapacity = getLogCapacity(commitCountToTakeSnapshot, maxPendingLogEntryCount);
@@ -220,6 +263,8 @@ public final class RaftNodeImpl implements RaftNode {
     this.random = requireNonNull(random);
     this.clock = requireNonNull(clock);
     this.heartbeatScheduler = requireNonNull(heartbeatScheduler);
+    this.activeGroupCountSupplier = requireNonNull(activeGroupCountSupplier);
+    this.currentElectionTimeoutMillis = sampleElectionTimeoutMillis();
     populateLifecycleAwareComponents();
   }
 
@@ -227,7 +272,8 @@ public final class RaftNodeImpl implements RaftNode {
   RaftNodeImpl(Object groupId, RestoredRaftState restoredState, RaftConfig config,
     RaftNodeExecutor executor, StateMachine stateMachine, Transport transport,
     RaftModelFactory modelFactory, RaftStore store, RaftNodeReportListener raftNodeReportListener,
-    Random random, Clock clock, HeartbeatScheduler heartbeatScheduler) {
+    Random random, Clock clock, HeartbeatScheduler heartbeatScheduler,
+    IntSupplier activeGroupCountSupplier, PendingBytesBudget pendingBytesBudget) {
     requireNonNull(store);
     this.groupId = requireNonNull(groupId);
     this.transport = requireNonNull(transport);
@@ -241,9 +287,11 @@ public final class RaftNodeImpl implements RaftNode {
       restoredState.getLocalEndpointPersistentState().getLocalEndpoint().getId() + "<" + groupId
         + ">";
     this.leaderHeartbeatTimeoutMillis = config.getLeaderHeartbeatTimeoutMillis();
+    this.electionRandomizationGroupScale = config.getElectionRandomizationGroupScale();
     this.commitCountToTakeSnapshot = config.getCommitCountToTakeSnapshot();
     this.appendEntriesRequestBatchSize = config.getAppendEntriesRequestBatchSize();
     this.maxPendingLogEntryCount = config.getMaxPendingLogEntryCount();
+    this.pendingBytesBudget = requireNonNull(pendingBytesBudget);
     this.maxLogEntryCountToKeepAfterSnapshot =
       getMaxLogEntryCountToKeepAfterSnapshot(commitCountToTakeSnapshot);
     int logCapacity = getLogCapacity(commitCountToTakeSnapshot, maxPendingLogEntryCount);
@@ -252,12 +300,39 @@ public final class RaftNodeImpl implements RaftNode {
     this.random = requireNonNull(random);
     this.clock = requireNonNull(clock);
     this.heartbeatScheduler = requireNonNull(heartbeatScheduler);
+    this.activeGroupCountSupplier = requireNonNull(activeGroupCountSupplier);
+    this.currentElectionTimeoutMillis = sampleElectionTimeoutMillis();
     populateLifecycleAwareComponents();
+  }
+
+  /**
+   * Rolls a fresh per-follower election timeout in
+   * {@code [leaderHeartbeatTimeoutMillis, leaderHeartbeatTimeoutMillis * (2 + scale * log(activeGroups)))}.
+   * Called from each timer-reset site so simultaneous followers de-correlate on the wall clock.
+   */
+  private long sampleElectionTimeoutMillis() {
+    long lower = leaderHeartbeatTimeoutMillis;
+    int groups = Math.max(1, activeGroupCountSupplier.getAsInt());
+    double upperMultiplier = 2.0d + (electionRandomizationGroupScale > 0d
+      ? electionRandomizationGroupScale * Math.log(groups)
+      : 0.0d);
+    long upperExclusive = (long) Math.ceil((double) lower * upperMultiplier);
+    if (upperExclusive <= lower) {
+      return lower;
+    }
+    long span = upperExclusive - lower;
+    long offset = ((long) (ThreadLocalRandom.current().nextDouble() * span));
+    if (offset < 0L) {
+      offset = 0L;
+    } else if (offset >= span) {
+      offset = span - 1L;
+    }
+    return lower + offset;
   }
 
   private void populateLifecycleAwareComponents() {
     for (Object component : Arrays.asList(executor, transport, stateMachine, store, modelFactory,
-      raftNodeReportListener)) {
+      raftNodeReportListener, heartbeatScheduler)) {
       if (component instanceof RaftNodeLifecycleAware) {
         lifecycleAwareComponents.add((RaftNodeLifecycleAware) component);
       }
@@ -290,11 +365,18 @@ public final class RaftNodeImpl implements RaftNode {
    * <li>The operation is a membership change and there's no committed entry in the current term
    * yet.</li>
    * </ul>
+   * <p>
+   * The server-wide pending-bytes budget is <i>not</i> consulted here: it is enforced by the
+   * propose path via {@link #tryReserveLeaderPendingBytes(long)} immediately before the log append,
+   * atomically with the reservation. Splitting the count check (here) from the byte-credit acquire
+   * (in the propose path) keeps this method side-effect-free for callers that want a pure-query
+   * precondition.
    * @param operation the operation to check for replication
    * @return true if the given operation can be replicated, false otherwise
    * @see RaftNodeStatus
    * @see RaftGroupOp
    * @see RaftConfig#getMaxPendingLogEntryCount()
+   * @see #tryReserveLeaderPendingBytes(long)
    * @see StateMachine#getNewTermOperation()
    */
   public boolean canReplicateNewOperation(Object operation) {
@@ -319,6 +401,78 @@ public final class RaftNodeImpl implements RaftNode {
       return lastCommittedEntry.getTerm() == state.term();
     }
     return state.leadershipTransferState() == null;
+  }
+
+  /**
+   * Atomically reserves {@code bytes} of credit from the server-wide {@link PendingBytesBudget} for
+   * an admitted leader-side propose at {@code logIndex}. Returns {@code true} on success (caller
+   * must {@link #releaseLeaderPendingBytesAt(long) release} the credit when the entry commits or
+   * wholesale-release on step-down / terminate); returns {@code false} if the global budget is
+   * exhausted, in which case the propose must fail with {@link CannotReplicateException}.
+   * <p>
+   * {@code bytes <= 0} is a no-op success: non-{@code byte[]} ops do not occupy heap-pinned payload
+   * bytes and so do not need to enter the credit accounting. Callers must invoke this on the
+   * per-group executor thread; the per-node bookkeeping map is not synchronized.
+   */
+  public boolean tryReserveLeaderPendingBytes(long logIndex, long bytes) {
+    if (bytes <= 0L) {
+      return true;
+    }
+    if (!pendingBytesBudget.tryAcquire(bytes)) {
+      return false;
+    }
+    Long previous = reservedBytesByIndex.put(logIndex, bytes);
+    if (previous != null) {
+      // Defensive: re-reserving for the same index would lose track of the prior reservation.
+      // This should not happen because each leader-side log index is appended exactly once.
+      // Treat the older reservation as still owed and aggregate.
+      reservedBytesByIndex.put(logIndex, previous + bytes);
+    }
+    return true;
+  }
+
+  /**
+   * Releases the credit (if any) previously reserved at {@code logIndex} via
+   * {@link #tryReserveLeaderPendingBytes(long, long)}. Call sites: per-entry on commit-apply (the
+   * entry is no longer "uncommitted" on this leader, so the back-pressure should let new proposes
+   * flow), and on log truncation that drops a previously reserved index without committing it.
+   * No-op if the index has no outstanding reservation.
+   */
+  public void releaseLeaderPendingBytesAt(long logIndex) {
+    Long bytes = reservedBytesByIndex.remove(logIndex);
+    if (bytes != null && bytes > 0L) {
+      pendingBytesBudget.release(bytes);
+    }
+  }
+
+  /**
+   * Releases <i>all</i> credit this node has currently reserved against the server-wide
+   * {@link PendingBytesBudget}. Called when the node steps down to follower or terminates with
+   * uncommitted leader-side reservations still outstanding (those entries will either be committed
+   * by a different leader, in which case the new leader's credits are what matter, or truncated by
+   * a different leader's log).
+   */
+  public void releaseAllLeaderPendingBytes() {
+    if (reservedBytesByIndex.isEmpty()) {
+      return;
+    }
+    long total = 0L;
+    for (Long bytes : reservedBytesByIndex.values()) {
+      if (bytes != null) {
+        total += bytes;
+      }
+    }
+    reservedBytesByIndex.clear();
+    if (total > 0L) {
+      pendingBytesBudget.release(total);
+    }
+  }
+
+  /**
+   * Returns the {@link PendingBytesBudget} this node consults for leader-side propose admission.
+   */
+  public PendingBytesBudget pendingBytesBudget() {
+    return pendingBytesBudget;
   }
 
   /**
@@ -356,6 +510,7 @@ public final class RaftNodeImpl implements RaftNode {
     return queryState.queryCount() < maxPendingLogEntryCount;
   }
 
+  @SuppressWarnings("unchecked")
   public void sendSnapshotChunk(RaftEndpoint follower, long snapshotIndex,
     int requestedSnapshotChunkIndex) {
     // this node can be a leader or a follower!
@@ -472,6 +627,9 @@ public final class RaftNodeImpl implements RaftNode {
       LOG.info("{} Status is set to {}", localEndpointStr, newStatus);
     } else {
       LOG.warn("{} Status is set to {}", localEndpointStr, newStatus);
+    }
+    if (isTerminal(newStatus)) {
+      releaseAllLeaderPendingBytes();
     }
     publishRaftNodeReport(RaftNodeReportReason.STATUS_CHANGE);
   }
@@ -660,10 +818,6 @@ public final class RaftNodeImpl implements RaftNode {
       handler = new InstallSnapshotRequestHandler(this, (InstallSnapshotRequest) message);
     } else if (message instanceof InstallSnapshotResponse) {
       handler = new InstallSnapshotResponseHandler(this, (InstallSnapshotResponse) message);
-    } else if (message instanceof LeaderHeartbeat) {
-      handler = new LeaderHeartbeatHandler(this, (LeaderHeartbeat) message);
-    } else if (message instanceof LeaderHeartbeatAck) {
-      handler = new LeaderHeartbeatAckHandler(this, (LeaderHeartbeatAck) message);
     } else if (message instanceof VoteRequest) {
       handler = new VoteRequestHandler(this, (VoteRequest) message);
     } else if (message instanceof VoteResponse) {
@@ -678,12 +832,77 @@ public final class RaftNodeImpl implements RaftNode {
       throw new IllegalArgumentException("Invalid Raft msg: " + message);
     }
     try {
-      executor.execute(handler);
+      if (isControlLaneMessage(message)) {
+        executor.executeControl(handler);
+      } else {
+        executor.execute(handler);
+      }
     } catch (Throwable t) {
       if (LOG.isDebugEnabled()) {
         LOG.error(localEndpointStr + " could not handle " + message, t);
       }
     }
+  }
+
+  /**
+   * {@link RaftMessage} interfaces whose implementations must be handled on the
+   * {@link RaftNodeExecutor#executeControl(Runnable) control} lane. Concrete message classes are
+   * classified once via {@link #CONTROL_LANE_MESSAGE_CACHE} so the per-RPC hot path remains a
+   * single identity-keyed map lookup, while still honoring {@code instanceof} subtype semantics for
+   * any {@link RaftMessage} implementation. Keep this list in sync with
+   * {@link #isControlLaneMessage(RaftMessage)} and {@link #handle(RaftMessage)}.
+   */
+  private static final Set<Class<? extends RaftMessage>> CONTROL_LANE_MESSAGE_INTERFACES;
+  static {
+    Set<Class<? extends RaftMessage>> s = new HashSet<>(8);
+    s.add(VoteRequest.class);
+    s.add(VoteResponse.class);
+    s.add(PreVoteRequest.class);
+    s.add(PreVoteResponse.class);
+    s.add(TriggerLeaderElectionRequest.class);
+    CONTROL_LANE_MESSAGE_INTERFACES = Collections.unmodifiableSet(s);
+  }
+
+  /**
+   * Per-concrete-class cache of control-lane membership. Each {@link RaftMessage} concrete class is
+   * classified once against {@link #CONTROL_LANE_MESSAGE_INTERFACES} via
+   * {@link Class#isAssignableFrom(Class)} and the result is memoized for subsequent dispatches.
+   */
+  private static final ClassValue<Boolean> CONTROL_LANE_MESSAGE_CACHE = new ClassValue<Boolean>() {
+    @Override
+    protected Boolean computeValue(Class<?> type) {
+      for (Class<? extends RaftMessage> iface : CONTROL_LANE_MESSAGE_INTERFACES) {
+        if (iface.isAssignableFrom(type)) {
+          return Boolean.TRUE;
+        }
+      }
+      return Boolean.FALSE;
+    }
+  };
+
+  /**
+   * Returns true if the given Raft message must be handled on the
+   * {@link RaftNodeExecutor#executeControl(Runnable) control} lane of the per-group executor
+   * mailbox.
+   * <p>
+   * Control-lane messages are leader election traffic (vote, pre-vote,
+   * {@link TriggerLeaderElectionRequest}). Heartbeat traffic does not flow through
+   * {@link #handle(RaftMessage)} (the per-server bulk envelope path inbound-dispatches it directly
+   * via {@code BulkHeartbeatFrameHandler} / {@code BulkHeartbeatAckFrameHandler}).
+   * <p>
+   * Bulk handlers ({@link AppendEntriesRequest} and its acks, {@link InstallSnapshotRequest} and
+   * its ack) keep the default {@link RaftNodeExecutor#execute(Runnable)} lane: every ack runs on
+   * the same lane as the request that produced it, so an
+   * {@link AppendEntriesSuccessResponse}/{@link AppendEntriesFailureResponse} that advances
+   * commitIndex (and therefore unblocks a client {@code replicate} future) is processed on the bulk
+   * lane behind any preceding bulk work, not in front of an unrelated heartbeat tick.
+   * <p>
+   * The classifier is exposed for tests that wire alternative {@link RaftNode} implementations
+   * (e.g. spies in the inbound-classification transport tests) without forcing them to redefine the
+   * same classification logic as {@link #handle(RaftMessage)} above.
+   */
+  public static boolean isControlLaneMessage(@NonNull RaftMessage message) {
+    return CONTROL_LANE_MESSAGE_CACHE.get(message.getClass());
   }
 
   @NonNull
@@ -696,18 +915,18 @@ public final class RaftNodeImpl implements RaftNode {
   @NonNull
   @Override
   public <T> CompletableFuture<Ordered<T>> query(@NonNull Object operation,
-    @NonNull QueryPolicy queryPolicy, Optional<Long> minCommitIndex, Optional<Duration> timeout) {
+    @NonNull QueryPolicy queryPolicy, long minCommitIndex, long timeoutMillis) {
     OrderedFuture<T> future = new OrderedFuture<>();
     Runnable task = new QueryTask(this, requireNonNull(operation), queryPolicy,
-      Math.max(minCommitIndex.orElse(0L), 0L), timeout, future);
+      Math.max(minCommitIndex, 0L), Math.max(timeoutMillis, 0L), future);
     return executeIfRunning(task, future);
   }
 
   @NonNull
   @Override
   public CompletableFuture<Ordered<Object>> waitFor(long minCommitIndex, Duration timeout) {
-    return query(NoOp.INSTANCE, QueryPolicy.EVENTUAL_CONSISTENCY, Optional.of(minCommitIndex),
-      Optional.of(timeout));
+    return query(NoOp.INSTANCE, QueryPolicy.EVENTUAL_CONSISTENCY, minCommitIndex,
+      timeout.toMillis());
   }
 
   @NonNull
@@ -778,17 +997,16 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   private RaftNodeReportImpl newReport(RaftNodeReportReason reason) {
-    Map<RaftEndpoint,
-      Long> heartbeatTimestamps = state.leaderState() != null
-        ? state.leaderState().responseTimestamps()
-        : Collections.emptyMap();
-    Optional<Long> quorumTimestamp = getQuorumHeartbeatTimestamp();
-    // non-empty if this node is not leader and received at least one heartbeat from
-    // the leader.
-    Optional<Long> leaderHeartbeatTimestamp =
-      (quorumTimestamp.isEmpty() && this.lastLeaderHeartbeatTimestamp > 0)
-        ? Optional.of(Math.min(this.lastLeaderHeartbeatTimestamp, clock.millis()))
-        : Optional.empty();
+    LeaderState leaderState = state.leaderState();
+    Map<RaftEndpoint, Long> heartbeatTimestamps =
+      leaderState != null ? leaderState.responseTimestamps() : Collections.emptyMap();
+    long quorumTimestamp = leaderState != null
+      ? leaderState.quorumResponseTimestamp(state.logReplicationQuorumSize(), clock.millis())
+      : 0L;
+    // Non-zero if this node is not leader and received at least one heartbeat from the leader.
+    long leaderHeartbeatTimestamp = (quorumTimestamp == 0L && this.lastLeaderHeartbeatTimestamp > 0)
+      ? Math.min(this.lastLeaderHeartbeatTimestamp, clock.millis())
+      : 0L;
     return new RaftNodeReportImpl(requireNonNull(reason), groupId, state.localEndpoint(),
       state.initialMembers(), state.committedGroupMembers(), state.effectiveGroupMembers(),
       state.role(), status, state.termState(), newLogReport(), heartbeatTimestamps, quorumTimestamp,
@@ -860,6 +1078,36 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   /**
+   * Cached {@link Runnable} that submits {@link #demoteToFollowerIfLeaseExpired()} on this node's
+   * executor. Held as a field so the bulk-heartbeat wheel does not allocate a capturing lambda per
+   * dispatch.
+   */
+  @NonNull
+  public Runnable demoteToFollowerIfLeaseExpiredTask() {
+    return demoteToFollowerIfLeaseExpiredTask;
+  }
+
+  /**
+   * Cached {@link Runnable} that submits {@link #sendCatchupAppendsIfNeeded()} on this node's
+   * executor. Held as a field so the bulk-heartbeat wheel does not allocate a capturing
+   * method-reference per dispatch.
+   */
+  @NonNull
+  public Runnable sendCatchupAppendsIfNeededTask() {
+    return sendCatchupAppendsIfNeededTask;
+  }
+
+  /**
+   * Cached {@link Runnable} that submits {@code resetLeaderAndTryTriggerPreVote(true)} on this
+   * node's executor. Held as a field so the bulk-heartbeat wheel's per-follower walk does not
+   * allocate a capturing lambda per dispatch.
+   */
+  @NonNull
+  public Runnable resetLeaderAndTryTriggerPreVoteTask() {
+    return resetLeaderAndTryTriggerPreVoteTask;
+  }
+
+  /**
    * Applies the committed log entries between {@code lastApplied} and {@code commitIndex}, if
    * there's any available. If new entries are applied, {@link RaftState}'s {@code lastApplied}
    * field is also updated.
@@ -907,6 +1155,9 @@ public final class RaftNodeImpl implements RaftNode {
       entry.getTerm(), entry.getOperation());
     long logIndex = entry.getIndex();
     Object operation = entry.getOperation();
+    // Return the global pending-bytes credit (if any) reserved for this log index at admission
+    // time. Map presence is the evidence that this node actually held the credit.
+    releaseLeaderPendingBytesAt(logIndex);
     Object response;
     if (operation instanceof RaftGroupOp) {
       if (operation instanceof UpdateRaftGroupMembersOp) {
@@ -953,23 +1204,29 @@ public final class RaftNodeImpl implements RaftNode {
   /**
    * Updates the last leader heartbeat timestamp to now. Also defers the local election timer (a
    * real leader heartbeat must suppress the local pre-vote pass too).
+   * <p>
+   * Safe to call from the per-group executor or from the bulk inbound netty event-loop thread. Both
+   * timestamp fields are advanced via monotonic-max accumulators so a stale concurrent write loses
+   * to a fresher one and never travels backwards.
    */
   public void leaderHeartbeatReceived() {
     long now = clock.millis();
-    lastLeaderHeartbeatTimestamp = Math.max(lastLeaderHeartbeatTimestamp, now);
-    lastElectionTimerResetTimestamp = Math.max(lastElectionTimerResetTimestamp, now);
+    LAST_HB.accumulateAndGet(this, now, Math::max);
+    LAST_ER.accumulateAndGet(this, now, Math::max);
+    currentElectionTimeoutMillis = sampleElectionTimeoutMillis();
   }
 
   /**
    * Defers the local election timer without claiming a fresh leader heartbeat. Called by
    * {@link org.apache.hadoop.hbase.consensus.raft.impl.handler.VoteRequestHandler} after granting a
-   * vote so that the {@link org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask} does
-   * not immediately preempt the candidate we just voted for. Crucially this does NOT refresh
-   * {@link #lastLeaderHeartbeatTimestamp}: a vote grant is not a leader heartbeat, so sticky leader
-   * checks in (Pre)VoteRequestHandler still correctly reflect whether a real leader is alive.
+   * vote so that the heartbeat scheduler does not immediately preempt the candidate we just voted
+   * for. This does NOT refresh {@link #lastLeaderHeartbeatTimestamp}. A vote grant is not a leader
+   * heartbeat, so sticky leader checks in (Pre)VoteRequestHandler still reflect whether a real
+   * leader is alive.
    */
   public void electionTimerReset() {
-    lastElectionTimerResetTimestamp = Math.max(lastElectionTimerResetTimestamp, clock.millis());
+    LAST_ER.accumulateAndGet(this, clock.millis(), Math::max);
+    currentElectionTimeoutMillis = sampleElectionTimeoutMillis();
   }
 
   /**
@@ -978,6 +1235,45 @@ public final class RaftNodeImpl implements RaftNode {
    */
   public RaftState state() {
     return state;
+  }
+
+  /**
+   * Visible for testing. Read on the per-node executor thread (the only thread allowed to mutate
+   * this field). See {@code TestRaftNodePauseRobustness}.
+   */
+  public long lastLeaderHeartbeatTimestampForTesting() {
+    return lastLeaderHeartbeatTimestamp;
+  }
+
+  /**
+   * Visible for testing. Read on the per-node executor thread (the only thread allowed to mutate
+   * this field). See {@code TestRaftNodePauseRobustness}.
+   */
+  public long lastElectionTimerResetTimestampForTesting() {
+    return lastElectionTimerResetTimestamp;
+  }
+
+  /** Volatile read of the most recent leader-heartbeat-observed timestamp. */
+  public long lastLeaderHeartbeatTimestampVolatile() {
+    return lastLeaderHeartbeatTimestamp;
+  }
+
+  /** Volatile read of the most recent election-timer-reset timestamp. */
+  public long lastElectionTimerResetTimestampVolatile() {
+    return lastElectionTimerResetTimestamp;
+  }
+
+  /** Volatile read of the per-follower randomized election timeout. */
+  public long currentElectionTimeoutMillisVolatile() {
+    return currentElectionTimeoutMillis;
+  }
+
+  /**
+   * Recomputes the per-follower randomized election timeout and publishes it via the volatile
+   * field.
+   */
+  public void publishFreshElectionTimeoutSample() {
+    currentElectionTimeoutMillis = sampleElectionTimeoutMillis();
   }
 
   private void takeSnapshot(RaftLog log, long snapshotIndex) {
@@ -1079,6 +1375,7 @@ public final class RaftNodeImpl implements RaftNode {
    * that the given snapshot is already persisted and flushed to the storage. the snapshot entry
    * object to install to the local Raft node
    */
+  @SuppressWarnings("unchecked")
   public void installSnapshot(SnapshotEntry snapshotEntry) {
     long commitIndex = state.commitIndex();
     if (commitIndex >= snapshotEntry.getIndex()) {
@@ -1242,81 +1539,46 @@ public final class RaftNodeImpl implements RaftNode {
   }
 
   /**
-   * Drives the periodic heartbeat / election-timer logic for this node.
-   * <p>
-   * Called by {@link HeartbeatScheduler} implementations on this node's executor. Public to enable
-   * alternate schedulers without exposing internals via reflection. Rescheduling (when relevant) is
-   * the caller's responsibility.
-   * <p>
-   * On the leader path: if the lease has expired the node demotes to follower and the tick exits.
-   * Otherwise the node broadcasts a lightweight {@link LeaderHeartbeat} to every remote member and
-   * fires {@link #sendCatchupAppendsIfNeeded()} for followers that need real
-   * {@code AppendEntriesRequest}s for log catch-up, snapshot trigger, or initial match-index
-   * discovery.
-   * <p>
-   * On the follower path: detects missing or timed-out leaders, leaders that are not members of the
-   * effective group, and triggers a pre-vote round through
-   * {@link #resetLeaderAndTryTriggerPreVote(boolean)}.
+   * Bumps {@link #lastLeaderHeartbeatTimestamp}, {@link #lastElectionTimerResetTimestamp}, and (if
+   * leader) {@link LeaderState#leaseExpiryMillis(long)} forward by {@code pauseHintMillis} when the
+   * sweeper-attested delta falls between {@link RaftConfig#getPauseDetectionThresholdMillis()} and
+   * {@link RaftConfig#getPauseToleranceCapMillis()}. Called once per per-server timing-wheel tick
+   * for every registered node so a JVM resuming from a stop-the-world pause does not see its lease
+   * appear instantly expired.
+   * @param pauseHintMillis externally-observed JVM-pause delta in milliseconds, or {@code 0} for a
+   *                        no-op
    */
-  public void runHeartbeatTick() {
-    if (state.leaderState() != null) {
-      if (demoteToFollowerIfLeaseExpired()) {
-        return;
-      }
-      broadcastLeaderHeartbeat();
-      sendCatchupAppendsIfNeeded();
+  public void absorbPauseIfDetected(long now, long pauseHintMillis) {
+    if (pauseHintMillis <= 0L) {
       return;
     }
-    RaftEndpoint leader = state.leader();
-    if (leader == null) {
-      if (state.role() == FOLLOWER && state.preCandidateState() == null) {
-        LOG.warn(
-          "{} We are FOLLOWER and there is no current leader. Will start new election round.",
-          localEndpointStr);
-        resetLeaderAndTryTriggerPreVote(false);
-      }
-    } else if (isElectionTimerElapsed() && state.preCandidateState() == null) {
-      LOG.warn("{} Current leader {}'s heartbeats are timed-out.", localEndpointStr,
-        leader.getId());
-      resetLeaderAndTryTriggerPreVote(true);
-    } else if (
-      !state.committedGroupMembers().isKnownMember(leader) && state.preCandidateState() == null
-    ) {
-      LOG.warn("{} Current leader {} is not member anymore.", localEndpointStr, leader.getId());
-      resetLeaderAndTryTriggerPreVote(true);
+    long delta = pauseHintMillis;
+    long threshold = config.getPauseDetectionThresholdMillis();
+    long cap = config.getPauseToleranceCapMillis();
+    if (delta < threshold || delta > cap) {
+      return;
+    }
+    LOG.warn(
+      "{} Detected JVM pause of {} ms; bumping heartbeat / election / lease timestamps "
+        + "forward to absorb it (threshold={} ms, cap={} ms).",
+      localEndpointStr, delta, threshold, cap);
+    // Only advance fields that already hold a meaningful wall-clock reference. A field at 0L
+    // means no prior event, no leader heartbeat seen yet, no election-timer reset yet.
+    final long bump = delta;
+    LAST_HB.accumulateAndGet(this, bump, (cur, d) -> cur > 0L ? cur + d : cur);
+    LAST_ER.accumulateAndGet(this, bump, (cur, d) -> cur > 0L ? cur + d : cur);
+    LeaderState ls = state.leaderState();
+    if (ls != null) {
+      ls.bumpLeaseExpiryMillis(bump);
     }
   }
 
   /**
-   * Sends one lightweight {@link LeaderHeartbeat} to each remote member of the Raft group.
-   * <p>
-   * Heartbeats only carry {@code (groupId, sender, term, commitIndex)} and do not touch the log on
-   * the receiving side. Followers update their commit index (clamped by the local
-   * {@code lastLogOrSnapshotIndex}) and reply with a {@link LeaderHeartbeatAck}. Match-index
-   * discovery, log catch-up, and snapshot triggering are handled separately by
-   * {@link #sendCatchupAppendsIfNeeded()}.
-   * <p>
-   * If this group is quiescent ({@link RaftState#groupQuiescent()} is {@code true}) the per-group
-   * heartbeat is skipped. Failure detection runs on the per-RS keepalive carried on every
-   * {@code HeartbeatBatchPB} envelope, see {@code SweepingHeartbeatScheduler}.
-   */
-  public void broadcastLeaderHeartbeat() {
-    if (state.groupQuiescent()) {
-      return;
-    }
-    for (RaftEndpoint follower : state.remoteMembers()) {
-      LeaderHeartbeat hb = modelFactory.createLeaderHeartbeatBuilder().setGroupId(getGroupId())
-        .setSender(getLocalEndpoint()).setTerm(state.term()).setCommitIndex(state.commitIndex())
-        .build();
-      send(follower, hb);
-    }
-  }
-
-  /**
-   * Marks this group quiescent on the leader and emits one fire-and-forget {@link LeaderHeartbeat}
-   * per follower with {@code quiesced = true}. The leader stops emitting per-group heartbeats for
-   * this group until {@link #wake()} is called or the role changes. Failure detection thereafter
-   * runs on the per-RS keepalive carried on every {@code HeartbeatBatchPB} envelope.
+   * Marks this group quiescent on the leader. The leader's bulk-heartbeat emission continues to
+   * include this group on every tick with the per-group quiesce bit set in the bulk frame, so
+   * followers see the transition without requiring a dedicated per-group fire-and-forget. Failure
+   * detection thereafter runs on the per-server keepalive carried at envelope level on every bulk
+   * frame and bulk acknowledgement.
    * <p>
    * Caller must have established that the eligibility checks pass: leader role, valid lease, grace
    * elapsed, no in-flight propose, no leadership transfer, all reachable voting followers caught
@@ -1336,12 +1598,6 @@ public final class RaftNodeImpl implements RaftNode {
     ls.laggingOnQuiesce(lagging == null ? Collections.emptyList() : lagging);
     state.groupQuiescent(true);
     LOG.debug("{} entering Quiescent (lagging={})", localEndpointStr, ls.laggingOnQuiesce());
-    for (RaftEndpoint follower : state.remoteMembers()) {
-      LeaderHeartbeat hb = modelFactory.createLeaderHeartbeatBuilder().setGroupId(getGroupId())
-        .setSender(getLocalEndpoint()).setTerm(state.term()).setCommitIndex(state.commitIndex())
-        .setQuiesced(true).build();
-      send(follower, hb);
-    }
   }
 
   /**
@@ -1351,7 +1607,7 @@ public final class RaftNodeImpl implements RaftNode {
    * {@link LeaderState#groupQuiescent()}, and {@link LeaderState#laggingOnQuiesce()}, and bumps the
    * leader's activity timestamp so the grace gate restarts.
    * <p>
-   * Followers are not pinged here; the next normal heartbeat broadcast will reach them and the
+   * Followers are not pinged here. The next normal heartbeat broadcast will reach them and the
    * receiving handler will call {@link RaftState#groupQuiescent(boolean)} {@code (false)} on any
    * non-quiesce signal.
    */
@@ -1376,14 +1632,10 @@ public final class RaftNodeImpl implements RaftNode {
 
   /**
    * Fires {@link #sendAppendEntriesRequest(RaftEndpoint)} only for those followers whose state
-   * indicates they need it, that is: their {@code matchIndex} is behind the leader's
-   * {@code lastLogOrSnapshotIndex}, or their {@code nextIndex} is at or below the leader's snapshot
-   * index (snapshot trigger). All other followers are kept in sync via the cheaper
-   * {@link #broadcastLeaderHeartbeat()} path.
-   * <p>
-   * Followers with active request-backoff (waiting on a previous AE response) are skipped here;
-   * they are followed up by {@code AppendEntriesSuccessResponseHandler.trySendAppendRequest} on
-   * response receipt or by the backoff reset task on timeout.
+   * indicates they need it. All other followers are kept in sync via the cheaper regular leader
+   * heartbeats path. Followers with active request backoff are skipped and followed up by
+   * {@code AppendEntriesSuccessResponseHandler.trySendAppendRequest} on response receipt or by the
+   * backoff reset task on timeout.
    */
   public void sendCatchupAppendsIfNeeded() {
     LeaderState leaderState = state.leaderState();
@@ -1409,11 +1661,8 @@ public final class RaftNodeImpl implements RaftNode {
   /**
    * Resets this node's known leader (optionally) and runs a pre-vote round, or promotes itself to a
    * singleton leader if it is the only voting member left.
-   * <p>
-   * Body moved verbatim from {@code HeartbeatTask.resetLeaderAndTryTriggerPreVote(boolean)}.
-   * Package-private so {@link HeartbeatTask} (and any future scheduler-driven tick) can delegate.
    */
-  void resetLeaderAndTryTriggerPreVote(boolean resetLeader) {
+  public void resetLeaderAndTryTriggerPreVote(boolean resetLeader) {
     if (resetLeader) {
       leader(null);
     }
@@ -1658,7 +1907,10 @@ public final class RaftNodeImpl implements RaftNode {
     for (RaftEndpoint member : state.remoteVotingMembers()) {
       send(member, request);
     }
-    executor.schedule(new LeaderElectionTimeoutTask(this), getLeaderElectionTimeoutMs(),
+    // Election-timeout firing must not be head-of-line blocked behind a bulk burst on the
+    // per-group mailbox: a delayed timeout extends the no-leader window and risks an election
+    // storm under load. Schedule onto the control lane.
+    executor.scheduleControl(new LeaderElectionTimeoutTask(this), getLeaderElectionTimeoutMs(),
       MILLISECONDS);
   }
 
@@ -1688,8 +1940,11 @@ public final class RaftNodeImpl implements RaftNode {
     for (RaftEndpoint member : state.remoteVotingMembers()) {
       send(member, request);
     }
-    executor.schedule(new PreVoteTimeoutTask(this, state.term()), getLeaderElectionTimeoutMs(),
-      MILLISECONDS);
+    // Pre-vote timeout firing must not be head-of-line blocked behind a bulk burst on the
+    // per-group mailbox; same reasoning as the candidate election timeout above. Schedule onto
+    // the control lane.
+    executor.scheduleControl(new PreVoteTimeoutTask(this, state.term()),
+      getLeaderElectionTimeoutMs(), MILLISECONDS);
   }
 
   public RaftException newCannotReplicateException() {
@@ -1848,36 +2103,34 @@ public final class RaftNodeImpl implements RaftNode {
    * commit index is greater than or equal to the given commit index.
    * <p>
    * Please note that the given operation must not make any mutation on the state machine.
+   * @param timeoutMillis duration in milliseconds to wait before timing out the query when the
+   *                      local commit index is below {@code minCommitIndex}; {@code 0L} fails the
+   *                      query immediately if the commit index has not advanced.
    */
-  public void runOrScheduleQuery(QueryContainer query, long minCommitIndex,
-    Optional<Duration> timeout) {
+  public void runOrScheduleQuery(QueryContainer query, long minCommitIndex, long timeoutMillis) {
     try {
       long lastApplied = state.lastApplied();
       if (lastApplied >= minCommitIndex) {
         query.run(lastApplied, stateMachine);
-      } else if (timeout.isPresent()) {
-        long timeoutNanos = timeout.get().toNanos();
-        if (timeoutNanos <= 0) {
-          query.fail(newLaggingCommitIndexException(minCommitIndex));
-        } else {
-          state.addScheduledQuery(minCommitIndex, query);
-          executor.schedule(() -> {
-            try {
-              if (state.removeScheduledQuery(minCommitIndex, query)) {
-                if (LOG.isDebugEnabled()) {
-                  LOG.debug(
-                    "{} query waiting to be executed at commit index: {} timed out! Current commit index: {}",
-                    localEndpointStr, minCommitIndex, state.commitIndex());
-                }
-                query.fail(newLaggingCommitIndexException(minCommitIndex));
+      } else if (timeoutMillis > 0L) {
+        state.addScheduledQuery(minCommitIndex, query);
+        executor.schedule(() -> {
+          try {
+            if (state.removeScheduledQuery(minCommitIndex, query)) {
+              if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                  "{} query waiting to be executed at commit index: {} timed out!"
+                    + " Current commit index: {}",
+                  localEndpointStr, minCommitIndex, state.commitIndex());
               }
-            } catch (Throwable t) {
-              LOG.error(localEndpointStr + " timing out of query for expected commit index: "
-                + minCommitIndex + " failed.", t);
-              query.fail(t);
+              query.fail(newLaggingCommitIndexException(minCommitIndex));
             }
-          }, timeoutNanos, NANOSECONDS);
-        }
+          } catch (Throwable t) {
+            LOG.error(localEndpointStr + " timing out of query for expected commit index: "
+              + minCommitIndex + " failed.", t);
+            query.fail(t);
+          }
+        }, timeoutMillis, MILLISECONDS);
       } else {
         query.fail(newLaggingCommitIndexException(minCommitIndex));
       }
@@ -1932,21 +2185,22 @@ public final class RaftNodeImpl implements RaftNode {
   /**
    * @return whether the local election timer has elapsed. The election timer is deferred by either
    *         a real leader heartbeat or by granting a vote, so this returning {@code false} means
-   *         the local {@link org.apache.hadoop.hbase.consensus.raft.impl.task.HeartbeatTask} must
-   *         NOT start a new pre-vote pass yet.
+   *         the per-server bulk-heartbeat wheel must NOT schedule a new pre-vote pass yet.
    */
   public boolean isElectionTimerElapsed() {
-    return isLeaderHeartbeatTimeoutElapsed(lastElectionTimerResetTimestamp, clock.millis());
-  }
-
-  private boolean isLeaderHeartbeatTimeoutElapsed(long timestamp) {
-    return isLeaderHeartbeatTimeoutElapsed(timestamp, clock.millis());
+    return clock.millis() - lastElectionTimerResetTimestamp >= currentElectionTimeoutMillis;
   }
 
   private boolean isLeaderHeartbeatTimeoutElapsed(long timestamp, long now) {
     return now - timestamp >= leaderHeartbeatTimeoutMillis;
   }
 
+  /** Visible for tests. */
+  public long getCurrentElectionTimeoutMillis() {
+    return currentElectionTimeoutMillis;
+  }
+
+  @SuppressWarnings("unchecked")
   private void initRestoredState() {
     SnapshotEntry snapshotEntry = state.log().snapshotEntry();
     if (isNonInitial(snapshotEntry)) {
@@ -2006,28 +2260,8 @@ public final class RaftNodeImpl implements RaftNode {
     return modelFactory;
   }
 
-  public boolean demoteToFollowerIfQuorumHeartbeatTimeoutElapsed() {
-    Optional<Long> quorumTimestamp = getQuorumHeartbeatTimestamp();
-    if (quorumTimestamp.isEmpty()) {
-      return true;
-    }
-    boolean demoteToFollower = isLeaderHeartbeatTimeoutElapsed(quorumTimestamp.get());
-    if (demoteToFollower) {
-      LOG.warn(
-        "{} Demoting to {} since not received append entries responses from majority recently. Latest quorum timestamp: {}",
-        localEndpointStr, FOLLOWER, quorumTimestamp.get());
-      toFollower(state.term());
-    }
-    return demoteToFollower;
-  }
-
-  private Optional<Long> getQuorumHeartbeatTimestamp() {
-    LeaderState leaderState = state.leaderState();
-    if (leaderState == null) {
-      return Optional.empty();
-    }
-    return Optional
-      .of(leaderState.quorumResponseTimestamp(state.logReplicationQuorumSize(), clock.millis()));
+  public Transport getTransport() {
+    return transport;
   }
 
   /**
@@ -2042,6 +2276,8 @@ public final class RaftNodeImpl implements RaftNode {
         localEndpointStr, term, state.term(), state.role(), status,
         new Throwable("toFollower call site"));
     }
+    // Surrender any outstanding leader-side pending-bytes credit.
+    releaseAllLeaderPendingBytes();
     state.toFollower(term);
     publishRaftNodeReport(RaftNodeReportReason.ROLE_CHANGE);
   }

@@ -42,10 +42,6 @@ public class TestConsensusFrameCodec extends TestBase {
 
   private static final int MAX_FRAME = 1 << 20;
 
-  // -------------------------------------------------------------------------------------------
-  // Encoder
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testEncodeFrame() {
     EmbeddedChannel ch = new EmbeddedChannel(new ConsensusFrameEncoder());
@@ -67,10 +63,6 @@ public class TestConsensusFrameCodec extends TestBase {
       ch.finishAndReleaseAll();
     }
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Decoder happy paths
-  // -------------------------------------------------------------------------------------------
 
   @Test
   public void testDecodeFrame() {
@@ -116,10 +108,6 @@ public class TestConsensusFrameCodec extends TestBase {
     ch.finishAndReleaseAll();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Decoder error paths
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testRejectCorruptBytes() {
     EmbeddedChannel ch = new EmbeddedChannel(new ConsensusFrameDecoder(MAX_FRAME));
@@ -143,10 +131,6 @@ public class TestConsensusFrameCodec extends TestBase {
     ch.finishAndReleaseAll();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Round-trip via encoder + decoder
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testRoundTrip() {
     EmbeddedChannel encoder = new EmbeddedChannel(new ConsensusFrameEncoder());
@@ -163,43 +147,76 @@ public class TestConsensusFrameCodec extends TestBase {
   }
 
   @Test
-  public void testHeartbeatAckBatchRoundTrip() {
+  public void testBulkHeartbeatRoundTrip() {
     EmbeddedChannel encoder = new EmbeddedChannel(new ConsensusFrameEncoder());
     EmbeddedChannel decoder = new EmbeddedChannel(new ConsensusFrameDecoder(MAX_FRAME));
-    ConsensusProtos.ConsensusFrame frame = newHeartbeatAckBatch("gA", "gB", 7);
+    ConsensusProtos.ConsensusFrame frame = newBulkHeartbeat("gA", "gB", 7, 100L);
     encoder.writeOutbound(frame);
     ByteBuf encoded = encoder.readOutbound();
     decoder.writeInbound(encoded);
     ConsensusProtos.ConsensusFrame parsed = decoder.readInbound();
-    assertThat(parsed.getKind()).isEqualTo(ConsensusProtos.ConsensusFrame.Kind.HEARTBEAT_ACK_BATCH);
-    assertThat(parsed.getHeartbeatAckBatch().getGroupsCount()).isEqualTo(2);
-    assertThat(parsed.getHeartbeatAckBatch().getGroups(0).getGroupId().toStringUtf8())
+    assertThat(parsed.getKind()).isEqualTo(ConsensusProtos.ConsensusFrame.Kind.BULK_HEARTBEAT);
+    assertThat(parsed.getBulkHeartbeat().getEpoch()).isEqualTo(12345L);
+    assertThat(parsed.getBulkHeartbeat().getTick()).isEqualTo(7L);
+    assertThat(parsed.getBulkHeartbeat().getGroupsCount()).isEqualTo(2);
+    assertThat(parsed.getBulkHeartbeat().getGroups(0).getGroupId().toStringUtf8()).isEqualTo("gA");
+    assertThat(parsed.getBulkHeartbeat().getGroups(0).getTerm()).isEqualTo(7);
+    assertThat(parsed.getBulkHeartbeat().getGroups(0).getCommitIndex()).isEqualTo(100L);
+    assertThat(parsed.getBulkHeartbeat().getGroups(1).getGroupId().toStringUtf8()).isEqualTo("gB");
+    encoder.finishAndReleaseAll();
+    decoder.finishAndReleaseAll();
+  }
+
+  @Test
+  public void testBulkHeartbeatAckRoundTrip() {
+    EmbeddedChannel encoder = new EmbeddedChannel(new ConsensusFrameEncoder());
+    EmbeddedChannel decoder = new EmbeddedChannel(new ConsensusFrameDecoder(MAX_FRAME));
+    ConsensusProtos.ConsensusFrame frame = newBulkHeartbeatAck("gA", "gB", 7);
+    encoder.writeOutbound(frame);
+    ByteBuf encoded = encoder.readOutbound();
+    decoder.writeInbound(encoded);
+    ConsensusProtos.ConsensusFrame parsed = decoder.readInbound();
+    assertThat(parsed.getKind()).isEqualTo(ConsensusProtos.ConsensusFrame.Kind.BULK_HEARTBEAT_ACK);
+    assertThat(parsed.getBulkHeartbeatAck().getEpoch()).isEqualTo(6789L);
+    assertThat(parsed.getBulkHeartbeatAck().getTick()).isEqualTo(7L);
+    assertThat(parsed.getBulkHeartbeatAck().getGroupsCount()).isEqualTo(2);
+    assertThat(parsed.getBulkHeartbeatAck().getGroups(0).getGroupId().toStringUtf8())
       .isEqualTo("gA");
-    assertThat(parsed.getHeartbeatAckBatch().getGroups(0).getTerm()).isEqualTo(7);
-    assertThat(parsed.getHeartbeatAckBatch().getGroups(1).getGroupId().toStringUtf8())
+    assertThat(parsed.getBulkHeartbeatAck().getGroups(0).getTerm()).isEqualTo(7);
+    assertThat(parsed.getBulkHeartbeatAck().getGroups(1).getGroupId().toStringUtf8())
       .isEqualTo("gB");
     encoder.finishAndReleaseAll();
     decoder.finishAndReleaseAll();
   }
 
-  private static ConsensusProtos.ConsensusFrame newHeartbeatAckBatch(String g1, String g2,
-    int term) {
+  private static ConsensusProtos.ConsensusFrame newBulkHeartbeat(String g1, String g2, int term,
+    long commitIndex) {
     ConsensusProtos.RaftEndpointPB sender =
       ConsensusProtos.RaftEndpointPB.newBuilder().setId(ByteString.copyFromUtf8("node-1")).build();
-    ConsensusProtos.BatchHeartbeatAckPB.Builder batch =
-      ConsensusProtos.BatchHeartbeatAckPB.newBuilder()
-        .addGroups(ConsensusProtos.GroupHeartbeatAckPB.newBuilder()
-          .setGroupId(ByteString.copyFromUtf8(g1)).setSender(sender).setTerm(term))
-        .addGroups(ConsensusProtos.GroupHeartbeatAckPB.newBuilder()
-          .setGroupId(ByteString.copyFromUtf8(g2)).setSender(sender).setTerm(term));
+    ConsensusProtos.BulkHeartbeatPB.Builder bulk =
+      ConsensusProtos.BulkHeartbeatPB.newBuilder().setSender(sender).setEpoch(12345L).setTick(term)
+        .addGroups(ConsensusProtos.GroupBulkHeartbeatPB.newBuilder()
+          .setGroupId(ByteString.copyFromUtf8(g1)).setTerm(term).setCommitIndex(commitIndex))
+        .addGroups(ConsensusProtos.GroupBulkHeartbeatPB.newBuilder()
+          .setGroupId(ByteString.copyFromUtf8(g2)).setTerm(term).setCommitIndex(commitIndex));
     return ConsensusProtos.ConsensusFrame.newBuilder()
-      .setKind(ConsensusProtos.ConsensusFrame.Kind.HEARTBEAT_ACK_BATCH).setHeartbeatAckBatch(batch)
-      .build();
+      .setKind(ConsensusProtos.ConsensusFrame.Kind.BULK_HEARTBEAT).setBulkHeartbeat(bulk).build();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Helpers
-  // -------------------------------------------------------------------------------------------
+  private static ConsensusProtos.ConsensusFrame newBulkHeartbeatAck(String g1, String g2,
+    int term) {
+    ConsensusProtos.RaftEndpointPB sender =
+      ConsensusProtos.RaftEndpointPB.newBuilder().setId(ByteString.copyFromUtf8("node-2")).build();
+    ConsensusProtos.BulkHeartbeatAckPB.Builder bulk = ConsensusProtos.BulkHeartbeatAckPB
+      .newBuilder().setSender(sender).setEpoch(6789L).setTick(term)
+      .addGroups(ConsensusProtos.GroupBulkHeartbeatAckPB.newBuilder()
+        .setGroupId(ByteString.copyFromUtf8(g1)).setTerm(term).setLastVerifiedLogIndex(50L))
+      .addGroups(ConsensusProtos.GroupBulkHeartbeatAckPB.newBuilder()
+        .setGroupId(ByteString.copyFromUtf8(g2)).setTerm(term).setLastVerifiedLogIndex(60L));
+    return ConsensusProtos.ConsensusFrame.newBuilder()
+      .setKind(ConsensusProtos.ConsensusFrame.Kind.BULK_HEARTBEAT_ACK).setBulkHeartbeatAck(bulk)
+      .build();
+  }
 
   private static ConsensusProtos.ConsensusFrame newVoteFrame(String groupId, int term) {
     return ConsensusProtos.ConsensusFrame.newBuilder()

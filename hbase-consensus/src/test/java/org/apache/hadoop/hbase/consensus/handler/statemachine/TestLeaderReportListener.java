@@ -27,7 +27,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetrics;
 import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetricsWrapper;
@@ -67,14 +66,12 @@ public class TestLeaderReportListener extends TestBase {
 
   private RaftNodeReport report(RaftRole role, int term, @Nullable RaftEndpoint leader,
     long lastSnapshotIndex, Map<RaftEndpoint, Long> followerMatchIndices) {
-    return report(role, term, leader, lastSnapshotIndex, followerMatchIndices, 0L, 0L,
-      Optional.empty(), Optional.empty());
+    return report(role, term, leader, lastSnapshotIndex, followerMatchIndices, 0L, 0L, 0L, 0L);
   }
 
   private RaftNodeReport report(RaftRole role, int term, @Nullable RaftEndpoint leader,
     long lastSnapshotIndex, Map<RaftEndpoint, Long> followerMatchIndices, long commitIndex,
-    long lastLogOrSnapshotIndex, Optional<Long> quorumHeartbeatTs,
-    Optional<Long> leaderHeartbeatTs) {
+    long lastLogOrSnapshotIndex, long quorumHeartbeatTs, long leaderHeartbeatTs) {
     RaftTerm raftTerm = mock(RaftTerm.class);
     when(raftTerm.getTerm()).thenReturn(term);
     when(raftTerm.getLeaderEndpoint()).thenReturn(leader);
@@ -267,8 +264,8 @@ public class TestLeaderReportListener extends TestBase {
     LeaderReportListener listener = new LeaderReportListener(spi, 0L, now::get, metrics);
     RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
 
-    listener.accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap(), 4L, 10L,
-      Optional.empty(), Optional.empty()));
+    listener
+      .accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap(), 4L, 10L, 0L, 0L));
 
     assertThat(metrics.getCommitBacklogHistogram().getCount()).isEqualTo(1);
     assertThat(metrics.getCommitBacklogHistogram().snapshot().getMax()).isEqualTo(6);
@@ -282,8 +279,8 @@ public class TestLeaderReportListener extends TestBase {
     RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
 
     now.set(1_000L);
-    listener.accept(report(RaftRole.LEADER, 1, leader, 0L, Collections.emptyMap(), 0L, 0L,
-      Optional.of(950L), Optional.empty()));
+    listener
+      .accept(report(RaftRole.LEADER, 1, leader, 0L, Collections.emptyMap(), 0L, 0L, 950L, 0L));
 
     assertThat(metrics.getQuorumHeartbeatLagHistogram().getCount()).isEqualTo(1);
     assertThat(metrics.getQuorumHeartbeatLagHistogram().snapshot().getMax()).isEqualTo(50);
@@ -307,8 +304,7 @@ public class TestLeaderReportListener extends TestBase {
     matches.put(b, 5L);
     matches.put(c, 9L);
 
-    listener.accept(
-      report(RaftRole.LEADER, 1, leader, 0L, matches, 5L, 10L, Optional.empty(), Optional.empty()));
+    listener.accept(report(RaftRole.LEADER, 1, leader, 0L, matches, 5L, 10L, 0L, 0L));
 
     assertThat(metrics.getReplicationLagHistogram().getCount()).isEqualTo(1);
     assertThat(metrics.getReplicationLagHistogram().snapshot().getMax())
@@ -323,8 +319,8 @@ public class TestLeaderReportListener extends TestBase {
     RaftEndpoint leader = LocalRaftEndpoint.newEndpoint();
 
     now.set(2_000L);
-    listener.accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap(), 0L, 0L,
-      Optional.empty(), Optional.of(1_975L)));
+    listener
+      .accept(report(RaftRole.FOLLOWER, 1, leader, 0L, Collections.emptyMap(), 0L, 0L, 0L, 1_975L));
 
     assertThat(metrics.getLeaderHeartbeatLagHistogram().getCount()).isEqualTo(1);
     assertThat(metrics.getLeaderHeartbeatLagHistogram().snapshot().getMax()).isEqualTo(25);

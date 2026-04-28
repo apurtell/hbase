@@ -66,7 +66,9 @@ public final class LeadershipTransferState {
    * same target endpoint. Otherwise, the given future object is notified with
    * {@link IllegalStateException}.
    */
-  void andThen(RaftEndpoint targetEndpoint, OrderedFuture otherFuture) {
+  @SuppressWarnings("unchecked")
+  void andThen(RaftEndpoint targetEndpoint,
+    @SuppressWarnings("rawtypes") OrderedFuture otherFuture) {
     if (this.endpoint.equals(targetEndpoint)) {
       future.thenApply(ordered -> {
         if (!otherFuture.isDone()) {

@@ -76,19 +76,22 @@ public class TestConsensusServerSpiSurface extends TestBase {
     assertThat(server.getGroup("g1")).isSameAs(h1);
     assertThat(server.getGroup("g2")).isSameAs(h2);
 
-    Set<Object> seenIds = new HashSet<>();
+    // GroupHandle.getGroupId() returns the canonical {@code GroupId} value object the server
+    // normalised to at the boundary; compare via {@code toString()} so the assertion stays
+    // expressed in caller-friendly String terms.
+    Set<String> seenIds = new HashSet<>();
     Iterator<GroupHandle> iter = server.groups().iterator();
     while (iter.hasNext()) {
-      seenIds.add(iter.next().getGroupId());
+      seenIds.add(iter.next().getGroupId().toString());
     }
     assertThat(seenIds).containsExactlyInAnyOrder("g1", "g2");
 
     // Snapshot semantics: removing a group after taking the iterable does not affect prior view.
     Iterable<GroupHandle> snapshot = server.groups();
     server.removeGroup("g1");
-    Set<Object> snapshotIds = new HashSet<>();
+    Set<String> snapshotIds = new HashSet<>();
     for (GroupHandle gh : snapshot) {
-      snapshotIds.add(gh.getGroupId());
+      snapshotIds.add(gh.getGroupId().toString());
     }
     assertThat(snapshotIds).containsExactlyInAnyOrder("g1", "g2");
     assertThat(server.groupCount()).isEqualTo(1);

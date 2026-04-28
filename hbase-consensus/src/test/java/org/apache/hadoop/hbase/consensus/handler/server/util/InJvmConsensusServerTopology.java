@@ -305,18 +305,12 @@ public final class InJvmConsensusServerTopology implements Closeable {
     RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(500).setLeaderHeartbeatPeriodMillis(100)
       .setLeaderHeartbeatTimeoutMillis(1500).build();
 
-  /** Default base configuration for tests: NIO Netty, fast batch, fast heartbeat tick. */
+  /** Default base configuration for tests: NIO Netty, fast heartbeat tick. */
   @NonNull
   public static Configuration defaultConf() {
     Configuration c = HBaseConfiguration.create();
     c.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
-    c.setLong(TransportConfig.BATCH_MS_KEY, 5L);
-    // Match the production default explicitly so test runs make the deadline-based fail-safe
-    // wakeup visible in OutboundChannelStats.getForcedFlushesByDeadline rather than relying on
-    // a silent default.
-    c.setLong(TransportConfig.FLUSH_DEADLINE_MS_KEY, 250L);
     c.setInt(TransportConfig.IO_THREADS_KEY, 2);
-    c.setLong(LogStoreConfig.BATCH_MS_KEY, 5L);
     c.setInt("hbase.consensus.heartbeat.interval.ms", 100);
     return c;
   }

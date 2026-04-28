@@ -30,6 +30,7 @@ import org.apache.hadoop.io.compress.Decompressor;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
+import org.apache.hbase.thirdparty.com.google.protobuf.UnsafeByteOperations;
 
 /**
  * Pluggable per-entry payload compression for {@code LogEntryPB.op_payload}.
@@ -131,7 +132,9 @@ public final class PayloadCompressor {
         raw.writeTo((OutputStream) cos);
         cos.finish();
       }
-      return ByteString.copyFrom(baos.toByteArray());
+      // Zero-copy: {@code baos.toByteArray()} returns a freshly allocated array owned solely by
+      // this call frame, so wrapping it instead of copying is safe.
+      return UnsafeByteOperations.unsafeWrap(baos.toByteArray());
     } finally {
       alg.returnCompressor(compressor);
     }
@@ -158,7 +161,7 @@ public final class PayloadCompressor {
       while ((n = in.read(buf)) > 0) {
         baos.write(buf, 0, n);
       }
-      return ByteString.copyFrom(baos.toByteArray());
+      return UnsafeByteOperations.unsafeWrap(baos.toByteArray());
     } finally {
       alg.returnDecompressor(decompressor);
     }

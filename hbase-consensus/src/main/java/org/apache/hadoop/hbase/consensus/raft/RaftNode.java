@@ -18,13 +18,11 @@
 package org.apache.hadoop.hbase.consensus.raft;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import java.time.Clock;
 import java.time.Duration;
 import java.util.Collection;
-import java.util.Optional;
-import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
+import java.util.function.IntSupplier;
 import org.apache.hadoop.hbase.consensus.raft.exception.CannotReplicateException;
 import org.apache.hadoop.hbase.consensus.raft.exception.IndeterminateStateException;
 import org.apache.hadoop.hbase.consensus.raft.exception.LaggingCommitIndexException;
@@ -33,7 +31,7 @@ import org.apache.hadoop.hbase.consensus.raft.exception.NotLeaderException;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
-import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.DefaultHeartbeatScheduler;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.BulkHeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeBuilderImpl;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
@@ -266,12 +264,15 @@ public interface RaftNode {
    * <p>
    * The returned future can be completed with {@link NotLeaderException},
    * {@link CannotReplicateException} or {@link LaggingCommitIndexException}. Please see individual
-   * exception classes for more information. the query operation to be executed the query policy to
-   * decide how to execute the given query (optional) minimum commit index that this Raft node's
-   * local commit index needs to advance (optional) duration to wait before timing out the query if
-   * the local commit index cannot advance until the given commit index have in order to execute the
-   * given query.
-   * @param <T> type of the result of the query execution
+   * exception classes for more information.
+   * @param <T>            type of the result of the query execution
+   * @param operation      the query operation to be executed
+   * @param queryPolicy    the query policy to decide how to execute the given query
+   * @param minCommitIndex minimum commit index this Raft node's local commit index needs to reach;
+   *                       {@code 0L} means no constraint
+   * @param timeoutMillis  duration in milliseconds to wait before timing out the query if the local
+   *                       commit index cannot advance up to {@code minCommitIndex}; {@code 0L}
+   *                       means no timeout
    * @return the future to be completed with the result of the query execution, or the exception if
    *         the query cannot be executed
    * @see QueryPolicy
@@ -281,7 +282,7 @@ public interface RaftNode {
    */
   @NonNull
   <T> CompletableFuture<Ordered<T>> query(@NonNull Object operation,
-    @NonNull QueryPolicy queryPolicy, Optional<Long> minCommitIndex, Optional<Duration> timeout);
+    @NonNull QueryPolicy queryPolicy, long minCommitIndex, long timeoutMillis);
 
   /**
    * The returned future is completed when the Raft node's last applied log index becomes greater
@@ -556,30 +557,43 @@ public interface RaftNode {
     RaftNodeBuilder setRaftNodeReportListener(@NonNull RaftNodeReportListener listener);
 
     /**
-     * Sets the Random instance used in parts of the Raft algorithm.
-     * @return the builder object for fluent calls
-     */
-    RaftNodeBuilder setRandom(Random random);
-
-    /**
-     * Sets the Clock instance used by parts of the Raft algorithm.
-     * @return the builder object for fluent calls
-     */
-    RaftNodeBuilder setClock(Clock clock);
-
-    /**
      * Sets the {@link HeartbeatScheduler} this Raft node will register itself with on start and
      * unregister from on terminate.
      * <p>
-     * If not set, {@link DefaultHeartbeatScheduler#INSTANCE} is used, which schedules an
-     * independent self-rescheduling task on each Raft node's own executor at the configured
-     * {@link RaftConfig#getLeaderHeartbeatPeriodMillis()} cadence.
+     * If not set, a per-node {@link BulkHeartbeatScheduler} bound to this node's transport is
+     * installed automatically and its lifecycle is tied to the node via
+     * {@link RaftNodeLifecycleAware}. Server-scoped embedders that want to share a single scheduler
+     * across all of a server's nodes should construct one and install it explicitly via this
+     * method.
      * @return the builder object for fluent calls
      * @see HeartbeatScheduler
-     * @see DefaultHeartbeatScheduler
+     * @see BulkHeartbeatScheduler
      */
     @NonNull
     RaftNodeBuilder setHeartbeatScheduler(@NonNull HeartbeatScheduler heartbeatScheduler);
+
+    /**
+     * Sets the supplier this Raft node consults for the host server's currently-active group count.
+     * Used by theelection-timer randomization formula
+     * {@code leaderHeartbeatTimeoutMillis * (2 + electionRandomizationGroupScale * log(activeGroups))}
+     * so the upper bound of the randomization interval widens with the simultaneous-follower
+     * density and avoids vote-storms at high group counts.
+     * <p>
+     * If not set, a default supplier returning {@code 1} is used (recovers the classic Raft-paper
+     * envelope of {@code [T, 2T)}).
+     * @return the builder object for fluent calls
+     */
+    @NonNull
+    RaftNodeBuilder setActiveGroupCountSupplier(@NonNull IntSupplier activeGroupCountSupplier);
+
+    /**
+     * Sets the server-wide pending-bytes credit pool this Raft node consults to admit new
+     * {@code byte[]} propose operations on the leader. The pool bounds the aggregate footprint of
+     * uncommitted leader-side bytes across all Raft groups.
+     * @return the builder object for fluent calls
+     */
+    @NonNull
+    RaftNodeBuilder setPendingBytesBudget(@NonNull PendingBytesBudget budget);
 
     /**
      * Builds and returns the RaftNode instance with the given settings.

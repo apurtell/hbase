@@ -33,6 +33,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
+import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.groupop.UpdateRaftGroupMembersOp.UpdateRaftGroupMembersOpBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
@@ -46,6 +47,8 @@ import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
 import org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesSuccessResponse;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotRequest.InstallSnapshotRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.InstallSnapshotResponse.InstallSnapshotResponseBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat.LeaderHeartbeatBuilder;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck.LeaderHeartbeatAckBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteRequest.PreVoteRequestBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.PreVoteResponse.PreVoteResponseBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
@@ -59,6 +62,8 @@ import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
 import org.apache.hadoop.hbase.consensus.raft.statemachine.StateMachine;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
+import org.apache.hadoop.hbase.consensus.raft.transport.BulkHeartbeatAckFrame;
+import org.apache.hadoop.hbase.consensus.raft.transport.BulkHeartbeatFrame;
 import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.jupiter.api.AfterEach;
@@ -296,6 +301,15 @@ public class TestRaftNodeLifecycleAware extends TestBase {
     public boolean isReachable(@NonNull RaftEndpoint endpoint) {
       return false;
     }
+
+    @Override
+    public void sendBulkHeartbeat(@NonNull RaftEndpoint target, @NonNull BulkHeartbeatFrame frame) {
+    }
+
+    @Override
+    public void sendBulkHeartbeatAck(@NonNull RaftEndpoint target,
+      @NonNull BulkHeartbeatAckFrame frame) {
+    }
   }
 
   private static class NopStateMachine implements StateMachine, RaftNodeLifecycleAware {
@@ -345,8 +359,7 @@ public class TestRaftNodeLifecycleAware extends TestBase {
     }
   }
 
-  private static class DelegatingRaftNodeExecutor extends DefaultRaftNodeExecutor
-    implements RaftNodeLifecycleAware {
+  private static class DelegatingRaftNodeExecutor extends DefaultRaftNodeExecutor {
     private volatile int startCall;
     private volatile int terminateCall;
     private volatile int executeCall;
@@ -395,8 +408,9 @@ public class TestRaftNodeLifecycleAware extends TestBase {
     }
   }
 
-  public static class DelegatingRaftModelFactory extends DefaultRaftModelFactory
-    implements RaftNodeLifecycleAware {
+  public static class DelegatingRaftModelFactory
+    implements RaftModelFactory, RaftNodeLifecycleAware {
+    private final DefaultRaftModelFactory delegate = new DefaultRaftModelFactory();
     private volatile int startCall;
     private volatile int terminateCall;
     private volatile int createCall;
@@ -421,28 +435,28 @@ public class TestRaftNodeLifecycleAware extends TestBase {
     @Override
     public LogEntryBuilder createLogEntryBuilder() {
       recordCall();
-      return super.createLogEntryBuilder();
+      return delegate.createLogEntryBuilder();
     }
 
     @NonNull
     @Override
     public SnapshotEntryBuilder createSnapshotEntryBuilder() {
       recordCall();
-      return super.createSnapshotEntryBuilder();
+      return delegate.createSnapshotEntryBuilder();
     }
 
     @NonNull
     @Override
     public SnapshotChunkBuilder createSnapshotChunkBuilder() {
       recordCall();
-      return super.createSnapshotChunkBuilder();
+      return delegate.createSnapshotChunkBuilder();
     }
 
     @NonNull
     @Override
     public AppendEntriesRequest.AppendEntriesRequestBuilder createAppendEntriesRequestBuilder() {
       recordCall();
-      return super.createAppendEntriesRequestBuilder();
+      return delegate.createAppendEntriesRequestBuilder();
     }
 
     @NonNull
@@ -450,70 +464,107 @@ public class TestRaftNodeLifecycleAware extends TestBase {
     public AppendEntriesSuccessResponse.AppendEntriesSuccessResponseBuilder
       createAppendEntriesSuccessResponseBuilder() {
       recordCall();
-      return super.createAppendEntriesSuccessResponseBuilder();
+      return delegate.createAppendEntriesSuccessResponseBuilder();
     }
 
     @NonNull
     @Override
     public AppendEntriesFailureResponseBuilder createAppendEntriesFailureResponseBuilder() {
       recordCall();
-      return super.createAppendEntriesFailureResponseBuilder();
+      return delegate.createAppendEntriesFailureResponseBuilder();
     }
 
     @NonNull
     @Override
     public InstallSnapshotRequestBuilder createInstallSnapshotRequestBuilder() {
       recordCall();
-      return super.createInstallSnapshotRequestBuilder();
+      return delegate.createInstallSnapshotRequestBuilder();
     }
 
     @NonNull
     @Override
     public InstallSnapshotResponseBuilder createInstallSnapshotResponseBuilder() {
       recordCall();
-      return super.createInstallSnapshotResponseBuilder();
+      return delegate.createInstallSnapshotResponseBuilder();
+    }
+
+    @NonNull
+    @Override
+    public LeaderHeartbeatBuilder createLeaderHeartbeatBuilder() {
+      recordCall();
+      return delegate.createLeaderHeartbeatBuilder();
+    }
+
+    @NonNull
+    @Override
+    public LeaderHeartbeatAckBuilder createLeaderHeartbeatAckBuilder() {
+      recordCall();
+      return delegate.createLeaderHeartbeatAckBuilder();
     }
 
     @NonNull
     @Override
     public PreVoteRequestBuilder createPreVoteRequestBuilder() {
       recordCall();
-      return super.createPreVoteRequestBuilder();
+      return delegate.createPreVoteRequestBuilder();
     }
 
     @NonNull
     @Override
     public PreVoteResponseBuilder createPreVoteResponseBuilder() {
       recordCall();
-      return super.createPreVoteResponseBuilder();
+      return delegate.createPreVoteResponseBuilder();
     }
 
     @NonNull
     @Override
     public TriggerLeaderElectionRequestBuilder createTriggerLeaderElectionRequestBuilder() {
       recordCall();
-      return super.createTriggerLeaderElectionRequestBuilder();
+      return delegate.createTriggerLeaderElectionRequestBuilder();
     }
 
     @NonNull
     @Override
     public VoteRequestBuilder createVoteRequestBuilder() {
       recordCall();
-      return super.createVoteRequestBuilder();
+      return delegate.createVoteRequestBuilder();
     }
 
     @NonNull
     @Override
     public VoteResponseBuilder createVoteResponseBuilder() {
       recordCall();
-      return super.createVoteResponseBuilder();
+      return delegate.createVoteResponseBuilder();
     }
 
     @NonNull
     @Override
     public UpdateRaftGroupMembersOpBuilder createUpdateRaftGroupMembersOpBuilder() {
       recordCall();
-      return super.createUpdateRaftGroupMembersOpBuilder();
+      return delegate.createUpdateRaftGroupMembersOpBuilder();
+    }
+
+    @NonNull
+    @Override
+    public RaftGroupMembersView.RaftGroupMembersViewBuilder createRaftGroupMembersViewBuilder() {
+      recordCall();
+      return delegate.createRaftGroupMembersViewBuilder();
+    }
+
+    @NonNull
+    @Override
+    public RaftEndpointPersistentState.RaftEndpointPersistentStateBuilder
+      createRaftEndpointPersistentStateBuilder() {
+      recordCall();
+      return delegate.createRaftEndpointPersistentStateBuilder();
+    }
+
+    @NonNull
+    @Override
+    public RaftTermPersistentState.RaftTermPersistentStateBuilder
+      createRaftTermPersistentStateBuilder() {
+      recordCall();
+      return delegate.createRaftTermPersistentStateBuilder();
     }
 
     private void recordCall() {

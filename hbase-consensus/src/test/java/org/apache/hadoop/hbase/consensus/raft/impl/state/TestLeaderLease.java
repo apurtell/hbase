@@ -21,6 +21,7 @@ import static org.apache.hadoop.hbase.consensus.raft.impl.local.SimpleStateMachi
 import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.eventually;
 import static org.apache.hadoop.hbase.consensus.raft.test.util.RaftTestUtils.getRole;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Collections;
@@ -58,7 +59,13 @@ public class TestLeaderLease extends TestBase {
   public void testLeaseExpiryMonotonic() {
     LeaderState ls = new LeaderState(Collections.emptyList(), 0, 0L);
     ls.leaseExpiryMillis(10L);
-    assertThatThrownBy(() -> ls.leaseExpiryMillis(5L)).isInstanceOf(IllegalStateException.class);
+    // A lower value must not lower the lease (pause-absorber + in-flight ack races make this
+    // legitimately reachable).
+    assertThatNoException().isThrownBy(() -> ls.leaseExpiryMillis(5L));
+    assertThat(ls.leaseExpiryMillis()).isEqualTo(10L);
+    // A higher value advances normally.
+    ls.leaseExpiryMillis(20L);
+    assertThat(ls.leaseExpiryMillis()).isEqualTo(20L);
   }
 
   @Test

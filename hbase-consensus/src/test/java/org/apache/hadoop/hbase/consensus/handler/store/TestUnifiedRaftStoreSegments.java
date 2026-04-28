@@ -20,22 +20,20 @@ package org.apache.hadoop.hbase.consensus.handler.store;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Collections;
+import org.apache.hadoop.hbase.consensus.handler.store.RaftStoreTestFixtures.LogStoreConfigs;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
-import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/**
- * Coverage of segment rolling and GC: a small segment-size override forces fast rolls; bumping the
- * GC frontier with {@link RaftStore#truncateLogEntriesUntil(long)} releases stale segments.
- */
+/** Coverage of segment rolling and GC */
 @Tag(SmallTests.TAG)
 public class TestUnifiedRaftStoreSegments extends TestBase {
 
@@ -45,11 +43,6 @@ public class TestUnifiedRaftStoreSegments extends TestBase {
   private UnifiedRaftStore store;
   private final DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
 
-  /** ~4 KiB segments so a few entries can roll the log within a single test. */
-  private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 1, 5L, 64, 4096L));
-  }
-
   @AfterEach
   public void tearDown() throws IOException {
     if (store != null) {
@@ -58,59 +51,120 @@ public class TestUnifiedRaftStoreSegments extends TestBase {
     }
   }
 
-  @Test
-  public void testSegmentRollsWhenSizeExceeded() throws IOException {
-    store = newStore();
+  /** ~4 KiB segments so a few entries can roll the log within a single test. */
+  private UnifiedRaftStore newStore(int shards, boolean prealloc) {
+    return new UnifiedRaftStore(prealloc
+      ? LogStoreConfigs.prealloc(tmp.toFile(), shards, 4096L)
+      : LogStoreConfigs.segmentBytes(tmp.toFile(), shards, 4096L));
+  }
+
+  private int shardOf(byte[] groupId) {
+    return store.routeShard(groupId);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testSegmentRollsWhenSizeExceeded(int shards) throws IOException {
+    store = newStore(shards, false);
     store.load();
-    RaftStore g = store.newGroupStore("g".getBytes());
-    int beforeRoll = store.segmentIndexForTesting().size();
-    byte[] op = new byte[1024];
-    for (int i = 1; i <= 16; i++) {
-      LogEntry e = factory.createLogEntryBuilder().setIndex(i).setTerm(1).setOperation(op).build();
-      g.persistLogEntries(Collections.singletonList(e));
-    }
+    byte[] gid = "g".getBytes();
+    int beforeRoll = store.segmentIndexForTesting(shardOf(gid)).size();
+    RaftStore g = store.newGroupStore(gid);
+    RaftStoreTestFixtures.appendEntries(g, 1, 16, 1, 1024, factory);
     g.flush();
-    int afterRoll = store.segmentIndexForTesting().size();
+    int afterRoll = store.segmentIndexForTesting(shardOf(gid)).size();
     assertThat(afterRoll).isGreaterThan(beforeRoll);
   }
 
-  @Test
-  public void testGcAdvancesAfterTruncateUntil() throws IOException {
-    store = newStore();
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testGcAdvancesAfterTruncateUntil(int shards) throws IOException {
+    store = newStore(shards, false);
     store.load();
-    RaftStore g = store.newGroupStore("g".getBytes());
-    byte[] op = new byte[1024];
-    for (int i = 1; i <= 16; i++) {
-      LogEntry e = factory.createLogEntryBuilder().setIndex(i).setTerm(1).setOperation(op).build();
-      g.persistLogEntries(Collections.singletonList(e));
-    }
+    byte[] gid = "g".getBytes();
+    RaftStore g = store.newGroupStore(gid);
+    RaftStoreTestFixtures.appendEntries(g, 1, 16, 1, 1024, factory);
     g.flush();
-    int rolled = store.segmentIndexForTesting().size();
+    int rolled = store.segmentIndexForTesting(shardOf(gid)).size();
     assertThat(rolled).isGreaterThan(1);
     g.truncateLogEntriesUntil(16L);
     g.flush();
-    int afterGc = store.segmentIndexForTesting().size();
+    int afterGc = store.segmentIndexForTesting(shardOf(gid)).size();
     assertThat(afterGc).isLessThanOrEqualTo(rolled);
     assertThat(afterGc).isGreaterThanOrEqualTo(1);
   }
 
-  @Test
-  public void testTruncateFromEmitsMarkerWithoutGc() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testTruncateFromEmitsMarkerWithoutGc(int shards) throws IOException {
     UnifiedRaftStore small =
-      new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 1, 5L, 64, 1L << 30));
+      new UnifiedRaftStore(LogStoreConfigs.segmentBytes(tmp.toFile(), shards, 1L << 30));
     store = small;
     store.load();
-    RaftStore g = store.newGroupStore("g".getBytes());
-    byte[] op = new byte[64];
-    for (int i = 1; i <= 4; i++) {
-      LogEntry e = factory.createLogEntryBuilder().setIndex(i).setTerm(1).setOperation(op).build();
-      g.persistLogEntries(Collections.singletonList(e));
-    }
+    byte[] gid = "g".getBytes();
+    RaftStore g = store.newGroupStore(gid);
+    RaftStoreTestFixtures.appendEntries(g, 1, 4, 1, 64, factory);
     g.flush();
-    int before = store.segmentIndexForTesting().size();
+    int before = store.segmentIndexForTesting(shardOf(gid)).size();
     g.truncateLogEntriesFrom(3L);
     g.flush();
-    int after = store.segmentIndexForTesting().size();
+    int after = store.segmentIndexForTesting(shardOf(gid)).size();
     assertThat(after).isEqualTo(before);
+  }
+
+  /**
+   * With {@code preallocSegment=true}, each shard's open active segment file is exactly
+   * {@code segmentSizeBytes} on disk, while its in-memory {@code currentSize()} tracks the actual
+   * record tail.
+   */
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testPreallocatedSegmentMatchesSegmentSizeWhileActive(int shards) throws IOException {
+    store = newStore(shards, true);
+    store.load();
+    for (int i = 0; i < shards; i++) {
+      LogSegment seg = store.currentSegmentForTesting(i);
+      assertThat(Files.size(seg.path())).isEqualTo(4096L);
+      assertThat(seg.currentSize()).isLessThan(4096L);
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testPreallocatedSegmentTruncatedToTailOnClose(int shards) throws IOException {
+    UnifiedRaftStore s = newStore(shards, true);
+    s.load();
+    byte[] gid = "g".getBytes();
+    RaftStore g = s.newGroupStore(gid);
+    RaftStoreTestFixtures.appendEntries(g, 1, 1, 1, 8, factory);
+    g.flush();
+    Path activePath = s.currentSegmentForTesting(s.routeShard(gid)).path();
+    long tailSize = s.currentSegmentForTesting(s.routeShard(gid)).currentSize();
+    s.close();
+    long fileSize = Files.size(activePath);
+    assertThat(fileSize).isEqualTo(tailSize);
+    assertThat(fileSize).isLessThan(4096L);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testRolledSegmentsTruncatedToTail(int shards) throws IOException {
+    store = newStore(shards, true);
+    store.load();
+    byte[] gid = "g".getBytes();
+    RaftStore g = store.newGroupStore(gid);
+    RaftStoreTestFixtures.appendEntries(g, 1, 16, 1, 1024, factory);
+    g.flush();
+    int sIdx = shardOf(gid);
+    long active = store.currentSegmentForTesting(sIdx).segmentId();
+    int rolled = 0;
+    for (LogSegment seg : store.segmentIndexForTesting(sIdx).segmentsById().values()) {
+      if (seg.segmentId() == active) {
+        continue;
+      }
+      rolled++;
+      assertThat(Files.size(seg.path())).isEqualTo(seg.currentSize());
+    }
+    assertThat(rolled).isGreaterThan(0);
   }
 }

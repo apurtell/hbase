@@ -34,7 +34,7 @@ import org.slf4j.LoggerFactory;
  * a leader is not available yet.
  */
 @InterfaceAudience.Private
-public final class PreVoteTask extends RaftNodeStatusAwareTask implements Runnable {
+public final class PreVoteTask extends RaftNodeStatusAwareTask {
   private static final Logger LOG = LoggerFactory.getLogger(PreVoteTask.class);
   private final int term;
 

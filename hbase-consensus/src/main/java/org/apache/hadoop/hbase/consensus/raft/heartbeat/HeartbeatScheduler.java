@@ -21,19 +21,12 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.yetus.audience.InterfaceAudience;
 
-/**
- * SPI for arranging periodic invocation of {@link RaftNodeImpl#runHeartbeatTick()}.
- * <p>
- * In the default implementation
- * ({@code org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.DefaultHeartbeatScheduler}) each
- * registered node schedules its own self-rescheduling task on its own {@code RaftNodeExecutor} at
- * the configured {@code leaderHeartbeatPeriodMillis} cadence.
- */
+/** SPI for arranging periodic per-server heartbeat work. */
 @InterfaceAudience.Private
 public interface HeartbeatScheduler {
   /**
-   * Called from {@code RaftNodeImpl.initTasks} during start up. The scheduler arranges for
-   * {@code node.runHeartbeatTick()} to be invoked periodically on {@code node.getExecutor()}.
+   * Called from {@code RaftNodeImpl.initTasks} during start up. The scheduler arranges for periodic
+   * heartbeat work to be performed on behalf of {@code node}.
    * <p>
    * Implementations should be safe under the same node being passed multiple times. The recommended
    * behavior is "second register is a no-op" for the same {@code (groupId, node)} pair, and to

@@ -21,6 +21,8 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.Closeable;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
+import org.apache.hadoop.hbase.consensus.metrics.HdrLatencyHistogram;
+import org.apache.hadoop.hbase.consensus.metrics.HdrLatencyTimer;
 import org.apache.hadoop.hbase.metrics.Counter;
 import org.apache.hadoop.hbase.metrics.Gauge;
 import org.apache.hadoop.hbase.metrics.Histogram;
@@ -72,7 +74,6 @@ public final class ConsensusServerMetrics implements Closeable {
   private final Counter groupsAdded;
   private final Counter groupsRemoved;
   private final Counter addGroupFailures;
-  private final Counter removeGroupFailures;
 
   // Raft event counters (fed from LeaderReportListener / StateMachineAdapter via the SPI).
   private final Counter leaderElections;
@@ -126,7 +127,6 @@ public final class ConsensusServerMetrics implements Closeable {
     this.groupsAdded = registry.counter("groupsAdded");
     this.groupsRemoved = registry.counter("groupsRemoved");
     this.addGroupFailures = registry.counter("addGroupFailures");
-    this.removeGroupFailures = registry.counter("removeGroupFailures");
 
     this.leaderElections = registry.counter("leaderElections");
     this.noLeaderEvents = registry.counter("noLeaderEvents");
@@ -140,17 +140,27 @@ public final class ConsensusServerMetrics implements Closeable {
     this.addGroupTimer = registry.timer("addGroupTime");
     this.removeGroupTimer = registry.timer("removeGroupTime");
     this.transferLeadershipTimer = registry.timer("transferLeadershipTime");
-    this.replicateTimer = registry.timer("replicateTime");
+    // replicateTime / commitApplyTime drive the user-visible commit-latency SLO and are bounded by
+    // hard percentile assertions in TestConsensusServerScale, so we back them with HdrHistogram
+    // instead of the default FastLongHistogram. See package-info in
+    // org.apache.hadoop.hbase.consensus.metrics for the why; the choice of 1 us .. 60 s range with
+    // 3 significant digits gives 0.1 % precision across the full latency spectrum we care about.
+    this.replicateTimer = (Timer) registry.register("replicateTime", new HdrLatencyTimer());
 
-    this.commitApplyTimer = registry.timer("commitApplyTime");
+    this.commitApplyTimer = (Timer) registry.register("commitApplyTime", new HdrLatencyTimer());
     this.flushCompleteTimer = registry.timer("flushCompleteTime");
     this.takeSnapshotTimer = registry.timer("takeSnapshotTime");
     this.installSnapshotTimer = registry.timer("installSnapshotTime");
 
     this.commitBatchSizeHistogram = registry.histogram("commitBatchSize");
     this.commitBatchBytesHistogram = registry.histogram("commitBatchBytes");
-    this.quorumHeartbeatLagHistogram = registry.histogram("quorumHeartbeatLagMillis");
-    this.leaderHeartbeatLagHistogram = registry.histogram("leaderHeartbeatLagMillis");
+    // {leader,quorum}HeartbeatLagMillis drive the heartbeat-lag SLO assertion and update with raw
+    // millisecond values. HdrLatencyHistogram parameters are unit-agnostic; here the range is
+    // 1 ms .. 600 s, three significant digits.
+    this.quorumHeartbeatLagHistogram = (Histogram) registry.register("quorumHeartbeatLagMillis",
+      new HdrLatencyHistogram(1L, TimeUnit.SECONDS.toMillis(600L), 3));
+    this.leaderHeartbeatLagHistogram = (Histogram) registry.register("leaderHeartbeatLagMillis",
+      new HdrLatencyHistogram(1L, TimeUnit.SECONDS.toMillis(600L), 3));
     this.commitBacklogHistogram = registry.histogram("commitBacklogEntries");
     this.replicationLagHistogram = registry.histogram("replicationLagEntries");
 
@@ -195,11 +205,6 @@ public final class ConsensusServerMetrics implements Closeable {
   public void updateRemoveGroup(long timeMillis) {
     removeGroupTimer.update(timeMillis, TimeUnit.MILLISECONDS);
     groupsRemoved.increment();
-  }
-
-  /** Records a failed {@code removeGroup} call. */
-  public void incRemoveGroupFailure() {
-    removeGroupFailures.increment();
   }
 
   /** Records a {@code transferLeadership} call's elapsed time, in milliseconds. */
@@ -359,22 +364,6 @@ public final class ConsensusServerMetrics implements Closeable {
   /** Records that a no-leader event has fired for some group. */
   public void incNoLeader() {
     noLeaderEvents.increment();
-  }
-
-  /**
-   * Records that the SPI has produced a state-snapshot for some group. Prefer
-   * {@link #updateTakeSnapshot(long)} on callers that have a wall-clock measurement.
-   */
-  public void incSnapshotTaken() {
-    snapshotsTaken.increment();
-  }
-
-  /**
-   * Records that the SPI has installed a state-snapshot for some group. Prefer
-   * {@link #updateInstallSnapshot(long)} on callers that have a wall-clock measurement.
-   */
-  public void incSnapshotInstalled() {
-    snapshotsInstalled.increment();
   }
 
   public long getGroupsAddedCount() {

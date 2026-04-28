@@ -22,7 +22,6 @@ import static java.util.Objects.requireNonNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.function.Consumer;
 import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetrics;
@@ -60,7 +59,7 @@ public final class StateMachineAdapter implements StateMachine {
   private final ConsensusSpi spi;
   @Nullable
   private final ConsensusServerMetrics metrics;
-  private final List<CommittedEntry> pending = new ArrayList<>();
+  private List<CommittedEntry> pending = new ArrayList<>();
   /**
    * Running byte total of the {@link #pending} payloads, refreshed in {@link #runOperation} and
    * reset in {@link #drainPending}. Avoids a second pass over the batch to compute
@@ -161,8 +160,8 @@ public final class StateMachineAdapter implements StateMachine {
     }
     int entryCount = pending.size();
     long batchBytes = pendingBytes;
-    List<CommittedEntry> batch = Collections.unmodifiableList(new ArrayList<>(pending));
-    pending.clear();
+    List<CommittedEntry> batch = pending;
+    pending = new ArrayList<>();
     pendingBytes = 0L;
     long start = EnvironmentEdgeManager.currentTime();
     spi.onCommit(groupId, batch);

@@ -228,8 +228,7 @@ public class AppendEntriesRequestHandler extends AbstractMessageHandler<AppendEn
           LOG.debug(localEndpointStr() + " Appending " + newLogEntries.size() + " entries: "
             + newLogEntries);
         }
-        log.appendEntries(newLogEntries);
-        log.flush();
+        log.appendEntriesAndFlush(newLogEntries);
       }
     }
     // I cannot use log.lastLogOrSnapshotIndex() for lastLogIndex because my log may

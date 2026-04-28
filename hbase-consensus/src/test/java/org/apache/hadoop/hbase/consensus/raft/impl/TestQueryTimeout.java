@@ -30,7 +30,6 @@ import static org.junit.jupiter.api.Assertions.fail;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -67,7 +66,7 @@ public class TestQueryTimeout extends TestBase {
     group.dropAppendsAndHeartbeatsTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     CompletableFuture<Ordered<Object>> f = follower.query(queryLastValue(), EVENTUAL_CONSISTENCY,
-      Optional.of(commitIndex), Optional.of(Duration.ofSeconds(30)));
+      commitIndex, Duration.ofSeconds(30).toMillis());
     group.allowAllMessagesTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
     Ordered<Object> o = f.join();
     assertThat(o.getResult()).isEqualTo("value");
@@ -86,7 +85,7 @@ public class TestQueryTimeout extends TestBase {
     int queryCount = 5;
     for (int i = 0; i < queryCount; i++) {
       CompletableFuture<Ordered<Object>> f = follower.query(queryLastValue(), EVENTUAL_CONSISTENCY,
-        Optional.of(commitIndex), Optional.of(Duration.ofSeconds(30)));
+        commitIndex, Duration.ofSeconds(30).toMillis());
       futures.add(f);
     }
     group.allowAllMessagesTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
@@ -115,7 +114,7 @@ public class TestQueryTimeout extends TestBase {
       latestCommitIndex = leader.replicate(applyValue(latestValue)).join().getCommitIndex();
     }
     CompletableFuture<Ordered<Object>> f = follower.query(queryLastValue(), EVENTUAL_CONSISTENCY,
-      Optional.of(latestCommitIndex - 1), Optional.of(Duration.ofSeconds(30)));
+      latestCommitIndex - 1, Duration.ofSeconds(30).toMillis());
     group.allowAllMessagesTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
     Ordered<Object> o = f.join();
     assertThat(o.getResult()).isEqualTo(latestValue);
@@ -132,8 +131,9 @@ public class TestQueryTimeout extends TestBase {
     eventually(() -> {
       assertThat(getCommitIndex(follower)).isEqualTo(commitIndex);
     });
-    Ordered<Object> o = follower.query(queryLastValue(), EVENTUAL_CONSISTENCY,
-      Optional.of(commitIndex), Optional.of(Duration.ofSeconds(1))).join();
+    Ordered<Object> o = follower
+      .query(queryLastValue(), EVENTUAL_CONSISTENCY, commitIndex, Duration.ofSeconds(1).toMillis())
+      .join();
     assertThat(o.getResult()).isEqualTo("value");
     assertThat(o.getCommitIndex()).isEqualTo(commitIndex);
   }
@@ -147,8 +147,8 @@ public class TestQueryTimeout extends TestBase {
     group.dropAppendsAndHeartbeatsTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     try {
-      follower.query(queryLastValue(), EVENTUAL_CONSISTENCY, Optional.of(commitIndex),
-        Optional.of(Duration.ofSeconds(1))).join();
+      follower.query(queryLastValue(), EVENTUAL_CONSISTENCY, commitIndex,
+        Duration.ofSeconds(1).toMillis()).join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(LaggingCommitIndexException.class);
@@ -163,8 +163,8 @@ public class TestQueryTimeout extends TestBase {
     RaftNodeImpl follower = group.getAnyNodeExcept(leader.getLocalEndpoint());
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     try {
-      follower.query(queryLastValue(), EVENTUAL_CONSISTENCY, Optional.of(commitIndex + 1),
-        Optional.of(Duration.ofSeconds(-1))).join();
+      follower.query(queryLastValue(), EVENTUAL_CONSISTENCY, commitIndex + 1,
+        Duration.ofSeconds(-1).toMillis()).join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(LaggingCommitIndexException.class);
@@ -178,8 +178,9 @@ public class TestQueryTimeout extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     try {
-      leader.query(queryLastValue(), LEADER_LEASE, Optional.of(commitIndex + 1),
-        Optional.of(Duration.ofSeconds(1))).join();
+      leader
+        .query(queryLastValue(), LEADER_LEASE, commitIndex + 1, Duration.ofSeconds(1).toMillis())
+        .join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(LaggingCommitIndexException.class);
@@ -193,8 +194,9 @@ public class TestQueryTimeout extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     try {
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.of(commitIndex + 1),
-        Optional.of(Duration.ofSeconds(1))).join();
+      leader
+        .query(queryLastValue(), LINEARIZABLE, commitIndex + 1, Duration.ofSeconds(1).toMillis())
+        .join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(LaggingCommitIndexException.class);
@@ -208,8 +210,8 @@ public class TestQueryTimeout extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     try {
-      leader.query(queryLastValue(), EVENTUAL_CONSISTENCY, Optional.of(commitIndex + 1),
-        Optional.of(Duration.ofSeconds(1))).join();
+      leader.query(queryLastValue(), EVENTUAL_CONSISTENCY, commitIndex + 1,
+        Duration.ofSeconds(1).toMillis()).join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(LaggingCommitIndexException.class);
@@ -225,7 +227,7 @@ public class TestQueryTimeout extends TestBase {
     group.dropAppendsAndHeartbeatsTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     CompletableFuture<Ordered<Object>> f = follower.query(queryLastValue(), EVENTUAL_CONSISTENCY,
-      Optional.of(commitIndex), Optional.of(Duration.ofSeconds(30)));
+      commitIndex, Duration.ofSeconds(30).toMillis());
     follower.terminate().join();
     try {
       f.join();
@@ -242,7 +244,7 @@ public class TestQueryTimeout extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     long commitIndex = leader.replicate(applyValue("value")).join().getCommitIndex();
     CompletableFuture<Ordered<Object>> f = leader.query(queryLastValue(), EVENTUAL_CONSISTENCY,
-      Optional.of(commitIndex + 100), Optional.of(Duration.ofSeconds(300)));
+      commitIndex + 100, Duration.ofSeconds(300).toMillis());
     leader.changeMembership(leader.getLocalEndpoint(), MembershipChangeMode.REMOVE_MEMBER, 0)
       .join();
     try {

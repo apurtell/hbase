@@ -21,14 +21,17 @@ import static java.util.Objects.requireNonNull;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hadoop.hbase.consensus.raft.EndpointId;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 
 public final class LocalRaftEndpoint implements RaftEndpoint {
   private static final AtomicInteger COUNTER = new AtomicInteger();
   private final String id;
+  private final EndpointId endpointId;
 
   private LocalRaftEndpoint(String id) {
     this.id = requireNonNull(id);
+    this.endpointId = EndpointId.of(id);
   }
 
   /**
@@ -45,9 +48,15 @@ public final class LocalRaftEndpoint implements RaftEndpoint {
     return id;
   }
 
+  @NonNull
+  @Override
+  public EndpointId endpointId() {
+    return endpointId;
+  }
+
   @Override
   public int hashCode() {
-    return id.hashCode();
+    return endpointId.hashCode();
   }
 
   @Override
@@ -58,7 +67,7 @@ public final class LocalRaftEndpoint implements RaftEndpoint {
     if (!(o instanceof RaftEndpoint)) {
       return false;
     }
-    return id.equals(String.valueOf(((RaftEndpoint) o).getId()));
+    return endpointId.equals(((RaftEndpoint) o).endpointId());
   }
 
   @Override

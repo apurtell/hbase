@@ -286,7 +286,8 @@ public class TestUnifiedRaftStoreFixtureParity extends TestBase {
   }
 
   private static long countGroupEntries(File endpointDir) throws IOException {
-    LogStoreConfig cfg = new LogStoreConfig(endpointDir, 8, 5L, 64);
+    LogStoreConfig cfg =
+      LogStoreConfig.newBuilder(endpointDir).setSegmentSizeMb(8).setMailboxChunkSize(64).build();
     OperationCodec codec =
       OperationCodecs.composite(OperationCodecs.defaultCodecs(), new SimpleStateMachineOpCodec());
     LogStoreSerializer serializer = new DefaultLogStoreSerializer(new DefaultRaftModelFactory(),

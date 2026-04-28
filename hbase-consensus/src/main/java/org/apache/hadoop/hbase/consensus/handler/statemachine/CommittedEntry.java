@@ -29,6 +29,11 @@ import org.apache.yetus.audience.InterfaceAudience;
  * <p>
  * The {@code payload} is the opaque operation bytes the application originally proposed. The
  * consensus layer never inspects them.
+ * <p>
+ * The {@code payload} array is referenced directly; the constructor performs no defensive copy.
+ * Callers must not retain a reference to the original byte[] after constructing a
+ * {@link CommittedEntry} from it: the consensus core hands its own freshly-decoded payloads in, and
+ * SPI consumers that read the array are expected to treat it as read-only.
  */
 @InterfaceAudience.Private
 public final class CommittedEntry {
@@ -38,7 +43,7 @@ public final class CommittedEntry {
 
   public CommittedEntry(long commitIndex, @NonNull byte[] payload) {
     this.commitIndex = commitIndex;
-    this.payload = requireNonNull(payload, "payload").clone();
+    this.payload = requireNonNull(payload, "payload");
   }
 
   public long getCommitIndex() {

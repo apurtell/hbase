@@ -59,6 +59,7 @@ import org.slf4j.LoggerFactory;
  * @see MembershipChangeMode
  */
 @InterfaceAudience.Private
+@SuppressWarnings("rawtypes")
 public final class MembershipChangeTask implements Runnable {
   private static final Logger LOG = LoggerFactory.getLogger(MembershipChangeTask.class);
   private final RaftNodeImpl raftNode;

@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase.consensus.raft.impl.util;
 
 import static java.util.Objects.requireNonNull;
 
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.util.AbstractCollection;
 import java.util.AbstractSet;
 import java.util.Arrays;
@@ -39,7 +38,6 @@ import org.apache.yetus.audience.InterfaceAudience;
  * @param <V> values stored in the {@link java.util.Map}
  */
 @InterfaceAudience.Private
-@SuppressWarnings("checkstyle:magicnumber")
 public final class Long2ObjectHashMap<V> implements Map<Long, V> {
   private static final int MAX_CAPACITY = 1 << 30;
   /** The default load factor for constructors not explicitly supplying it */
@@ -551,9 +549,9 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
     }
   }
 
+  @SuppressWarnings("unchecked")
   private class ValueIterator<T> extends AbstractIterator<T> {
     @Override
-    @SuppressWarnings("unchecked")
     public T next() {
       findNext();
       return (T) values[getPosition()];
@@ -574,7 +572,7 @@ public final class Long2ObjectHashMap<V> implements Map<Long, V> {
     }
   }
 
-  @SuppressFBWarnings(value = "PZ_DONT_REUSE_ENTRY_OBJECTS_IN_ITERATORS")
+  @SuppressWarnings("unchecked")
   private class EntryIterator extends AbstractIterator<Entry<Long, V>> implements Entry<Long, V> {
     @Override
     public Entry<Long, V> next() {

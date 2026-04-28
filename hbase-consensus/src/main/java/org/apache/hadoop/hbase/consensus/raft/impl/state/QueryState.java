@@ -67,7 +67,8 @@ public final class QueryState {
    * be executed. Also updates the minimum commit index that is expected on the leader to execute
    * the queries.
    */
-  public boolean addQuery(long commitIndex, Object query, OrderedFuture resultFuture) {
+  public boolean addQuery(long commitIndex, Object query,
+    @SuppressWarnings("rawtypes") OrderedFuture resultFuture) {
     if (commitIndex < readIndex) {
       throw new IllegalArgumentException(
         "Cannot execute query: " + query + " at commit index because of the current " + this);
@@ -80,8 +81,10 @@ public final class QueryState {
     if (firstQuery) {
       querySequenceNumber++;
     }
-    LOG.trace("TRACE> QueryState.addQuery commitIndex={} readIndex={} queries={} qsn={} first={}",
-      commitIndex, readIndex, queries.size(), querySequenceNumber, firstQuery);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("TRACE> QueryState.addQuery commitIndex={} readIndex={} queries={} qsn={} first={}",
+        commitIndex, readIndex, queries.size(), querySequenceNumber, firstQuery);
+    }
     return firstQuery;
   }
 
@@ -94,8 +97,10 @@ public final class QueryState {
     // If there is no query waiting to be executed or the received ack
     // belongs to an earlier query, we ignore it.
     if (queries.isEmpty() || this.querySequenceNumber > querySequenceNumber) {
-      LOG.trace("TRACE> QueryState.tryAck IGNORED follower={} ackQsn={} curQsn={} queries={}",
-        follower.getId(), querySequenceNumber, this.querySequenceNumber, queries.size());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("TRACE> QueryState.tryAck IGNORED follower={} ackQsn={} curQsn={} queries={}",
+          follower.getId(), querySequenceNumber, this.querySequenceNumber, queries.size());
+      }
       return false;
     }
     if (querySequenceNumber != this.querySequenceNumber) {
@@ -103,8 +108,10 @@ public final class QueryState {
         this + ", acked query sequence number: " + querySequenceNumber + ", follower: " + follower);
     }
     boolean added = acks.add(follower);
-    LOG.trace("TRACE> QueryState.tryAck follower={} qsn={} added={} acks={} queries={}",
-      follower.getId(), querySequenceNumber, added, acks, queries.size());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("TRACE> QueryState.tryAck follower={} qsn={} added={} acks={} queries={}",
+        follower.getId(), querySequenceNumber, added, acks, queries.size());
+    }
     return added;
   }
 
@@ -129,8 +136,10 @@ public final class QueryState {
     long previous = querySequenceNumber;
     querySequenceNumber++;
     acks.clear();
-    LOG.trace("TRACE> QueryState.incrementQuerySequenceNumber {} -> {} queries={}", previous,
-      querySequenceNumber, queries.size());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("TRACE> QueryState.incrementQuerySequenceNumber {} -> {} queries={}", previous,
+        querySequenceNumber, queries.size());
+    }
   }
 
   /**
@@ -146,9 +155,12 @@ public final class QueryState {
         "Cannot execute: " + this + ", current commit index: " + commitIndex);
     }
     boolean ok = queries.size() > 0 && quorumSize <= ackCount();
-    LOG
-      .trace("TRACE> QueryState.isQuorumAckReceived commitIndex={} quorumSize={} queries={} acks={}"
-        + " ackCount={} ok={}", commitIndex, quorumSize, queries.size(), acks, ackCount(), ok);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace(
+        "TRACE> QueryState.isQuorumAckReceived commitIndex={} quorumSize={} queries={} acks={}"
+          + " ackCount={} ok={}",
+        commitIndex, quorumSize, queries.size(), acks, ackCount(), ok);
+    }
     return ok;
   }
 
@@ -161,11 +173,13 @@ public final class QueryState {
   /** Returns {@code true} if more acks are needed to complete the given quorum size. */
   public boolean isAckNeeded(RaftEndpoint follower, int quorumSize) {
     boolean needed = queryCount() > 0 && !acks.contains(follower) && ackCount() < quorumSize;
-    LOG.trace(
-      "TRACE> QueryState.isAckNeeded follower={} quorumSize={} queries={} acks={} ackCount={}"
-        + " contains={} needed={}",
-      follower.getId(), quorumSize, queries.size(), acks, ackCount(), acks.contains(follower),
-      needed);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace(
+        "TRACE> QueryState.isAckNeeded follower={} quorumSize={} queries={} acks={} ackCount={}"
+          + " contains={} needed={}",
+        follower.getId(), quorumSize, queries.size(), acks, ackCount(), acks.contains(follower),
+        needed);
+    }
     return needed;
   }
 
@@ -181,8 +195,10 @@ public final class QueryState {
 
   /** Fails the pending query futures with the given throwable. */
   public void fail(Throwable t) {
-    LOG.trace("TRACE> QueryState.fail queries={} acks={} qsn={} cause={}", queries.size(), acks,
-      querySequenceNumber, t.getClass().getSimpleName(), t);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("TRACE> QueryState.fail queries={} acks={} qsn={} cause={}", queries.size(), acks,
+        querySequenceNumber, t.getClass().getSimpleName(), t);
+    }
     for (QueryContainer query : queries) {
       query.fail(t);
     }
@@ -191,8 +207,10 @@ public final class QueryState {
 
   /** Resets the collection of waiting queries and acks. */
   public void reset() {
-    LOG.trace("TRACE> QueryState.reset queries={} acks={} qsn={}", queries.size(), acks,
-      querySequenceNumber);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("TRACE> QueryState.reset queries={} acks={} qsn={}", queries.size(), acks,
+        querySequenceNumber);
+    }
     queries.clear();
     acks.clear();
   }
@@ -203,6 +221,7 @@ public final class QueryState {
       + ", queryCount=" + queryCount() + ", acks=" + acks + '}';
   }
 
+  @SuppressWarnings("rawtypes")
   public static class QueryContainer {
     final Object operation;
     final OrderedFuture future;
@@ -212,25 +231,32 @@ public final class QueryState {
       this.future = future;
     }
 
+    @SuppressWarnings("unchecked")
     public void run(long commitIndex, StateMachine stateMachine) {
       try {
         Object result = null;
         if (!(operation instanceof NoOp)) {
           result = stateMachine.runOperation(commitIndex, operation);
         }
-        LOG.trace("TRACE> QueryContainer.run COMPLETE commitIndex={} operation={} resultNull={}",
-          commitIndex, operation, result == null);
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("TRACE> QueryContainer.run COMPLETE commitIndex={} operation={} resultNull={}",
+            commitIndex, operation, result == null);
+        }
         future.complete(commitIndex, result);
       } catch (Throwable t) {
-        LOG.trace("TRACE> QueryContainer.run THREW commitIndex={} operation={} cause={}",
-          commitIndex, operation, t.getClass().getSimpleName(), t);
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("TRACE> QueryContainer.run THREW commitIndex={} operation={} cause={}",
+            commitIndex, operation, t.getClass().getSimpleName(), t);
+        }
         fail(t);
       }
     }
 
     public void fail(Throwable t) {
-      LOG.trace("TRACE> QueryContainer.fail operation={} cause={}", operation,
-        t.getClass().getSimpleName());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("TRACE> QueryContainer.fail operation={} cause={}", operation,
+          t.getClass().getSimpleName());
+      }
       future.fail(t);
     }
   }

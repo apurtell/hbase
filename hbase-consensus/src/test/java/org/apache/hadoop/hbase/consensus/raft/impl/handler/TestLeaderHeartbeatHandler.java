@@ -26,10 +26,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import org.apache.hadoop.hbase.consensus.raft.RaftRole;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftGroup;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
+import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
 import org.apache.hadoop.hbase.consensus.raft.test.util.RaftTestUtils;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
@@ -41,6 +43,17 @@ import org.junit.jupiter.api.Timeout;
 @Tag(SmallTests.TAG)
 public class TestLeaderHeartbeatHandler extends TestBase {
   private LocalRaftGroup group;
+
+  /**
+   * Dispatches the given {@link LeaderHeartbeat} to {@code target} on the per-group control lane,
+   * mirroring how the production transport delivers heartbeat envelopes (see
+   * {@code LocalTransport.sendBulkHeartbeat}). Acks are discarded.
+   */
+  private static void deliverHeartbeat(RaftNodeImpl target, LeaderHeartbeat hb) {
+    Consumer<LeaderHeartbeatAck> ackSink = ack -> {
+    };
+    target.getExecutor().executeControl(new LeaderHeartbeatHandler(target, hb, ackSink));
+  }
 
   @AfterEach
   public void tearDown() {
@@ -60,7 +73,7 @@ public class TestLeaderHeartbeatHandler extends TestBase {
     LeaderHeartbeat hb =
       follower.getModelFactory().createLeaderHeartbeatBuilder().setGroupId(follower.getGroupId())
         .setSender(leader.getLocalEndpoint()).setTerm(higherTerm).setCommitIndex(0L).build();
-    follower.handle(hb);
+    deliverHeartbeat(follower, hb);
     eventually(() -> assertThat(getTerm(follower)).isEqualTo(higherTerm));
     assertThat(getRole(follower)).isEqualTo(RaftRole.FOLLOWER);
   }
@@ -82,7 +95,7 @@ public class TestLeaderHeartbeatHandler extends TestBase {
     LeaderHeartbeat hb = follower.getModelFactory().createLeaderHeartbeatBuilder()
       .setGroupId(follower.getGroupId()).setSender(leader.getLocalEndpoint()).setTerm(currentTerm)
       .setCommitIndex(preCommitIndex).build();
-    follower.handle(hb);
+    deliverHeartbeat(follower, hb);
     eventually(() -> assertThat(
       RaftTestUtils.readRaftState(follower, () -> follower.state().log().lastLogOrSnapshotIndex()))
       .isEqualTo(preLastLogOrSnapshot));
@@ -100,7 +113,7 @@ public class TestLeaderHeartbeatHandler extends TestBase {
     LeaderHeartbeat hb = leader.getModelFactory().createLeaderHeartbeatBuilder()
       .setGroupId(leader.getGroupId()).setSender(followers.get(0).getLocalEndpoint())
       .setTerm(currentTerm).setCommitIndex(0L).build();
-    leader.handle(hb);
+    deliverHeartbeat(leader, hb);
     eventually(() -> assertThat(getRole(leader)).isEqualTo(RaftRole.FOLLOWER));
   }
 }

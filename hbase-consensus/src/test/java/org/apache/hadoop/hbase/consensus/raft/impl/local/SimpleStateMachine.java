@@ -157,6 +157,7 @@ public class SimpleStateMachine
   }
 
   @Override
+  @SuppressWarnings("unchecked")
   public synchronized void installSnapshot(long commitIndex, @NonNull List<Object> chunks) {
     this.commitIndex = commitIndex;
     map.clear();

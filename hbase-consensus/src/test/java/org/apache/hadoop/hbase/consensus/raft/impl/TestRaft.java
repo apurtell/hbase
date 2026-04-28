@@ -39,7 +39,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -217,27 +216,25 @@ public class TestRaft extends TestBase {
       RaftConfig.newBuilder().setCommitCountToTakeSnapshot(entryCount + 2).build();
     group = LocalRaftGroup.start(nodeCount, config);
     RaftNodeImpl leader = group.waitUntilLeaderElected();
-    Optional<Long> quorumTimestamp =
-      leader.getReport().join().getResult().getQuorumHeartbeatTimestamp();
-    assertThat(quorumTimestamp).isPresent();
+    long quorumTimestamp = leader.getReport().join().getResult().getQuorumHeartbeatTimestamp();
+    assertThat(quorumTimestamp).isGreaterThan(0L);
     Map<RaftEndpoint, Long> leaderHeartbeatTimestamps = new HashMap<>();
     for (int i = 0; i < entryCount; i++) {
       sleepMillis(1);
       Object val = "val" + i;
       Ordered<Object> result = leader.replicate(applyValue(val)).join();
       assertThat(result.getCommitIndex()).isEqualTo(i + 1);
-      Optional<Long> quorumTimestamp2 =
-        leader.getReport().join().getResult().getQuorumHeartbeatTimestamp();
-      assertTrue(quorumTimestamp2.isPresent());
-      assertThat(quorumTimestamp2.get()).isGreaterThan(quorumTimestamp.get());
+      long quorumTimestamp2 = leader.getReport().join().getResult().getQuorumHeartbeatTimestamp();
+      assertThat(quorumTimestamp2).isGreaterThan(0L);
+      assertThat(quorumTimestamp2).isGreaterThan(quorumTimestamp);
       quorumTimestamp = quorumTimestamp2;
       for (RaftNode node : group.getNodesExcept(leader.getLocalEndpoint())) {
-        Optional<Long> leaderHearthbeatTimestamp =
+        long leaderHearthbeatTimestamp =
           node.getReport().join().getResult().getLeaderHeartbeatTimestamp();
-        assertThat(leaderHearthbeatTimestamp).isPresent();
+        assertThat(leaderHearthbeatTimestamp).isGreaterThan(0L);
         long previousTimestamp =
           leaderHeartbeatTimestamps.getOrDefault(node.getLocalEndpoint(), 0L);
-        assertThat(leaderHearthbeatTimestamp.get()).isGreaterThan(previousTimestamp);
+        assertThat(leaderHearthbeatTimestamp).isGreaterThan(previousTimestamp);
         leaderHeartbeatTimestamps.put(node.getLocalEndpoint(), previousTimestamp);
       }
     }
@@ -730,8 +727,8 @@ public class TestRaft extends TestBase {
         e2 -> assertThat(e2).hasCauseInstanceOf(IndeterminateStateException.class),
         e2 -> assertThat(e2).hasCauseInstanceOf(NotLeaderException.class));
     }
-    assertThat(leader.getReport().join().getResult().getQuorumHeartbeatTimestamp()).isEmpty();
-    assertThat(leader.getReport().join().getResult().getLeaderHeartbeatTimestamp()).isEmpty();
+    assertThat(leader.getReport().join().getResult().getQuorumHeartbeatTimestamp()).isEqualTo(0L);
+    assertThat(leader.getReport().join().getResult().getLeaderHeartbeatTimestamp()).isEqualTo(0L);
   }
 
   @Test

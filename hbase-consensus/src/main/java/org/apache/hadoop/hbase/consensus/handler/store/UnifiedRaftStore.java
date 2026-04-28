@@ -39,10 +39,10 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.log.DefaultSnapshotEntryOrBuilder;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
 import org.apache.hadoop.hbase.consensus.raft.model.log.RaftGroupMembersView;
@@ -53,68 +53,81 @@ import org.apache.hadoop.hbase.consensus.raft.model.persistence.RaftTermPersiste
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RestoredRaftState;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
-import org.apache.hadoop.hbase.util.Threads;
 import org.apache.yetus.audience.InterfaceAudience;
-import org.jctools.queues.MpscUnboundedArrayQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Default {@link DurableLogStore} implementation.
  * <p>
- * This is a single multiplexed append-only log shared by every Raft group on the local server,
- * inspired by ZooKeeper's {@code FileTxnLog}.
+ * This is a multiplexed append-only log shared by every Raft group on the local server, inspired by
+ * ZooKeeper's {@code FileTxnLog}. Group ids are routed to one of {@code N} independent
+ * {@link WriterShard}s by stable hashing. Each shard owns a private MPSC mailbox, a dedicated
+ * writer thread, and an isolated segment chain under {@code <log.dir>/shard-<i>/}. Per-group
+ * ordering is preserved because all of a group's frames land on the same shard.
  * <p>
  * <b>Write path.</b> Records are encoded on the producing thread (via
- * {@link LogRecord#encode(LogRecord)} into a direct {@link ByteBuffer}) and offered to a
- * {@code MpscUnboundedArrayQueue} mailbox. A dedicated writer thread drains the mailbox in
- * coalescing windows of {@link LogStoreConfig#getBatchMs() batchMs}, issues a single
- * {@link FileChannel#write(ByteBuffer[]) gathered write}, calls {@link FileChannel#force(boolean)
- * force(false)} when any frame in the batch requested sync-fsync, then completes every
- * {@link CompletableFuture} in the batch.
+ * {@link LogRecord#encode(LogRecord)} into a direct {@link ByteBuffer}) and offered to the target
+ * shard's {@code MpscUnboundedArrayQueue} mailbox. Each iteration polls every record currently
+ * queued, gathers them into a single {@link ByteBuffer} array, writes it to the active segment,
+ * issues a single {@link FileChannel#write(ByteBuffer[]) gathered write}, calls
+ * {@link FileChannel#force(boolean) force(false)} when any frame in the batch requested fsync, then
+ * completes every {@link CompletableFuture} in the batch.
  * <p>
- * <b>Fsync-before-commit contract.</b> {@code persistAndFlush{Term,LocalEndpoint,
- * InitialGroupMembers}} block until {@code force(false)} returns (per-call fsync). Log entries and
- * snapshot chunks are enqueued without a per-record fsync, but every caller of
- * {@link RaftStore#flush()} blocks until the writer issues an {@code force(false)} that covers the
- * active segment, so all log-entry frames written before the call are on disk by the time
- * {@code flush()} returns. This is the durability anchor that Raft commit-index advancement relies
- * on: a follower's {@code AppendEntriesSuccessResponse.lastLogIndex} is sent only after
- * {@link RaftStore#flush()} returns, and the leader's {@code FlushTask} sets {@code
- * leaderState.flushedLogIndex()} only after {@link RaftStore#flush()} returns. The leader's
- * commit-index advancement counts only on-disk acks; an entry on a majority's logs is, by
- * construction, on a majority's disks.
+ * <b>Durability tiers.</b> Three independent triggers dictate when {@code force(false)} is issued
+ * on the active segment of each shard:
+ * <ul>
+ * <li><b>Tier A (synchronous, mandatory).</b>
+ * {@code persistAndFlush{Term,LocalEndpoint,InitialGroupMembers}} block until {@code force(false)}
+ * returns (per-call fsync). These cover election-safety state (current term, vote, the local
+ * endpoint id, the initial group-members view) which Raft requires on disk before the calling
+ * thread can proceed. Rare path; the synchronous fsync cost does not show up in the steady-state
+ * commit pipeline.</li>
+ * <li><b>Tier B (default, segment-roll + periodic).</b> Log entries, snapshot chunks, and
+ * truncations are page-cache durable on writev. {@code force(false)} fires (i) when the active
+ * segment rolls (either on {@code segment-size} threshold or on graceful close), and (ii) every
+ * {@link LogStoreConfig#FSYNC_INTERVAL_MS_KEY} milliseconds <i>iff</i> the writer has appended
+ * bytes since the last fsync (the per-shard {@code unflushedBytes} counter). The periodic safety
+ * net bounds the unfsynced tail under light load. {@link RaftStore#flush()} barriers in this tier
+ * complete after the batch's write returns.</li>
+ * <li><b>Tier C (opt-in strict, per-commit).</b> Setting {@link LogStoreConfig#FSYNC_ON_COMMIT_KEY}
+ * to {@code true} restores per-{@link RaftStore#flush()} {@code force(false)}: every flush barrier
+ * blocks on fsync, the leader's {@code flushedLogIndex} and the follower's
+ * {@code AppendEntriesSuccessResponse} both advance only after disk durability.</li>
+ * </ul>
  * <p>
  * <b>Flush barrier.</b> {@link RaftStore#flush()} on a per-group adapter enqueues an empty-frame
- * {@code PendingWrite} with {@code fsyncRequested=true}. The writer recognises the empty frame as a
- * no-op marker, so nothing is written for it, but the marker drives the batch's {@code
- * anyFsync} flag and the marker's {@link CompletableFuture} is completed only after the writer has
- * issued {@code force(false)} for the batch. Multiple groups blocked on {@code flush()} collapse
- * onto the same window and amortise the single fsync.
+ * {@code PendingWrite} on the group's shard. {@code persistLogEntriesAndFlush} additionally fuses
+ * the trailing barrier into the last {@code LOG_ENTRY} frame's {@code PendingWrite}.
  * <p>
- * <b>Segment rolling, GC, truncation.</b> When the active segment crosses
- * {@link LogStoreConfig#getSegmentSizeBytes()}, the writer appends a best-effort
- * {@link LogRecord.Kind#SEGMENT_FOOTER}, fsyncs+closes, and opens a new segment with a magic +
- * version prologue and a {@link LogRecord.Kind#SEGMENT_HEADER}. Per-tick GC deletes a non-active
- * segment when every group with data in it has advanced past that segment's {@code maxLogIndex}.
- * {@link LogRecord.Kind#TRUNCATE_UNTIL} advances the GC frontier.
- * {@link LogRecord.Kind#TRUNCATE_FROM} is a marker for replay-time tail discard.
- * <p>
- * <b>Recovery.</b> {@link #load()} replays the on-disk log once, in segment-id order. The first
- * non-{@code OK} read result anywhere ({@link LogRecord.ReadResult.Kind#CRC} or
+ * <b>Recovery.</b> {@link #load()} replays each shard's directory in segment-id order. The first
+ * non-{@code OK} read result inside a shard ({@link LogRecord.ReadResult.Kind#CRC} or
  * {@link LogRecord.ReadResult.Kind#TRUNCATED}) truncates the offending segment at the bad offset,
- * deletes every later segment, and stops replay. Whatever per-group state was reconstructed up to
- * that point is returned. Gaps are closed at the layer above by Raft's
- * {@code AppendEntries}/{@code InstallSnapshot} catch-up.
+ * deletes every later segment in that shard, and stops replay for that shard. Whatever per-group
+ * state was reconstructed up to that point is returned. Other shards replay independently. Gaps are
+ * closed at the layer above by Raft's {@code AppendEntries}/{@code InstallSnapshot} catch-up.
  */
 @InterfaceAudience.Private
 public class UnifiedRaftStore implements DurableLogStore {
 
   private static final Logger LOG = LoggerFactory.getLogger(UnifiedRaftStore.class);
 
+  /** Subdirectory prefix for per-shard segment chains: {@code <log.dir>/shard-<i>/}. */
+  static final String SHARD_DIR_PREFIX = "shard-";
+
   /**
-   * Single message in the writer mailbox. Empty {@code encodedFrame} marks a {@code flush()}
-   * barrier.
+   * Single message in a writer shard's mailbox. Empty {@code encodedFrame} marks a {@code flush()}
+   * barrier or a periodic-fsync timer marker.
+   * <p>
+   * The two fsync flags are deliberately distinct:
+   * <ul>
+   * <li>{@code fsyncRequested} signals "this is a flush barrier — caller wants to know the writer
+   * has at least observed the preceding writev". In Tier C strict mode it gates a
+   * {@code force(false)}.</li>
+   * <li>{@code mandatoryFsync} signals "always issue {@code force(false)} for this batch,
+   * regardless of {@code fsyncOnCommit}". Set on Tier A frames (term / vote / local-endpoint /
+   * initial-members) and on the periodic-fsync timer marker.</li>
+   * </ul>
    */
   static final class PendingWrite {
     @Nullable
@@ -124,15 +137,18 @@ public class UnifiedRaftStore implements DurableLogStore {
     final LogRecord.Kind kind;
     final long logIndex;
     final boolean fsyncRequested;
+    final boolean mandatoryFsync;
     final CompletableFuture<Void> done = new CompletableFuture<>();
 
     PendingWrite(@Nullable ByteBuffer encodedFrame, @NonNull byte[] groupId,
-      @Nullable LogRecord.Kind kind, long logIndex, boolean fsyncRequested) {
+      @Nullable LogRecord.Kind kind, long logIndex, boolean fsyncRequested,
+      boolean mandatoryFsync) {
       this.encodedFrame = encodedFrame;
       this.groupId = groupId;
       this.kind = kind;
       this.logIndex = logIndex;
       this.fsyncRequested = fsyncRequested;
+      this.mandatoryFsync = mandatoryFsync;
     }
 
     boolean isFlushBarrier() {
@@ -144,33 +160,20 @@ public class UnifiedRaftStore implements DurableLogStore {
 
   private final LogStoreConfig config;
   private final LogStoreSerializer serializer;
-
-  // write-path state
-  private final MpscUnboundedArrayQueue<PendingWrite> mailbox;
-  private final Thread writer;
-
-  // segment + GC state
-  private final SegmentIndex segmentIndex = new SegmentIndex();
-  @Nullable
-  private volatile LogSegment currentSegment;
+  private final WriterShard[] shards;
 
   /**
-   * Per-group GC frontier. The highest {@code TRUNCATE_UNTIL} log index applied for that group. A
-   * non-active segment is GCable when every group with frames in it has advanced past that
-   * segment's {@code maxLogIndex} for the group.
+   * Single-threaded scheduler that owns the Tier B periodic-fsync timer. {@code null} when the
+   * timer is disabled ({@link LogStoreConfig#getFsyncIntervalMs()} {@code <= 0}). The scheduler
+   * thread does no blocking I/O; it only reads each shard's {@code unflushedBytes} and offers an
+   * empty {@link PendingWrite} with {@code mandatoryFsync=true} onto that shard's mailbox.
    */
-  private final Map<ByteBuffer, Long> lastAppliedFlushSeqId = new HashMap<>();
+  @Nullable
+  private ScheduledExecutorService fsyncScheduler;
 
-  private final AtomicLong nextSeq = new AtomicLong(0L);
-
-  // Lightweight counters powering {@link #getStats()}. Updated only on the writer thread. Uses
-  // {@link AtomicLong} so reader threads (test harnesses, metrics scrapers) see consistent values
-  // without a lock.
-  private final AtomicLong fdatasyncCount = new AtomicLong();
-  private final AtomicLong bytesAppended = new AtomicLong();
-  private final AtomicLong framesAppended = new AtomicLong();
-  private final AtomicLong segmentRolls = new AtomicLong();
-  private final AtomicLong batchesProcessed = new AtomicLong();
+  /** Handle to the recurring periodic-fsync task; cancelled on {@link #close()}. */
+  @Nullable
+  private ScheduledFuture<?> fsyncSchedulerHandle;
 
   private volatile boolean running = false;
   private volatile boolean loaded = false;
@@ -183,12 +186,13 @@ public class UnifiedRaftStore implements DurableLogStore {
   public UnifiedRaftStore(@NonNull LogStoreConfig config, @NonNull LogStoreSerializer serializer) {
     this.config = config;
     this.serializer = serializer;
-    this.mailbox = new MpscUnboundedArrayQueue<>(config.getMailboxChunkSize());
-    this.writer = new Thread(this::writerLoop);
-  }
-
-  public UnifiedRaftStore(@NonNull Configuration conf) {
-    this(new LogStoreConfig(conf));
+    int n = config.getWriterShards();
+    this.shards = new WriterShard[n];
+    Path baseDir = config.getLogDir().toPath();
+    for (int i = 0; i < n; i++) {
+      Path shardDir = baseDir.resolve(SHARD_DIR_PREFIX + i);
+      this.shards[i] = new WriterShard(this, config, serializer, i, shardDir);
+    }
   }
 
   @NonNull
@@ -196,14 +200,13 @@ public class UnifiedRaftStore implements DurableLogStore {
     return config;
   }
 
-  /**
-   * Returns a point-in-time snapshot of the write-path counters. Cheap (a handful of volatile
-   * reads); safe to call from any thread; never blocks the writer.
-   */
-  @NonNull
-  public LogStoreStats getStats() {
-    return new LogStoreStats(fdatasyncCount.get(), bytesAppended.get(), framesAppended.get(),
-      segmentRolls.get(), batchesProcessed.get(), mailbox.size());
+  /** Stable shard routing for a group id. Used by the SPI fast-path. */
+  int routeShard(@NonNull byte[] groupId) {
+    return (Arrays.hashCode(groupId) & 0x7fffffff) % shards.length;
+  }
+
+  boolean isRunning() {
+    return running;
   }
 
   @NonNull
@@ -212,18 +215,309 @@ public class UnifiedRaftStore implements DurableLogStore {
     if (loaded) {
       throw new IllegalStateException("load() must be called exactly once");
     }
-    Path dir = config.getLogDir().toPath();
-    if (!Files.exists(dir)) {
-      Files.createDirectories(dir);
+    Path baseDir = config.getLogDir().toPath();
+    if (!Files.exists(baseDir)) {
+      Files.createDirectories(baseDir);
     }
-    if (!Files.isDirectory(dir)) {
-      throw new IOException(LogStoreConfig.LOG_DIR_KEY + " is not a directory: " + dir);
+    if (!Files.isDirectory(baseDir)) {
+      throw new IOException(LogStoreConfig.LOG_DIR_KEY + " is not a directory: " + baseDir);
+    }
+    detectLayoutMismatch(baseDir);
+
+    Map<ByteBuffer, RestoredRaftState> out = new HashMap<>();
+    for (WriterShard sh : shards) {
+      Path shardDir = sh.shardDir();
+      if (!Files.exists(shardDir)) {
+        Files.createDirectories(shardDir);
+      }
+      Map<ByteBuffer, RestoredRaftState> shardOut = loadShard(sh, shardDir);
+      // Per the routing invariant, a group id appears in at most one shard. We don't bother
+      // checking for collisions here.
+      out.putAll(shardOut);
     }
 
-    NavigableMap<Long, Path> segmentsOnDisk = scanSegmentDir(dir);
+    running = true;
+    loaded = true;
+    for (WriterShard sh : shards) {
+      sh.start("UnifiedRaftStore-writer-" + sh.shardIndex());
+    }
+
+    long intervalMs = config.getFsyncIntervalMs();
+    if (intervalMs > 0L) {
+      fsyncScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "UnifiedRaftStore-periodic-fsync");
+        t.setDaemon(true);
+        return t;
+      });
+      fsyncSchedulerHandle = fsyncScheduler.scheduleWithFixedDelay(this::periodicFsyncTick,
+        intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    LOG.info(
+      "UnifiedRaftStore loaded: {} group(s), {} shard(s), fsyncOnCommit={}, fsyncIntervalMs={},"
+        + " preallocSegment={}",
+      out.size(), shards.length, config.isFsyncOnCommit(), intervalMs, config.isPreallocSegment());
+    return out;
+  }
+
+  /**
+   * Refuse to start if the on-disk layout disagrees with the configured shard count. This is a
+   * defence against silently splitting an existing log across the wrong number of writer shards.
+   */
+  private void detectLayoutMismatch(Path baseDir) throws IOException {
+    Set<Integer> presentShardIds = new HashSet<>();
+    boolean strayLogFiles = false;
+    try (DirectoryStream<Path> stream = Files.newDirectoryStream(baseDir)) {
+      for (Path p : stream) {
+        String name = p.getFileName().toString();
+        if (Files.isDirectory(p)) {
+          if (name.startsWith(SHARD_DIR_PREFIX)) {
+            String idStr = name.substring(SHARD_DIR_PREFIX.length());
+            try {
+              presentShardIds.add(Integer.parseInt(idStr));
+            } catch (NumberFormatException nfe) {
+              // not a shard subdirectory; ignore
+            }
+          }
+        } else if (
+          name.startsWith(LogSegment.FILE_PREFIX) && name.endsWith(LogSegment.FILE_SUFFIX)
+            && LogSegment.parseSegmentId(name) >= 0
+        ) {
+          strayLogFiles = true;
+        }
+      }
+    }
+    if (strayLogFiles) {
+      throw new IOException("Found legacy flat-layout log segments under " + baseDir
+        + "; this UnifiedRaftStore requires the per-shard layout (<log.dir>/shard-<i>/raft-NN.log)."
+        + " Auto-migration is not supported.");
+    }
+    if (presentShardIds.isEmpty()) {
+      // Fresh directory; no mismatch possible.
+      return;
+    }
+    int maxShardId = Collections.max(presentShardIds);
+    int minShardId = Collections.min(presentShardIds);
+    boolean dense = presentShardIds.size() == maxShardId + 1;
+    if (minShardId < 0 || !dense || maxShardId + 1 != shards.length) {
+      throw new IOException("On-disk shard layout under " + baseDir + " has shards "
+        + presentShardIds + " but configured shard count is " + shards.length
+        + ". Layout mismatch is not auto-migrated.");
+    }
+  }
+
+  @NonNull
+  @Override
+  public RaftStore newGroupStore(@NonNull byte[] groupId) throws IOException {
+    if (!loaded) {
+      throw new IllegalStateException("load() must be called before newGroupStore()");
+    }
+    if (closed) {
+      throw new IOException("UnifiedRaftStore is closed");
+    }
+    return new GroupRaftStore(this, groupId.clone());
+  }
+
+  @Override
+  public synchronized void close() throws IOException {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    running = false;
+    if (fsyncSchedulerHandle != null) {
+      fsyncSchedulerHandle.cancel(false);
+      fsyncSchedulerHandle = null;
+    }
+    if (fsyncScheduler != null) {
+      fsyncScheduler.shutdownNow();
+      try {
+        if (!fsyncScheduler.awaitTermination(5L, TimeUnit.SECONDS)) {
+          LOG.warn("Periodic-fsync scheduler did not terminate within 5s");
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      fsyncScheduler = null;
+    }
+    for (WriterShard sh : shards) {
+      sh.shutdown();
+    }
+    for (WriterShard sh : shards) {
+      sh.closeSegments();
+    }
+  }
+
+  /**
+   * Periodic-fsync timer tick. Runs on a dedicated single-threaded scheduler. For every shard whose
+   * writer has appended bytes since the last fsync, enqueues a fire-and-forget empty
+   * {@link PendingWrite} with {@code mandatoryFsync=true}. The shard's writer thread picks it up
+   * and issues a single {@code force(false)} for the batch. When a shard's {@code unflushedBytes}
+   * is zero this is a no-op for that shard.
+   */
+  private void periodicFsyncTick() {
+    if (!running || closed) {
+      return;
+    }
+    for (WriterShard sh : shards) {
+      if (sh.unflushedBytes() <= 0L) {
+        continue;
+      }
+      PendingWrite marker = new PendingWrite(null, EMPTY_GROUP_ID, null, -1L, true, true);
+      sh.submit(marker);
+    }
+  }
+
+  void persistLogEntries(@NonNull byte[] groupId, @NonNull List<LogEntry> entries)
+    throws IOException {
+    requireOpen();
+    WriterShard sh = shards[routeShard(groupId)];
+    LogStoreSerializer.Serializer<LogEntry> ser = serializer.logEntrySerializer();
+    for (LogEntry entry : entries) {
+      byte[] payload = ser.serialize(entry);
+      enqueueAsync(sh, LogRecord.Kind.LOG_ENTRY, groupId, payload, entry.getIndex());
+    }
+  }
+
+  /**
+   * Encode all entries onto the shard, mark the trailing frame as a flush barrier, and await it.
+   */
+  void persistLogEntriesAndFlush(@NonNull byte[] groupId, @NonNull List<LogEntry> entries)
+    throws IOException {
+    requireOpen();
+    if (entries.isEmpty()) {
+      flushBarrier(groupId);
+      return;
+    }
+    WriterShard sh = shards[routeShard(groupId)];
+    LogStoreSerializer.Serializer<LogEntry> ser = serializer.logEntrySerializer();
+    PendingWrite last = null;
+    int n = entries.size();
+    for (int i = 0; i < n; i++) {
+      LogEntry entry = entries.get(i);
+      byte[] payload = ser.serialize(entry);
+      LogRecord rec = new LogRecord(LogRecord.Kind.LOG_ENTRY, sh.nextSequence(), groupId, payload);
+      ByteBuffer frame = LogRecord.encode(rec);
+      boolean fsyncBarrier = (i == n - 1);
+      PendingWrite pw = new PendingWrite(frame, groupId, LogRecord.Kind.LOG_ENTRY, entry.getIndex(),
+        fsyncBarrier, /* mandatoryFsync */ false);
+      sh.submit(pw);
+      if (fsyncBarrier) {
+        last = pw;
+      }
+    }
+    await(last);
+  }
+
+  void persistSnapshotChunk(@NonNull byte[] groupId, @NonNull SnapshotChunk chunk)
+    throws IOException {
+    requireOpen();
+    byte[] payload = serializer.snapshotChunkSerializer().serialize(chunk);
+    enqueueAsync(shards[routeShard(groupId)], LogRecord.Kind.SNAPSHOT_CHUNK, groupId, payload,
+      chunk.getIndex());
+  }
+
+  void persistAndFlushTerm(@NonNull byte[] groupId, @NonNull RaftTermPersistentState state)
+    throws IOException {
+    requireOpen();
+    byte[] payload = serializer.raftTermPersistentStateSerializer().serialize(state);
+    awaitFsync(shards[routeShard(groupId)], LogRecord.Kind.TERM_VOTE, groupId, payload, -1L);
+  }
+
+  void persistAndFlushLocalEndpoint(@NonNull byte[] groupId,
+    @NonNull RaftEndpointPersistentState state) throws IOException {
+    requireOpen();
+    byte[] payload = serializer.raftEndpointPersistentStateSerializer().serialize(state);
+    awaitFsync(shards[routeShard(groupId)], LogRecord.Kind.LOCAL_ENDPOINT, groupId, payload, -1L);
+  }
+
+  void persistAndFlushInitialGroupMembers(@NonNull byte[] groupId,
+    @NonNull RaftGroupMembersView view) throws IOException {
+    requireOpen();
+    byte[] payload = serializer.raftGroupMembersViewSerializer().serialize(view);
+    awaitFsync(shards[routeShard(groupId)], LogRecord.Kind.INITIAL_MEMBERS, groupId, payload, -1L);
+  }
+
+  void truncateLogEntriesFrom(@NonNull byte[] groupId, long logIndexInclusive) throws IOException {
+    requireOpen();
+    byte[] payload = LogRecord.encodeTruncatePayload(logIndexInclusive);
+    enqueueAsync(shards[routeShard(groupId)], LogRecord.Kind.TRUNCATE_FROM, groupId, payload,
+      logIndexInclusive);
+  }
+
+  void truncateLogEntriesUntil(@NonNull byte[] groupId, long logIndexInclusive) throws IOException {
+    requireOpen();
+    byte[] payload = LogRecord.encodeTruncatePayload(logIndexInclusive);
+    enqueueAsync(shards[routeShard(groupId)], LogRecord.Kind.TRUNCATE_UNTIL, groupId, payload,
+      logIndexInclusive);
+  }
+
+  void deleteSnapshotChunks(@NonNull byte[] groupId, long logIndex, int chunkCount)
+    throws IOException {
+    requireOpen();
+    byte[] payload = LogRecord.encodeDeleteSnapshotChunksPayload(logIndex, chunkCount);
+    enqueueAsync(shards[routeShard(groupId)], LogRecord.Kind.DELETE_SNAPSHOT_CHUNKS, groupId,
+      payload, logIndex);
+  }
+
+  void flushBarrier(@NonNull byte[] groupId) throws IOException {
+    requireOpen();
+    PendingWrite pw = new PendingWrite(null, groupId, null, -1L, true, false);
+    shards[routeShard(groupId)].submit(pw);
+    await(pw);
+  }
+
+  private void requireOpen() throws IOException {
+    if (closed) {
+      throw new IOException("UnifiedRaftStore is closed");
+    }
+    if (!loaded) {
+      throw new IOException("UnifiedRaftStore.load() has not been called");
+    }
+  }
+
+  private void enqueueAsync(WriterShard sh, LogRecord.Kind kind, byte[] groupId, byte[] payload,
+    long logIndex) {
+    LogRecord rec = new LogRecord(kind, sh.nextSequence(), groupId, payload);
+    ByteBuffer frame = LogRecord.encode(rec);
+    sh.submit(new PendingWrite(frame, groupId, kind, logIndex, false, false));
+  }
+
+  private void awaitFsync(WriterShard sh, LogRecord.Kind kind, byte[] groupId, byte[] payload,
+    long logIndex) throws IOException {
+    LogRecord rec = new LogRecord(kind, sh.nextSequence(), groupId, payload);
+    ByteBuffer frame = LogRecord.encode(rec);
+    PendingWrite pw = new PendingWrite(frame, groupId, kind, logIndex, true, true);
+    sh.submit(pw);
+    await(pw);
+  }
+
+  private static void await(PendingWrite pw) throws IOException {
+    try {
+      pw.done.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while waiting for log write", e);
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof IOException) {
+        throw (IOException) cause;
+      }
+      throw new IOException("Log write failed", cause);
+    }
+  }
+
+  /**
+   * Replays one shard's directory and (re-)opens it for append. Returns per-group restored state
+   * for groups whose data lives in this shard.
+   */
+  private Map<ByteBuffer, RestoredRaftState> loadShard(WriterShard sh, Path shardDir)
+    throws IOException {
+    NavigableMap<Long, Path> segmentsOnDisk = scanSegmentDir(shardDir);
 
     Map<ByteBuffer, GroupReplayState> perGroup = new HashMap<>();
     Map<Long, Map<ByteBuffer, Long>> perSegmentMax = new HashMap<>();
+    Map<ByteBuffer, Long> shardFrontier = new HashMap<>();
     long highestSeq = 0L;
 
     boolean stoppedEarly = false;
@@ -236,7 +530,7 @@ public class UnifiedRaftStore implements DurableLogStore {
       Map<ByteBuffer, Long> segMax = new HashMap<>();
       ReplayResult rr;
       try {
-        rr = replaySegment(segmentId, path, perGroup, segMax);
+        rr = replaySegment(segmentId, path, perGroup, segMax, shardFrontier);
       } catch (IOException ioe) {
         LOG.warn("Segment {} failed prologue/header validation; treating as truncation point", path,
           ioe);
@@ -263,11 +557,9 @@ public class UnifiedRaftStore implements DurableLogStore {
       activeSegmentSize =
         truncateAndDeleteAfter(segmentsOnDisk, stoppedAtSegmentId, stoppedAtOffset);
       if (activeSegmentSize < 0) {
-        // This segment was deleted entirely.
         goodSegmentIds.remove(stoppedAtSegmentId);
         perSegmentMax.remove(stoppedAtSegmentId);
       }
-      // Drop accounting for any segment we removed.
       Iterator<Map.Entry<Long, Path>> it =
         segmentsOnDisk.tailMap(stoppedAtSegmentId, false).entrySet().iterator();
       while (it.hasNext()) {
@@ -277,8 +569,9 @@ public class UnifiedRaftStore implements DurableLogStore {
       }
     }
 
-    rebuildSegmentIndexFromSurvivors(dir, segmentsOnDisk, goodSegmentIds, perSegmentMax,
+    rebuildSegmentIndexFromSurvivors(sh, shardDir, segmentsOnDisk, goodSegmentIds, perSegmentMax,
       activeSegmentSize, highestSeq);
+    sh.seedGcFrontier(shardFrontier);
 
     Map<ByteBuffer, RestoredRaftState> out = new HashMap<>();
     for (Map.Entry<ByteBuffer, GroupReplayState> e : perGroup.entrySet()) {
@@ -287,338 +580,17 @@ public class UnifiedRaftStore implements DurableLogStore {
         out.put(e.getKey(), rs);
       }
     }
-
-    running = true;
-    loaded = true;
-    Threads.setDaemonThreadRunning(writer, "UnifiedRaftStore-writer",
-      Threads.LOGGING_EXCEPTION_HANDLER);
-
-    LOG.info("UnifiedRaftStore loaded: {} group(s), {} segment(s), nextSeq={}", out.size(),
-      segmentIndex.size(), nextSeq.get());
     return out;
-  }
-
-  @NonNull
-  @Override
-  public RaftStore newGroupStore(@NonNull byte[] groupId) throws IOException {
-    if (!loaded) {
-      throw new IllegalStateException("load() must be called before newGroupStore()");
-    }
-    if (closed) {
-      throw new IOException("UnifiedRaftStore is closed");
-    }
-    return new GroupRaftStore(this, groupId.clone());
-  }
-
-  @Override
-  public synchronized void close() throws IOException {
-    if (closed) {
-      return;
-    }
-    closed = true;
-    running = false;
-    if (writer.isAlive()) {
-      LockSupport.unpark(writer);
-      try {
-        writer.join(TimeUnit.SECONDS.toMillis(30));
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
-    if (currentSegment != null) {
-      try {
-        currentSegment.force(true);
-      } catch (IOException ignore) {
-        // best-effort
-      }
-      currentSegment.close();
-    }
-    for (LogSegment s : segmentIndex.segmentsById().values()) {
-      if (s != currentSegment) {
-        try {
-          s.close();
-        } catch (IOException ignore) {
-          // best-effort
-        }
-      }
-    }
-  }
-
-  void persistLogEntries(@NonNull byte[] groupId, @NonNull List<LogEntry> entries)
-    throws IOException {
-    requireOpen();
-    LogStoreSerializer.Serializer<LogEntry> ser = serializer.logEntrySerializer();
-    for (LogEntry entry : entries) {
-      byte[] payload = ser.serialize(entry);
-      enqueueAsync(LogRecord.Kind.LOG_ENTRY, groupId, payload, entry.getIndex());
-    }
-  }
-
-  void persistSnapshotChunk(@NonNull byte[] groupId, @NonNull SnapshotChunk chunk)
-    throws IOException {
-    requireOpen();
-    byte[] payload = serializer.snapshotChunkSerializer().serialize(chunk);
-    enqueueAsync(LogRecord.Kind.SNAPSHOT_CHUNK, groupId, payload, chunk.getIndex());
-  }
-
-  void persistAndFlushTerm(@NonNull byte[] groupId, @NonNull RaftTermPersistentState state)
-    throws IOException {
-    requireOpen();
-    byte[] payload = serializer.raftTermPersistentStateSerializer().serialize(state);
-    awaitFsync(LogRecord.Kind.TERM_VOTE, groupId, payload, -1L);
-  }
-
-  void persistAndFlushLocalEndpoint(@NonNull byte[] groupId,
-    @NonNull RaftEndpointPersistentState state) throws IOException {
-    requireOpen();
-    byte[] payload = serializer.raftEndpointPersistentStateSerializer().serialize(state);
-    awaitFsync(LogRecord.Kind.LOCAL_ENDPOINT, groupId, payload, -1L);
-  }
-
-  void persistAndFlushInitialGroupMembers(@NonNull byte[] groupId,
-    @NonNull RaftGroupMembersView view) throws IOException {
-    requireOpen();
-    byte[] payload = serializer.raftGroupMembersViewSerializer().serialize(view);
-    awaitFsync(LogRecord.Kind.INITIAL_MEMBERS, groupId, payload, -1L);
-  }
-
-  void truncateLogEntriesFrom(@NonNull byte[] groupId, long logIndexInclusive) throws IOException {
-    requireOpen();
-    byte[] payload = LogRecord.encodeTruncatePayload(logIndexInclusive);
-    enqueueAsync(LogRecord.Kind.TRUNCATE_FROM, groupId, payload, logIndexInclusive);
-  }
-
-  void truncateLogEntriesUntil(@NonNull byte[] groupId, long logIndexInclusive) throws IOException {
-    requireOpen();
-    byte[] payload = LogRecord.encodeTruncatePayload(logIndexInclusive);
-    enqueueAsync(LogRecord.Kind.TRUNCATE_UNTIL, groupId, payload, logIndexInclusive);
-  }
-
-  void deleteSnapshotChunks(@NonNull byte[] groupId, long logIndex, int chunkCount)
-    throws IOException {
-    requireOpen();
-    byte[] payload = LogRecord.encodeDeleteSnapshotChunksPayload(logIndex, chunkCount);
-    enqueueAsync(LogRecord.Kind.DELETE_SNAPSHOT_CHUNKS, groupId, payload, logIndex);
-  }
-
-  void flushBarrier(@NonNull byte[] groupId) throws IOException {
-    requireOpen();
-    // fsyncRequested = true: the writer thread coalesces this barrier with any other concurrent
-    // entries / barriers in the same window and issues a single force(false) at the end of the
-    // window. flush() therefore returns only after the active segment has been fsynced, so every
-    // log-entry frame appended before this call is on disk. This is the durability anchor that
-    // Raft commit-index advancement depends on. A follower sends its AppendEntriesSuccessResponse
-    // after log.flush() returns, so the matchIndex it advertises reflects on-disk content. The
-    // leader's FlushTask sets flushedLogIndex (its own contribution to the commit quorum) after
-    // log.flush() returns for the same reason.
-    PendingWrite pw = new PendingWrite(null, groupId, null, -1L, true);
-    submit(pw);
-    await(pw);
-  }
-
-  private void requireOpen() throws IOException {
-    if (closed) {
-      throw new IOException("UnifiedRaftStore is closed");
-    }
-    if (!loaded) {
-      throw new IOException("UnifiedRaftStore.load() has not been called");
-    }
-  }
-
-  private void enqueueAsync(LogRecord.Kind kind, byte[] groupId, byte[] payload, long logIndex) {
-    LogRecord rec = new LogRecord(kind, nextSeq.getAndIncrement(), groupId, payload);
-    ByteBuffer frame = LogRecord.encode(rec);
-    submit(new PendingWrite(frame, groupId, kind, logIndex, false));
-  }
-
-  private void awaitFsync(LogRecord.Kind kind, byte[] groupId, byte[] payload, long logIndex)
-    throws IOException {
-    LogRecord rec = new LogRecord(kind, nextSeq.getAndIncrement(), groupId, payload);
-    ByteBuffer frame = LogRecord.encode(rec);
-    PendingWrite pw = new PendingWrite(frame, groupId, kind, logIndex, true);
-    submit(pw);
-    await(pw);
-  }
-
-  private void submit(PendingWrite pw) {
-    while (!mailbox.offer(pw)) {
-      // MpscUnboundedArrayQueue.offer never returns false (unbounded), but treat as a backpressure
-      // hook for symmetry with bounded variants.
-      Thread.onSpinWait();
-    }
-    LockSupport.unpark(writer);
-  }
-
-  private static void await(PendingWrite pw) throws IOException {
-    try {
-      pw.done.get();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new IOException("Interrupted while waiting for log write", e);
-    } catch (ExecutionException e) {
-      Throwable cause = e.getCause();
-      if (cause instanceof IOException) {
-        throw (IOException) cause;
-      }
-      throw new IOException("Log write failed", cause);
-    }
-  }
-
-  private void writerLoop() {
-    final long batchMs = config.getBatchMs();
-    while (running) {
-      PendingWrite first = mailbox.poll();
-      if (first == null) {
-        LockSupport.parkNanos(this, TimeUnit.MILLISECONDS.toNanos(Math.max(1L, batchMs)));
-        continue;
-      }
-      List<PendingWrite> batch = new ArrayList<>();
-      batch.add(first);
-      drainBatch(batch, batchMs);
-      runBatch(batch);
-    }
-    // Drain anything left in the mailbox before we exit.
-    List<PendingWrite> tail = new ArrayList<>();
-    PendingWrite p;
-    while ((p = mailbox.poll()) != null) {
-      tail.add(p);
-    }
-    if (!tail.isEmpty()) {
-      runBatch(tail);
-    }
-  }
-
-  private void drainBatch(List<PendingWrite> batch, long batchMs) {
-    long deadline = EnvironmentEdgeManager.currentTime() + Math.max(1L, batchMs);
-    long now;
-    while ((now = EnvironmentEdgeManager.currentTime()) < deadline) {
-      PendingWrite next = mailbox.poll();
-      if (next != null) {
-        batch.add(next);
-      } else {
-        long sleepMs = Math.max(1L, deadline - now);
-        LockSupport.parkNanos(this, TimeUnit.MILLISECONDS.toNanos(Math.min(sleepMs, 1L)));
-      }
-    }
-    PendingWrite next;
-    while ((next = mailbox.poll()) != null) {
-      batch.add(next);
-    }
-  }
-
-  private void runBatch(List<PendingWrite> batch) {
-    try {
-      processBatch(batch);
-    } catch (IOException e) {
-      LOG.error("UnifiedRaftStore writer batch failed", e);
-      for (PendingWrite pw : batch) {
-        if (!pw.done.isDone()) {
-          pw.done.completeExceptionally(e);
-        }
-      }
-    }
-  }
-
-  private void processBatch(List<PendingWrite> batch) throws IOException {
-    List<ByteBuffer> framesList = new ArrayList<>(batch.size());
-    boolean anyFsync = false;
-    long batchBytes = 0L;
-    for (PendingWrite pw : batch) {
-      if (pw.encodedFrame != null) {
-        framesList.add(pw.encodedFrame);
-        batchBytes += pw.encodedFrame.remaining();
-      }
-      if (pw.fsyncRequested) {
-        anyFsync = true;
-      }
-    }
-    batchesProcessed.incrementAndGet();
-    if (!framesList.isEmpty()) {
-      currentSegment.appendFrames(framesList.toArray(new ByteBuffer[0]));
-      bytesAppended.addAndGet(batchBytes);
-      framesAppended.addAndGet(framesList.size());
-    }
-    for (PendingWrite pw : batch) {
-      if (pw.kind == LogRecord.Kind.LOG_ENTRY || pw.kind == LogRecord.Kind.SNAPSHOT_CHUNK) {
-        currentSegment.recordMaxLogIndex(pw.groupId, pw.logIndex);
-      } else if (pw.kind == LogRecord.Kind.TRUNCATE_UNTIL) {
-        ByteBuffer key =
-          ByteBuffer.wrap(Arrays.copyOf(pw.groupId, pw.groupId.length)).asReadOnlyBuffer();
-        lastAppliedFlushSeqId.merge(key, pw.logIndex, Math::max);
-      }
-    }
-    if (anyFsync && currentSegment != null) {
-      currentSegment.force(false);
-      fdatasyncCount.incrementAndGet();
-    }
-    if (currentSegment != null && currentSegment.currentSize() >= config.getSegmentSizeBytes()) {
-      rollSegment();
-      segmentRolls.incrementAndGet();
-    }
-    maybeGcSegments();
-    for (PendingWrite pw : batch) {
-      pw.done.complete(null);
-    }
-  }
-
-  private void rollSegment() throws IOException {
-    long currentId = currentSegment.segmentId();
-    long nextId = currentId + 1L;
-    appendHousekeepingFrame(LogRecord.Kind.SEGMENT_FOOTER,
-      LogRecord.encodeSegmentFooterPayload(nextId, false));
-    currentSegment.force(true);
-    currentSegment.close();
-    Path newPath = config.getLogDir().toPath().resolve(LogSegment.filename(nextId));
-    LogSegment newSeg = LogSegment.create(nextId, newPath);
-    segmentIndex.register(newSeg);
-    currentSegment = newSeg;
-    appendHousekeepingFrame(LogRecord.Kind.SEGMENT_HEADER,
-      LogRecord.encodeSegmentHeaderPayload(nextId, EnvironmentEdgeManager.currentTime()));
-    currentSegment.force(true);
-  }
-
-  private void appendHousekeepingFrame(LogRecord.Kind kind, byte[] payload) throws IOException {
-    LogRecord rec = new LogRecord(kind, nextSeq.getAndIncrement(), EMPTY_GROUP_ID, payload);
-    currentSegment.appendFrame(LogRecord.encode(rec));
-  }
-
-  private void maybeGcSegments() {
-    Iterator<Map.Entry<Long, LogSegment>> it = segmentIndex.segmentsById().entrySet().iterator();
-    while (it.hasNext()) {
-      Map.Entry<Long, LogSegment> e = it.next();
-      LogSegment s = e.getValue();
-      if (s == currentSegment) {
-        continue;
-      }
-      boolean canDelete = true;
-      for (Map.Entry<ByteBuffer, Long> g : s.maxLogIndexByGroup().entrySet()) {
-        Long frontier = lastAppliedFlushSeqId.get(g.getKey());
-        if (frontier == null || frontier < g.getValue()) {
-          canDelete = false;
-          break;
-        }
-      }
-      if (canDelete) {
-        try {
-          s.close();
-          s.deleteFile();
-          it.remove();
-          LOG.debug("GC'd segment {}", s.path());
-        } catch (IOException ioe) {
-          LOG.warn("Failed to GC segment {}", s, ioe);
-        }
-      }
-    }
   }
 
   /**
    * Streams a single segment file in one pass, accumulating per-group state, populating the
    * supplied {@code segMax} (per-group max log index this segment carries, used for GC), and
-   * applying any {@code TRUNCATE_UNTIL} markers to the global GC frontier. Returns whether the
-   * segment ended cleanly (EndOfFile at a frame boundary) and where it stopped if it didn't.
+   * applying any {@code TRUNCATE_UNTIL} markers to the shard-local GC frontier.
    */
   private ReplayResult replaySegment(long segmentId, Path path,
-    Map<ByteBuffer, GroupReplayState> perGroup, Map<ByteBuffer, Long> segMax) throws IOException {
+    Map<ByteBuffer, GroupReplayState> perGroup, Map<ByteBuffer, Long> segMax,
+    Map<ByteBuffer, Long> shardFrontier) throws IOException {
     long highestSeq = 0L;
     try (FileChannel ch = FileChannel.open(path, StandardOpenOption.READ);
       LogRecord.Reader reader = new LogRecord.Reader(ch)) {
@@ -627,7 +599,7 @@ public class UnifiedRaftStore implements DurableLogStore {
         switch (rr.kind()) {
           case OK:
             highestSeq = Math.max(highestSeq, rr.record().getSeq());
-            applyRecord(rr.record(), perGroup, segMax);
+            applyRecord(rr.record(), perGroup, segMax, shardFrontier);
             break;
           case END_OF_FILE:
             return new ReplayResult(true, reader.position(), highestSeq);
@@ -645,7 +617,7 @@ public class UnifiedRaftStore implements DurableLogStore {
   }
 
   private void applyRecord(LogRecord rec, Map<ByteBuffer, GroupReplayState> perGroup,
-    Map<ByteBuffer, Long> segMax) {
+    Map<ByteBuffer, Long> segMax, Map<ByteBuffer, Long> shardFrontier) {
     if (
       rec.getKind() == LogRecord.Kind.SEGMENT_HEADER
         || rec.getKind() == LogRecord.Kind.SEGMENT_FOOTER
@@ -661,7 +633,7 @@ public class UnifiedRaftStore implements DurableLogStore {
     }
     if (rec.getKind() == LogRecord.Kind.TRUNCATE_UNTIL) {
       long idx = LogRecord.decodeTruncatePayload(rec.getPayload());
-      lastAppliedFlushSeqId.merge(key, idx, Math::max);
+      shardFrontier.merge(key, idx, Math::max);
     }
   }
 
@@ -693,29 +665,31 @@ public class UnifiedRaftStore implements DurableLogStore {
   }
 
   /**
-   * Rebuilds {@link #segmentIndex} from the segments that survived load-time replay. The highest
-   * surviving segment id becomes the active segment open for append. If the directory is empty
-   * (post-truncation or first-boot), creates a fresh segment {@code 0} with the standard prologue +
-   * {@code SEGMENT_HEADER}.
+   * Rebuilds the shard's segment index from the segments that survived load-time replay. The
+   * highest surviving segment id becomes the active segment open for append. If the shard has no
+   * segments yet (post-truncation or first-boot), creates a fresh segment {@code 0} with the
+   * standard prologue + {@code SEGMENT_HEADER}.
    */
-  private void rebuildSegmentIndexFromSurvivors(Path dir, NavigableMap<Long, Path> segmentsOnDisk,
-    Set<Long> goodSegmentIds, Map<Long, Map<ByteBuffer, Long>> perSegmentMax,
-    long activeSegmentSize, long highestSeqSeen) throws IOException {
+  private void rebuildSegmentIndexFromSurvivors(WriterShard sh, Path shardDir,
+    NavigableMap<Long, Path> segmentsOnDisk, Set<Long> goodSegmentIds,
+    Map<Long, Map<ByteBuffer, Long>> perSegmentMax, long activeSegmentSize, long highestSeqSeen)
+    throws IOException {
     if (goodSegmentIds.isEmpty()) {
       long bootId = 0L;
-      Path firstPath = dir.resolve(LogSegment.filename(bootId));
-      LogSegment seg = LogSegment.create(bootId, firstPath);
-      segmentIndex.register(seg);
-      currentSegment = seg;
+      Path firstPath = shardDir.resolve(LogSegment.filename(bootId));
+      LogSegment seg = LogSegment.create(bootId, firstPath,
+        config.isPreallocSegment() ? config.getSegmentSizeBytes() : 0L);
       long seedSeq = highestSeqSeen + 1L;
       LogRecord header = new LogRecord(LogRecord.Kind.SEGMENT_HEADER, seedSeq, EMPTY_GROUP_ID,
         LogRecord.encodeSegmentHeaderPayload(bootId, EnvironmentEdgeManager.currentTime()));
       seg.appendFrame(LogRecord.encode(header));
       seg.force(true);
-      nextSeq.set(seedSeq + 1L);
+      sh.setCurrentSegment(seg);
+      sh.seedNextSequence(seedSeq + 1L);
       return;
     }
     long activeId = Collections.max(goodSegmentIds);
+    LogSegment activeSeg = null;
     for (Long id : goodSegmentIds) {
       Path p = segmentsOnDisk.get(id);
       long size;
@@ -732,12 +706,16 @@ public class UnifiedRaftStore implements DurableLogStore {
           seg.recordMaxLogIndex(gid, e.getValue());
         }
       }
-      segmentIndex.register(seg);
       if (id == activeId) {
-        currentSegment = seg;
+        activeSeg = seg;
+      } else {
+        sh.segmentIndex().register(seg);
       }
     }
-    nextSeq.set(highestSeqSeen + 1L);
+    if (activeSeg != null) {
+      sh.setCurrentSegment(activeSeg);
+    }
+    sh.seedNextSequence(highestSeqSeen + 1L);
   }
 
   private static byte[] readOnlyBufferToBytes(ByteBuffer b) {
@@ -922,36 +900,40 @@ public class UnifiedRaftStore implements DurableLogStore {
     }
   }
 
-  /** Visible for tests */
+  /** Visible for tests. */
   @Nullable
-  LogSegment currentSegmentForTesting() {
-    return currentSegment;
+  LogSegment currentSegmentForTesting(int shardIndex) {
+    return shards[shardIndex].currentSegment();
   }
 
-  /**
-   * Visible for tests. Installs {@code segment} as the active segment, also re-registering it under
-   * the same id in the {@link SegmentIndex} so the writer's own GC pass treats it as the active
-   * segment. Caller must quiesce the writer first (e.g. via
-   * {@link #awaitMailboxDrainedForTesting()}) and must not exercise segment roll while the wrapper
-   * is in place.
-   */
-  void replaceCurrentSegmentForTesting(@NonNull LogSegment segment) {
-    this.currentSegment = segment;
-    segmentIndex.register(segment);
+  /** Visible for tests. */
+  @Nullable
+  LogSegment currentSegmentForGroup(@NonNull byte[] groupId) {
+    return shards[routeShard(groupId)].currentSegment();
   }
 
-  /** Visible for tests */
-  SegmentIndex segmentIndexForTesting() {
-    return segmentIndex;
+  /** Visible for tests. */
+  void replaceCurrentSegmentForTesting(int shardIndex, @NonNull LogSegment segment) {
+    shards[shardIndex].setCurrentSegment(segment);
   }
 
-  /** Visible for tests */
-  Map<ByteBuffer, Long> gcFrontierForTesting() {
-    return new HashMap<>(lastAppliedFlushSeqId);
+  /** Visible for tests. */
+  @NonNull
+  SegmentIndex segmentIndexForTesting(int shardIndex) {
+    return shards[shardIndex].segmentIndex();
   }
 
-  /** Visible for tests */
+  /** Visible for tests. */
   void awaitMailboxDrainedForTesting() throws IOException {
-    flushBarrier(EMPTY_GROUP_ID);
+    for (WriterShard sh : shards) {
+      PendingWrite pw = new PendingWrite(null, EMPTY_GROUP_ID, null, -1L, true, false);
+      sh.submit(pw);
+      await(pw);
+    }
+  }
+
+  /** Visible for tests. */
+  WriterShard shardForTesting(int shardIndex) {
+    return shards[shardIndex];
   }
 }

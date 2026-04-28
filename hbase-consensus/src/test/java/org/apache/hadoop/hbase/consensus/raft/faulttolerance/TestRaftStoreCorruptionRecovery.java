@@ -164,11 +164,8 @@ public class TestRaftStoreCorruptionRecovery extends TestBase {
 
   /**
    * Models a power-failure that takes the whole cluster down at once and leaves one node's active
-   * segment with a zero-filled trailing filesystem block (a common ext4-style outcome for a
-   * partially-written block on a faulty device). After all three nodes cold-start from disk,
-   * {@code load()} on the damaged node detects the run of {@code 0x00} bytes as a bad frame,
-   * truncates back to the last good record, and the freshly elected leader closes the resulting
-   * tail gap via {@code AppendEntriesRequest}.
+   * segment with a zero-filled trailing filesystem block which is a common ext4-style outcome for a
+   * partially-written block.
    */
   @Test
   @Timeout(value = 240, unit = TimeUnit.SECONDS)
@@ -241,9 +238,16 @@ public class TestRaftStoreCorruptionRecovery extends TestBase {
   /** On-disk file prefix used by {@code LogSegment} (mirrored here as test access). */
   private static final String SEGMENT_FILE_PREFIX = "raft-";
 
+  /**
+   * Walks {@code dir} (the endpoint log directory) including the per-shard {@code shard-N/}
+   * subdirectories created by {@code UnifiedRaftStore}, and returns the single segment file. The
+   * "default" group used by these tests routes to exactly one shard so there is exactly one segment
+   * file across all subdirectories.
+   */
   private static Path onlySegmentIn(File dir) throws IOException {
-    try (Stream<Path> s = Files.list(dir.toPath())) {
-      return s.filter(p -> p.getFileName().toString().startsWith(SEGMENT_FILE_PREFIX)).findFirst()
+    try (Stream<Path> s = Files.walk(dir.toPath())) {
+      return s.filter(Files::isRegularFile)
+        .filter(p -> p.getFileName().toString().startsWith(SEGMENT_FILE_PREFIX)).findFirst()
         .orElseThrow();
     }
   }

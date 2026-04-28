@@ -39,7 +39,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map.Entry;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -87,19 +86,19 @@ public class TestSingletonRaftGroup extends TestBase {
     List<RaftNodeReport> reports = group.getRaftNodeReports(leader.getLocalEndpoint());
     assertThat(reports).hasSize(3);
     assertThat(reports.get(0).getRole()).isEqualTo(RaftRole.FOLLOWER);
-    assertThat(reports.get(0).getLeaderHeartbeatTimestamp()).isEmpty();
-    assertThat(reports.get(0).getQuorumHeartbeatTimestamp()).isEmpty();
+    assertThat(reports.get(0).getLeaderHeartbeatTimestamp()).isEqualTo(0L);
+    assertThat(reports.get(0).getQuorumHeartbeatTimestamp()).isEqualTo(0L);
     assertThat(reports.get(0).getHeartbeatTimestamps()).isEmpty();
     assertThat(reports.get(1).getRole()).isEqualTo(RaftRole.CANDIDATE);
-    assertThat(reports.get(1).getLeaderHeartbeatTimestamp()).isEmpty();
-    assertThat(reports.get(1).getQuorumHeartbeatTimestamp()).isEmpty();
+    assertThat(reports.get(1).getLeaderHeartbeatTimestamp()).isEqualTo(0L);
+    assertThat(reports.get(1).getQuorumHeartbeatTimestamp()).isEqualTo(0L);
     assertThat(reports.get(1).getHeartbeatTimestamps()).isEmpty();
     assertThat(reports.get(2).getRole()).isEqualTo(RaftRole.LEADER);
-    assertThat(reports.get(2).getLeaderHeartbeatTimestamp()).isEmpty();
-    assertThat(reports.get(2).getQuorumHeartbeatTimestamp()).isPresent();
+    assertThat(reports.get(2).getLeaderHeartbeatTimestamp()).isEqualTo(0L);
+    assertThat(reports.get(2).getQuorumHeartbeatTimestamp()).isGreaterThan(0L);
     assertThat(reports.get(2).getHeartbeatTimestamps()).isEmpty();
-    Optional<Long> quorumTimestamp = reports.get(2).getQuorumHeartbeatTimestamp();
-    assertThat(quorumTimestamp.get()).isGreaterThan(0).isLessThan(Long.MAX_VALUE);
+    long quorumTimestamp = reports.get(2).getQuorumHeartbeatTimestamp();
+    assertThat(quorumTimestamp).isGreaterThan(0).isLessThan(Long.MAX_VALUE);
     allTheTime(() -> assertThat(leader.getLeaderEndpoint()).isEqualTo(leader.getLocalEndpoint()),
       2 * TimeUnit.MILLISECONDS.toSeconds(config.getLeaderHeartbeatTimeoutMillis()));
   }
@@ -113,9 +112,8 @@ public class TestSingletonRaftGroup extends TestBase {
     Ordered<Object> result = leader.replicate(applyValue(expectedVal)).join();
     Object val = group.getStateMachine(leader.getLocalEndpoint()).get(result.getCommitIndex());
     assertThat(val).isEqualTo(expectedVal);
-    Optional<Long> quorumTimestamp =
-      leader.getReport().join().getResult().getQuorumHeartbeatTimestamp();
-    assertThat(quorumTimestamp.get()).isGreaterThan(0).isLessThan(Long.MAX_VALUE);
+    long quorumTimestamp = leader.getReport().join().getResult().getQuorumHeartbeatTimestamp();
+    assertThat(quorumTimestamp).isGreaterThan(0).isLessThan(Long.MAX_VALUE);
   }
 
   @Test
@@ -623,8 +621,8 @@ public class TestSingletonRaftGroup extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String val = "val";
     Ordered<Object> result = leader.replicate(applyValue(val)).join();
-    Ordered<Object> queryResult = leader
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult =
+      leader.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join();
     assertThat(queryResult.getCommitIndex()).isEqualTo(result.getCommitIndex());
     assertThat(queryResult.getResult()).isEqualTo(val);
   }
@@ -637,8 +635,8 @@ public class TestSingletonRaftGroup extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String val = "val";
     Ordered<Object> result = leader.replicate(applyValue(val)).join();
-    Ordered<Object> queryResult = leader
-      .query(queryLastValue(), QueryPolicy.LEADER_LEASE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult =
+      leader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, 0L, 0L).join();
     assertThat(queryResult.getCommitIndex()).isEqualTo(result.getCommitIndex());
     assertThat(queryResult.getResult()).isEqualTo(val);
   }
@@ -651,8 +649,8 @@ public class TestSingletonRaftGroup extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     String expectedVal = "val";
     Ordered<Object> result = leader.replicate(applyValue(expectedVal)).join();
-    Ordered<Object> queryResult = leader
-      .query(queryLastValue(), EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult =
+      leader.query(queryLastValue(), EVENTUAL_CONSISTENCY, 0L, 0L).join();
     assertThat(queryResult.getCommitIndex()).isEqualTo(result.getCommitIndex());
     assertThat(queryResult.getResult()).isEqualTo(expectedVal);
   }
@@ -680,9 +678,8 @@ public class TestSingletonRaftGroup extends TestBase {
       long commitIndex = getCommitIndex(restoredNode);
       assertThat(entry.getIndex()).isEqualTo(commitIndex);
     });
-    Object queryResult = restoredNode
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join()
-      .getResult();
+    Object queryResult =
+      restoredNode.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join().getResult();
     assertThat(queryResult).isEqualTo(val);
     assertThat(group.getStateMachine(restoredNode.getLocalEndpoint()).get(result.getCommitIndex()))
       .isEqualTo(val);
@@ -718,8 +715,7 @@ public class TestSingletonRaftGroup extends TestBase {
       }
     });
     Object queryResult = restoredNode
-      .query(queryLastValue(), QueryPolicy.EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty())
-      .join().getResult();
+      .query(queryLastValue(), QueryPolicy.EVENTUAL_CONSISTENCY, 0L, 0L).join().getResult();
     assertThat(queryResult).isEqualTo(val);
     assertThat(group.getStateMachine(restoredNode.getLocalEndpoint()).get(result.getCommitIndex()))
       .isEqualTo(val);
@@ -755,8 +751,7 @@ public class TestSingletonRaftGroup extends TestBase {
       }
     });
     Object queryResult = restoredNode
-      .query(queryLastValue(), QueryPolicy.EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty())
-      .join().getResult();
+      .query(queryLastValue(), QueryPolicy.EVENTUAL_CONSISTENCY, 0L, 0L).join().getResult();
     assertThat(queryResult).isEqualTo(val);
     assertThat(group.getStateMachine(restoredNode.getLocalEndpoint()).get(result.getCommitIndex()))
       .isEqualTo(val);
@@ -795,8 +790,7 @@ public class TestSingletonRaftGroup extends TestBase {
       }
     });
     Object queryResult =
-      restoredNode.query(queryLastValue(), EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty())
-        .join().getResult();
+      restoredNode.query(queryLastValue(), EVENTUAL_CONSISTENCY, 0L, 0L).join().getResult();
     assertThat(queryResult).isEqualTo(val);
     assertThat(group.getStateMachine(restoredNode.getLocalEndpoint()).get(result.getCommitIndex()))
       .isEqualTo(val);
@@ -815,14 +809,14 @@ public class TestSingletonRaftGroup extends TestBase {
     follower.terminate();
     assertThat(mewGroupMembers.getResult().getMembers().size()).isEqualTo(1);
     assertThat(mewGroupMembers.getResult().getMembers()).contains(leader.getLocalEndpoint());
-    Ordered<Object> queryResult1 = leader
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult1 =
+      leader.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join();
     assertThat(queryResult1.getResult()).isEqualTo(val1);
     String val2 = "val2";
     Ordered<Object> result2 = leader.replicate(applyValue(val2)).join();
     assertThat(result2.getCommitIndex()).isGreaterThan(queryResult1.getCommitIndex());
-    Ordered<Object> queryResult2 = leader
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult2 =
+      leader.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join();
     assertThat(queryResult2.getResult()).isEqualTo(val2);
     assertThat(queryResult2.getCommitIndex()).isEqualTo(result2.getCommitIndex());
   }
@@ -851,14 +845,14 @@ public class TestSingletonRaftGroup extends TestBase {
       assertThat(newTerm).isGreaterThan(term);
       assertThat(getCommitIndex(follower)).isGreaterThan(newGroupMembers.getCommitIndex());
     });
-    Ordered<Object> queryResult1 = follower
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult1 =
+      follower.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join();
     assertThat(queryResult1.getResult()).isEqualTo(val1);
     String val2 = "val2";
     Ordered<Object> result2 = follower.replicate(applyValue(val2)).join();
     assertThat(result2.getCommitIndex()).isGreaterThan(queryResult1.getCommitIndex());
-    Ordered<Object> queryResult2 = follower
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult2 =
+      follower.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join();
     assertThat(queryResult2.getResult()).isEqualTo(val2);
     assertThat(queryResult2.getCommitIndex()).isEqualTo(result2.getCommitIndex());
   }
@@ -888,8 +882,8 @@ public class TestSingletonRaftGroup extends TestBase {
     });
     String val2 = "val2";
     Ordered<Object> result2 = follower.replicate(applyValue(val2)).join();
-    Ordered<Object> queryResult = follower
-      .query(queryLastValue(), QueryPolicy.LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> queryResult =
+      follower.query(queryLastValue(), QueryPolicy.LINEARIZABLE, 0L, 0L).join();
     assertThat(queryResult.getResult()).isEqualTo(val2);
     assertThat(queryResult.getCommitIndex()).isEqualTo(result2.getCommitIndex());
   }

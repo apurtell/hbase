@@ -39,7 +39,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Per-group actor.
+ * Per-group actor with a two-lane mailbox.
+ * <p>
+ * Vote / pre-vote / heartbeat / heartbeat-ack handlers must not be head-of-line blocked behind bulk
+ * {@code AppendEntriesRequest} payloads. Producers use {@link #executeControl(Runnable)} for
+ * control-class tasks. Everything else goes through {@link #execute(Runnable)}. A single drain pass
+ * services up to {@code controlBatchCap} control tasks before touching the bulk mailbox. The
+ * cap-then-resubmit fairness rule applies to the combined drain pass.
  */
 @InterfaceAudience.Private
 final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
@@ -48,14 +54,15 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
 
   /**
    * Sentinel installed in a schedule trampoline's reference cell when the trampoline runs before
-   * the producer has stored the {@link ScheduledFuture} returned from the underlyin pool.
+   * the producer has stored the {@link ScheduledFuture} returned from the underlying pool.
    * Coordinates the handshake without holding a lock.
    */
   private static final ScheduledFuture<?> TRAMPOLINE_SENTINEL = new SentinelFuture();
 
   private final MultiGroupExecutor parent;
   private final Object groupId;
-  private final MpscUnboundedArrayQueue<Runnable> mailbox;
+  private final MpscUnboundedArrayQueue<Runnable> controlMailbox;
+  private final MpscUnboundedArrayQueue<Runnable> bulkMailbox;
   private final AtomicBoolean scheduled = new AtomicBoolean(false);
   private final Set<ScheduledFuture<?>> scheduledFutures = ConcurrentHashMap.newKeySet();
   private final AtomicBoolean terminated = new AtomicBoolean(false);
@@ -63,8 +70,9 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   private final Runnable drainRunnable = this::drain;
 
   /**
-   * The JCTools MPSC queue requires single-consumer semantics for {@code relaxedPoll()} /
-   * {@code peek()}, so all mailbox reads happen under this lock.
+   * The MPSC queues require single-consumer semantics for {@code relaxedPoll()} / {@code peek()},
+   * so all mailbox reads happen under this lock. Both lanes are read by the same single-threaded
+   * drain so they share one lock.
    */
   private final Object drainLock = new Object();
 
@@ -77,16 +85,31 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   GroupExecutor(MultiGroupExecutor parent, Object groupId, int mailboxChunkSize) {
     this.parent = requireNonNull(parent);
     this.groupId = requireNonNull(groupId);
-    this.mailbox = new MpscUnboundedArrayQueue<>(mailboxChunkSize);
+    this.controlMailbox = new MpscUnboundedArrayQueue<>(mailboxChunkSize);
+    this.bulkMailbox = new MpscUnboundedArrayQueue<>(mailboxChunkSize);
   }
 
   @Override
   public void execute(@NonNull Runnable task) {
-    requireNonNull(task);
+    enqueue(bulkMailbox, requireNonNull(task), false);
+  }
+
+  @Override
+  public void executeControl(@NonNull Runnable task) {
+    enqueue(controlMailbox, requireNonNull(task), true);
+  }
+
+  @Override
+  public void submit(@NonNull Runnable task) {
+    execute(task);
+  }
+
+  private void enqueue(MpscUnboundedArrayQueue<Runnable> mailbox, Runnable task,
+    boolean controlLane) {
     if (terminated.get()) {
       droppedTaskCount.incrementAndGet();
       if (LOG.isDebugEnabled()) {
-        LOG.debug("execute dropped, group {} terminated", groupId);
+        LOG.debug("{} dropped, group {} terminated", controlLane ? "CONTROL" : "BULK", groupId);
       }
       return;
     }
@@ -100,12 +123,17 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   }
 
   @Override
-  public void submit(@NonNull Runnable task) {
-    execute(task);
+  public void schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit) {
+    scheduleInternal(task, delay, timeUnit, false);
   }
 
   @Override
-  public void schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit) {
+  public void scheduleControl(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit) {
+    scheduleInternal(task, delay, timeUnit, true);
+  }
+
+  private void scheduleInternal(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit,
+    boolean controlLane) {
     requireNonNull(task);
     requireNonNull(timeUnit);
     if (terminated.get()) {
@@ -116,7 +144,11 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
       return;
     }
     if (delay <= 0L) {
-      execute(task);
+      if (controlLane) {
+        executeControl(task);
+      } else {
+        execute(task);
+      }
       return;
     }
     // Lock-free coordination of the producer/trampoline handshake. The
@@ -135,7 +167,11 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
       if (f != null && f != TRAMPOLINE_SENTINEL) {
         scheduledFutures.remove(f);
       }
-      execute(task);
+      if (controlLane) {
+        executeControl(task);
+      } else {
+        execute(task);
+      }
     };
     ScheduledFuture<?> f = parent.schedule(trampoline, delay, timeUnit);
     if (f == null) {
@@ -172,10 +208,17 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
   }
 
   /**
-   * Single-threaded drain pass per invocation. Ensures {@link #mailbox} is polled by at most one
-   * thread at a time. Runs at most {@link MultiGroupExecutor#drainBatchCap} tasks then yields back
-   * to the parent pool by re-submitting itself if work remains. The yield is what bounds any one
-   * group's share of a worker thread.
+   * Single-threaded drain pass per invocation. Ensures both mailboxes are polled by at most one
+   * thread at a time.
+   * <p>
+   * Drain rule:
+   * <ol>
+   * <li>Pop up to {@code controlBatchCap} entries from the control mailbox.</li>
+   * <li>Pop up to {@code drainBatchCap} entries from the bulk mailbox.</li>
+   * <li>Yield back to the parent pool by re-submitting {@code drainRunnable} if either lane has
+   * remaining work, preserving the cap-then-resubmit fairness rule.</li>
+   * </ol>
+   * Per-group serial happens-before across both lanes is preserved by single-threaded drain.
    */
   private void drain() {
     synchronized (drainLock) {
@@ -183,44 +226,37 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
         return;
       }
       if (terminated.get()) {
-        discardMailbox();
+        discardMailboxes();
         unregisterOnce();
         scheduled.set(false);
         return;
       }
 
-      int cap = parent.drainBatchCap();
-      int processed = 0;
-      while (processed < cap && !terminated.get()) {
-        Runnable r = mailbox.relaxedPoll();
-        if (r == null) {
-          break;
-        }
-        try {
-          r.run();
-        } catch (Throwable t) {
-          LOG.error("group {} task failed", groupId, t);
-        } finally {
-          executedTaskCount.incrementAndGet();
-        }
-        processed++;
+      int controlCap = parent.controlBatchCap();
+      int bulkCap = parent.drainBatchCap();
+      // Phase 1: control burst.
+      drainLane(controlMailbox, controlCap);
+      // Phase 2: bulk burst (only if not terminated by control side-effects).
+      if (!terminated.get()) {
+        drainLane(bulkMailbox, bulkCap);
       }
 
       if (terminated.get()) {
-        discardMailbox();
+        discardMailboxes();
         unregisterOnce();
         scheduled.set(false);
         return;
       }
 
-      // Lost-wakeup-safe handoff plus cap-driven yield.
+      // Lost-wakeup-safe handoff plus cap-driven yield. Either lane having a remaining head
+      // re-arms the drain.
       scheduled.set(false);
-      boolean hasMore = mailbox.peek() != null;
+      boolean hasMore = controlMailbox.peek() != null || bulkMailbox.peek() != null;
       if ((hasMore || terminated.get()) && scheduled.compareAndSet(false, true)) {
         if (!parent.submitDrain(drainRunnable)) {
           scheduled.set(false);
           if (terminated.get()) {
-            discardMailbox();
+            discardMailboxes();
             unregisterOnce();
           }
         }
@@ -228,9 +264,42 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
     }
   }
 
-  private void discardMailbox() {
-    Runnable r;
-    while ((r = mailbox.relaxedPoll()) != null) {
+  /**
+   * Pops up to {@code cap} tasks from the lane and runs them. Caller holds drainLock.
+   * <p>
+   * The {@code terminated.get()} check is intentionally evaluated per iteration so that a task that
+   * triggers {@link #onRaftNodeTerminate()} (or a concurrent terminator on another thread) stops
+   * the rest of the batch from running. Surviving queued tasks are then drained as
+   * {@code droppedTaskCount} by {@link #discardMailboxes()} on the trailing edge of
+   * {@link #drain()}, which is the contract relied on by tests asserting "no further work runs
+   * after terminate".
+   */
+  private void drainLane(MpscUnboundedArrayQueue<Runnable> mailbox, int cap) {
+    int processed = 0;
+    while (processed < cap) {
+      if (terminated.get()) {
+        return;
+      }
+      Runnable t = mailbox.relaxedPoll();
+      if (t == null) {
+        break;
+      }
+      try {
+        t.run();
+      } catch (Throwable e) {
+        LOG.error("group {} task failed", groupId, e);
+      } finally {
+        executedTaskCount.incrementAndGet();
+      }
+      processed++;
+    }
+  }
+
+  private void discardMailboxes() {
+    while (controlMailbox.relaxedPoll() != null) {
+      droppedTaskCount.incrementAndGet();
+    }
+    while (bulkMailbox.relaxedPoll() != null) {
       droppedTaskCount.incrementAndGet();
     }
   }
@@ -296,12 +365,7 @@ final class GroupExecutor implements RaftNodeExecutor, RaftNodeLifecycleAware {
 
   /** Visible for tests. */
   int pendingMailboxSize() {
-    return mailbox.size();
-  }
-
-  /** Visible for tests. */
-  Object groupId() {
-    return groupId;
+    return controlMailbox.size() + bulkMailbox.size();
   }
 
   /** Visible for tests. */

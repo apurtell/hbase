@@ -38,5 +38,4 @@
  * standard {@code AppendEntries} / {@code InstallSnapshot} catchup at the layer above closes any
  * gap automatically.
  */
-@org.apache.yetus.audience.InterfaceAudience.LimitedPrivate({ "Tools" })
 package org.apache.hadoop.hbase.consensus.handler.store;

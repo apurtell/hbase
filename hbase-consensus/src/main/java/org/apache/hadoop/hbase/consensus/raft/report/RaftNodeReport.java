@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase.consensus.raft.report;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Map;
-import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig.RaftConfigBuilder;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
@@ -137,24 +136,24 @@ public interface RaftNodeReport {
   Map<RaftEndpoint, Long> getHeartbeatTimestamps();
 
   /**
-   * Returns earliest heartbeat timestamp of the replication quorum. This method returns a non-empty
-   * value only for the leader Raft node. For instance, this method returns 8 for the following
-   * heartbeat timestamps of 5 Raft nodes, A (leader) ts = -, B (follower) ts = 10, C (follower) ts
-   * = 8, D (follower) ts = 6, E (follower) ts = 4. Please note that {@link RaftRole#LEARNER} nodes
-   * and their heartbeats are excluded in quorum calculations.
-   * @return earliest heartbeat timestamp of the replication quorum
+   * Returns earliest heartbeat timestamp of the replication quorum. This method returns a positive
+   * value only for the leader Raft node, and {@code 0L} when no value is available. For instance,
+   * this method returns 8 for the following heartbeat timestamps of 5 Raft nodes, A (leader) ts =
+   * -, B (follower) ts = 10, C (follower) ts = 8, D (follower) ts = 6, E (follower) ts = 4. Please
+   * note that {@link RaftRole#LEARNER} nodes and their heartbeats are excluded in quorum
+   * calculations.
+   * @return earliest heartbeat timestamp of the replication quorum, or {@code 0L} if absent
    */
-  @NonNull
-  Optional<Long> getQuorumHeartbeatTimestamp();
+  long getQuorumHeartbeatTimestamp();
 
   /**
    * Returns timestamp of the latest heartbeat received from the leader Raft node. This method
-   * returns a non-empty value only from a non-leader Raft node if it has ever received a heartbeat
-   * from the leader.
-   * @return timestamp of the latest heartbeat received from the leader Raft node
+   * returns a positive value only from a non-leader Raft node if it has ever received a heartbeat
+   * from the leader, and {@code 0L} otherwise.
+   * @return timestamp of the latest heartbeat received from the leader Raft node, or {@code 0L} if
+   *         absent
    */
-  @NonNull
-  Optional<Long> getLeaderHeartbeatTimestamp();
+  long getLeaderHeartbeatTimestamp();
 
   /** Denotes the reason for a given report. */
   enum RaftNodeReportReason {

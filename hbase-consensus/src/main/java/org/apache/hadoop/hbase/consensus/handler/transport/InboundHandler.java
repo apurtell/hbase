@@ -22,7 +22,7 @@ import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
-import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 import org.apache.hadoop.hbase.util.NettyFutureUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
@@ -39,6 +39,12 @@ import org.apache.hbase.thirdparty.io.netty.channel.SimpleChannelInboundHandler;
  * Turns each {@link ConsensusProtos.ConsensusFrame} arriving on the wire into one or more
  * {@link RaftMessage}s and hands them to the local {@link RaftNode#handle(RaftMessage)}.
  * <p>
+ * {@code BULK_HEARTBEAT} and {@code BULK_HEARTBEAT_ACK} frames are processed in-line on the netty
+ * inbound event-loop thread by {@link BulkHeartbeatFrameHandler} and
+ * {@link BulkHeartbeatAckFrameHandler}, which run a lock-free fast path against
+ * {@code RaftNodeImpl}'s volatile timestamp / lease accumulators and only fall back to the
+ * per-group executor when the per-entry state actually needs to transition.
+ * <p>
  * Sharable so the inbound pipeline can mount a single instance for every accepted connection.
  */
 @InterfaceAudience.Private
@@ -47,19 +53,18 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
 
   private static final Logger LOG = LoggerFactory.getLogger(InboundHandler.class);
 
-  private final InboundDispatcher dispatcher;
+  private final RegistryDispatcher dispatcher;
   private final ProtoConverter converter;
-  private final PeerKeepaliveTrackerImpl peerKeepaliveTracker;
+  private final BulkHeartbeatFrameHandler bulkHeartbeatHandler;
+  private final BulkHeartbeatAckFrameHandler bulkHeartbeatAckHandler;
 
-  InboundHandler(@NonNull InboundDispatcher dispatcher, @NonNull ProtoConverter converter) {
-    this(dispatcher, converter, null);
-  }
-
-  InboundHandler(@NonNull InboundDispatcher dispatcher, @NonNull ProtoConverter converter,
-    PeerKeepaliveTrackerImpl peerKeepaliveTracker) {
+  InboundHandler(@NonNull RegistryDispatcher dispatcher, @NonNull ProtoConverter converter,
+    @NonNull Transport transport, @NonNull RaftEndpoint localEndpoint, long localEpoch) {
     this.dispatcher = dispatcher;
     this.converter = converter;
-    this.peerKeepaliveTracker = peerKeepaliveTracker;
+    this.bulkHeartbeatHandler =
+      new BulkHeartbeatFrameHandler(dispatcher, converter, transport, localEndpoint, localEpoch);
+    this.bulkHeartbeatAckHandler = new BulkHeartbeatAckFrameHandler(dispatcher, converter);
   }
 
   @Override
@@ -83,87 +88,101 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
       case BATCH_APPEND:
         requirePayload(frame.hasBatchAppend(), frame.getKind(), "batch_append");
         for (ConsensusProtos.GroupAppendEntriesPB pb : frame.getBatchAppend().getGroupsList()) {
-          dispatch(pb.getGroupId(), converter.fromGroupAppendPB(pb));
+          RaftNode node = lookupOrDrop(pb.getGroupId(), "BATCH_APPEND");
+          if (node != null) {
+            deliver(node, converter.fromGroupAppendPB(pb, node.getGroupId()));
+          }
         }
         break;
-      case HEARTBEAT_BATCH:
-        requirePayload(frame.hasHeartbeatBatch(), frame.getKind(), "heartbeat_batch");
-        ConsensusProtos.HeartbeatBatchPB hbBatch = frame.getHeartbeatBatch();
-        // Per-RS keepalive: every HEARTBEAT_BATCH envelope carries sender / epoch / tick.
-        // Quiescent followers consult this map in lieu of the per-group election timer.
-        if (
-          peerKeepaliveTracker != null && hbBatch.hasSender() && hbBatch.hasEpoch()
-            && hbBatch.hasTick()
-        ) {
-          RaftEndpoint sender = ProtoConverter.fromEndpointPB(hbBatch.getSender());
-          peerKeepaliveTracker.onPeerKeepalive(sender, hbBatch.getEpoch(), hbBatch.getTick(),
-            EnvironmentEdgeManager.currentTime());
-        }
-        for (ConsensusProtos.GroupHeartbeatPB pb : hbBatch.getGroupsList()) {
-          dispatch(pb.getGroupId(), converter.fromGroupHeartbeatPB(pb));
-        }
+      case BULK_HEARTBEAT:
+        requirePayload(frame.hasBulkHeartbeat(), frame.getKind(), "bulk_heartbeat");
+        bulkHeartbeatHandler.handle(frame.getBulkHeartbeat());
+        break;
+      case BULK_HEARTBEAT_ACK:
+        requirePayload(frame.hasBulkHeartbeatAck(), frame.getKind(), "bulk_heartbeat_ack");
+        bulkHeartbeatAckHandler.handle(frame.getBulkHeartbeatAck());
         break;
       case APPEND_SUCCESS: {
         requirePayload(frame.hasAppendSuccess(), frame.getKind(), "append_success");
         ConsensusProtos.GroupAppendSuccessPB pb = frame.getAppendSuccess();
-        dispatch(pb.getGroupId(), converter.fromAppendSuccessPB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "APPEND_SUCCESS");
+        if (node != null) {
+          deliver(node, converter.fromAppendSuccessPB(pb, node.getGroupId()));
+        }
         break;
       }
       case APPEND_FAILURE: {
         requirePayload(frame.hasAppendFailure(), frame.getKind(), "append_failure");
         ConsensusProtos.GroupAppendFailurePB pb = frame.getAppendFailure();
-        dispatch(pb.getGroupId(), converter.fromAppendFailurePB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "APPEND_FAILURE");
+        if (node != null) {
+          deliver(node, converter.fromAppendFailurePB(pb, node.getGroupId()));
+        }
         break;
       }
       case INSTALL_SNAPSHOT: {
         requirePayload(frame.hasInstallRequest(), frame.getKind(), "install_request");
         ConsensusProtos.InstallSnapshotRequestPB pb = frame.getInstallRequest();
-        dispatch(pb.getGroupId(), converter.fromInstallSnapshotPB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "INSTALL_SNAPSHOT");
+        if (node != null) {
+          deliver(node, converter.fromInstallSnapshotPB(pb, node.getGroupId()));
+        }
         break;
       }
       case INSTALL_SNAPSHOT_RESP: {
         requirePayload(frame.hasInstallResponse(), frame.getKind(), "install_response");
         ConsensusProtos.InstallSnapshotResponsePB pb = frame.getInstallResponse();
-        dispatch(pb.getGroupId(), converter.fromInstallSnapshotResponsePB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "INSTALL_SNAPSHOT_RESP");
+        if (node != null) {
+          deliver(node, converter.fromInstallSnapshotResponsePB(pb, node.getGroupId()));
+        }
         break;
       }
       case VOTE_REQUEST: {
         requirePayload(frame.hasVoteRequest(), frame.getKind(), "vote_request");
         ConsensusProtos.VoteRequestPB pb = frame.getVoteRequest();
-        dispatch(pb.getGroupId(), converter.fromVoteRequestPB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "VOTE_REQUEST");
+        if (node != null) {
+          deliver(node, converter.fromVoteRequestPB(pb, node.getGroupId()));
+        }
         break;
       }
       case VOTE_RESPONSE: {
         requirePayload(frame.hasVoteResponse(), frame.getKind(), "vote_response");
         ConsensusProtos.VoteResponsePB pb = frame.getVoteResponse();
-        dispatch(pb.getGroupId(), converter.fromVoteResponsePB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "VOTE_RESPONSE");
+        if (node != null) {
+          deliver(node, converter.fromVoteResponsePB(pb, node.getGroupId()));
+        }
         break;
       }
       case PRE_VOTE_REQUEST: {
         requirePayload(frame.hasPreVoteRequest(), frame.getKind(), "pre_vote_request");
         ConsensusProtos.PreVoteRequestPB pb = frame.getPreVoteRequest();
-        dispatch(pb.getGroupId(), converter.fromPreVoteRequestPB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "PRE_VOTE_REQUEST");
+        if (node != null) {
+          deliver(node, converter.fromPreVoteRequestPB(pb, node.getGroupId()));
+        }
         break;
       }
       case PRE_VOTE_RESPONSE: {
         requirePayload(frame.hasPreVoteResponse(), frame.getKind(), "pre_vote_response");
         ConsensusProtos.PreVoteResponsePB pb = frame.getPreVoteResponse();
-        dispatch(pb.getGroupId(), converter.fromPreVoteResponsePB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "PRE_VOTE_RESPONSE");
+        if (node != null) {
+          deliver(node, converter.fromPreVoteResponsePB(pb, node.getGroupId()));
+        }
         break;
       }
       case TRIGGER_LEADER_ELECTION: {
         requirePayload(frame.hasTriggerElection(), frame.getKind(), "trigger_election");
         ConsensusProtos.TriggerLeaderElectionPB pb = frame.getTriggerElection();
-        dispatch(pb.getGroupId(), converter.fromTriggerElectionPB(pb));
-        break;
-      }
-      case HEARTBEAT_ACK_BATCH:
-        requirePayload(frame.hasHeartbeatAckBatch(), frame.getKind(), "heartbeat_ack_batch");
-        for (ConsensusProtos.GroupHeartbeatAckPB pb : frame.getHeartbeatAckBatch()
-          .getGroupsList()) {
-          dispatch(pb.getGroupId(), converter.fromGroupHeartbeatAckPB(pb));
+        RaftNode node = lookupOrDrop(pb.getGroupId(), "TRIGGER_LEADER_ELECTION");
+        if (node != null) {
+          deliver(node, converter.fromTriggerElectionPB(pb, node.getGroupId()));
         }
         break;
+      }
       default:
         LOG.debug("Dropping ConsensusFrame with unknown kind {}", frame.getKind());
         break;
@@ -178,19 +197,20 @@ final class InboundHandler extends SimpleChannelInboundHandler<ConsensusProtos.C
     }
   }
 
-  private void dispatch(ByteString groupIdBytes, RaftMessage message) {
-    Object groupId = ProtoConverter.bytesToGroupId(groupIdBytes);
-    RaftNode node = dispatcher.lookup(groupId);
-    if (node == null) {
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("Dropping {} for unknown group {}", message.getClass().getSimpleName(), groupId);
-      }
-      return;
+  /** Resolves the destination {@link RaftNode} for the wire group-id bytes. */
+  private RaftNode lookupOrDrop(ByteString groupIdBytes, String kind) {
+    RaftNode node = dispatcher.lookup(groupIdBytes);
+    if (node == null && LOG.isDebugEnabled()) {
+      LOG.debug("Dropping {} for unknown group bytes (size={})", kind, groupIdBytes.size());
     }
+    return node;
+  }
+
+  private void deliver(RaftNode node, RaftMessage message) {
     try {
       node.handle(message);
     } catch (RuntimeException e) {
-      LOG.warn("RaftNode.handle threw for group {}", groupId, e);
+      LOG.warn("RaftNode.handle threw for group {}", node.getGroupId(), e);
     }
   }
 

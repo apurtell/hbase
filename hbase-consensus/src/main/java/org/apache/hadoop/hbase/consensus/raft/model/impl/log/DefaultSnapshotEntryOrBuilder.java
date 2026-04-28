@@ -42,6 +42,7 @@ public class DefaultSnapshotEntryOrBuilder extends DefaultAbstractLogEntry
   private DefaultSnapshotEntryOrBuilder builder = this;
 
   @Override
+  @SuppressWarnings("unchecked")
   public int getSnapshotChunkCount() {
     return ((List<SnapshotChunk>) getOperation()).size();
   }

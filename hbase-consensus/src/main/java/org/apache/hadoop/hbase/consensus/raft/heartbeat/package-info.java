@@ -20,13 +20,13 @@
  * Heartbeat scheduling SPI used by the RAFT core.
  * <p>
  * {@link org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler} is the abstraction
- * that arranges periodic invocation of
- * {@link org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl#runHeartbeatTick()} on each
- * Raft node's executor. The default implementation
- * ({@link org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.DefaultHeartbeatScheduler})
- * schedules a per-Raft-node {@code HeartbeatTask} on the node's own executor. Store-level
- * implementations (e.g. the {@code SweepingHeartbeatScheduler} under
- * {@code handler/heartbeat/}) can sweep all registered nodes from a single timer to coalesce
- * heartbeat traffic in the transport layer.
+ * that arranges periodic per-server heartbeat work. When the
+ * {@link org.apache.hadoop.hbase.consensus.raft.RaftNode.RaftNodeBuilder} is not configured with
+ * an explicit scheduler, a per-node
+ * {@link org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.BulkHeartbeatScheduler} bound to
+ * this node's transport is installed automatically. Embedders that need a shared per-server
+ * timing wheel should construct a {@code BulkHeartbeatScheduler} and install it explicitly via
+ * {@link
+ * org.apache.hadoop.hbase.consensus.raft.RaftNode.RaftNodeBuilder#setHeartbeatScheduler}.
  */
 package org.apache.hadoop.hbase.consensus.raft.heartbeat;

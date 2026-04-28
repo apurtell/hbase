@@ -27,14 +27,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
+import org.apache.hadoop.hbase.consensus.raft.transport.Transport;
 
-/**
- * Used for blocking and altering Raft messages sent between Raft nodes during local testing.
- */
+/** Used for blocking and altering Raft messages sent between Raft nodes during local testing. */
 class Firewall {
   private final Set<DropRule> dropRules = newSetFromMap(new ConcurrentHashMap<>());
   private final Map<RaftEndpoint, Function<RaftMessage, RaftMessage>> alterFunctions =
     new ConcurrentHashMap<>();
+  private final Set<RaftEndpoint> dropBulkHeartbeatTargets =
+    newSetFromMap(new ConcurrentHashMap<>());
+  private volatile boolean dropBulkHeartbeatsToAll = false;
 
   /**
    * Adds a drop-message rule for the given target Raft endpoint and the Raft message type.
@@ -135,11 +137,45 @@ class Firewall {
   }
 
   /**
+   * Drops every bulk heartbeat envelope (bulk heartbeats and bulk heartbeat acks) sent to the given
+   * target. Per-message {@link #dropMessagesTo(RaftEndpoint, Class)} rules do not catch these
+   * because the bulk path bypasses {@link Transport#send(RaftEndpoint, RaftMessage)}.
+   */
+  void dropBulkHeartbeatsTo(RaftEndpoint target) {
+    dropBulkHeartbeatTargets.add(target);
+  }
+
+  /** Removes the bulk-heartbeat drop rule for {@code target}. */
+  void allowBulkHeartbeatsTo(RaftEndpoint target) {
+    dropBulkHeartbeatTargets.remove(target);
+  }
+
+  /** Drops every bulk heartbeat envelope to every target. */
+  void dropBulkHeartbeatsToAll() {
+    dropBulkHeartbeatsToAll = true;
+  }
+
+  /** Reverses {@link #dropBulkHeartbeatsToAll()}. Existing per-target rules are not affected. */
+  void allowBulkHeartbeatsToAll() {
+    dropBulkHeartbeatsToAll = false;
+  }
+
+  /**
+   * Returns true if the bulk heartbeat path to {@code target} is currently dropped, either by a
+   * per-target rule or by the drop-all rule.
+   */
+  boolean shouldDropBulkHeartbeats(RaftEndpoint target) {
+    return dropBulkHeartbeatsToAll || dropBulkHeartbeatTargets.contains(target);
+  }
+
+  /**
    * Resets all drop-message and alter-message rules.
    */
   void resetAllRules() {
     dropRules.clear();
     alterFunctions.clear();
+    dropBulkHeartbeatTargets.clear();
+    dropBulkHeartbeatsToAll = false;
   }
 
   private static final class DropRule {

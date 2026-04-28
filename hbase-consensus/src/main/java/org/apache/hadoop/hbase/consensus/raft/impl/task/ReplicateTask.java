@@ -51,6 +51,7 @@ import org.slf4j.LoggerFactory;
  * {@link CannotReplicateException}.
  */
 @InterfaceAudience.Private
+@SuppressWarnings("rawtypes")
 public final class ReplicateTask implements Runnable {
   private static final Logger LOG = LoggerFactory.getLogger(ReplicateTask.class);
   private final RaftNodeImpl raftNode;
@@ -89,6 +90,16 @@ public final class ReplicateTask implements Runnable {
         return;
       }
       long newEntryLogIndex = log.lastLogOrSnapshotIndex() + 1;
+      // Borrow a credit from the server-wide pending-bytes budget before appending. We do this
+      // after canReplicateNewOperation and before registering the future / appending so that on
+      // rejection no future is left dangling and no log slot is consumed.
+      // The credit is returned per-entry on commit-apply, or wholesale on termination via
+      // RaftNodeImpl.releaseAllLeaderPendingBytes.
+      long opBytes = (operation instanceof byte[]) ? ((byte[]) operation).length : 0L;
+      if (!raftNode.tryReserveLeaderPendingBytes(newEntryLogIndex, opBytes)) {
+        future.fail(raftNode.newCannotReplicateException());
+        return;
+      }
       state.registerFuture(newEntryLogIndex, future);
       LogEntry entry = raftNode.getModelFactory().createLogEntryBuilder().setTerm(state.term())
         .setIndex(newEntryLogIndex).setOperation(operation).build();

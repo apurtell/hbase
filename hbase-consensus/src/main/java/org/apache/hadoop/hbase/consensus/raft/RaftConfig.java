@@ -50,18 +50,35 @@ public final class RaftConfig {
   public static final boolean DEFAULT_TRANSFER_SNAPSHOTS_FROM_FOLLOWERS_ENABLED = true;
   /** The default value for {@link #raftNodeReportPublishPeriodSecs}. */
   public static final int DEFAULT_RAFT_NODE_REPORT_PUBLISH_PERIOD_SECS = 10;
-  /**
-   * The default value for {@link #quiescenceEnabled}. Off in MVP; flips to true after
-   * {@code TestConsensusServerScaleQuiescence} validates the byte-rate reduction at 10k idle
-   * groups.
-   */
+  /** The default value for {@link #quiescenceEnabled}. */
   public static final boolean DEFAULT_QUIESCENCE_ENABLED = false;
-  /**
-   * The default value for {@link #quiescenceGraceMillis}. Picked to be safely above one heartbeat
-   * sweep tick so that a brief pause (e.g. the gap between two Phoenix UPSERTs) does not trigger
-   * oscillation.
-   */
+  /** The default value for {@link #quiescenceGraceMillis}. */
   public static final long DEFAULT_QUIESCENCE_GRACE_MILLIS = 1000;
+  /**
+   * The default value for {@link #electionRandomizationGroupScale}. The receiver fairness formula
+   * widens the upper bound of the per-follower election-timer randomization interval as
+   * {@code leaderHeartbeatTimeoutMillis * (2 + electionRandomizationGroupScale * log(activeGroups))}
+   * so that with {@code N} simultaneous followers re-arming on the same wall-clock minute the
+   * variance of expiry times grows enough to avoid election storms. {@code 0.0} disables the
+   * scaling entirely (the upper bound stays at {@code 2 *} the timeout, the classic Raft-paper
+   * envelope). {@code 0.1} gives roughly a {@code +85 %} widening at 5000 groups.
+   */
+  public static final double DEFAULT_ELECTION_RANDOMIZATION_GROUP_SCALE = 0.1;
+  /**
+   * The default value for {@link #pauseDetectionThresholdMillis}. The detector treats an inter-tick
+   * wall-clock delta exceeding {@code expected_period + threshold} as a possible JVM pause. Below
+   * this floor we charge the latency to ordinary scheduling jitter, leave timestamps alone, and let
+   * the normal lease / election-timer logic run. 1 s is well above any clean G1 young-gen pause and
+   * below the smallest credible stop-the-world budget that should still preserve leadership.
+   */
+  public static final long DEFAULT_PAUSE_DETECTION_THRESHOLD_MILLIS = 1000;
+  /**
+   * The default value for {@link #pauseToleranceCapMillis}. Pauses larger than this are treated as
+   * real failures (we genuinely lost time; let the cluster re-elect). 5 s covers normal G1 / ZGC
+   * stop-the-world budgets on multi-GB heaps; longer pauses generally mean a degraded host that
+   * should lose leadership.
+   */
+  public static final long DEFAULT_PAUSE_TOLERANCE_CAP_MILLIS = 5000;
   /** The config object with default configuration. */
   public static final RaftConfig DEFAULT_RAFT_CONFIG = new RaftConfigBuilder().build();
   /**
@@ -136,24 +153,41 @@ public final class RaftConfig {
   private final int raftNodeReportPublishPeriodSecs;
   /**
    * Whether idle-group quiescence is enabled. When true, a leader that has held its lease and seen
-   * no proposals for {@link #quiescenceGraceMillis} ms transitions to the {@code Quiescent} state,
-   * emits a fire-and-forget {@code GroupHeartbeatPB.quiesced=true} notice once, and then emits zero
-   * per-group heartbeat bytes until a Wake event clears the state. Failure detection runs on the
-   * per-RS keepalive carried on every {@code HeartbeatBatchPB} envelope.
+   * no proposals for {@link #quiescenceGraceMillis} ms transitions to the {@code Quiescent} state.
+   * Subsequent bulk heartbeat frames carry the per-group {@code quiesced} bit set so followers can
+   * mirror the state without an extra round-trip. Failure detection during quiescence runs on the
+   * per-server keepalive carried at envelope level on every bulk heartbeat / heartbeat-ack frame.
    */
   private final boolean quiescenceEnabled;
   /**
    * Grace period (ms) the leader must hold its lease and see no propose-side activity before the
-   * {@code SweepingHeartbeatScheduler} is allowed to call {@code RaftNodeImpl.quiesce}.
+   * bulk-heartbeat wheel is allowed to call {@code RaftNodeImpl.quiesce}.
    */
   private final long quiescenceGraceMillis;
+  /**
+   * Receiver fairness scaling factor for the per-follower election-timer randomization upper bound.
+   * See {@link #DEFAULT_ELECTION_RANDOMIZATION_GROUP_SCALE} for the formula.
+   */
+  private final double electionRandomizationGroupScale;
+  /**
+   * Floor (ms) on observed inter-tick wall-clock delta above the expected sweep period at which the
+   * heartbeat tick treats the gap as a JVM pause. See
+   * {@link #DEFAULT_PAUSE_DETECTION_THRESHOLD_MILLIS}.
+   */
+  private final long pauseDetectionThresholdMillis;
+  /**
+   * Cap (ms) on the pause delta the heartbeat tick will absorb. Deltas above the cap are treated as
+   * real failures and not bumped forward. See {@link #DEFAULT_PAUSE_TOLERANCE_CAP_MILLIS}.
+   */
+  private final long pauseToleranceCapMillis;
 
   /** Creates a config object with the given parameters. */
   public RaftConfig(long leaderElectionTimeoutMillis, long leaderHeartbeatPeriodMillis,
     long leaderHeartbeatTimeoutMillis, long maxClockDriftMillis, int appendEntriesRequestBatchSize,
     int commitCountToTakeSnapshot, int maxPendingLogEntryCount,
     boolean transferSnapshotsFromFollowersEnabled, int raftNodeReportPublishPeriodSecs,
-    boolean quiescenceEnabled, long quiescenceGraceMillis) {
+    boolean quiescenceEnabled, long quiescenceGraceMillis, double electionRandomizationGroupScale,
+    long pauseDetectionThresholdMillis, long pauseToleranceCapMillis) {
     this.leaderElectionTimeoutMillis = leaderElectionTimeoutMillis;
     this.leaderHeartbeatPeriodMillis = leaderHeartbeatPeriodMillis;
     this.leaderHeartbeatTimeoutMillis = leaderHeartbeatTimeoutMillis;
@@ -165,6 +199,9 @@ public final class RaftConfig {
     this.raftNodeReportPublishPeriodSecs = raftNodeReportPublishPeriodSecs;
     this.quiescenceEnabled = quiescenceEnabled;
     this.quiescenceGraceMillis = quiescenceGraceMillis;
+    this.electionRandomizationGroupScale = electionRandomizationGroupScale;
+    this.pauseDetectionThresholdMillis = pauseDetectionThresholdMillis;
+    this.pauseToleranceCapMillis = pauseToleranceCapMillis;
   }
 
   /**
@@ -195,14 +232,6 @@ public final class RaftConfig {
    */
   public long getLeaderHeartbeatTimeoutMillis() {
     return leaderHeartbeatTimeoutMillis;
-  }
-
-  /**
-   * @return upper bound on clock skew between nodes (milliseconds)
-   * @see #maxClockDriftMillis
-   */
-  public long getMaxClockDriftMillis() {
-    return maxClockDriftMillis;
   }
 
   /**
@@ -278,6 +307,32 @@ public final class RaftConfig {
     return quiescenceGraceMillis;
   }
 
+  /**
+   * @return the election timer randomization group scale factor
+   * @see #electionRandomizationGroupScale
+   */
+  public double getElectionRandomizationGroupScale() {
+    return electionRandomizationGroupScale;
+  }
+
+  /**
+   * @return floor (ms) on observed inter-tick wall-clock delta above the expected sweep period at
+   *         which the heartbeat tick treats the gap as a JVM pause
+   * @see #pauseDetectionThresholdMillis
+   */
+  public long getPauseDetectionThresholdMillis() {
+    return pauseDetectionThresholdMillis;
+  }
+
+  /**
+   * @return cap (ms) on the pause delta the heartbeat tick will absorb without triggering
+   *         re-election
+   * @see #pauseToleranceCapMillis
+   */
+  public long getPauseToleranceCapMillis() {
+    return pauseToleranceCapMillis;
+  }
+
   @Override
   public String toString() {
     return "RaftConfig{" + "leaderElectionTimeoutMillis=" + leaderElectionTimeoutMillis
@@ -288,7 +343,10 @@ public final class RaftConfig {
       + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
       + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs
       + ", quiescenceEnabled=" + quiescenceEnabled + ", quiescenceGraceMillis="
-      + quiescenceGraceMillis + '}';
+      + quiescenceGraceMillis + ", electionRandomizationGroupScale="
+      + electionRandomizationGroupScale + ", pauseDetectionThresholdMillis="
+      + pauseDetectionThresholdMillis + ", pauseToleranceCapMillis=" + pauseToleranceCapMillis
+      + '}';
   }
 
   /** Builder for Raft config. */
@@ -305,6 +363,9 @@ public final class RaftConfig {
     private int raftNodeReportPublishPeriodSecs = DEFAULT_RAFT_NODE_REPORT_PUBLISH_PERIOD_SECS;
     private boolean quiescenceEnabled = DEFAULT_QUIESCENCE_ENABLED;
     private long quiescenceGraceMillis = DEFAULT_QUIESCENCE_GRACE_MILLIS;
+    private double electionRandomizationGroupScale = DEFAULT_ELECTION_RANDOMIZATION_GROUP_SCALE;
+    private long pauseDetectionThresholdMillis = DEFAULT_PAUSE_DETECTION_THRESHOLD_MILLIS;
+    private long pauseToleranceCapMillis = DEFAULT_PAUSE_TOLERANCE_CAP_MILLIS;
 
     private RaftConfigBuilder() {
     }
@@ -439,6 +500,54 @@ public final class RaftConfig {
     }
 
     /**
+     * Sets the election timer randomization group-scale factor. Must be non-negative. {@code 0.0}
+     * disables the per-group widening.
+     * @return the builder object for fluent calls
+     * @see RaftConfig#electionRandomizationGroupScale
+     */
+    public RaftConfigBuilder
+      setElectionRandomizationGroupScale(double electionRandomizationGroupScale) {
+      if (electionRandomizationGroupScale < 0d || Double.isNaN(electionRandomizationGroupScale)) {
+        throw new IllegalArgumentException("election randomization group scale must be >= 0, got "
+          + electionRandomizationGroupScale);
+      }
+      this.electionRandomizationGroupScale = electionRandomizationGroupScale;
+      return this;
+    }
+
+    /**
+     * Sets the pause-detection threshold in milliseconds. Inter-tick wall-clock deltas above the
+     * expected sweep period plus this threshold are treated as JVM pauses. Must be non-negative.
+     * {@code 0} disables the floor and treats any positive jitter as a pause.
+     * @return the builder object for fluent calls
+     * @see RaftConfig#pauseDetectionThresholdMillis
+     */
+    public RaftConfigBuilder setPauseDetectionThresholdMillis(long pauseDetectionThresholdMillis) {
+      if (pauseDetectionThresholdMillis < 0) {
+        throw new IllegalArgumentException(
+          "pause detection threshold millis must be >= 0, got " + pauseDetectionThresholdMillis);
+      }
+      this.pauseDetectionThresholdMillis = pauseDetectionThresholdMillis;
+      return this;
+    }
+
+    /**
+     * Sets the pause tolerance cap in milliseconds. Pauses whose detected delta exceeds this cap
+     * are treated as real failures (no timestamp bumping, normal lease / election timer logic
+     * runs). Must be non-negative.
+     * @return the builder object for fluent calls
+     * @see RaftConfig#pauseToleranceCapMillis
+     */
+    public RaftConfigBuilder setPauseToleranceCapMillis(long pauseToleranceCapMillis) {
+      if (pauseToleranceCapMillis < 0) {
+        throw new IllegalArgumentException(
+          "pause tolerance cap millis must be >= 0, got " + pauseToleranceCapMillis);
+      }
+      this.pauseToleranceCapMillis = pauseToleranceCapMillis;
+      return this;
+    }
+
+    /**
      * Builds the RaftConfig object.
      * @return the RaftConfig object.
      */
@@ -458,7 +567,8 @@ public final class RaftConfig {
       return new RaftConfig(leaderElectionTimeoutMillis, leaderHeartbeatPeriodMillis,
         leaderHeartbeatTimeoutMillis, maxClockDriftMillis, appendEntriesRequestBatchSize,
         commitCountToTakeSnapshot, maxPendingLogEntryCount, transferSnapshotsFromFollowersEnabled,
-        raftNodeReportPublishPeriodSecs, quiescenceEnabled, quiescenceGraceMillis);
+        raftNodeReportPublishPeriodSecs, quiescenceEnabled, quiescenceGraceMillis,
+        electionRandomizationGroupScale, pauseDetectionThresholdMillis, pauseToleranceCapMillis);
     }
 
     @Override
@@ -472,7 +582,10 @@ public final class RaftConfig {
         + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
         + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs
         + ", quiescenceEnabled=" + quiescenceEnabled + ", quiescenceGraceMillis="
-        + quiescenceGraceMillis + '}';
+        + quiescenceGraceMillis + ", electionRandomizationGroupScale="
+        + electionRandomizationGroupScale + ", pauseDetectionThresholdMillis="
+        + pauseDetectionThresholdMillis + ", pauseToleranceCapMillis=" + pauseToleranceCapMillis
+        + '}';
     }
   }
 }

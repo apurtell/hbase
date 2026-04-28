@@ -29,10 +29,6 @@ import org.apache.yetus.audience.InterfaceAudience;
 public class UnknownEndpointException extends HBaseException {
   private static final long serialVersionUID = 1L;
 
-  public UnknownEndpointException(String message) {
-    super(message);
-  }
-
   public UnknownEndpointException(RaftEndpoint endpoint) {
     super("No address registered for endpoint " + endpoint.getId());
   }

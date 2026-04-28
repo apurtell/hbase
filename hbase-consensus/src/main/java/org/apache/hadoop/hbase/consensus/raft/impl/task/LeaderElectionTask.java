@@ -36,7 +36,7 @@ import org.slf4j.LoggerFactory;
  * election if a leader is not elected yet.
  */
 @InterfaceAudience.Private
-public final class LeaderElectionTask extends RaftNodeStatusAwareTask implements Runnable {
+public final class LeaderElectionTask extends RaftNodeStatusAwareTask {
   private static final Logger LOG = LoggerFactory.getLogger(LeaderElectionTask.class);
   private final boolean sticky;
 

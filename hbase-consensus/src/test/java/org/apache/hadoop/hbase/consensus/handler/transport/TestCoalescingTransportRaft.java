@@ -31,7 +31,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -169,11 +168,9 @@ public class TestCoalescingTransportRaft extends TestBase {
 
     // Leader-side linearizable query confirms last applied value.
     Object xLast =
-      xLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, Optional.empty(), Optional.empty())
-        .join().getResult();
+      xLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, 0L, 0L).join().getResult();
     Object yLast =
-      yLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, Optional.empty(), Optional.empty())
-        .join().getResult();
+      yLeader.query(queryLastValue(), QueryPolicy.LEADER_LEASE, 0L, 0L).join().getResult();
     assertThat(new String((byte[]) xLast, StandardCharsets.UTF_8)).isEqualTo("x3");
     assertThat(new String((byte[]) yLast, StandardCharsets.UTF_8)).isEqualTo("y2");
 
@@ -258,7 +255,6 @@ public class TestCoalescingTransportRaft extends TestBase {
   private static Configuration baseConf() {
     Configuration c = HBaseConfiguration.create();
     c.setBoolean(TransportConfig.NATIVE_TRANSPORT_KEY, false);
-    c.setLong(TransportConfig.BATCH_MS_KEY, 5L);
     c.setInt(TransportConfig.IO_THREADS_KEY, 2);
     return c;
   }

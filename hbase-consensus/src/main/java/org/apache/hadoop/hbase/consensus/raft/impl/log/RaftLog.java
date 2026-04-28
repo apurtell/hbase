@@ -65,10 +65,17 @@ public final class RaftLog {
   private SnapshotEntry snapshot = new DefaultSnapshotEntryOrBuilder().build();
   /** Indicates if there is a change after the last {@link #flush()} call. */
   private boolean dirty;
+  /**
+   * Volatile cache of {@link #lastLogOrSnapshotIndex()}, updated after every mutation that changes
+   * the log tail or the snapshot. Read by the bulk inbound fast path on the netty event-loop thread
+   * without entering the per-group executor.
+   */
+  private volatile long lastLogOrSnapshotIndexCached;
 
   private RaftLog(int capacity, RaftStore store) {
     this.log = new ArrayRingbuffer<>(capacity);
     this.store = requireNonNull(store);
+    refreshLastLogOrSnapshotIndexCached();
   }
 
   private RaftLog(int capacity, SnapshotEntry snapshot, List<LogEntry> entries, RaftStore store) {
@@ -89,18 +96,20 @@ public final class RaftLog {
       }
     }
     this.store = store;
+    refreshLastLogOrSnapshotIndexCached();
   }
 
+  private void refreshLastLogOrSnapshotIndexCached() {
+    this.lastLogOrSnapshotIndexCached = lastLogOrSnapshotEntry().getIndex();
+  }
+
+  /** Visible for tests. */
   public static RaftLog create(int capacity) {
     return create(capacity, new NopRaftStore());
   }
 
   public static RaftLog create(int capacity, RaftStore store) {
     return new RaftLog(capacity, store);
-  }
-
-  public static RaftLog restore(int capacity, SnapshotEntry snapshot, List<LogEntry> entries) {
-    return restore(capacity, snapshot, entries, new NopRaftStore());
   }
 
   public static RaftLog restore(int capacity, SnapshotEntry snapshot, List<LogEntry> entries,
@@ -172,15 +181,25 @@ public final class RaftLog {
           "Failed to truncate log entries in persistence from index=" + entryIndex, null, e);
       }
     }
+    refreshLastLogOrSnapshotIndexCached();
     return truncated;
   }
 
   /**
    * Returns the last entry index in the Raft log, either from the last log entry or from the last
-   * snapshot
+   * snapshot.
    */
   public long lastLogOrSnapshotIndex() {
     return lastLogOrSnapshotEntry().getIndex();
+  }
+
+  /**
+   * Volatile read of the cached {@link #lastLogOrSnapshotIndex()}. Safe to call from any thread.
+   * The cache is refreshed by the per-group executor (the only writer) on every mutation, so a
+   * concurrent reader observes either the pre- or post-mutation value but never a torn one.
+   */
+  public long lastLogOrSnapshotIndexVolatile() {
+    return lastLogOrSnapshotIndexCached;
   }
 
   /**
@@ -216,6 +235,24 @@ public final class RaftLog {
     // we are modifying the memory state after the entries are persisted.
     entries.forEach(log::add);
     dirty = true;
+    refreshLastLogOrSnapshotIndexCached();
+  }
+
+  /** Appends new entries to the Raft log and flushes the underlying store before returning. */
+  public void appendEntriesAndFlush(List<LogEntry> entries) {
+    if (entries.isEmpty()) {
+      return;
+    }
+    validateForAppend(entries);
+    try {
+      store.persistLogEntriesAndFlush(entries);
+    } catch (IOException e) {
+      throw new RaftException("Could not persist+flush entries from start index: "
+        + entries.get(0).getIndex() + ", entry count: " + entries.size(), null, e);
+    }
+    entries.forEach(log::add);
+    dirty = false;
+    refreshLastLogOrSnapshotIndexCached();
   }
 
   private void validateForAppend(List<LogEntry> entries) {
@@ -288,6 +325,7 @@ public final class RaftLog {
     // we are modifying the memory state after the entries are persisted.
     log.add(entry);
     dirty = true;
+    refreshLastLogOrSnapshotIndexCached();
   }
 
   /**
@@ -358,6 +396,7 @@ public final class RaftLog {
     // method is called. however, we also truncated log entries,
     // hence setting the dirty flag.
     dirty = true;
+    refreshLastLogOrSnapshotIndexCached();
     return truncatedEntryCount;
   }
 

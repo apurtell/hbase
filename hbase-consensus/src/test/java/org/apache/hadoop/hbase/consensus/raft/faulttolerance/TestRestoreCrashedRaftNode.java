@@ -21,7 +21,6 @@ import static org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftGroup.I
 import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.eventually;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
@@ -57,8 +56,8 @@ public class TestRestoreCrashedRaftNode {
     leader.replicate(SimpleStateMachine.applyValue(value)).join();
     eventually(() -> {
       Object queryOperation = SimpleStateMachine.queryLastValue();
-      Ordered<String> queryResult = crashedFollower.<String> query(queryOperation,
-        QueryPolicy.EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty()).join();
+      Ordered<String> queryResult = crashedFollower
+        .<String> query(queryOperation, QueryPolicy.EVENTUAL_CONSISTENCY, 0L, 0L).join();
       assertThat(queryResult.getResult()).isEqualTo(value);
     });
     RestoredRaftState restoredState = RaftTestUtils.getRestoredState(crashedFollower);
@@ -67,8 +66,8 @@ public class TestRestoreCrashedRaftNode {
     RaftNodeImpl restoredFollower = group.restoreNode(restoredState, raftStore);
     eventually(() -> {
       Object queryOperation = SimpleStateMachine.queryLastValue();
-      Ordered<String> queryResult = restoredFollower.<String> query(queryOperation,
-        QueryPolicy.EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty()).join();
+      Ordered<String> queryResult = restoredFollower
+        .<String> query(queryOperation, QueryPolicy.EVENTUAL_CONSISTENCY, 0L, 0L).join();
       assertThat(queryResult.getResult()).isEqualTo(value);
     });
   }

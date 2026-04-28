@@ -23,6 +23,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
@@ -63,9 +64,8 @@ public class TestGroupExecutorSchedule extends TestBase {
         overlap.incrementAndGet();
       }
       scheduledFiredAtNanos.set(System.nanoTime());
-      try {
-        Thread.sleep(20);
-      } catch (InterruptedException e) {
+      LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
+      if (Thread.interrupted()) {
         Thread.currentThread().interrupt();
       }
       inFlight.decrementAndGet();

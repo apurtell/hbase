@@ -23,11 +23,11 @@ import static org.apache.hadoop.hbase.consensus.raft.RaftRole.FOLLOWER;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEARNER;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.util.function.Consumer;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat;
 import org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeatAck;
-import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,14 +44,17 @@ import org.slf4j.LoggerFactory;
 public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbeat> {
   private static final Logger LOG = LoggerFactory.getLogger(LeaderHeartbeatHandler.class);
 
-  public LeaderHeartbeatHandler(RaftNodeImpl raftNode, LeaderHeartbeat request) {
+  private final Consumer<LeaderHeartbeatAck> ackSink;
+
+  public LeaderHeartbeatHandler(RaftNodeImpl raftNode, LeaderHeartbeat request,
+    @NonNull Consumer<LeaderHeartbeatAck> ackSink) {
     super(raftNode, request);
+    this.ackSink = requireNonNull(ackSink);
   }
 
   @Override
-  protected boolean wakesQuiescentFollower() {
-    // Heartbeats interpret the quiesce bit explicitly in handle(); do not pre-wake.
-    return false;
+  protected void preHandle() {
+    // Heartbeats interpret the quiesce bit explicitly in handle(). Do not pre-wake.
   }
 
   @Override
@@ -115,10 +118,10 @@ public class LeaderHeartbeatHandler extends AbstractMessageHandler<LeaderHeartbe
     // pre-restart entries but the follower has reset its lastVerifiedLogIndex on recovery) and
     // send a catch-up AppendEntries to re-establish log matching, allowing commit index to
     // resume advancing on the follower.
-    RaftMessage ack = modelFactory.createLeaderHeartbeatAckBuilder().setGroupId(node.getGroupId())
-      .setSender(localEndpoint()).setTerm(state.term())
+    LeaderHeartbeatAck ack = modelFactory.createLeaderHeartbeatAckBuilder()
+      .setGroupId(node.getGroupId()).setSender(localEndpoint()).setTerm(state.term())
       .setLastVerifiedLogIndex(state.lastVerifiedLogIndex()).build();
-    node.send(leader, ack);
+    ackSink.accept(ack);
   }
 
   private void maybeQuiesceFromNotice(LeaderHeartbeat request, RaftEndpoint leader) {

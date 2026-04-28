@@ -25,7 +25,6 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -56,13 +55,26 @@ class LogSegment implements Closeable {
   }
 
   /**
-   * Opens a brand-new segment file and writes the {@link LogRecord#PROLOGUE_BYTES} prologue. Caller
-   * must {@link FileChannel#force(boolean) force} the prologue to disk if durability is required.
+   * Opens a brand-new segment file, pre-allocates it to {@code preallocBytes}, and writes the
+   * prologue. Pre-allocation is implemented by writing a single zero byte at offset
+   * {@code preallocBytes - 1}, which extends the file length in a single metadata update. The
+   * trailing zero region is interpreted by {@link LogRecord.Reader#next()} as {@code TRUNCATED}
+   * fails the {@code frameLen < CRC_BYTES + 1} check), so recovery-time replay early-stops at the
+   * actual record tail. The graceful close path ({@link UnifiedRaftStore#rollSegment} /
+   * {@code close()}) truncates the file back to {@code currentSize()} so non-active segments do not
+   * waste disk.
    */
   @NonNull
-  static LogSegment create(long segmentId, @NonNull Path path) throws IOException {
+  static LogSegment create(long segmentId, @NonNull Path path, long preallocBytes)
+    throws IOException {
     FileChannel ch = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
       StandardOpenOption.READ);
+    if (preallocBytes > LogRecord.PROLOGUE_BYTES) {
+      ByteBuffer marker = ByteBuffer.allocate(1);
+      while (marker.hasRemaining()) {
+        ch.write(marker, preallocBytes - 1);
+      }
+    }
     ByteBuffer prologue = LogRecord.encodePrologue();
     while (prologue.hasRemaining()) {
       ch.write(prologue);
@@ -107,15 +119,19 @@ class LogSegment implements Closeable {
     }
   }
 
-  /** Appends a list of pre-encoded frames using a single gathered {@code FileChannel.write}. */
-  void appendFrames(@NonNull ByteBuffer[] bufs) throws IOException {
+  /**
+   * Appends the {@code length} pre-encoded frames starting at {@code offset} of {@code bufs} using
+   * a single gathered {@code FileChannel.write}. Lets the writer reuse a single ByteBuffer[]
+   * scratch array across batches without nulling out trailing slots.
+   */
+  void appendFrames(@NonNull ByteBuffer[] bufs, int offset, int length) throws IOException {
     long expected = 0L;
-    for (ByteBuffer b : bufs) {
-      expected += b.remaining();
+    for (int i = offset; i < offset + length; i++) {
+      expected += bufs[i].remaining();
     }
     long written = 0L;
     while (written < expected) {
-      written += channel.write(bufs);
+      written += channel.write(bufs, offset, length);
     }
     currentSize += written;
   }
@@ -140,7 +156,7 @@ class LogSegment implements Closeable {
    * the highest seen value.
    */
   void recordMaxLogIndex(@NonNull byte[] groupId, long logIndex) {
-    ByteBuffer key = ByteBuffer.wrap(Arrays.copyOf(groupId, groupId.length)).asReadOnlyBuffer();
+    ByteBuffer key = ByteBuffer.wrap(groupId).asReadOnlyBuffer();
     maxLogIndexByGroup.merge(key, logIndex, Math::max);
   }
 
@@ -148,13 +164,6 @@ class LogSegment implements Closeable {
   @NonNull
   Map<ByteBuffer, Long> maxLogIndexByGroup() {
     return maxLogIndexByGroup;
-  }
-
-  /** Returns the highest log index this segment carries for {@code groupId}, or {@code -1}. */
-  long maxLogIndexFor(@NonNull byte[] groupId) {
-    ByteBuffer key = ByteBuffer.wrap(groupId).asReadOnlyBuffer();
-    Long v = maxLogIndexByGroup.get(key);
-    return v != null ? v : -1L;
   }
 
   /** Deletes the underlying file. Safe to call after {@link #close()}. */
@@ -169,9 +178,7 @@ class LogSegment implements Closeable {
     }
   }
 
-  /**
-   * Builds the canonical filename for a segment, e.g. {@code raft-0000000000000000007.log}.
-   */
+  /** Builds the canonical filename for a segment, e.g. {@code raft-0000000000000000007.log}. */
   @NonNull
   static String filename(long segmentId) {
     return String.format("%s%019d%s", FILE_PREFIX, segmentId, FILE_SUFFIX);

@@ -25,10 +25,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
 import java.util.Map;
+import org.apache.hadoop.hbase.consensus.handler.store.RaftStoreTestFixtures.LogStoreConfigs;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
@@ -41,11 +39,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/**
- * Whole-disk replay survives corruption. The Raft layer fills the gap via {@code AppendEntries} /
- * {@code InstallSnapshot} catch-up. This test exercises the store half.
- */
+/** Whole-disk replay survives corruption. */
 @Tag(SmallTests.TAG)
 public class TestUnifiedRaftStoreCorruption extends TestBase {
 
@@ -55,9 +52,10 @@ public class TestUnifiedRaftStoreCorruption extends TestBase {
   private UnifiedRaftStore store;
   private final DefaultRaftModelFactory factory = new DefaultRaftModelFactory();
   private final RaftEndpoint a = LocalRaftEndpoint.newEndpoint();
+  private final RaftEndpoint b = LocalRaftEndpoint.newEndpoint();
 
-  private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 5L, 64));
+  private UnifiedRaftStore newStore(int shards) {
+    return new UnifiedRaftStore(LogStoreConfigs.defaults(tmp.toFile(), shards));
   }
 
   @AfterEach
@@ -68,56 +66,50 @@ public class TestUnifiedRaftStoreCorruption extends TestBase {
     }
   }
 
-  @Test
-  public void testTornTailTruncatedOnReload() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testTornTailTruncatedOnReload(int shards) throws IOException {
     byte[] gid = "g".getBytes();
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
-    seedMinimal(g);
-    for (int i = 1; i <= 4; i++) {
-      g.persistLogEntries(Collections.singletonList(
-        factory.createLogEntryBuilder().setIndex(i).setTerm(1).setOperation(new byte[64]).build()));
-    }
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    RaftStoreTestFixtures.appendEntries(g, 1, 4, 1, 64, factory);
     g.flush();
     s1.close();
 
-    Path seg = onlySegment();
+    Path seg = RaftStoreTestFixtures.onlySegmentForGroup(s1, gid, tmp);
     long size = Files.size(seg);
-    // Drop the last 8 bytes — simulates a torn write.
     try (FileChannel ch = FileChannel.open(seg, StandardOpenOption.WRITE)) {
       ch.truncate(size - 8L);
     }
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     RestoredRaftState rs = out.values().iterator().next();
-    List<LogEntry> entries = rs.getLogEntries();
-    // We lose the trailing entry; everything before it must still be there.
+    java.util.List<LogEntry> entries = rs.getLogEntries();
     assertThat(entries).hasSizeBetween(0, 4);
     long after = Files.size(seg);
     assertThat(after).isLessThanOrEqualTo(size - 8L);
   }
 
-  @Test
-  public void testCrcFlipTruncatedOnReload() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testCrcFlipTruncatedOnReload(int shards) throws IOException {
     byte[] gid = "g".getBytes();
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
-    seedMinimal(g);
-    for (int i = 1; i <= 6; i++) {
-      g.persistLogEntries(Collections.singletonList(
-        factory.createLogEntryBuilder().setIndex(i).setTerm(1).setOperation(new byte[32]).build()));
-    }
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    RaftStoreTestFixtures.appendEntries(g, 1, 6, 1, 32, factory);
     g.flush();
     s1.close();
 
-    Path seg = onlySegment();
+    Path seg = RaftStoreTestFixtures.onlySegmentForGroup(s1, gid, tmp);
     long sizeBefore = Files.size(seg);
     flipByteAt(seg, sizeBefore - 16L);
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     RestoredRaftState rs = out.values().iterator().next();
     assertThat(rs.getLogEntries()).hasSizeBetween(0, 6);
@@ -125,38 +117,77 @@ public class TestUnifiedRaftStoreCorruption extends TestBase {
     assertThat(sizeAfter).isLessThanOrEqualTo(sizeBefore);
   }
 
-  @Test
-  public void testBadPrologueDeletesSegment() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testBadPrologueDeletesSegment(int shards) throws IOException {
     byte[] gid = "g".getBytes();
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
-    seedMinimal(g);
-    for (int i = 1; i <= 3; i++) {
-      g.persistLogEntries(Collections.singletonList(
-        factory.createLogEntryBuilder().setIndex(i).setTerm(1).setOperation(new byte[16]).build()));
-    }
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    RaftStoreTestFixtures.appendEntries(g, 1, 3, 1, 16, factory);
     g.flush();
     s1.close();
 
-    Path seg = onlySegment();
-    // Smash the magic.
+    Path seg = RaftStoreTestFixtures.onlySegmentForGroup(s1, gid, tmp);
     try (FileChannel ch = FileChannel.open(seg, StandardOpenOption.WRITE)) {
       ByteBuffer bad = ByteBuffer.wrap(new byte[] { 0, 0, 0, 0 });
       ch.write(bad, 0L);
     }
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
-    // Bad-magic segment is deleted by load(); store comes back with no usable groups.
     assertThat(out).isEmpty();
-    assertThat(store.currentSegmentForTesting()).isNotNull();
+    // Each shard must still have a fresh active segment; verify the corrupted shard does too.
+    int sIdx = store.routeShard(gid);
+    assertThat(store.currentSegmentForTesting(sIdx)).isNotNull();
   }
 
-  private Path onlySegment() throws IOException {
-    return Files.list(tmp)
-      .filter(p -> p.getFileName().toString().startsWith(LogSegment.FILE_PREFIX)).findFirst()
-      .orElseThrow();
+  /** Corrupting one shard's segment does not damage other shards' groups. */
+  @Test
+  public void testCorruptionOnOneShardDoesNotAffectOtherShards() throws IOException {
+    int shards = 4;
+    UnifiedRaftStore s1 = newStore(shards);
+    s1.load();
+    byte[] gA = null;
+    byte[] gB = null;
+    for (int i = 0; i < 64 && (gA == null || gB == null); i++) {
+      byte[] cand = ("g-iso-" + i).getBytes();
+      int s = s1.routeShard(cand);
+      if (gA == null) {
+        gA = cand;
+      } else if (s != s1.routeShard(gA)) {
+        gB = cand;
+      }
+    }
+    assertThat(gA).isNotNull();
+    assertThat(gB).isNotNull();
+
+    RaftStore rA = s1.newGroupStore(gA);
+    RaftStore rB = s1.newGroupStore(gB);
+    RaftStoreTestFixtures.seedMinimal(rA, a, factory);
+    RaftStoreTestFixtures.seedMinimal(rB, b, factory);
+    RaftStoreTestFixtures.appendEntries(rA, 1, 3, 1, 16, factory);
+    RaftStoreTestFixtures.appendEntries(rB, 1, 3, 1, 16, factory);
+    rA.flush();
+    rB.flush();
+    s1.close();
+
+    // Corrupt only shard-A's segment by smashing its prologue.
+    Path segA = RaftStoreTestFixtures.onlySegmentForGroup(s1, gA, tmp);
+    try (FileChannel ch = FileChannel.open(segA, StandardOpenOption.WRITE)) {
+      ch.write(ByteBuffer.wrap(new byte[] { 0, 0, 0, 0 }), 0L);
+    }
+
+    store = newStore(shards);
+    Map<ByteBuffer, RestoredRaftState> out = store.load();
+    // Group B (untouched shard) must restore; group A (corrupted shard) must not.
+    ByteBuffer bKey = ByteBuffer.wrap(gB).asReadOnlyBuffer();
+    ByteBuffer aKey = ByteBuffer.wrap(gA).asReadOnlyBuffer();
+    assertThat(out).containsKey(bKey);
+    assertThat(out).doesNotContainKey(aKey);
+    RestoredRaftState rsB = out.get(bKey);
+    assertThat(rsB.getLogEntries()).hasSize(3);
   }
 
   private void flipByteAt(Path file, long offset) throws IOException {
@@ -169,14 +200,5 @@ public class TestUnifiedRaftStoreCorruption extends TestBase {
       ByteBuffer flipped = ByteBuffer.wrap(new byte[] { (byte) (~b & 0xFF) });
       ch.write(flipped, offset);
     }
-  }
-
-  private void seedMinimal(RaftStore g) throws IOException {
-    g.persistAndFlushLocalEndpoint(factory.createRaftEndpointPersistentStateBuilder()
-      .setLocalEndpoint(a).setVoting(true).build());
-    g.persistAndFlushInitialGroupMembers(factory.createRaftGroupMembersViewBuilder().setLogIndex(0L)
-      .setMembers(Arrays.asList(a)).setVotingMembers(Arrays.asList(a)).build());
-    g.persistAndFlushTerm(
-      factory.createRaftTermPersistentStateBuilder().setTerm(1).setVotedFor(a).build());
   }
 }

@@ -75,8 +75,6 @@ public class LogRecord {
   /** Defensive cap on per-frame size: 64 MiB. Anything larger is treated as truncation. */
   public static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
-  private static final byte[] EMPTY = new byte[0];
-
   /**
    * On-disk record kind. Stored as a {@code uint8}.
    * <p>

@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.stream.Collectors;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -47,8 +48,13 @@ public final class LeaderState {
   /**
    * Wall-clock time (ms) until which this leader considers its lease valid for leader stickiness /
    * step-down. Refreshed from replication quorum ack timestamps.
+   * <p>
+   * Volatile + monotonic-max accumulator so the bulk inbound handler can advance it from the netty
+   * event-loop thread without entering the per-group executor.
    */
-  private long leaseExpiryMillis;
+  private volatile long leaseExpiryMillis;
+  private static final AtomicLongFieldUpdater<LeaderState> LEASE_EXPIRY =
+    AtomicLongFieldUpdater.newUpdater(LeaderState.class, "leaseExpiryMillis");
   /**
    * Wall-clock time (ms) of the last leader-side activity that should reset the idle-group
    * quiescence grace timer. Updated whenever {@code ReplicateTask} runs, a membership change is
@@ -179,17 +185,28 @@ public final class LeaderState {
     return leaseExpiryMillis;
   }
 
+  /**
+   * Sets the lease expiry to {@code expiry} if it is greater than the current value. Otherwise
+   * leaves the lease unchanged. The lease is strictly monotonic by construction, but callers do not
+   * always know whether their newly-computed value is ahead of or behind the current lease.
+   */
   public void leaseExpiryMillis(long expiry) {
-    if (expiry < this.leaseExpiryMillis) {
-      throw new IllegalStateException(
-        "lease expiry must be monotonic: new=" + expiry + ", existing=" + this.leaseExpiryMillis);
-    }
-    this.leaseExpiryMillis = expiry;
+    LEASE_EXPIRY.accumulateAndGet(this, expiry, Math::max);
   }
 
   /**
-   * Returns the earliest append entries response timestamp of the log replication quorum nodes.
+   * Atomically advances the lease expiry by {@code delta} milliseconds, but only when a real lease
+   * has already been established (current value &gt; 0). Used by the JVM-pause absorber which the
+   * per-server timing wheel runs from its own thread.
    */
+  public void bumpLeaseExpiryMillis(long delta) {
+    if (delta <= 0L) {
+      return;
+    }
+    LEASE_EXPIRY.accumulateAndGet(this, delta, (cur, d) -> cur > 0L ? cur + d : cur);
+  }
+
+  /** Returns the earliest append entries response timestamp of the log replication quorum nodes. */
   public long quorumResponseTimestamp(int quorumSize, long localNodeTimestamp) {
     long[] timestamps = new long[followerStates.size() + 1];
     int i = 0;
@@ -223,7 +240,7 @@ public final class LeaderState {
   /**
    * Updates the last replicate-activity timestamp. The quiescence sweep gates the
    * active-to-quiescent transition on
-   * {@code currentTimeMillis - lastReplicateActivityMillis >= quiescenceGraceMs}; bumping this
+   * {@code currentTimeMillis - lastReplicateActivityMillis >= quiescenceGraceMs}. Bumping this
    * timestamp on every {@code ReplicateTask} or membership change run is what makes the gate track
    * real activity rather than the wall clock.
    */

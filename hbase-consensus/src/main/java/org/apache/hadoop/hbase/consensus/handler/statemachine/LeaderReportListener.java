@@ -23,7 +23,6 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 import org.apache.hadoop.hbase.consensus.handler.server.ConsensusServerMetrics;
@@ -32,6 +31,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftRole;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftLogStats;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReport;
 import org.apache.hadoop.hbase.consensus.raft.report.RaftNodeReportListener;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -74,7 +74,7 @@ public final class LeaderReportListener implements RaftNodeReportListener {
   private final Map<RaftEndpoint, Long> lastLagFireMillis = new HashMap<>();
 
   public LeaderReportListener(@NonNull ConsensusSpi spi) {
-    this(spi, DEFAULT_LAGGING_COOLDOWN_MS, System::currentTimeMillis, null);
+    this(spi, DEFAULT_LAGGING_COOLDOWN_MS, EnvironmentEdgeManager::currentTime, null);
   }
 
   /**
@@ -83,7 +83,7 @@ public final class LeaderReportListener implements RaftNodeReportListener {
    * {@code (spi)} constructor delegates here with {@code null}).
    */
   public LeaderReportListener(@NonNull ConsensusSpi spi, @Nullable ConsensusServerMetrics metrics) {
-    this(spi, DEFAULT_LAGGING_COOLDOWN_MS, System::currentTimeMillis, metrics);
+    this(spi, DEFAULT_LAGGING_COOLDOWN_MS, EnvironmentEdgeManager::currentTime, metrics);
   }
 
   public LeaderReportListener(@NonNull ConsensusSpi spi, long laggingCooldownMs,
@@ -138,15 +138,15 @@ public final class LeaderReportListener implements RaftNodeReportListener {
     }
 
     if (report.getRole() == RaftRole.LEADER) {
+      Map<RaftEndpoint, Long> matchIndices = log.getFollowerMatchIndices();
       if (metrics != null) {
-        Optional<Long> qhbTs = report.getQuorumHeartbeatTimestamp();
-        if (qhbTs.isPresent()) {
-          metrics.recordQuorumHeartbeatLag(clock.getAsLong() - qhbTs.get());
+        long qhbTs = report.getQuorumHeartbeatTimestamp();
+        if (qhbTs > 0L) {
+          metrics.recordQuorumHeartbeatLag(clock.getAsLong() - qhbTs);
         }
-        Map<RaftEndpoint, Long> matchIndicesForLag = log.getFollowerMatchIndices();
-        if (matchIndicesForLag != null && !matchIndicesForLag.isEmpty()) {
+        if (matchIndices != null && !matchIndices.isEmpty()) {
           long minMatch = Long.MAX_VALUE;
-          for (long m : matchIndicesForLag.values()) {
+          for (long m : matchIndices.values()) {
             if (m < minMatch) {
               minMatch = m;
             }
@@ -157,7 +157,6 @@ public final class LeaderReportListener implements RaftNodeReportListener {
         }
       }
       long lastSnapshotIndex = log.getLastSnapshotIndex();
-      Map<RaftEndpoint, Long> matchIndices = log.getFollowerMatchIndices();
       if (matchIndices != null && lastSnapshotIndex > 0) {
         long now = clock.getAsLong();
         for (Map.Entry<RaftEndpoint, Long> e : matchIndices.entrySet()) {
@@ -176,9 +175,9 @@ public final class LeaderReportListener implements RaftNodeReportListener {
       }
     } else {
       if (metrics != null) {
-        Optional<Long> lhbTs = report.getLeaderHeartbeatTimestamp();
-        if (lhbTs.isPresent()) {
-          metrics.recordLeaderHeartbeatLag(clock.getAsLong() - lhbTs.get());
+        long lhbTs = report.getLeaderHeartbeatTimestamp();
+        if (lhbTs > 0L) {
+          metrics.recordLeaderHeartbeatLag(clock.getAsLong() - lhbTs);
         }
       }
       if (!lastLagFireMillis.isEmpty()) {

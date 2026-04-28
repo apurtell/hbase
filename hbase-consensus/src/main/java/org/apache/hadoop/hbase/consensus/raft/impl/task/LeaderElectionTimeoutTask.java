@@ -29,7 +29,7 @@ import org.slf4j.LoggerFactory;
  * elected yet.
  */
 @InterfaceAudience.Private
-public final class LeaderElectionTimeoutTask extends RaftNodeStatusAwareTask implements Runnable {
+public final class LeaderElectionTimeoutTask extends RaftNodeStatusAwareTask {
   private static final Logger LOG = LoggerFactory.getLogger(LeaderElectionTimeoutTask.class);
 
   public LeaderElectionTimeoutTask(RaftNodeImpl raftNode) {

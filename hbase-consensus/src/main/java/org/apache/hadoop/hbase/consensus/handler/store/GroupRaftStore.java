@@ -70,6 +70,11 @@ final class GroupRaftStore implements RaftStore {
   }
 
   @Override
+  public void persistLogEntriesAndFlush(@NonNull List<LogEntry> logEntries) throws IOException {
+    parent.persistLogEntriesAndFlush(groupId, logEntries);
+  }
+
+  @Override
   public void persistSnapshotChunk(@NonNull SnapshotChunk snapshotChunk) throws IOException {
     parent.persistSnapshotChunk(groupId, snapshotChunk);
   }

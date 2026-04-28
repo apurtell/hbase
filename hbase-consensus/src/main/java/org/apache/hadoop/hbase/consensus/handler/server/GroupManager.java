@@ -22,6 +22,7 @@ import edu.umd.cs.findbugs.annotations.Nullable;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
+import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.ConsensusSpi;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
@@ -36,7 +37,7 @@ import org.apache.yetus.audience.InterfaceStability;
  * {@link ConsensusServer} implements this interface; this is the type that operational and test
  * code should hold instead of the concrete server class.
  */
-@InterfaceAudience.LimitedPrivate({ "Coprocessor" })
+@InterfaceAudience.LimitedPrivate({ HBaseInterfaceAudience.COPROC })
 @InterfaceStability.Evolving
 public interface GroupManager {
 

@@ -66,7 +66,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * Creates POJO-style implementations of the {@link RaftModel} objects.
  */
 @InterfaceAudience.Private
-public class DefaultRaftModelFactory implements RaftModelFactory {
+public final class DefaultRaftModelFactory implements RaftModelFactory {
   @NonNull
   @Override
   public LogEntryBuilder createLogEntryBuilder() {

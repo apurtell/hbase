@@ -18,7 +18,6 @@
 package org.apache.hadoop.hbase.consensus.handler.server;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import org.apache.hadoop.hbase.consensus.handler.statemachine.ConsensusSpi;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
@@ -28,13 +27,11 @@ import org.apache.yetus.audience.InterfaceStability;
  * {@link GroupManager#getGroup}.
  * <p>
  * {@link #getRaftNode()} is the canonical entry point for replicate / query / membership-change
- * operations against the group. {@link #getSpi()} is the per-group SPI registered with the server,
- * useful for tests that want to inspect committed entries.
+ * operations against the group.
  * <p>
  * Handles are stable for the lifetime of the underlying group and become inert (the
  * {@link RaftNode} is terminated and detached from the server) once
- * {@link GroupManager#removeGroup} returns. Test code is responsible for not holding handles across
- * removal.
+ * {@link GroupManager#removeGroup} returns.
  */
 @InterfaceAudience.Private
 @InterfaceStability.Evolving
@@ -42,12 +39,10 @@ public final class GroupHandle {
 
   private final Object groupId;
   private final RaftNode raftNode;
-  private final ConsensusSpi spi;
 
-  GroupHandle(@NonNull Object groupId, @NonNull RaftNode raftNode, @NonNull ConsensusSpi spi) {
+  GroupHandle(@NonNull Object groupId, @NonNull RaftNode raftNode) {
     this.groupId = groupId;
     this.raftNode = raftNode;
-    this.spi = spi;
   }
 
   /** Returns the group id this handle was registered under. */
@@ -60,11 +55,5 @@ public final class GroupHandle {
   @NonNull
   public RaftNode getRaftNode() {
     return raftNode;
-  }
-
-  /** Returns the {@link ConsensusSpi} registered for this group. */
-  @NonNull
-  public ConsensusSpi getSpi() {
-    return spi;
   }
 }

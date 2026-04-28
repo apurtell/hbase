@@ -33,4 +33,17 @@ public interface RaftEndpoint {
   /** Returns the unique identifier of the Raft endpoint. */
   @NonNull
   Object getId();
+
+  /**
+   * Returns the {@link EndpointId} value object that wraps this endpoint's id bytes for hot-path
+   * use (cached {@code ByteString} view, pre-built {@code RaftEndpointPB}).
+   * <p>
+   * The default implementation derives the value from {@link #getId()} on every call, which
+   * allocates. Implementations should override this to return a cached instance built once at
+   * construction time.
+   */
+  @NonNull
+  default EndpointId endpointId() {
+    return EndpointId.of(getId());
+  }
 }

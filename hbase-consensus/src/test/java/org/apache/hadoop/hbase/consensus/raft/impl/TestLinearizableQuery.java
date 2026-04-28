@@ -33,7 +33,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -79,8 +78,7 @@ public class TestLinearizableQuery extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
     long commitIndex1 = getCommitIndex(leader);
-    Ordered<Object> o1 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> o1 = leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L).join();
     assertThat(o1.getResult()).isEqualTo("value1");
     assertThat(o1.getCommitIndex()).isEqualTo(commitIndex1);
     long leaderQuerySeqNum1 = getLeaderQuerySequenceNumber(leader);
@@ -88,8 +86,7 @@ public class TestLinearizableQuery extends TestBase {
     assertThat(getCommitIndex(leader)).isEqualTo(commitIndex1);
     leader.replicate(applyValue("value2")).join();
     long commitIndex2 = getCommitIndex(leader);
-    Ordered<Object> o2 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+    Ordered<Object> o2 = leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L).join();
     assertThat(o2.getResult()).isEqualTo("value2");
     assertThat(o2.getCommitIndex()).isEqualTo(commitIndex2);
     long leaderQuerySeqNum2 = getLeaderQuerySequenceNumber(leader);
@@ -104,8 +101,7 @@ public class TestLinearizableQuery extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("value1")).join();
     long commitIndex1 = getCommitIndex(leader);
-    Ordered<Object> o1 = leader
-      .query(queryLastValue(), LINEARIZABLE, Optional.of(commitIndex1), Optional.empty()).join();
+    Ordered<Object> o1 = leader.query(queryLastValue(), LINEARIZABLE, commitIndex1, 0L).join();
     assertThat(o1.getResult()).isEqualTo("value1");
     assertThat(o1.getCommitIndex()).isEqualTo(commitIndex1);
     long leaderQuerySeqNum1 = getLeaderQuerySequenceNumber(leader);
@@ -113,8 +109,7 @@ public class TestLinearizableQuery extends TestBase {
     assertThat(getCommitIndex(leader)).isEqualTo(commitIndex1);
     leader.replicate(applyValue("value2")).join();
     long commitIndex2 = getCommitIndex(leader);
-    Ordered<Object> o2 = leader
-      .query(queryLastValue(), LINEARIZABLE, Optional.of(commitIndex2), Optional.empty()).join();
+    Ordered<Object> o2 = leader.query(queryLastValue(), LINEARIZABLE, commitIndex2, 0L).join();
     assertThat(o2.getResult()).isEqualTo("value2");
     assertThat(o2.getCommitIndex()).isEqualTo(commitIndex2);
     long leaderQuerySeqNum2 = getLeaderQuerySequenceNumber(leader);
@@ -130,8 +125,7 @@ public class TestLinearizableQuery extends TestBase {
     leader.replicate(applyValue("value1")).join();
     long commitIndex = getCommitIndex(leader);
     try {
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.of(commitIndex + 1), Optional.empty())
-        .join();
+      leader.query(queryLastValue(), LINEARIZABLE, commitIndex + 1, 0L).join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(LaggingCommitIndexException.class);
@@ -153,7 +147,7 @@ public class TestLinearizableQuery extends TestBase {
       followers.get(2).getLocalEndpoint());
     CompletableFuture<Ordered<Object>> replicateFuture = leader.replicate(applyValue("value2"));
     CompletableFuture<Ordered<Object>> queryFuture =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     group.resetAllRulesFrom(leader.getLocalEndpoint());
     Ordered<Object> replicationResult = replicateFuture.join();
     Ordered<Object> queryResult = queryFuture.join();
@@ -175,9 +169,9 @@ public class TestLinearizableQuery extends TestBase {
     group.dropAppendsAndHeartbeatsTo(leader.getLocalEndpoint(),
       followers.get(2).getLocalEndpoint());
     CompletableFuture<Ordered<Object>> queryFuture1 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     CompletableFuture<Ordered<Object>> queryFuture2 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     group.resetAllRulesFrom(leader.getLocalEndpoint());
     long commitIndex = getCommitIndex(leader);
     Ordered<Object> result1 = queryFuture1.join();
@@ -204,9 +198,9 @@ public class TestLinearizableQuery extends TestBase {
     CompletableFuture<Ordered<Object>> replicateFuture1 = leader.replicate(applyValue("value2"));
     CompletableFuture<Ordered<Object>> replicateFuture2 = leader.replicate(applyValue("value3"));
     CompletableFuture<Ordered<Object>> queryFuture1 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     CompletableFuture<Ordered<Object>> queryFuture2 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     group.resetAllRulesFrom(leader.getLocalEndpoint());
     replicateFuture1.join().getCommitIndex();
     long commitIndex = replicateFuture2.join().getCommitIndex();
@@ -225,7 +219,7 @@ public class TestLinearizableQuery extends TestBase {
     RaftNode leader = group.waitUntilLeaderElected();
     try {
       group.getAnyNodeExcept(leader.getLocalEndpoint())
-        .query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty()).join();
+        .query(queryLastValue(), LINEARIZABLE, 0L, 0L).join();
       fail();
     } catch (CompletionException e) {
       assertThat(e).hasCauseInstanceOf(NotLeaderException.class);
@@ -247,9 +241,9 @@ public class TestLinearizableQuery extends TestBase {
     group.dropAppendsAndHeartbeatsTo(leader.getLocalEndpoint(),
       followers.get(2).getLocalEndpoint());
     CompletableFuture<Ordered<Object>> queryFuture1 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     CompletableFuture<Ordered<Object>> queryFuture2 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     try {
       queryFuture2.join();
       fail();
@@ -269,7 +263,7 @@ public class TestLinearizableQuery extends TestBase {
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     group.splitMembers(leader.getLocalEndpoint());
     CompletableFuture<Ordered<Object>> queryFuture =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     eventually(() -> assertThat(getRole(leader)).isEqualTo(FOLLOWER));
     try {
       queryFuture.join();
@@ -302,8 +296,7 @@ public class TestLinearizableQuery extends TestBase {
       followers.get(0).getLocalEndpoint());
     group.dropMessagesTo(leader.getLocalEndpoint(), followers.get(0).getLocalEndpoint(),
       InstallSnapshotRequest.class);
-    CompletableFuture<Ordered<Object>> f =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+    CompletableFuture<Ordered<Object>> f = leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     eventually(() -> assertThat(getLeaderQuerySequenceNumber(leader)).isEqualTo(1));
     group.allowAllMessagesTo(leader.getLocalEndpoint(), followers.get(0).getLocalEndpoint());
     group.allowAllMessagesTo(leader.getLocalEndpoint(), followers.get(1).getLocalEndpoint());
@@ -328,8 +321,7 @@ public class TestLinearizableQuery extends TestBase {
       AppendEntriesFailureResponse.class);
     leader.changeMembership(newFollower.getLocalEndpoint(), ADD_OR_PROMOTE_TO_FOLLOWER, 0).join();
     group.dropAppendsAndHeartbeatsTo(leader.getLocalEndpoint(), follower.getLocalEndpoint());
-    CompletableFuture<Ordered<Object>> f =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+    CompletableFuture<Ordered<Object>> f = leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     group.allowMessagesTo(newFollower.getLocalEndpoint(), leader.getLocalEndpoint(),
       AppendEntriesFailureResponse.class);
     group.allowAppendsAndHeartbeatsTo(leader.getLocalEndpoint(), newFollower.getLocalEndpoint());
@@ -349,7 +341,7 @@ public class TestLinearizableQuery extends TestBase {
     // Start the linearizable query before membership removal so it is waiting on the
     // leader's query path when the REMOVE_MEMBER entry commits (avoids racing on UPDATING).
     CompletableFuture<Ordered<Object>> queryFuture =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     CompletableFuture<Ordered<RaftGroupMembers>> membershipChangeFuture =
       leader.changeMembership(leader.getLocalEndpoint(), MembershipChangeMode.REMOVE_MEMBER, 0);
     for (RaftNodeImpl follower : group.<RaftNodeImpl> getNodesExcept(leader.getLocalEndpoint())) {
@@ -386,9 +378,9 @@ public class TestLinearizableQuery extends TestBase {
     CompletableFuture<Ordered<Object>> replicateFuture1 = leader.replicate(applyValue("value2"));
     CompletableFuture<Ordered<Object>> replicateFuture2 = leader.replicate(applyValue("value3"));
     CompletableFuture<Ordered<Object>> queryFuture1 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     CompletableFuture<Ordered<Object>> queryFuture2 =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     group.resetAllRulesFrom(leader.getLocalEndpoint());
     for (RaftNodeImpl follower : followers) {
       group.resetAllRulesFrom(follower.getLocalEndpoint());
@@ -422,7 +414,7 @@ public class TestLinearizableQuery extends TestBase {
       }
     }
     CompletableFuture<Ordered<Object>> queryFuture =
-      leader.query(queryLastValue(), LINEARIZABLE, Optional.empty(), Optional.empty());
+      leader.query(queryLastValue(), LINEARIZABLE, 0L, 0L);
     try {
       queryFuture.join();
       fail();

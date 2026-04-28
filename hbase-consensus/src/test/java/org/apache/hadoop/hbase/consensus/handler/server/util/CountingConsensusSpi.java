@@ -29,6 +29,7 @@ import org.apache.hadoop.hbase.consensus.handler.statemachine.CommittedEntry;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.ConsensusSpi;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.FlushMarker;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 
 /**
  * Lightweight {@link ConsensusSpi} fixture for the scalability harness and unit tests. Counts
@@ -51,6 +52,12 @@ public final class CountingConsensusSpi implements ConsensusSpi {
     private final AtomicLong leaderElections = new AtomicLong();
     private final AtomicLong noLeaderEvents = new AtomicLong();
     private final CountDownLatch firstLeaderElected = new CountDownLatch(1);
+    /**
+     * Wall-clock timestamp (ms) of the first time {@link ConsensusSpi#onLeaderElected} fired for
+     * this group. Captured under {@link AtomicLong#compareAndSet} so racing callbacks across
+     * servers cannot overwrite the earliest-observed value. Sentinel {@code 0L} means "never".
+     */
+    private final AtomicLong firstLeaderElectedTimestampMs = new AtomicLong(0L);
 
     public long getCommitBatches() {
       return commitBatches.get();
@@ -89,9 +96,19 @@ public final class CountingConsensusSpi implements ConsensusSpi {
       throws InterruptedException {
       return firstLeaderElected.await(timeout, unit);
     }
+
+    /**
+     * @return the wall-clock millis at which the first {@link ConsensusSpi#onLeaderElected} fired
+     *         for this group across any server, or {@code 0L} if no leader has been elected yet.
+     */
+    public long getFirstLeaderElectedTimestampMs() {
+      return firstLeaderElectedTimestampMs.get();
+    }
   }
 
-  private final ConcurrentMap<Object, Stats> perGroup = new ConcurrentHashMap<>();
+  // Keyed on the textual form of the group id so a test that calls {@code stats("g1")} and a
+  // production callback driven with a {@code GroupId.of("g1")} resolve to the same Stats object.
+  private final ConcurrentMap<String, Stats> perGroup = new ConcurrentHashMap<>();
   @Nullable
   private final ConsensusSpi delegate;
   @Nullable
@@ -121,7 +138,7 @@ public final class CountingConsensusSpi implements ConsensusSpi {
 
   @NonNull
   public Stats stats(@NonNull Object groupId) {
-    return perGroup.computeIfAbsent(groupId, k -> new Stats());
+    return perGroup.computeIfAbsent(String.valueOf(groupId), k -> new Stats());
   }
 
   @Override
@@ -154,6 +171,9 @@ public final class CountingConsensusSpi implements ConsensusSpi {
   public void onLeaderElected(@NonNull Object groupId, int term, @NonNull RaftEndpoint leader) {
     Stats s = stats(groupId);
     s.leaderElections.incrementAndGet();
+    // Capture the very first observation atomically so racing callbacks across servers do not
+    // overwrite the earliest-observed timestamp.
+    s.firstLeaderElectedTimestampMs.compareAndSet(0L, EnvironmentEdgeManager.currentTime());
     s.firstLeaderElected.countDown();
     if (delegate != null) {
       delegate.onLeaderElected(groupId, term, leader);

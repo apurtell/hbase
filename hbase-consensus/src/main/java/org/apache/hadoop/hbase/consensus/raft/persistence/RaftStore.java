@@ -101,6 +101,12 @@ public interface RaftStore {
    */
   void persistLogEntries(@NonNull List<LogEntry> logEntries) throws IOException;
 
+  /** Persists the given log entries and flushes (i.e. {@link #flush()}) before returning. */
+  default void persistLogEntriesAndFlush(@NonNull List<LogEntry> logEntries) throws IOException {
+    persistLogEntries(logEntries);
+    flush();
+  }
+
   /**
    * Persists the given snapshot chunk.
    * <p>
@@ -110,14 +116,11 @@ public interface RaftStore {
    * called afterwards.
    * <p>
    * The engine takes snapshots at a predetermined interval, controlled by
-   * {@link RaftConfig#getCommitCountToTakeSnapshot()}. For instance, if it is 100, snapshots will
-   * occur at indices 100, 200, 300, and so on.
+   * {@link RaftConfig#getCommitCountToTakeSnapshot()}.
    * <p>
    * The snapshot index can lag behind the index of the highest log entry which was already
    * persisted and flushed, but there is an upper bound to this difference, controlled by
-   * {@link RaftConfig#getMaxPendingLogEntryCount()}. For instance, if it is 10, and a
-   * {@code persistSnapshot()} call is made with <em>snapshotIndex=100</em>, the index of the
-   * preceding {@code persistLogEntries()} call can be at most 110.
+   * {@link RaftConfig#getMaxPendingLogEntryCount()}.
    * <p>
    * On the other hand, the snapshot index can also be ahead of the highest log entry. This can
    * happen when a Raft follower has fallen so far behind the leader and the leader no longer holds

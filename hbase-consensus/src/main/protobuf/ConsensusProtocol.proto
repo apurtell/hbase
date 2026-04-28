@@ -22,16 +22,10 @@ option java_outer_classname = "ConsensusProtos";
 option java_generate_equals_and_hash = true;
 option optimize_for = SPEED;
 
-// Opaque endpoint id; carries the bytes of the producer's RaftEndpoint.getId().
 message RaftEndpointPB {
   optional bytes id = 1;
 }
 
-// One Raft log entry. op_payload may optionally be compressed; when compressed,
-// op_payload_compression carries the ordinal of the Compression.Algorithm enum used
-// by the producer so the receiver can resolve the codec on demand without sharing
-// configuration with the sender. Absent (or NONE's ordinal) means the payload is
-// uncompressed.
 message LogEntryPB {
   optional int64 index = 1;
   optional int32 term = 2;
@@ -82,33 +76,23 @@ message GroupAppendEntriesPB {
   optional int64 flow_control_seq = 9;
 }
 
-// Dataless heartbeat for one group. Carries only what LeaderHeartbeat needs.
-//
-// quiesced: set by the leader on the active->quiescent transition heartbeat
-// After this field is sent on a GroupHeartbeatPB the leader emits zero per-
-// group heartbeats for that group until a Wake event clears it. A follower
-// that receives a quiesced-tagged heartbeat applies the
-// shouldFollowerQuiesceOnNotify checks (term match, commit match, expected
-// leader, no pending local proposals) before transitioning. A missed
-// notice just leaves that follower running its own election timer until
-// the next non-quiesced signal arrives, which is safe.
-message GroupHeartbeatPB {
+// Per-group entry inside a BulkHeartbeatPB envelope. The sender endpoint is
+// carried at envelope level so it is not duplicated per entry.
+message GroupBulkHeartbeatPB {
   optional bytes group_id = 1;
-  optional RaftEndpointPB sender = 2;
-  optional int32 term = 3;
-  optional int64 commit_index = 4;
-  optional bool quiesced = 5;
+  optional int32 term = 2;
+  optional int64 commit_index = 3;
+  optional bool  quiesced = 4;
 }
 
-// Acknowledgment of one LeaderHeartbeat. The follower also reports the highest
-// local log index that has been verified to match the leader's log
-// (last_verified_log_index). The leader uses this to detect when a follower's
-// runtime verification state lags its persisted log.
-message GroupHeartbeatAckPB {
+// Per-group acknowledgement entry inside a BulkHeartbeatAckPB envelope.
+// last_verified_log_index lets the leader detect when a follower's runtime
+// verification state lags its persisted log so the leader can fire a
+// catch-up AppendEntries.
+message GroupBulkHeartbeatAckPB {
   optional bytes group_id = 1;
-  optional RaftEndpointPB sender = 2;
-  optional int32 term = 3;
-  optional int64 last_verified_log_index = 4;
+  optional int32 term = 2;
+  optional int64 last_verified_log_index = 3;
 }
 
 message GroupAppendSuccessPB {
@@ -193,37 +177,42 @@ message TriggerLeaderElectionPB {
   optional int64 last_log_index = 5;
 }
 
-// Coalescing batches; one envelope can carry many groups' append/heartbeat
-// messages bound for the same peer.
+// Coalescing batch for AppendEntries. One envelope can carry many groups'
+// append messages bound for the same peer.
 message BatchAppendEntriesPB {
   repeated GroupAppendEntriesPB groups = 1;
 }
 
-// Top-level fields sender / epoch / tick carry the per-RS keepalive that
-// backs idle-group failure detection. Every HeartbeatBatchPB envelope
-// (including the empty-groups envelope synthesized by
-// SweepingHeartbeatScheduler when every group on this peer is quiescent)
-// populates them. The receiving ConsensusServer dispatches them to
-// onPeerKeepalive(sender, epoch, tick), which updates a process-wide
-// Map<RaftEndpoint, Long> lastPeerKeepaliveMillis. Quiescent groups on
-// the receiving RS that have `sender` as leader use this map for their
-// election-timer gate.
-message HeartbeatBatchPB {
-  repeated GroupHeartbeatPB groups  = 1;
-  optional RaftEndpointPB   sender  = 2;
-  optional int64            epoch   = 3;
-  optional int64            tick    = 4;
+// Bulk heartbeat envelope. One frame per (sender, peer) per heartbeat tick
+// carries one per-group entry for every local leader group whose committed
+// membership includes the target peer. Top-level sender / epoch / tick form
+// the per-RS keepalive that backs idle-group failure detection: the receiver
+// updates a process-wide map of the most recently observed (epoch, tick) for
+// each peer endpoint, and quiescent groups consult that map in lieu of a
+// per-group election timer.
+message BulkHeartbeatPB {
+  optional RaftEndpointPB sender = 1;
+  optional int64          epoch  = 2;
+  optional int64          tick   = 3;
+  repeated GroupBulkHeartbeatPB groups = 4;
 }
 
-message BatchHeartbeatAckPB {
-  repeated GroupHeartbeatAckPB groups = 1;
+// Bulk heartbeat acknowledgement envelope. One frame per (sender, peer) per
+// inbound BulkHeartbeatPB it acks. The envelope-level (sender, epoch, tick)
+// fields also serve as the follower-to-leader keepalive so the leader can
+// observe per-RS liveness independently of any per-group ack.
+message BulkHeartbeatAckPB {
+  optional RaftEndpointPB sender = 1;
+  optional int64          epoch  = 2;
+  optional int64          tick   = 3;
+  repeated GroupBulkHeartbeatAckPB groups = 4;
 }
 
 // Top-level frame; one per outbound flush window per peer.
 message ConsensusFrame {
   enum Kind {
     BATCH_APPEND            = 1;
-    HEARTBEAT_BATCH         = 2;
+    BULK_HEARTBEAT          = 2;
     APPEND_SUCCESS          = 3;
     APPEND_FAILURE          = 4;
     INSTALL_SNAPSHOT        = 5;
@@ -233,11 +222,11 @@ message ConsensusFrame {
     PRE_VOTE_REQUEST        = 9;
     PRE_VOTE_RESPONSE       = 10;
     TRIGGER_LEADER_ELECTION = 11;
-    HEARTBEAT_ACK_BATCH     = 12;
+    BULK_HEARTBEAT_ACK      = 12;
   }
   optional Kind kind = 1;
   optional BatchAppendEntriesPB      batch_append        = 2;
-  optional HeartbeatBatchPB          heartbeat_batch     = 3;
+  optional BulkHeartbeatPB           bulk_heartbeat      = 3;
   optional GroupAppendSuccessPB      append_success      = 4;
   optional GroupAppendFailurePB      append_failure      = 5;
   optional InstallSnapshotRequestPB  install_request     = 6;
@@ -247,5 +236,5 @@ message ConsensusFrame {
   optional PreVoteRequestPB          pre_vote_request    = 10;
   optional PreVoteResponsePB         pre_vote_response   = 11;
   optional TriggerLeaderElectionPB   trigger_election    = 12;
-  optional BatchHeartbeatAckPB       heartbeat_ack_batch = 13;
+  optional BulkHeartbeatAckPB        bulk_heartbeat_ack  = 13;
 }

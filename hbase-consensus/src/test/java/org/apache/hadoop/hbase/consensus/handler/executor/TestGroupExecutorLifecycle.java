@@ -106,7 +106,8 @@ public class TestGroupExecutorLifecycle extends TestBase {
     b.execute(bRan::countDown);
     assertThat(bRan.await(5, TimeUnit.SECONDS))
       .as("parent pool must still execute work after one group terminated").isTrue();
-    assertThat(mge.pool().isShutdown()).isFalse();
+    assertThat(mge.drainPool().isShutdown()).isFalse();
+    assertThat(mge.scheduledPool().isShutdown()).isFalse();
   }
 
   @Test
@@ -119,7 +120,8 @@ public class TestGroupExecutorLifecycle extends TestBase {
     assertThat(ran.await(5, TimeUnit.SECONDS)).isTrue();
 
     mge.close();
-    assertThat(mge.pool().isShutdown()).isTrue();
+    assertThat(mge.drainPool().isShutdown()).isTrue();
+    assertThat(mge.scheduledPool().isShutdown()).isTrue();
     assertThatThrownBy(() -> mge.executorFor("b")).isInstanceOf(IllegalStateException.class);
   }
 }

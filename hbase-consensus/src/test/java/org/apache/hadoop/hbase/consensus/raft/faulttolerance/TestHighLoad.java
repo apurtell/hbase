@@ -21,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.locks.LockSupport;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
@@ -60,7 +61,10 @@ public class TestHighLoad {
       // will start to fail new requests with CannotReplicateException
       CompletableFuture<Ordered<Object>> future =
         leader.replicate(SimpleStateMachine.applyValue("val"));
-      Thread.sleep(10);
+      LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10));
+      if (Thread.interrupted()) {
+        Thread.currentThread().interrupt();
+      }
       if (future.isCompletedExceptionally()) {
         try {
           future.join();

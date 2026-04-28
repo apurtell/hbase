@@ -26,6 +26,9 @@ import java.time.Clock;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Random;
+import java.util.function.IntSupplier;
+import org.apache.hadoop.hbase.consensus.raft.GroupId;
+import org.apache.hadoop.hbase.consensus.raft.PendingBytesBudget;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
@@ -34,7 +37,7 @@ import org.apache.hadoop.hbase.consensus.raft.RaftRole;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.executor.impl.DefaultRaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.heartbeat.HeartbeatScheduler;
-import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.DefaultHeartbeatScheduler;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.BulkHeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.model.RaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.log.DefaultRaftGroupMembersViewOrBuilder;
@@ -65,13 +68,18 @@ public class RaftNodeBuilderImpl implements RaftNodeBuilder {
   private RaftModelFactory modelFactory = new DefaultRaftModelFactory();
   private Random random = new Random();
   private Clock clock = Clock.systemUTC();
-  private HeartbeatScheduler heartbeatScheduler = DefaultHeartbeatScheduler.INSTANCE;
+  private HeartbeatScheduler heartbeatScheduler;
+  private IntSupplier activeGroupCountSupplier = () -> 1;
+  private PendingBytesBudget pendingBytesBudget = PendingBytesBudget.UNLIMITED;
   private boolean done;
 
   @NonNull
   @Override
   public RaftNodeBuilder setGroupId(@NonNull Object groupId) {
-    this.groupId = groupId;
+    // Normalize once at the boundary so the resulting RaftNode always holds an immutable
+    // GroupId with a cached ByteString view. The wire codec and the dispatcher registry both
+    // assume this when they short-circuit to zero-copy on hot paths.
+    this.groupId = GroupId.of(groupId);
     return this;
   }
 
@@ -173,22 +181,23 @@ public class RaftNodeBuilderImpl implements RaftNodeBuilder {
 
   @NonNull
   @Override
-  public RaftNodeBuilder setRandom(@NonNull Random random) {
-    this.random = requireNonNull(random);
-    return this;
-  }
-
-  @NonNull
-  @Override
-  public RaftNodeBuilder setClock(@NonNull Clock clock) {
-    this.clock = requireNonNull(clock);
-    return this;
-  }
-
-  @NonNull
-  @Override
   public RaftNodeBuilder setHeartbeatScheduler(@NonNull HeartbeatScheduler heartbeatScheduler) {
     this.heartbeatScheduler = requireNonNull(heartbeatScheduler);
+    return this;
+  }
+
+  @NonNull
+  @Override
+  public RaftNodeBuilder
+    setActiveGroupCountSupplier(@NonNull IntSupplier activeGroupCountSupplier) {
+    this.activeGroupCountSupplier = requireNonNull(activeGroupCountSupplier);
+    return this;
+  }
+
+  @NonNull
+  @Override
+  public RaftNodeBuilder setPendingBytesBudget(@NonNull PendingBytesBudget pendingBytesBudget) {
+    this.pendingBytesBudget = requireNonNull(pendingBytesBudget);
     return this;
   }
 
@@ -210,15 +219,23 @@ public class RaftNodeBuilderImpl implements RaftNodeBuilder {
       throw new IllegalStateException(message);
     }
     done = true;
+    if (heartbeatScheduler == null) {
+      requireNonNull(transport, "transport");
+      int intervalMs = (int) Math.min(Integer.MAX_VALUE, config.getLeaderHeartbeatPeriodMillis());
+      heartbeatScheduler = new BulkHeartbeatScheduler(intervalMs, 1,
+        config.getPauseDetectionThresholdMillis(), config.getPauseToleranceCapMillis(), transport);
+    }
     if (restoredState != null) {
       return new RaftNodeImpl(groupId, restoredState, config, executor, stateMachine, transport,
-        modelFactory, store, listener, random, clock, heartbeatScheduler);
+        modelFactory, store, listener, random, clock, heartbeatScheduler, activeGroupCountSupplier,
+        pendingBytesBudget);
     } else {
       // this groupMembers object does not hit network or disk.
       RaftGroupMembersView groupMembers = new DefaultRaftGroupMembersViewOrBuilder().setLogIndex(0)
         .setMembers(initialGroupMembers).setVotingMembers(initialVotingGroupMembers).build();
       return new RaftNodeImpl(groupId, localEndpoint, groupMembers, config, executor, stateMachine,
-        transport, modelFactory, store, listener, random, clock, heartbeatScheduler);
+        transport, modelFactory, store, listener, random, clock, heartbeatScheduler,
+        activeGroupCountSupplier, pendingBytesBudget);
     }
   }
 }

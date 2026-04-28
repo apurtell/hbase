@@ -95,6 +95,21 @@
       <groupId>org.jctools</groupId>
       <artifactId>jctools-core</artifactId>
     </dependency>
+    <!--
+      HdrHistogram is used to back the latency-sensitive Timers and Histograms in
+      ConsensusServerMetrics (replicateTime, commitApplyTime, leaderHeartbeatLagMillis,
+      quorumHeartbeatLagMillis). The default hbase-metrics FastLongHistogram has very coarse buckets
+      at the upper end (default upper bound ~8.5e9, 255 bins), so percentile readouts at sub-50 ms
+      latency cluster on bucket boundaries and lose useful resolution. HdrHistogram records
+      lock-free with configurable significant-digit precision (default 3 sig figs / 0.1% precision)
+      across a fixed range, and Recorder.getIntervalHistogram() gives us proper double-buffered
+      snapshot semantics that match the existing Histogram.snapshot() contract.
+    -->
+    <dependency>
+      <groupId>org.hdrhistogram</groupId>
+      <artifactId>HdrHistogram</artifactId>
+      <version>2.2.2</version>
+    </dependency>
     <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-compression-aircompressor</artifactId>
@@ -185,4 +200,41 @@
       </plugin>
     </plugins>
   </build>
+  <profiles>
+    <!--
+      Profile-driven scale testing for TestConsensusServerScale.
+
+      Activated by `-PconsensusScaleProfile`. Intentionally minimal.
+      <p>
+      Caller conventions (see {@code run-scale-tests.sh}):
+      <ul>
+        <li>{@code -Dconsensus.scale.argLine.extra="..."} extra JVM flags appended verbatim.</li>
+        <li>{@code -Dconsensus.scale.outDir=...} per-run output directory; consumed by the test
+            class for metrics.txt, jfr files, and the test JVM's gc.log / heap-dump path.</li>
+        <li>{@code -Dsurefire.Xmx=12g -Dsurefire.Xms=4g} larger heap; consumed by the parent's
+            argLine template.</li>
+      </ul>
+    -->
+    <profile>
+      <id>consensusScaleProfile</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <properties>
+        <consensus.scale.outDir>${project.build.directory}/scale</consensus.scale.outDir>
+        <consensus.scale.argLine.extra/>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <argLine>${argLine} ${consensus.scale.argLine.extra}</argLine>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

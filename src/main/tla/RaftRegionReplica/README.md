@@ -320,35 +320,35 @@ java -XX:+UseParallelGC -Xmx8g -cp tla2tools.jar \
 
 ## Side specs
 
-### `OutboundChannelFlush.tla` — outbound transport flush latency
+### `GroupExecutorFairness.tla` — receive-side per-group two-lane mailbox fairness
 
-`OutboundChannelFlush.tla` is a standalone, single-channel model of the per-peer outbound mailbox in `OutboundChannel.java` that the deadline-based flush wakeup mechanism (introduced to bound head-of-line latency in `CoalescingTransport`) operates on. It models four producers of "schedule a drain" wake-ups: immediate enqueues, coalescible enqueues with the new head-age deadline check, the periodic `BATCH_MS` tick (folded into `ClockTick`), and the post-drain tail re-arm. Both the CAS-fail behavior of `scheduleDrainOn` and the unbounded-poll loop in `drainOnce` are modeled so the spec captures the lost-wakeup window the deadline mechanism is designed to close.
+`GroupExecutorFairness.tla` is a standalone, single-group model of the two-lane (control / bulk) `GroupExecutor` mailbox in `GroupExecutor.java`. It models bounded producers, per-task `ServiceCost` (wall-clock), the cap-then-resubmit drain rule (up to `ControlBatchCap` control tasks per pass before yielding to up to `BulkBatchCap` bulk tasks, then re-submitting the drain runnable if either lane has remaining work), and a `headArrival` bit on every enqueue marking tasks that found an empty lane mailbox at enqueue time. Both the JCTools `MpscUnboundedArrayQueue` semantics and the single-threaded drain critical section are abstracted into the same shape the implementation actually uses.
 
-Composition with `RaftRegionReplica.tla` is by *assumption*, not `INSTANCE`: the consensus spec's atomic `LeaderHeartbeat` action assumes wire delivery is "fast enough" relative to `leaderHeartbeatTimeoutMillis`. `OutboundChannelFlush.tla` proves a tight value for that "fast enough" — `BoundedDeliveryLatency(L)` with `L = TickPeriod + DrainCost` in the worst case — that the implementation must respect. As long as the configured `hbase.consensus.transport.flush.deadline.ms` plus the worst-case observed `OutboundChannelStats.drainWallNanos` stays well below `2 * leaderHeartbeatTimeoutMillis`, the leader-election liveness story in the main spec carries over.
+Composition with `RaftRegionReplica.tla` is by *assumption*, not `INSTANCE`: the consensus spec models per-group message dispatch as atomic actions and assumes mailbox handoff is "fast enough" relative to `leaderHeartbeatTimeoutMillis`. `GroupExecutorFairness.tla` proves a tight value for that "fast enough" — `BoundedControlLatency(L)` with `L = BulkBatchCap × ServiceCost` for *head-arrival* control tasks (those that find an empty control mailbox at enqueue) — that the implementation must respect. The bound is asymmetric: head-arrival control-lane wait is bounded by the bulk burst cost, and head-arrival bulk-lane wait is bounded by the control burst cost. Tasks queued behind earlier head-of-line peers in the same lane have an unbounded queue-depth-dominated wait and are not what the cap-then-resubmit rule is designed to bound. As long as the configured `hbase.consensus.executor.control.batch.cap` plus the worst-case observed bulk-task wallclock keeps the head-arrival p99 well below `leaderHeartbeatTimeoutMillis / 4`, the leader-election liveness story in the main spec carries over at high group counts.
 
 | Configuration | Module | Constants | Purpose | States | Result |
 |---|---|---|---|---|---|
-| Base safety | `MCOutboundChannelFlush` (`MCOutboundChannelFlush.cfg`) | TickPeriod=1, FlushDeadline=3, DrainCost=1, MaxClock=8, MaxEnqueues=3, **L=2** | Tight latency bound at TickPeriod=DrainCost=1; L=1 is provably violated, L=2 holds. | 35,205 | Pass |
-| Stress safety | `MCOutboundChannelFlush` (`MCOutboundChannelFlush_stress.cfg`) | TickPeriod=4, FlushDeadline=2, DrainCost=5, MaxClock=16, MaxEnqueues=4, **L=9** | DrainCost > FlushDeadline regime; mirrors the 1000-group stress where one drain absorbs ~1s of encode work. L=9 = TickPeriod + DrainCost is tight. | 3,212,421 | Pass |
-| Liveness | `MCOutboundChannelFlush` (`MCOutboundChannelFlush_liveness.cfg`) | TickPeriod=1, FlushDeadline=3, DrainCost=1, MaxClock=10, MaxEnqueues=3 | `EventualDelivery` under WF on ClockTick / BeginDrain / EndDrain. | 109,837 | Pass |
-| Simulation | `MCOutboundChannelFlush` (`MCOutboundChannelFlush_sim.cfg`) | TickPeriod=5, FlushDeadline=3, DrainCost=7, MaxClock=60, MaxEnqueues=12, L=12 | Deeper random exploration, ~3.4 minutes. | 192,000,001 | Pass |
+| Base safety | `MCGroupExecutorFairness` (`MCGroupExecutorFairness.cfg`) | ControlBatchCap=2, BulkBatchCap=2, ServiceCost=1, MaxClock=12, MaxEnqueues=4, **L=2** | Tight head-arrival latency bound at `BulkBatchCap × ServiceCost`. L=1 is provably violated, L=2 holds. | ~3.9M | Pass |
+| Stress safety | `MCGroupExecutorFairness` (`MCGroupExecutorFairness_stress.cfg`) | ControlBatchCap=2, BulkBatchCap=3, ServiceCost=3, MaxClock=30, MaxEnqueues=5, **L=9** | `ServiceCost > ControlBatchCap` regime mirroring the saturated-thread case where one bulk handler absorbs more wallclock than a full control burst. L=9 = BulkBatchCap × ServiceCost is tight. | ~21M | Pass |
+| Liveness | `MCGroupExecutorFairness` (`MCGroupExecutorFairness_liveness.cfg`) | ControlBatchCap=2, BulkBatchCap=2, ServiceCost=1, MaxClock=14, MaxEnqueues=4 | `EventualDelivery` and `MailboxFairness` under WF on `BeginDrain` / `EndDrain` / `EnterBulkPhase`. | ~2.1M | Pass |
+| Simulation | `MCGroupExecutorFairness` (`MCGroupExecutorFairness_sim.cfg`) | ControlBatchCap=4, BulkBatchCap=4, ServiceCost=2, MaxClock=80, MaxEnqueues=10, L=8 | Deeper random exploration at larger constants. | TBD | TBD (overnight) |
 
 The verification fed three concrete decisions back into the implementation plan:
 
-1. **Default `hbase.consensus.transport.flush.deadline.ms = 250 ms`** — the deadline only changes the worst case under tick starvation (where the mechanism is the only safety net). With sustained producer activity it caps head age at FlushDeadline + DrainCost, so 250 ms keeps the head-of-line latency under one second in the realistic worst case (DrainCost ≈ 700 ms for an 8000-batch encode on an oversubscribed event loop).
-2. **`TestConsensusServerScale.leaderHeartbeatLag.p99 < 2 * leaderHeartbeatTimeoutMillis`** — the model's tight bound is well below `2 * 5 s = 10 s`, so the hardened invariant is achievable.
-3. **No additional wake-up sites needed** — counterexample triage showed all known lost-wakeup scenarios are closed by the combination of `scheduleDrainOn`'s CAS, the unbounded poll in `drainOnce`, and the deadline check in `enqueue()`. The tail re-arm extension to also fire on stale heads is the only Java-side protocol change required.
+1. **The tight bound is `BulkBatchCap × ServiceCost` (not `ControlBatchCap × ServiceCost`)** — the asymmetric drain rule means the control lane's head-arrival wait is set by *bulk-burst tail*, not by the control batch cap. Bounding the worst-case bulk-task wallclock (chunking long-running handlers) is therefore the primary lever for control-lane latency. A symmetric bound on the bulk lane (`ControlBatchCap × ServiceCost`) follows automatically.
+2. **The bound applies only to *head-arrival* tasks** — control tasks queued behind earlier control peers have an unbounded queue-depth-dominated wait (FIFO, `k × ServiceCost` for `k` tasks ahead). The model marks every enqueue with a `headArrival` flag and restricts `BoundedControlLatency` to `headArrival = TRUE`; any operational measurement of "control mailbox latency" must distinguish the two populations the same way to be comparable to the proved bound.
+3. **Default `hbase.consensus.executor.control.batch.cap = 32`** — pinned by the `BulkBatchCap × ServiceCost` analysis on realistic constants. With `BulkBatchCap = 64` (`hbase.consensus.executor.drain.batch.cap`) and bulk-task wallclock budgeted at ~1 ms (chunked) the proved head-arrival bound stays well within the `leaderHeartbeatTimeoutMillis / 4` operational budget for control-lane latency.
 
 #### Counterexample log
 
-The TLC iteration that produced the model also produced a small, useful list of "would-have-been-bug" traces. All were closed by tightening the model rather than the implementation; none required a Java code change.
+The TLC iteration that produced the model also produced a small list of "would-have-been-bug" traces. All were closed by tightening the model rather than the implementation; none required a Java code change.
 
 | # | Counterexample | Triage | Fix |
 |---|---|---|---|
-| 1 | TLC interleaved arbitrary `ClockTick`s between `drainScheduled = TRUE` and `BeginDrain`, inflating latency past L. | Modeling artifact — the implementation queues the drain runnable synchronously with the CAS. | Added `~drainScheduled` precondition to `ClockTick`. |
-| 2 | TickFlush as a may-fire action with no fairness let TLC defer ticks arbitrarily, again inflating latency past L. | Modeling artifact — `scheduleWithFixedDelay` is deterministic on its period. | Folded the periodic tick into `ClockTick` so it fires at every clock multiple of `TickPeriod`. |
-| 3 | TLC interleaved `ClockTick`s past the EndDrain enabling boundary (`clock >= drainStart + DrainCost`). | Modeling artifact — once a drain has consumed its work it proceeds straight to releasing the latch. | Added `~(draining /\ clock >= drainStart + DrainCost)` precondition to `ClockTick`. |
-| 4 | Liveness CE: producer enqueue at `clock = MaxClock` left the mailbox non-empty with no clock budget for a drain to complete. | Model-horizon artifact. | Added `EnqueueHonoursHorizon` CONSTRAINT used by the liveness config. |
+| 1 | `ServiceControlTask` / `ServiceBulkTask` / `EnterBulkPhase` could fire from the idle (no-latch-held) state. | Modeling artifact — the implementation's drain body only runs while `drainLock` is held. | Added `draining` precondition to `ControlDrainable` and `BulkDrainable`. |
+| 2 | `TypeOK` failed because `serviceUntil = clock + ServiceCost` could exceed `MaxClock` when service started at `clock = MaxClock`. | Modeling artifact — the type bound was too tight at the horizon. | Widened `serviceUntil` type bound to `0..(MaxClock + ServiceCost)`; `MaxClockHonoursDrain` constraint pins the model horizon so no started-but-unfinished drain wedges the model at the boundary. |
+| 3 | `BoundedControlLatency` was violated for any `L` under deep control-lane backlog. | Real semantic gap — the cap-then-resubmit rule does NOT bound wait for tasks queued behind earlier control peers. The bound applies only to *head-arrival* tasks (those that find an empty control mailbox at enqueue). | Added `headArrival : BOOLEAN` to `TaskRec` / `DeliveredRec`; restricted `BoundedControlLatency` to `headArrival = TRUE`. |
+| 4 | Loose `L = ControlBatchCap × ServiceCost` was conservative but not tight; TLC found the tight `L = BulkBatchCap × ServiceCost`. | Real refinement — the asymmetric drain rule means the control lane's wait is bounded by the bulk burst cost, not the control batch cap. | Updated module header and `BoundedControlLatency` rationale to reflect that the bulk batch cap, not the control batch cap, is the lever for control head-arrival latency. |
 
 #### Running
 
@@ -356,20 +356,20 @@ The TLC iteration that produced the model also produced a small, useful list of 
 JAR=/path/to/tla2tools.jar
 cd src/main/tla/RaftRegionReplica
 
-# Base safety (~1s, exhaustive)
+# Base safety (~30s, exhaustive)
 java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
-  -config MCOutboundChannelFlush.cfg MCOutboundChannelFlush
+  -config MCGroupExecutorFairness.cfg MCGroupExecutorFairness
 
-# Stress safety (~10s, exhaustive)
+# Stress safety (~5 min, exhaustive)
 java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
-  -config MCOutboundChannelFlush_stress.cfg MCOutboundChannelFlush
+  -config MCGroupExecutorFairness_stress.cfg MCGroupExecutorFairness
 
-# Liveness (~3s, exhaustive)
+# Liveness (~3 min, exhaustive)
 java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
-  -config MCOutboundChannelFlush_liveness.cfg MCOutboundChannelFlush
+  -config MCGroupExecutorFairness_liveness.cfg MCGroupExecutorFairness
 
-# Simulation (~3 minutes)
+# Simulation (overnight)
 java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto \
-  -simulate num=200000 -depth 60 \
-  -config MCOutboundChannelFlush_sim.cfg MCOutboundChannelFlush
+  -simulate num=200000 -depth 80 \
+  -config MCGroupExecutorFairness_sim.cfg MCGroupExecutorFairness
 ```

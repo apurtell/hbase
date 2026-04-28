@@ -19,12 +19,12 @@ package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import org.apache.hadoop.hbase.consensus.handler.store.RaftModelPbCodecs;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
+import org.apache.hadoop.hbase.consensus.raft.GroupId;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
 import org.apache.hadoop.hbase.consensus.raft.model.log.LogEntry;
@@ -103,16 +103,19 @@ final class ProtoConverter {
     requireField(present, pbType, "term");
   }
 
+  /**
+   * Returns the wire {@link ByteString} for {@code groupId}. The fast path expects an immutable
+   * {@link GroupId} value handle (set at the API boundary by {@code DefaultRaftMessage}-builders or
+   * {@code ConsensusServer.addGroup}) whose cached {@link ByteString} is reused without copying.
+   * {@code byte[]} and arbitrary {@code Object} group ids are normalised through
+   * {@link GroupId#of(Object)} and pay a one-shot allocation; this branch is reserved for legacy
+   * test callers that have not yet migrated to {@link GroupId}.
+   */
   static ByteString groupIdToBytes(Object groupId) {
-    if (groupId instanceof byte[]) {
-      return ByteString.copyFrom((byte[]) groupId);
+    if (groupId instanceof GroupId) {
+      return ((GroupId) groupId).byteString();
     }
-    return ByteString.copyFromUtf8(String.valueOf(groupId));
-  }
-
-  /** Decodes the on-wire group id back to the local representation. */
-  static Object bytesToGroupId(ByteString bytes) {
-    return new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+    return GroupId.of(groupId).byteString();
   }
 
   ConsensusProtos.LogEntryPB toLogEntryPB(LogEntry entry) {
@@ -164,7 +167,8 @@ final class ProtoConverter {
     return builder.build();
   }
 
-  AppendEntriesRequest fromGroupAppendPB(ConsensusProtos.GroupAppendEntriesPB pb) {
+  AppendEntriesRequest fromGroupAppendPB(ConsensusProtos.GroupAppendEntriesPB pb,
+    Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "GroupAppendEntriesPB");
     requireSender(pb.hasSender(), "GroupAppendEntriesPB");
     requireTerm(pb.hasTerm(), "GroupAppendEntriesPB");
@@ -177,7 +181,7 @@ final class ProtoConverter {
     for (ConsensusProtos.LogEntryPB e : pb.getEntriesList()) {
       entries.add(fromLogEntryPB(e));
     }
-    return factory.createAppendEntriesRequestBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+    return factory.createAppendEntriesRequestBuilder().setGroupId(localGroupId)
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
       .setPreviousLogTerm(pb.getPrevLogTerm()).setPreviousLogIndex(pb.getPrevLogIndex())
       .setCommitIndex(pb.getCommitIndex()).setLogEntries(entries)
@@ -185,42 +189,74 @@ final class ProtoConverter {
       .build();
   }
 
-  ConsensusProtos.GroupHeartbeatPB toGroupHeartbeatPB(LeaderHeartbeat hb) {
-    ConsensusProtos.GroupHeartbeatPB.Builder b = ConsensusProtos.GroupHeartbeatPB.newBuilder()
-      .setGroupId(groupIdToBytes(hb.getGroupId())).setSender(toEndpointPB(hb.getSender()))
-      .setTerm(hb.getTerm()).setCommitIndex(hb.getCommitIndex());
+  /**
+   * Builds a per-group entry for a bulk heartbeat envelope. The sender is carried at envelope level
+   * only, so it does not appear in the per-entry encoding.
+   */
+  ConsensusProtos.GroupBulkHeartbeatPB toGroupBulkHeartbeatPB(LeaderHeartbeat hb) {
+    ConsensusProtos.GroupBulkHeartbeatPB.Builder b =
+      ConsensusProtos.GroupBulkHeartbeatPB.newBuilder().setGroupId(groupIdToBytes(hb.getGroupId()))
+        .setTerm(hb.getTerm()).setCommitIndex(hb.getCommitIndex());
     if (hb.isQuiesced()) {
       b.setQuiesced(true);
     }
     return b.build();
   }
 
-  LeaderHeartbeat fromGroupHeartbeatPB(ConsensusProtos.GroupHeartbeatPB pb) {
-    requireGroupId(pb.hasGroupId(), "GroupHeartbeatPB");
-    requireSender(pb.hasSender(), "GroupHeartbeatPB");
-    requireTerm(pb.hasTerm(), "GroupHeartbeatPB");
-    requireField(pb.hasCommitIndex(), "GroupHeartbeatPB", "commit_index");
-    return factory.createLeaderHeartbeatBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
-      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
-      .setCommitIndex(pb.getCommitIndex()).setQuiesced(pb.getQuiesced()).build();
+  /**
+   * Builds a {@link LeaderHeartbeat} from a bulk envelope per-group entry plus the envelope level
+   * sender. Used by the bulk inbound handler to drive the slow path through the
+   * {@code LeaderHeartbeatHandler}.
+   */
+  LeaderHeartbeat fromGroupBulkHeartbeatPB(ConsensusProtos.GroupBulkHeartbeatPB pb,
+    Object localGroupId, RaftEndpoint sender) {
+    requireGroupId(pb.hasGroupId(), "GroupBulkHeartbeatPB");
+    requireTerm(pb.hasTerm(), "GroupBulkHeartbeatPB");
+    requireField(pb.hasCommitIndex(), "GroupBulkHeartbeatPB", "commit_index");
+    return factory.createLeaderHeartbeatBuilder().setGroupId(localGroupId).setSender(sender)
+      .setTerm(pb.getTerm()).setCommitIndex(pb.getCommitIndex()).setQuiesced(pb.getQuiesced())
+      .build();
   }
 
-  ConsensusProtos.GroupHeartbeatAckPB toGroupHeartbeatAckPB(LeaderHeartbeatAck ack) {
-    return ConsensusProtos.GroupHeartbeatAckPB.newBuilder()
-      .setGroupId(groupIdToBytes(ack.getGroupId())).setSender(toEndpointPB(ack.getSender()))
-      .setTerm(ack.getTerm()).setLastVerifiedLogIndex(ack.getLastVerifiedLogIndex()).build();
+  /**
+   * Builds an outbound bulk heartbeat envelope from a list of pre-converted per-group entries plus
+   * the envelope-level keepalive header.
+   */
+  static ConsensusProtos.BulkHeartbeatPB buildBulkHeartbeatPB(RaftEndpoint sender, long epoch,
+    long tick, @NonNull List<ConsensusProtos.GroupBulkHeartbeatPB> entries) {
+    return ConsensusProtos.BulkHeartbeatPB.newBuilder().setSender(toEndpointPB(sender))
+      .setEpoch(epoch).setTick(tick).addAllGroups(entries).build();
   }
 
-  LeaderHeartbeatAck fromGroupHeartbeatAckPB(ConsensusProtos.GroupHeartbeatAckPB pb) {
-    requireGroupId(pb.hasGroupId(), "GroupHeartbeatAckPB");
-    requireSender(pb.hasSender(), "GroupHeartbeatAckPB");
-    requireTerm(pb.hasTerm(), "GroupHeartbeatAckPB");
-    // last_verified_log_index is optional for wire-compatibility; default 0 is safe (the leader
-    // will treat absent / 0 as "follower may need verification" and send a catch-up AE).
-    return factory.createLeaderHeartbeatAckBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
-      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+  /** Builds a per-group ack entry for a bulk heartbeat-ack envelope. */
+  ConsensusProtos.GroupBulkHeartbeatAckPB toGroupBulkHeartbeatAckPB(LeaderHeartbeatAck ack) {
+    return ConsensusProtos.GroupBulkHeartbeatAckPB.newBuilder()
+      .setGroupId(groupIdToBytes(ack.getGroupId())).setTerm(ack.getTerm())
+      .setLastVerifiedLogIndex(ack.getLastVerifiedLogIndex()).build();
+  }
+
+  /**
+   * Builds a {@link LeaderHeartbeatAck} from a bulk-ack envelope per group entry plus the envelope
+   * level sender.
+   */
+  LeaderHeartbeatAck fromGroupBulkHeartbeatAckPB(ConsensusProtos.GroupBulkHeartbeatAckPB pb,
+    Object localGroupId, RaftEndpoint sender) {
+    requireGroupId(pb.hasGroupId(), "GroupBulkHeartbeatAckPB");
+    requireTerm(pb.hasTerm(), "GroupBulkHeartbeatAckPB");
+    return factory.createLeaderHeartbeatAckBuilder().setGroupId(localGroupId).setSender(sender)
+      .setTerm(pb.getTerm())
       .setLastVerifiedLogIndex(pb.hasLastVerifiedLogIndex() ? pb.getLastVerifiedLogIndex() : 0L)
       .build();
+  }
+
+  /**
+   * Builds an outbound bulk heartbeat-ack envelope from a list of pre-converted per group entries
+   * plus the envelope level keepalive header.
+   */
+  static ConsensusProtos.BulkHeartbeatAckPB buildBulkHeartbeatAckPB(RaftEndpoint sender, long epoch,
+    long tick, @NonNull List<ConsensusProtos.GroupBulkHeartbeatAckPB> entries) {
+    return ConsensusProtos.BulkHeartbeatAckPB.newBuilder().setSender(toEndpointPB(sender))
+      .setEpoch(epoch).setTick(tick).addAllGroups(entries).build();
   }
 
   ConsensusProtos.GroupAppendSuccessPB toAppendSuccessPB(AppendEntriesSuccessResponse resp) {
@@ -231,18 +267,18 @@ final class ProtoConverter {
       .setFlowControlSeq(resp.getFlowControlSequenceNumber()).build();
   }
 
-  AppendEntriesSuccessResponse fromAppendSuccessPB(ConsensusProtos.GroupAppendSuccessPB pb) {
+  AppendEntriesSuccessResponse fromAppendSuccessPB(ConsensusProtos.GroupAppendSuccessPB pb,
+    Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "GroupAppendSuccessPB");
     requireSender(pb.hasSender(), "GroupAppendSuccessPB");
     requireTerm(pb.hasTerm(), "GroupAppendSuccessPB");
     requireField(pb.hasLastLogIndex(), "GroupAppendSuccessPB", "last_log_index");
     requireField(pb.hasQuerySeq(), "GroupAppendSuccessPB", "query_seq");
     requireField(pb.hasFlowControlSeq(), "GroupAppendSuccessPB", "flow_control_seq");
-    return factory.createAppendEntriesSuccessResponseBuilder()
-      .setGroupId(bytesToGroupId(pb.getGroupId())).setSender(fromEndpointPB(pb.getSender()))
-      .setTerm(pb.getTerm()).setLastLogIndex(pb.getLastLogIndex())
-      .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
-      .build();
+    return factory.createAppendEntriesSuccessResponseBuilder().setGroupId(localGroupId)
+      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+      .setLastLogIndex(pb.getLastLogIndex()).setQuerySequenceNumber(pb.getQuerySeq())
+      .setFlowControlSequenceNumber(pb.getFlowControlSeq()).build();
   }
 
   ConsensusProtos.GroupAppendFailurePB toAppendFailurePB(AppendEntriesFailureResponse resp) {
@@ -253,18 +289,18 @@ final class ProtoConverter {
       .setFlowControlSeq(resp.getFlowControlSequenceNumber()).build();
   }
 
-  AppendEntriesFailureResponse fromAppendFailurePB(ConsensusProtos.GroupAppendFailurePB pb) {
+  AppendEntriesFailureResponse fromAppendFailurePB(ConsensusProtos.GroupAppendFailurePB pb,
+    Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "GroupAppendFailurePB");
     requireSender(pb.hasSender(), "GroupAppendFailurePB");
     requireTerm(pb.hasTerm(), "GroupAppendFailurePB");
     requireField(pb.hasExpectedNextIndex(), "GroupAppendFailurePB", "expected_next_index");
     requireField(pb.hasQuerySeq(), "GroupAppendFailurePB", "query_seq");
     requireField(pb.hasFlowControlSeq(), "GroupAppendFailurePB", "flow_control_seq");
-    return factory.createAppendEntriesFailureResponseBuilder()
-      .setGroupId(bytesToGroupId(pb.getGroupId())).setSender(fromEndpointPB(pb.getSender()))
-      .setTerm(pb.getTerm()).setExpectedNextIndex(pb.getExpectedNextIndex())
-      .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
-      .build();
+    return factory.createAppendEntriesFailureResponseBuilder().setGroupId(localGroupId)
+      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+      .setExpectedNextIndex(pb.getExpectedNextIndex()).setQuerySequenceNumber(pb.getQuerySeq())
+      .setFlowControlSequenceNumber(pb.getFlowControlSeq()).build();
   }
 
   ConsensusProtos.VoteRequestPB toVoteRequestPB(VoteRequest req) {
@@ -274,14 +310,14 @@ final class ProtoConverter {
       .setSticky(req.isSticky()).build();
   }
 
-  VoteRequest fromVoteRequestPB(ConsensusProtos.VoteRequestPB pb) {
+  VoteRequest fromVoteRequestPB(ConsensusProtos.VoteRequestPB pb, Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "VoteRequestPB");
     requireSender(pb.hasSender(), "VoteRequestPB");
     requireTerm(pb.hasTerm(), "VoteRequestPB");
     requireField(pb.hasLastLogTerm(), "VoteRequestPB", "last_log_term");
     requireField(pb.hasLastLogIndex(), "VoteRequestPB", "last_log_index");
     requireField(pb.hasSticky(), "VoteRequestPB", "sticky");
-    return factory.createVoteRequestBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+    return factory.createVoteRequestBuilder().setGroupId(localGroupId)
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
       .setLastLogTerm(pb.getLastLogTerm()).setLastLogIndex(pb.getLastLogIndex())
       .setSticky(pb.getSticky()).build();
@@ -293,12 +329,12 @@ final class ProtoConverter {
       .setGranted(resp.isGranted()).build();
   }
 
-  VoteResponse fromVoteResponsePB(ConsensusProtos.VoteResponsePB pb) {
+  VoteResponse fromVoteResponsePB(ConsensusProtos.VoteResponsePB pb, Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "VoteResponsePB");
     requireSender(pb.hasSender(), "VoteResponsePB");
     requireTerm(pb.hasTerm(), "VoteResponsePB");
     requireField(pb.hasGranted(), "VoteResponsePB", "granted");
-    return factory.createVoteResponseBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+    return factory.createVoteResponseBuilder().setGroupId(localGroupId)
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm()).setGranted(pb.getGranted())
       .build();
   }
@@ -310,13 +346,13 @@ final class ProtoConverter {
       .setLastLogIndex(req.getLastLogIndex()).build();
   }
 
-  PreVoteRequest fromPreVoteRequestPB(ConsensusProtos.PreVoteRequestPB pb) {
+  PreVoteRequest fromPreVoteRequestPB(ConsensusProtos.PreVoteRequestPB pb, Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "PreVoteRequestPB");
     requireSender(pb.hasSender(), "PreVoteRequestPB");
     requireTerm(pb.hasTerm(), "PreVoteRequestPB");
     requireField(pb.hasLastLogTerm(), "PreVoteRequestPB", "last_log_term");
     requireField(pb.hasLastLogIndex(), "PreVoteRequestPB", "last_log_index");
-    return factory.createPreVoteRequestBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+    return factory.createPreVoteRequestBuilder().setGroupId(localGroupId)
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
       .setLastLogTerm(pb.getLastLogTerm()).setLastLogIndex(pb.getLastLogIndex()).build();
   }
@@ -327,12 +363,12 @@ final class ProtoConverter {
       .setTerm(resp.getTerm()).setGranted(resp.isGranted()).build();
   }
 
-  PreVoteResponse fromPreVoteResponsePB(ConsensusProtos.PreVoteResponsePB pb) {
+  PreVoteResponse fromPreVoteResponsePB(ConsensusProtos.PreVoteResponsePB pb, Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "PreVoteResponsePB");
     requireSender(pb.hasSender(), "PreVoteResponsePB");
     requireTerm(pb.hasTerm(), "PreVoteResponsePB");
     requireField(pb.hasGranted(), "PreVoteResponsePB", "granted");
-    return factory.createPreVoteResponseBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+    return factory.createPreVoteResponseBuilder().setGroupId(localGroupId)
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm()).setGranted(pb.getGranted())
       .build();
   }
@@ -344,16 +380,16 @@ final class ProtoConverter {
       .setLastLogIndex(req.getLastLogIndex()).build();
   }
 
-  TriggerLeaderElectionRequest fromTriggerElectionPB(ConsensusProtos.TriggerLeaderElectionPB pb) {
+  TriggerLeaderElectionRequest fromTriggerElectionPB(ConsensusProtos.TriggerLeaderElectionPB pb,
+    Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "TriggerLeaderElectionPB");
     requireSender(pb.hasSender(), "TriggerLeaderElectionPB");
     requireTerm(pb.hasTerm(), "TriggerLeaderElectionPB");
     requireField(pb.hasLastLogTerm(), "TriggerLeaderElectionPB", "last_log_term");
     requireField(pb.hasLastLogIndex(), "TriggerLeaderElectionPB", "last_log_index");
-    return factory.createTriggerLeaderElectionRequestBuilder()
-      .setGroupId(bytesToGroupId(pb.getGroupId())).setSender(fromEndpointPB(pb.getSender()))
-      .setTerm(pb.getTerm()).setLastLogTerm(pb.getLastLogTerm())
-      .setLastLogIndex(pb.getLastLogIndex()).build();
+    return factory.createTriggerLeaderElectionRequestBuilder().setGroupId(localGroupId)
+      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+      .setLastLogTerm(pb.getLastLogTerm()).setLastLogIndex(pb.getLastLogIndex()).build();
   }
 
   ConsensusProtos.InstallSnapshotRequestPB toInstallSnapshotPB(InstallSnapshotRequest req) {
@@ -376,7 +412,8 @@ final class ProtoConverter {
     return builder.build();
   }
 
-  InstallSnapshotRequest fromInstallSnapshotPB(ConsensusProtos.InstallSnapshotRequestPB pb) {
+  InstallSnapshotRequest fromInstallSnapshotPB(ConsensusProtos.InstallSnapshotRequestPB pb,
+    Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "InstallSnapshotRequestPB");
     requireSender(pb.hasSender(), "InstallSnapshotRequestPB");
     requireTerm(pb.hasTerm(), "InstallSnapshotRequestPB");
@@ -394,7 +431,7 @@ final class ProtoConverter {
     }
     @Nullable
     SnapshotChunk chunk = pb.hasSnapshotChunk() ? fromSnapshotChunkPB(pb.getSnapshotChunk()) : null;
-    return factory.createInstallSnapshotRequestBuilder().setGroupId(bytesToGroupId(pb.getGroupId()))
+    return factory.createInstallSnapshotRequestBuilder().setGroupId(localGroupId)
       .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
       .setSenderLeader(pb.getSenderLeader()).setSnapshotTerm(pb.getSnapshotTerm())
       .setSnapshotIndex(pb.getSnapshotIndex())
@@ -415,8 +452,8 @@ final class ProtoConverter {
       .setFlowControlSeq(resp.getFlowControlSequenceNumber()).build();
   }
 
-  InstallSnapshotResponse
-    fromInstallSnapshotResponsePB(ConsensusProtos.InstallSnapshotResponsePB pb) {
+  InstallSnapshotResponse fromInstallSnapshotResponsePB(
+    ConsensusProtos.InstallSnapshotResponsePB pb, Object localGroupId) {
     requireGroupId(pb.hasGroupId(), "InstallSnapshotResponsePB");
     requireSender(pb.hasSender(), "InstallSnapshotResponsePB");
     requireTerm(pb.hasTerm(), "InstallSnapshotResponsePB");
@@ -425,9 +462,9 @@ final class ProtoConverter {
       "requested_snapshot_chunk_index");
     requireField(pb.hasQuerySeq(), "InstallSnapshotResponsePB", "query_seq");
     requireField(pb.hasFlowControlSeq(), "InstallSnapshotResponsePB", "flow_control_seq");
-    return factory.createInstallSnapshotResponseBuilder()
-      .setGroupId(bytesToGroupId(pb.getGroupId())).setSender(fromEndpointPB(pb.getSender()))
-      .setTerm(pb.getTerm()).setSnapshotIndex(pb.getSnapshotIndex())
+    return factory.createInstallSnapshotResponseBuilder().setGroupId(localGroupId)
+      .setSender(fromEndpointPB(pb.getSender())).setTerm(pb.getTerm())
+      .setSnapshotIndex(pb.getSnapshotIndex())
       .setRequestedSnapshotChunkIndex(pb.getRequestedSnapshotChunkIndex())
       .setQuerySequenceNumber(pb.getQuerySeq()).setFlowControlSequenceNumber(pb.getFlowControlSeq())
       .build();

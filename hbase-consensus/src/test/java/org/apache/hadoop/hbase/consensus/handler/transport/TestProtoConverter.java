@@ -28,6 +28,7 @@ import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.consensus.protobuf.generated.ConsensusProtos;
+import org.apache.hadoop.hbase.consensus.raft.GroupId;
 import org.apache.hadoop.hbase.consensus.raft.MembershipChangeMode;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftEndpoint;
@@ -74,10 +75,6 @@ public class TestProtoConverter extends TestBase {
   private final PayloadCompressor noCompress = new PayloadCompressor(Compression.Algorithm.NONE);
   private final ProtoConverter converter = new ProtoConverter(factory, codec, noCompress);
 
-  // -------------------------------------------------------------------------------------------
-  // Endpoints / group id encoding
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testEndpointRoundTrip() {
     ConsensusProtos.RaftEndpointPB pb = ProtoConverter.toEndpointPB(a);
@@ -87,20 +84,17 @@ public class TestProtoConverter extends TestBase {
 
   @Test
   public void testGroupIdRoundTrip() {
-    Object back = ProtoConverter.bytesToGroupId(ProtoConverter.groupIdToBytes(GID));
-    assertThat(back).isEqualTo(GID);
+    ByteString wire = ProtoConverter.groupIdToBytes(GID);
+    GroupId back = GroupId.fromWire(wire);
+    assertThat(back.toString()).isEqualTo(GID);
   }
 
   @Test
   public void testGroupIdFromBytes() {
-    Object back =
-      ProtoConverter.bytesToGroupId(ProtoConverter.groupIdToBytes("rawString".getBytes()));
-    assertThat(back).isEqualTo("rawString");
+    ByteString wire = ProtoConverter.groupIdToBytes("rawString".getBytes());
+    GroupId back = GroupId.fromWire(wire);
+    assertThat(back.toString()).isEqualTo("rawString");
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Log entry / snapshot chunk / members view
-  // -------------------------------------------------------------------------------------------
 
   @Test
   public void testLogEntryIdentityRoundTrip() {
@@ -117,12 +111,6 @@ public class TestProtoConverter extends TestBase {
     assertThat((byte[]) back.getOperation()).containsExactly(payload);
   }
 
-  /**
-   * The compression algorithm travels with each entry as {@code LogEntryPB.op_payload_compression};
-   * the receiver resolves the codec from that ordinal and so does not need to share the sender's
-   * compressor configuration. This test pins that contract by encoding through an LZ4 converter and
-   * decoding through a NONE converter.
-   */
   @Test
   public void testLogEntryCompressionTravelsOnTheWire() {
     Configuration conf = HBaseConfiguration.create();
@@ -154,11 +142,9 @@ public class TestProtoConverter extends TestBase {
 
   @Test
   public void testAlgorithmFromOrdinalRejectsUnknown() {
-    org.assertj.core.api.Assertions
-      .assertThatThrownBy(() -> PayloadCompressor.algorithmFromOrdinal(-1))
+    assertThatThrownBy(() -> PayloadCompressor.algorithmFromOrdinal(-1))
       .isInstanceOf(IllegalArgumentException.class);
-    org.assertj.core.api.Assertions
-      .assertThatThrownBy(() -> PayloadCompressor.algorithmFromOrdinal(Integer.MAX_VALUE))
+    assertThatThrownBy(() -> PayloadCompressor.algorithmFromOrdinal(Integer.MAX_VALUE))
       .isInstanceOf(IllegalArgumentException.class);
   }
 
@@ -211,10 +197,6 @@ public class TestProtoConverter extends TestBase {
     assertThat((byte[]) back.getOperation()).containsExactly(raw);
   }
 
-  // -------------------------------------------------------------------------------------------
-  // AppendEntries (with entries + heartbeat)
-  // -------------------------------------------------------------------------------------------
-
   @Test
   public void testAppendEntriesRequestRoundTrip() {
     LogEntry e1 = factory.createLogEntryBuilder().setIndex(10L).setTerm(2)
@@ -225,7 +207,8 @@ public class TestProtoConverter extends TestBase {
       .setSender(a).setTerm(2).setPreviousLogTerm(1).setPreviousLogIndex(9L).setCommitIndex(8L)
       .setLogEntries(Arrays.asList(e1, e2)).setQuerySequenceNumber(100L)
       .setFlowControlSequenceNumber(50L).build();
-    AppendEntriesRequest back = converter.fromGroupAppendPB(converter.toGroupAppendPB(req));
+    AppendEntriesRequest back =
+      converter.fromGroupAppendPB(converter.toGroupAppendPB(req), GroupId.of(GID));
     assertThat(back.getGroupId().toString()).isEqualTo(GID);
     assertThat(back.getTerm()).isEqualTo(2);
     assertThat(back.getPreviousLogTerm()).isEqualTo(1);
@@ -240,23 +223,54 @@ public class TestProtoConverter extends TestBase {
   }
 
   @Test
-  public void testLeaderHeartbeatRoundTrip() {
-    LeaderHeartbeat hb = factory.createLeaderHeartbeatBuilder().setGroupId(GID).setSender(a)
-      .setTerm(7).setCommitIndex(99L).build();
-    LeaderHeartbeat back = converter.fromGroupHeartbeatPB(converter.toGroupHeartbeatPB(hb));
-    assertThat(back.getTerm()).isEqualTo(7);
-    assertThat(back.getCommitIndex()).isEqualTo(99L);
-    assertThat(String.valueOf(back.getSender().getId())).isEqualTo(String.valueOf(a.getId()));
+  public void testBulkHeartbeatRoundTrip() {
+    LeaderHeartbeat hb1 = factory.createLeaderHeartbeatBuilder().setGroupId(GID).setSender(a)
+      .setTerm(7).setCommitIndex(99L).setQuiesced(false).build();
+    LeaderHeartbeat hb2 = factory.createLeaderHeartbeatBuilder().setGroupId("groupH").setSender(a)
+      .setTerm(8).setCommitIndex(100L).setQuiesced(true).build();
+    ConsensusProtos.GroupBulkHeartbeatPB e1 = converter.toGroupBulkHeartbeatPB(hb1);
+    ConsensusProtos.GroupBulkHeartbeatPB e2 = converter.toGroupBulkHeartbeatPB(hb2);
+    ConsensusProtos.BulkHeartbeatPB pb =
+      ProtoConverter.buildBulkHeartbeatPB(a, /* epoch */ 12345L, /* tick */ 42L, List.of(e1, e2));
+    assertThat(pb.hasSender()).isTrue();
+    assertThat(pb.getEpoch()).isEqualTo(12345L);
+    assertThat(pb.getTick()).isEqualTo(42L);
+    assertThat(pb.getGroupsCount()).isEqualTo(2);
+    LeaderHeartbeat back1 = converter.fromGroupBulkHeartbeatPB(pb.getGroups(0), GroupId.of(GID), a);
+    assertThat(back1.getTerm()).isEqualTo(7);
+    assertThat(back1.getCommitIndex()).isEqualTo(99L);
+    assertThat(back1.isQuiesced()).isFalse();
+    assertThat(String.valueOf(back1.getSender().getId())).isEqualTo(String.valueOf(a.getId()));
+    LeaderHeartbeat back2 =
+      converter.fromGroupBulkHeartbeatPB(pb.getGroups(1), GroupId.of("groupH"), a);
+    assertThat(back2.getTerm()).isEqualTo(8);
+    assertThat(back2.getCommitIndex()).isEqualTo(100L);
+    assertThat(back2.isQuiesced()).isTrue();
   }
 
   @Test
-  public void testLeaderHeartbeatAckRoundTrip() {
-    LeaderHeartbeatAck ack =
-      factory.createLeaderHeartbeatAckBuilder().setGroupId(GID).setSender(a).setTerm(7).build();
-    LeaderHeartbeatAck back =
-      converter.fromGroupHeartbeatAckPB(converter.toGroupHeartbeatAckPB(ack));
-    assertThat(back.getTerm()).isEqualTo(7);
-    assertThat(String.valueOf(back.getSender().getId())).isEqualTo(String.valueOf(a.getId()));
+  public void testBulkHeartbeatAckRoundTrip() {
+    LeaderHeartbeatAck ack1 = factory.createLeaderHeartbeatAckBuilder().setGroupId(GID).setSender(a)
+      .setTerm(7).setLastVerifiedLogIndex(20L).build();
+    LeaderHeartbeatAck ack2 = factory.createLeaderHeartbeatAckBuilder().setGroupId("groupH")
+      .setSender(a).setTerm(8).setLastVerifiedLogIndex(30L).build();
+    ConsensusProtos.GroupBulkHeartbeatAckPB e1 = converter.toGroupBulkHeartbeatAckPB(ack1);
+    ConsensusProtos.GroupBulkHeartbeatAckPB e2 = converter.toGroupBulkHeartbeatAckPB(ack2);
+    ConsensusProtos.BulkHeartbeatAckPB pb =
+      ProtoConverter.buildBulkHeartbeatAckPB(a, /* epoch */ 6789L, /* tick */ 11L, List.of(e1, e2));
+    assertThat(pb.hasSender()).isTrue();
+    assertThat(pb.getEpoch()).isEqualTo(6789L);
+    assertThat(pb.getTick()).isEqualTo(11L);
+    assertThat(pb.getGroupsCount()).isEqualTo(2);
+    LeaderHeartbeatAck back1 =
+      converter.fromGroupBulkHeartbeatAckPB(pb.getGroups(0), GroupId.of(GID), a);
+    assertThat(back1.getTerm()).isEqualTo(7);
+    assertThat(back1.getLastVerifiedLogIndex()).isEqualTo(20L);
+    assertThat(String.valueOf(back1.getSender().getId())).isEqualTo(String.valueOf(a.getId()));
+    LeaderHeartbeatAck back2 =
+      converter.fromGroupBulkHeartbeatAckPB(pb.getGroups(1), GroupId.of("groupH"), a);
+    assertThat(back2.getTerm()).isEqualTo(8);
+    assertThat(back2.getLastVerifiedLogIndex()).isEqualTo(30L);
   }
 
   @Test
@@ -265,7 +279,7 @@ public class TestProtoConverter extends TestBase {
       factory.createAppendEntriesSuccessResponseBuilder().setGroupId(GID).setSender(a).setTerm(3)
         .setLastLogIndex(42L).setQuerySequenceNumber(11L).setFlowControlSequenceNumber(22L).build();
     AppendEntriesSuccessResponse back =
-      converter.fromAppendSuccessPB(converter.toAppendSuccessPB(resp));
+      converter.fromAppendSuccessPB(converter.toAppendSuccessPB(resp), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(3);
     assertThat(back.getLastLogIndex()).isEqualTo(42L);
     assertThat(back.getQuerySequenceNumber()).isEqualTo(11L);
@@ -278,20 +292,16 @@ public class TestProtoConverter extends TestBase {
       .setGroupId(GID).setSender(a).setTerm(3).setExpectedNextIndex(13L).setQuerySequenceNumber(8L)
       .setFlowControlSequenceNumber(7L).build();
     AppendEntriesFailureResponse back =
-      converter.fromAppendFailurePB(converter.toAppendFailurePB(resp));
+      converter.fromAppendFailurePB(converter.toAppendFailurePB(resp), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(3);
     assertThat(back.getExpectedNextIndex()).isEqualTo(13L);
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Vote / PreVote / TriggerLeaderElection
-  // -------------------------------------------------------------------------------------------
 
   @Test
   public void testVoteRequestRoundTrip() {
     VoteRequest req = factory.createVoteRequestBuilder().setGroupId(GID).setSender(a).setTerm(4)
       .setLastLogTerm(3).setLastLogIndex(99L).setSticky(true).build();
-    VoteRequest back = converter.fromVoteRequestPB(converter.toVoteRequestPB(req));
+    VoteRequest back = converter.fromVoteRequestPB(converter.toVoteRequestPB(req), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(4);
     assertThat(back.getLastLogTerm()).isEqualTo(3);
     assertThat(back.getLastLogIndex()).isEqualTo(99L);
@@ -302,7 +312,8 @@ public class TestProtoConverter extends TestBase {
   public void testVoteResponseRoundTrip() {
     VoteResponse resp = factory.createVoteResponseBuilder().setGroupId(GID).setSender(a).setTerm(4)
       .setGranted(true).build();
-    VoteResponse back = converter.fromVoteResponsePB(converter.toVoteResponsePB(resp));
+    VoteResponse back =
+      converter.fromVoteResponsePB(converter.toVoteResponsePB(resp), GroupId.of(GID));
     assertThat(back.isGranted()).isTrue();
   }
 
@@ -310,7 +321,8 @@ public class TestProtoConverter extends TestBase {
   public void testPreVoteRequestRoundTrip() {
     PreVoteRequest req = factory.createPreVoteRequestBuilder().setGroupId(GID).setSender(a)
       .setTerm(7).setLastLogTerm(6).setLastLogIndex(50L).build();
-    PreVoteRequest back = converter.fromPreVoteRequestPB(converter.toPreVoteRequestPB(req));
+    PreVoteRequest back =
+      converter.fromPreVoteRequestPB(converter.toPreVoteRequestPB(req), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(7);
     assertThat(back.getLastLogIndex()).isEqualTo(50L);
   }
@@ -319,7 +331,8 @@ public class TestProtoConverter extends TestBase {
   public void testPreVoteResponseRoundTrip() {
     PreVoteResponse resp = factory.createPreVoteResponseBuilder().setGroupId(GID).setSender(a)
       .setTerm(7).setGranted(false).build();
-    PreVoteResponse back = converter.fromPreVoteResponsePB(converter.toPreVoteResponsePB(resp));
+    PreVoteResponse back =
+      converter.fromPreVoteResponsePB(converter.toPreVoteResponsePB(resp), GroupId.of(GID));
     assertThat(back.isGranted()).isFalse();
   }
 
@@ -328,14 +341,10 @@ public class TestProtoConverter extends TestBase {
     TriggerLeaderElectionRequest req = factory.createTriggerLeaderElectionRequestBuilder()
       .setGroupId(GID).setSender(a).setTerm(2).setLastLogTerm(1).setLastLogIndex(20L).build();
     TriggerLeaderElectionRequest back =
-      converter.fromTriggerElectionPB(converter.toTriggerElectionPB(req));
+      converter.fromTriggerElectionPB(converter.toTriggerElectionPB(req), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(2);
     assertThat(back.getLastLogIndex()).isEqualTo(20L);
   }
-
-  // -------------------------------------------------------------------------------------------
-  // InstallSnapshot (request + response, optional fields)
-  // -------------------------------------------------------------------------------------------
 
   @Test
   public void testInstallSnapshotWithChunk() {
@@ -350,7 +359,7 @@ public class TestProtoConverter extends TestBase {
       .setSnapshottedMembers(Arrays.asList(a, b)).setGroupMembersView(view)
       .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build();
     InstallSnapshotRequest back =
-      converter.fromInstallSnapshotPB(converter.toInstallSnapshotPB(req));
+      converter.fromInstallSnapshotPB(converter.toInstallSnapshotPB(req), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(3);
     assertThat(back.isSenderLeader()).isTrue();
     assertThat(back.getSnapshotTerm()).isEqualTo(2);
@@ -372,7 +381,7 @@ public class TestProtoConverter extends TestBase {
       .setGroupMembersView(view).setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L)
       .build();
     InstallSnapshotRequest back =
-      converter.fromInstallSnapshotPB(converter.toInstallSnapshotPB(req));
+      converter.fromInstallSnapshotPB(converter.toInstallSnapshotPB(req), GroupId.of(GID));
     assertThat(back.getSnapshotChunk()).isNull();
     assertThat(back.getSnapshottedMembers()).isEmpty();
   }
@@ -382,16 +391,12 @@ public class TestProtoConverter extends TestBase {
     InstallSnapshotResponse resp = factory.createInstallSnapshotResponseBuilder().setGroupId(GID)
       .setSender(a).setTerm(3).setSnapshotIndex(5L).setRequestedSnapshotChunkIndex(2)
       .setQuerySequenceNumber(1L).setFlowControlSequenceNumber(2L).build();
-    InstallSnapshotResponse back =
-      converter.fromInstallSnapshotResponsePB(converter.toInstallSnapshotResponsePB(resp));
+    InstallSnapshotResponse back = converter
+      .fromInstallSnapshotResponsePB(converter.toInstallSnapshotResponsePB(resp), GroupId.of(GID));
     assertThat(back.getTerm()).isEqualTo(3);
     assertThat(back.getSnapshotIndex()).isEqualTo(5L);
     assertThat(back.getRequestedSnapshotChunkIndex()).isEqualTo(2);
   }
-
-  // -------------------------------------------------------------------------------------------
-  // toFrame: discriminator selection
-  // -------------------------------------------------------------------------------------------
 
   @Test
   public void testToFrameKinds() {
@@ -422,13 +427,6 @@ public class TestProtoConverter extends TestBase {
     assertThat(converter.toFrame(bad).getKind())
       .isEqualTo(ConsensusProtos.ConsensusFrame.Kind.APPEND_FAILURE);
   }
-
-  // -------------------------------------------------------------------------------------------
-  // Defensive presence guards: every from*PB rejects messages missing load-bearing fields.
-  // Each proto field in ConsensusProtocol.proto is now `optional` (so we can deprecate cleanly);
-  // the converters re-establish the original `required` invariants by throwing
-  // MalformedMessageException when a field that the in-memory model genuinely needs is absent.
-  // -------------------------------------------------------------------------------------------
 
   @Test
   public void testFromEndpointPBRejectsMissingId() {
@@ -473,28 +471,28 @@ public class TestProtoConverter extends TestBase {
       .setLogEntries(List.of()).setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build();
     ConsensusProtos.GroupAppendEntriesPB pb =
       converter.toGroupAppendPB(req).toBuilder().clearGroupId().build();
-    assertThatThrownBy(() -> converter.fromGroupAppendPB(pb))
+    assertThatThrownBy(() -> converter.fromGroupAppendPB(pb, GroupId.of(GID)))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("GroupAppendEntriesPB")
       .hasMessageContaining("'group_id'");
   }
 
   @Test
-  public void testFromGroupHeartbeatPBRejectsMissingSender() {
+  public void testFromGroupBulkHeartbeatPBRejectsMissingTerm() {
     LeaderHeartbeat hb = factory.createLeaderHeartbeatBuilder().setGroupId(GID).setSender(a)
       .setTerm(1).setCommitIndex(0L).build();
-    ConsensusProtos.GroupHeartbeatPB pb =
-      converter.toGroupHeartbeatPB(hb).toBuilder().clearSender().build();
-    assertThatThrownBy(() -> converter.fromGroupHeartbeatPB(pb))
-      .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'sender'");
+    ConsensusProtos.GroupBulkHeartbeatPB pb =
+      converter.toGroupBulkHeartbeatPB(hb).toBuilder().clearTerm().build();
+    assertThatThrownBy(() -> converter.fromGroupBulkHeartbeatPB(pb, GroupId.of(GID), a))
+      .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'term'");
   }
 
   @Test
-  public void testFromGroupHeartbeatAckPBRejectsMissingTerm() {
+  public void testFromGroupBulkHeartbeatAckPBRejectsMissingTerm() {
     LeaderHeartbeatAck ack =
       factory.createLeaderHeartbeatAckBuilder().setGroupId(GID).setSender(a).setTerm(1).build();
-    ConsensusProtos.GroupHeartbeatAckPB pb =
-      converter.toGroupHeartbeatAckPB(ack).toBuilder().clearTerm().build();
-    assertThatThrownBy(() -> converter.fromGroupHeartbeatAckPB(pb))
+    ConsensusProtos.GroupBulkHeartbeatAckPB pb =
+      converter.toGroupBulkHeartbeatAckPB(ack).toBuilder().clearTerm().build();
+    assertThatThrownBy(() -> converter.fromGroupBulkHeartbeatAckPB(pb, GroupId.of(GID), a))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'term'");
   }
 
@@ -504,7 +502,7 @@ public class TestProtoConverter extends TestBase {
       .setLastLogTerm(0).setLastLogIndex(0L).setSticky(false).build();
     ConsensusProtos.VoteRequestPB pb =
       converter.toVoteRequestPB(req).toBuilder().clearTerm().build();
-    assertThatThrownBy(() -> converter.fromVoteRequestPB(pb))
+    assertThatThrownBy(() -> converter.fromVoteRequestPB(pb, GroupId.of(GID)))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'term'");
   }
 
@@ -514,7 +512,7 @@ public class TestProtoConverter extends TestBase {
       .setLastLogTerm(0).setLastLogIndex(0L).setSticky(true).build();
     ConsensusProtos.VoteRequestPB pb =
       converter.toVoteRequestPB(req).toBuilder().clearSticky().build();
-    assertThatThrownBy(() -> converter.fromVoteRequestPB(pb))
+    assertThatThrownBy(() -> converter.fromVoteRequestPB(pb, GroupId.of(GID)))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'sticky'");
   }
 
@@ -528,7 +526,7 @@ public class TestProtoConverter extends TestBase {
       .setQuerySequenceNumber(0L).setFlowControlSequenceNumber(0L).build();
     ConsensusProtos.InstallSnapshotRequestPB pb =
       converter.toInstallSnapshotPB(req).toBuilder().clearGroupMembersView().build();
-    assertThatThrownBy(() -> converter.fromInstallSnapshotPB(pb))
+    assertThatThrownBy(() -> converter.fromInstallSnapshotPB(pb, GroupId.of(GID)))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'group_members_view'");
   }
 
@@ -538,7 +536,7 @@ public class TestProtoConverter extends TestBase {
       .setGroupId(GID).setSender(a).setTerm(1).setLastLogTerm(0).setLastLogIndex(0L).build();
     ConsensusProtos.TriggerLeaderElectionPB pb =
       converter.toTriggerElectionPB(req).toBuilder().clearLastLogIndex().build();
-    assertThatThrownBy(() -> converter.fromTriggerElectionPB(pb))
+    assertThatThrownBy(() -> converter.fromTriggerElectionPB(pb, GroupId.of(GID)))
       .isInstanceOf(MalformedMessageException.class).hasMessageContaining("'last_log_index'");
   }
 

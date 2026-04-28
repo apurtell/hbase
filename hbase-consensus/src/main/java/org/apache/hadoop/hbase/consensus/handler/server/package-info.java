@@ -23,7 +23,7 @@
  * components that every Raft group on a single JVM shares (a
  * {@link org.apache.hadoop.hbase.consensus.handler.executor.MultiGroupExecutor},
  * {@link org.apache.hadoop.hbase.consensus.handler.transport.CoalescingTransport},
- * {@link org.apache.hadoop.hbase.consensus.handler.heartbeat.SweepingHeartbeatScheduler}, and
+ * {@link org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.BulkHeartbeatScheduler}, and
  * {@link org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore}) and exposes a
  * {@link org.apache.hadoop.hbase.consensus.handler.server.GroupManager} surface for adding,
  * removing, and inspecting Raft groups.

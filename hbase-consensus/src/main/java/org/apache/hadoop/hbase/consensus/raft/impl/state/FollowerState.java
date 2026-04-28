@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.impl.state;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /** State maintained for each follower by the Raft group leader. */
@@ -39,8 +40,15 @@ public final class FollowerState {
   private int backoffRound;
   /** Used for calculating how many rounds will be used in the next backoff period. */
   private int nextBackoffPower;
-  /** The timestamp of the last append entries or install snapshot response. */
-  private long responseTimestamp;
+  /**
+   * The timestamp of the last append entries, install snapshot, or bulk-heartbeat-ack response.
+   * Volatile + monotonic-max accumulator so the bulk inbound handler can advance it from the netty
+   * event-loop thread, while the lease quorum recomputation reads every follower's value from any
+   * thread.
+   */
+  private volatile long responseTimestamp;
+  private static final AtomicLongFieldUpdater<FollowerState> RESPONSE_TS =
+    AtomicLongFieldUpdater.newUpdater(FollowerState.class, "responseTimestamp");
   /**
    * The flow control sequence number sent to the follower in the last append entries or install
    * snapshot request.
@@ -91,10 +99,7 @@ public final class FollowerState {
     return ++flowControlSequenceNumber;
   }
 
-  /**
-   * Completes a single round of the request backoff period.
-   * @return true if the current backoff period is completed, false otherwise
-   */
+  /** Completes a single round of the request backoff period. */
   public boolean completeBackoffRound() {
     assert backoffRound > 0;
     return --backoffRound == 0;
@@ -105,9 +110,11 @@ public final class FollowerState {
    * {@link #responseReceived(long, long)} because heartbeat acks do not carry a flow-control
    * sequence number. They only refresh the response timestamp used by leader-lease quorum
    * calculations and never touch the request-backoff state.
+   * <p>
+   * Thread-safe via the monotonic-max accumulator on {@link #responseTimestamp}.
    */
   public void heartbeatAcked(long currentTimeMillis) {
-    responseTimestamp = max(responseTimestamp, currentTimeMillis);
+    RESPONSE_TS.accumulateAndGet(this, currentTimeMillis, Math::max);
   }
 
   /**
@@ -116,7 +123,7 @@ public final class FollowerState {
    * number, the internal request backoff state is also reset.
    */
   public boolean responseReceived(long flowControlSequenceNumber, long currentTimeMillis) {
-    responseTimestamp = max(responseTimestamp, currentTimeMillis);
+    RESPONSE_TS.accumulateAndGet(this, currentTimeMillis, Math::max);
     boolean success = this.flowControlSequenceNumber == flowControlSequenceNumber;
     if (success) {
       resetRequestBackoff();

@@ -22,7 +22,6 @@ import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.ev
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
@@ -101,8 +100,9 @@ public class TestMajorityFailure {
     // Our Raft group is unavailable for operations involving the majority
     // or a leader. However, we can still perform a local query with the
     // QueryPolicy.EVENTUAL_CONSISTENCY policy.
-    Ordered<String> queryResult = leader.<String> query(SimpleStateMachine.queryLastValue(),
-      QueryPolicy.EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty()).join();
+    Ordered<String> queryResult = leader
+      .<String> query(SimpleStateMachine.queryLastValue(), QueryPolicy.EVENTUAL_CONSISTENCY, 0L, 0L)
+      .join();
     assertThat(queryResult.getCommitIndex()).isEqualTo(commitIndex1);
     assertThat(queryResult.getResult()).isEqualTo(value);
     // in order to restore availability of the Raft group, we don't need to

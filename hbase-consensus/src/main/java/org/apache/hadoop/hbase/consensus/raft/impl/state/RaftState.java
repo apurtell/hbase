@@ -60,7 +60,7 @@ import org.slf4j.LoggerFactory;
 
 /** State maintained by each Raft node. **/
 @InterfaceAudience.Private
-@SuppressWarnings({ "checkstyle:methodcount" })
+@SuppressWarnings("rawtypes")
 public final class RaftState {
   private static final Logger LOG = LoggerFactory.getLogger(RaftState.class);
   /** Unique ID of the Raft group that this Raft node belongs to. */
@@ -225,6 +225,7 @@ public final class RaftState {
     this.modelFactory = modelFactory;
   }
 
+  /** Visible for tests. */
   public static RaftState create(Object groupId, RaftEndpoint localEndpoint,
     RaftGroupMembersView initialGroupMembers, int logCapacity, RaftModelFactory modelFactory) {
     return create(groupId, localEndpoint, initialGroupMembers, logCapacity, new NopRaftStore(),
@@ -236,11 +237,6 @@ public final class RaftState {
     RaftModelFactory modelFactory) {
     return new RaftState(groupId, localEndpoint, initialGroupMembers, logCapacity, store,
       modelFactory);
-  }
-
-  public static RaftState restore(Object groupId, RestoredRaftState restoredState, int logCapacity,
-    RaftModelFactory modelFactory) {
-    return restore(groupId, restoredState, logCapacity, new NopRaftStore(), modelFactory);
   }
 
   public static RaftState restore(Object groupId, RestoredRaftState restoredState, int logCapacity,
@@ -777,6 +773,7 @@ public final class RaftState {
    * Future objects are registered only in the leader node. the log index to complete the future at
    * the result to object the future at the given log index
    */
+  @SuppressWarnings("unchecked")
   public void completeFuture(long logIndex, Object result) {
     OrderedFuture f = futures.remove(logIndex);
     if (f != null) {

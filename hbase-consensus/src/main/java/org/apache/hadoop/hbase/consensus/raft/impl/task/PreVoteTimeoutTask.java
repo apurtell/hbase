@@ -29,7 +29,7 @@ import org.slf4j.LoggerFactory;
  * follower and a leader is not yet available after the leader election timeout.
  */
 @InterfaceAudience.Private
-public final class PreVoteTimeoutTask extends RaftNodeStatusAwareTask implements Runnable {
+public final class PreVoteTimeoutTask extends RaftNodeStatusAwareTask {
   private static final Logger LOG = LoggerFactory.getLogger(PreVoteTimeoutTask.class);
   private final int term;
 

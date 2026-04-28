@@ -18,14 +18,19 @@
 package org.apache.hadoop.hbase.consensus.handler.store;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import org.apache.hadoop.hbase.consensus.handler.store.RaftStoreTestFixtures.LogStoreConfigs;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.model.impl.DefaultRaftModelFactory;
@@ -40,11 +45,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/**
- * Whole-disk replay coverage for {@link UnifiedRaftStore#load()}: multi-group state, segment rolls,
- * truncate-from / truncate-until, and snapshot reassembly survive a close-then-reload cycle.
- */
+/** Whole-disk replay coverage for {@link UnifiedRaftStore#load()}. */
 @Tag(SmallTests.TAG)
 public class TestUnifiedRaftStoreLoad extends TestBase {
 
@@ -57,8 +61,12 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
   private final RaftEndpoint a = LocalRaftEndpoint.newEndpoint();
   private final RaftEndpoint b = LocalRaftEndpoint.newEndpoint();
 
-  private UnifiedRaftStore newStore() {
-    return new UnifiedRaftStore(new LogStoreConfig(tmp.toFile(), 8, 2L, 64));
+  private UnifiedRaftStore newStore(int shards) {
+    return new UnifiedRaftStore(LogStoreConfigs.defaults(tmp.toFile(), shards));
+  }
+
+  private UnifiedRaftStore newPreallocStore(int shards) {
+    return new UnifiedRaftStore(LogStoreConfigs.prealloc(tmp.toFile(), shards, 4096L));
   }
 
   @AfterEach
@@ -71,16 +79,17 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
 
   @Test
   public void testLoadEmptyDirReturnsEmptyMap() throws IOException {
-    store = newStore();
+    store = newStore(1);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     assertThat(out).isEmpty();
   }
 
-  @Test
-  public void testRestoreSingleGroupAfterRestart() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testRestoreSingleGroupAfterRestart(int shards) throws IOException {
     byte[] gid = "g1".getBytes();
 
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
     g.persistAndFlushLocalEndpoint(factory.createRaftEndpointPersistentStateBuilder()
@@ -97,7 +106,7 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     g.flush();
     s1.close();
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     assertThat(out).hasSize(1);
     RestoredRaftState rs = out.values().iterator().next();
@@ -111,28 +120,21 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     assertThat(entries.get(1).getIndex()).isEqualTo(2L);
   }
 
-  @Test
-  public void testTruncateFromAppliedDuringReplay() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testTruncateFromAppliedDuringReplay(int shards) throws IOException {
     byte[] gid = "g1".getBytes();
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
-    g.persistAndFlushLocalEndpoint(factory.createRaftEndpointPersistentStateBuilder()
-      .setLocalEndpoint(a).setVoting(true).build());
-    g.persistAndFlushInitialGroupMembers(factory.createRaftGroupMembersViewBuilder().setLogIndex(0L)
-      .setMembers(Arrays.asList(a)).setVotingMembers(Arrays.asList(a)).build());
-    g.persistAndFlushTerm(
-      factory.createRaftTermPersistentStateBuilder().setTerm(1).setVotedFor(a).build());
-    for (int i = 1; i <= 5; i++) {
-      g.persistLogEntries(Collections.singletonList(factory.createLogEntryBuilder().setIndex(i)
-        .setTerm(1).setOperation(new byte[] { (byte) i }).build()));
-    }
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    RaftStoreTestFixtures.appendEntries(g, 1, 5, 1, 1, factory);
     g.flush();
     g.truncateLogEntriesFrom(3L);
     g.flush();
     s1.close();
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     RestoredRaftState rs = out.values().iterator().next();
     assertThat(rs.getLogEntries()).hasSize(2);
@@ -140,28 +142,21 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     assertThat(rs.getLogEntries().get(1).getIndex()).isEqualTo(2L);
   }
 
-  @Test
-  public void testTruncateUntilAppliedDuringReplay() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testTruncateUntilAppliedDuringReplay(int shards) throws IOException {
     byte[] gid = "g1".getBytes();
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
-    g.persistAndFlushLocalEndpoint(factory.createRaftEndpointPersistentStateBuilder()
-      .setLocalEndpoint(a).setVoting(true).build());
-    g.persistAndFlushInitialGroupMembers(factory.createRaftGroupMembersViewBuilder().setLogIndex(0L)
-      .setMembers(Arrays.asList(a)).setVotingMembers(Arrays.asList(a)).build());
-    g.persistAndFlushTerm(
-      factory.createRaftTermPersistentStateBuilder().setTerm(1).setVotedFor(a).build());
-    for (int i = 1; i <= 5; i++) {
-      g.persistLogEntries(Collections.singletonList(factory.createLogEntryBuilder().setIndex(i)
-        .setTerm(1).setOperation(new byte[] { (byte) i }).build()));
-    }
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    RaftStoreTestFixtures.appendEntries(g, 1, 5, 1, 1, factory);
     g.flush();
     g.truncateLogEntriesUntil(3L);
     g.flush();
     s1.close();
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     RestoredRaftState rs = out.values().iterator().next();
     List<LogEntry> entries = rs.getLogEntries();
@@ -170,16 +165,14 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     assertThat(entries.get(1).getIndex()).isEqualTo(5L);
   }
 
-  @Test
-  public void testSnapshotReassembledAcrossRestart() throws IOException {
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testSnapshotReassembledAcrossRestart(int shards) throws IOException {
     byte[] gid = "g1".getBytes();
-    UnifiedRaftStore s1 = newStore();
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g = s1.newGroupStore(gid);
-    g.persistAndFlushLocalEndpoint(factory.createRaftEndpointPersistentStateBuilder()
-      .setLocalEndpoint(a).setVoting(true).build());
-    g.persistAndFlushInitialGroupMembers(factory.createRaftGroupMembersViewBuilder().setLogIndex(0L)
-      .setMembers(Arrays.asList(a)).setVotingMembers(Arrays.asList(a)).build());
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
     g.persistAndFlushTerm(
       factory.createRaftTermPersistentStateBuilder().setTerm(3).setVotedFor(a).build());
     RaftGroupMembersView snapMembers = factory.createRaftGroupMembersViewBuilder().setLogIndex(0L)
@@ -194,7 +187,7 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     g.flush();
     s1.close();
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     RestoredRaftState rs = out.values().iterator().next();
     assertThat(rs.getSnapshotEntry()).isNotNull();
@@ -202,14 +195,15 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     assertThat(rs.getSnapshotEntry().getTerm()).isEqualTo(3);
   }
 
-  @Test
-  public void testTwoGroupsRestoreIndependently() throws IOException {
-    UnifiedRaftStore s1 = newStore();
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testTwoGroupsRestoreIndependently(int shards) throws IOException {
+    UnifiedRaftStore s1 = newStore(shards);
     s1.load();
     RaftStore g1 = s1.newGroupStore("g1".getBytes());
     RaftStore g2 = s1.newGroupStore("g2".getBytes());
-    seedMinimal(g1, a);
-    seedMinimal(g2, b);
+    RaftStoreTestFixtures.seedMinimal(g1, a, factory);
+    RaftStoreTestFixtures.seedMinimal(g2, b, factory);
     g1.persistLogEntries(Collections.singletonList(factory.createLogEntryBuilder().setIndex(1L)
       .setTerm(1).setOperation(new byte[] { 1 }).build()));
     g2.persistLogEntries(Collections.singletonList(factory.createLogEntryBuilder().setIndex(1L)
@@ -218,17 +212,69 @@ public class TestUnifiedRaftStoreLoad extends TestBase {
     g2.flush();
     s1.close();
 
-    store = newStore();
+    store = newStore(shards);
     Map<ByteBuffer, RestoredRaftState> out = store.load();
     assertThat(out).hasSize(2);
   }
 
-  private void seedMinimal(RaftStore g, RaftEndpoint ep) throws IOException {
-    g.persistAndFlushLocalEndpoint(factory.createRaftEndpointPersistentStateBuilder()
-      .setLocalEndpoint(ep).setVoting(true).build());
-    g.persistAndFlushInitialGroupMembers(factory.createRaftGroupMembersViewBuilder().setLogIndex(0L)
-      .setMembers(Arrays.asList(ep)).setVotingMembers(Arrays.asList(ep)).build());
-    g.persistAndFlushTerm(
-      factory.createRaftTermPersistentStateBuilder().setTerm(1).setVotedFor(ep).build());
+  /**
+   * Hard-crash recovery with pre-allocated segments: write N records, simulate a {@code kill -9},
+   * then reopen.
+   */
+  @ParameterizedTest
+  @ValueSource(ints = { 1, 4 })
+  public void testHardCrashWithPreallocStopsAtZeroTail(int shards) throws IOException {
+    byte[] gid = "g1".getBytes();
+    UnifiedRaftStore s1 = newPreallocStore(shards);
+    s1.load();
+    RaftStore g = s1.newGroupStore(gid);
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    RaftStoreTestFixtures.appendEntries(g, 1, 4, 1, 1, factory);
+    g.flush();
+    Path activePath = s1.currentSegmentForGroup(gid).path();
+    long recordTail = s1.currentSegmentForGroup(gid).currentSize();
+    s1.close();
+    try (FileChannel ch = FileChannel.open(activePath, StandardOpenOption.WRITE)) {
+      java.nio.ByteBuffer marker = java.nio.ByteBuffer.allocate(1);
+      while (marker.hasRemaining()) {
+        ch.write(marker, 4096L - 1L);
+      }
+    }
+    assertThat(Files.size(activePath)).isEqualTo(4096L);
+    assertThat(recordTail).isLessThan(4096L);
+
+    store = newPreallocStore(shards);
+    Map<ByteBuffer, RestoredRaftState> out = store.load();
+    RestoredRaftState rs = out.values().iterator().next();
+    assertThat(rs.getLogEntries()).hasSize(4);
+    for (int i = 0; i < 4; i++) {
+      assertThat(rs.getLogEntries().get(i).getIndex()).isEqualTo((long) (i + 1));
+    }
+  }
+
+  /** Refuse to start when the on-disk shard count differs from the configured shard count. */
+  @Test
+  public void testLayoutMismatchRefusedOnLoad() throws IOException {
+    UnifiedRaftStore s4 = newStore(4);
+    s4.load();
+    RaftStore g = s4.newGroupStore("g".getBytes());
+    RaftStoreTestFixtures.seedMinimal(g, a, factory);
+    s4.close();
+
+    UnifiedRaftStore downsize = newStore(1);
+    try {
+      assertThatThrownBy(downsize::load).isInstanceOf(IOException.class)
+        .hasMessageContaining("shard");
+    } finally {
+      downsize.close();
+    }
+
+    UnifiedRaftStore upsize = newStore(8);
+    try {
+      assertThatThrownBy(upsize::load).isInstanceOf(IOException.class)
+        .hasMessageContaining("shard");
+    } finally {
+      upsize.close();
+    }
   }
 }

@@ -18,14 +18,13 @@
 package org.apache.hadoop.hbase.consensus.raft.impl.handler;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import org.apache.hadoop.hbase.consensus.raft.RaftRole;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.impl.task.RaftNodeStatusAwareTask;
 import org.apache.hadoop.hbase.consensus.raft.model.message.RaftMessage;
 import org.apache.yetus.audience.InterfaceAudience;
 
-/**
- * Base class for {@link RaftMessage} handlers.
- */
+/** Base class for {@link RaftMessage} handlers. */
 @InterfaceAudience.Private
 public abstract class AbstractMessageHandler<T extends RaftMessage>
   extends RaftNodeStatusAwareTask {
@@ -38,22 +37,19 @@ public abstract class AbstractMessageHandler<T extends RaftMessage>
 
   @Override
   protected final void doRun() {
-    // Any inbound non-heartbeat Raft message implicitly wakes the local view of the group on a
-    // follower. Heartbeats opt out via {@link #wakesQuiescentFollower()}.
-    if (wakesQuiescentFollower() && state.groupQuiescent()) {
-      state.groupQuiescent(false);
-    }
+    preHandle();
     handle(message);
   }
 
   /**
-   * Whether dispatching this message should clear the follower's local quiescence flag before the
-   * typed handler runs. Defaults to {@code true}. {@link LeaderHeartbeatHandler} overrides it to
-   * {@code false} because it is the path that interprets the {@code quiesced} bit and decides
-   * quiescence transitions explicitly.
+   * Hook run before the typed handler. The default implementation clears the follower's local
+   * quiescence flag. {@link LeaderHeartbeatHandler} overrides this hook and decides quiescence
+   * transitions explicitly.
    */
-  protected boolean wakesQuiescentFollower() {
-    return true;
+  protected void preHandle() {
+    if (state.role() != RaftRole.LEADER && state.groupQuiescent()) {
+      state.groupQuiescent(false);
+    }
   }
 
   protected abstract void handle(@NonNull T message);

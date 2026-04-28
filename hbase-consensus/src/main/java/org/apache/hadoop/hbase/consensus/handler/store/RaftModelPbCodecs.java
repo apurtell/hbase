@@ -35,6 +35,7 @@ import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
+import org.apache.hbase.thirdparty.com.google.protobuf.UnsafeByteOperations;
 
 /**
  * Bidirectional helpers between Raft model interfaces and {@code ConsensusProtos.*PB} for the types
@@ -85,8 +86,7 @@ public final class RaftModelPbCodecs {
 
   @NonNull
   public static ConsensusProtos.RaftEndpointPB toEndpointPB(@NonNull RaftEndpoint endpoint) {
-    return ConsensusProtos.RaftEndpointPB.newBuilder().setId(WireRaftEndpoint.toBytes(endpoint))
-      .build();
+    return endpoint.endpointId().pb();
   }
 
   @NonNull
@@ -171,7 +171,9 @@ public final class RaftModelPbCodecs {
     Object op = chunk.getOperation();
     ByteString payload;
     if (op instanceof byte[]) {
-      payload = ByteString.copyFrom((byte[]) op);
+      // Snapshot chunks are produced once and immediately framed for the wire; the source byte[]
+      // is owned by the caller and will not be mutated, so unsafeWrap avoids a per-chunk copy.
+      payload = UnsafeByteOperations.unsafeWrap((byte[]) op);
     } else {
       payload = operationCodec.encode(op);
     }

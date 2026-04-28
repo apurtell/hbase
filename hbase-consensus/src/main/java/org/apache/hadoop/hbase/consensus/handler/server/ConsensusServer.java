@@ -28,7 +28,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -38,7 +37,6 @@ import java.util.function.Function;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.handler.executor.MultiGroupExecutor;
-import org.apache.hadoop.hbase.consensus.handler.heartbeat.SweepingHeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.ConsensusSpi;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.LeaderReportListener;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.StateMachineAdapter;
@@ -47,11 +45,14 @@ import org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore;
 import org.apache.hadoop.hbase.consensus.handler.transport.CoalescingTransport;
 import org.apache.hadoop.hbase.consensus.handler.transport.EndpointResolver;
 import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodec;
+import org.apache.hadoop.hbase.consensus.raft.GroupId;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
+import org.apache.hadoop.hbase.consensus.raft.PendingBytesBudget;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
+import org.apache.hadoop.hbase.consensus.raft.heartbeat.impl.BulkHeartbeatScheduler;
 import org.apache.hadoop.hbase.consensus.raft.impl.RaftNodeImpl;
 import org.apache.hadoop.hbase.consensus.raft.lifecycle.RaftNodeLifecycleAware;
 import org.apache.hadoop.hbase.consensus.raft.persistence.RaftStore;
@@ -72,7 +73,8 @@ import org.slf4j.LoggerFactory;
  * <li>{@link MultiGroupExecutor} &mdash; shared serial executor pool.</li>
  * <li>{@link CoalescingTransport} &mdash; Netty + protobuf transport bound to a single local
  * endpoint.</li>
- * <li>{@link SweepingHeartbeatScheduler} &mdash; O(peers) heartbeat sweeper.</li>
+ * <li>{@link BulkHeartbeatScheduler} &mdash; per-server timing-wheel emitting one bulk heartbeat
+ * frame per peer per tick.</li>
  * <li>{@link UnifiedRaftStore} &mdash; multiplexed durable log shared by every group.</li>
  * </ul>
  * Each registered group is wired to its own {@link ConsensusSpi} via a {@link StateMachineAdapter}
@@ -98,22 +100,31 @@ public final class ConsensusServer
 
   private static final Logger LOG = LoggerFactory.getLogger(ConsensusServer.class);
 
-  private final Configuration conf;
   private final ConsensusServerConfig serverConfig;
   private final RaftEndpoint localEndpoint;
-  private final EndpointResolver resolver;
-  private final OperationCodec operationCodec;
-  private final InetSocketAddress bindAddress;
   private final Function<Object, byte[]> groupIdEncoder;
   private final RaftConfig defaultRaftConfig;
 
   private final MultiGroupExecutor executor;
-  private final SweepingHeartbeatScheduler scheduler;
+  private final BulkHeartbeatScheduler scheduler;
   private final UnifiedRaftStore logStore;
   private final CoalescingTransport transport;
   private final ConsensusServerMetrics metrics;
+  /**
+   * Server-wide credit pool that bounds the aggregate footprint of uncommitted leader-side propose
+   * operations across all hosted groups.
+   */
+  private final PendingBytesBudget pendingBytesBudget;
   /** Whether this server owns (and therefore must close) {@link #executor}. */
   private final boolean ownsExecutor;
+
+  /**
+   * Wall-clock millis at which this {@code ConsensusServer} instance was constructed. This is the
+   * single boot-epoch value forwarded to every co-booted component that stamps an envelope-level
+   * keepalive header (transport, bulk-heartbeat scheduler), so peers see the same epoch regardless
+   * of which component emits the envelope.
+   */
+  private final long bootEpochMillis;
 
   private final ConcurrentHashMap<Object, GroupHandle> groups = new ConcurrentHashMap<>();
   private final AtomicReference<ConsensusServerStatus.State> state =
@@ -130,7 +141,7 @@ public final class ConsensusServer
    * @param conf           hadoop {@link Configuration} carrying every {@code hbase.consensus.*}
    *                       knob
    * @param self           local Raft endpoint identity
-   * @param bindAddress    server-side bind address (typically {@code 127.0.0.1:0} in tests)
+   * @param bindAddress    server-side bind address
    * @param resolver       resolves remote endpoints to socket addresses
    * @param operationCodec encodes/decodes opaque operations carried in {@code LogEntry}s
    */
@@ -138,53 +149,36 @@ public final class ConsensusServer
     @NonNull InetSocketAddress bindAddress, @NonNull EndpointResolver resolver,
     @NonNull OperationCodec operationCodec) {
     this(conf, self, bindAddress, resolver, operationCodec, /* executor */ null,
-      defaultGroupIdEncoder(), RaftConfig.DEFAULT_RAFT_CONFIG);
+      defaultGroupIdEncoder(), RaftConfig.newBuilder().build());
   }
 
-  /**
-   * Test/integration ctor that lets the caller provide a pre-built {@link MultiGroupExecutor} (e.g.
-   * shared across multiple in-JVM servers in a test minicluster). When {@code executor} is non-null
-   * this server will <em>not</em> close it on {@link #stop()}.
-   * @param groupIdEncoder maps an opaque {@code groupId} (e.g. a {@code String} or an HBase
-   *                       region-name byte[]) to the {@code byte[]} key used by
-   *                       {@link UnifiedRaftStore#newGroupStore(byte[])}; defaults to
-   *                       {@code String.valueOf(groupId).getBytes(UTF_8)}
-   */
-  public ConsensusServer(@NonNull Configuration conf, @NonNull RaftEndpoint self,
-    @NonNull InetSocketAddress bindAddress, @NonNull EndpointResolver resolver,
-    @NonNull OperationCodec operationCodec, @Nullable MultiGroupExecutor executor,
-    @NonNull Function<Object, byte[]> groupIdEncoder) {
-    this(conf, self, bindAddress, resolver, operationCodec, executor, groupIdEncoder,
-      RaftConfig.DEFAULT_RAFT_CONFIG);
-  }
-
-  /**
-   * Most-general ctor. Permits overriding the per-group {@link RaftConfig} (e.g. shorter election
-   * timeouts in tests) in addition to all of the inputs accepted by the other ctors.
-   */
   public ConsensusServer(@NonNull Configuration conf, @NonNull RaftEndpoint self,
     @NonNull InetSocketAddress bindAddress, @NonNull EndpointResolver resolver,
     @NonNull OperationCodec operationCodec, @Nullable MultiGroupExecutor executor,
     @NonNull Function<Object, byte[]> groupIdEncoder, @NonNull RaftConfig raftConfig) {
-    this.conf = requireNonNull(conf, "conf");
+    requireNonNull(conf, "conf");
+    requireNonNull(bindAddress, "bindAddress");
+    requireNonNull(resolver, "resolver");
+    requireNonNull(operationCodec, "operationCodec");
     this.serverConfig = new ConsensusServerConfig(conf);
     this.localEndpoint = requireNonNull(self, "self");
-    this.bindAddress = requireNonNull(bindAddress, "bindAddress");
-    this.resolver = requireNonNull(resolver, "resolver");
-    this.operationCodec = requireNonNull(operationCodec, "operationCodec");
     this.groupIdEncoder = requireNonNull(groupIdEncoder, "groupIdEncoder");
     this.defaultRaftConfig = requireNonNull(raftConfig, "raftConfig");
+    this.bootEpochMillis = EnvironmentEdgeManager.currentTime();
+    this.pendingBytesBudget = PendingBytesBudget.create(serverConfig.getMaxPendingBytes());
     if (executor != null) {
       this.executor = executor;
       this.ownsExecutor = false;
     } else {
-      this.executor = new MultiGroupExecutor(conf);
+      // Pass maxGroups so the MGE can scale its worker-thread floor up with the configured maximum
+      // group count.
+      this.executor = new MultiGroupExecutor(conf, this.serverConfig.getMaxGroups());
       this.ownsExecutor = true;
     }
     this.logStore = new UnifiedRaftStore(new LogStoreConfig(conf));
-    this.scheduler = new SweepingHeartbeatScheduler(conf);
-    this.transport =
-      new CoalescingTransport(localEndpoint, bindAddress, resolver, operationCodec, conf);
+    this.transport = new CoalescingTransport(localEndpoint, bindAddress, resolver, operationCodec,
+      conf, bootEpochMillis);
+    this.scheduler = new BulkHeartbeatScheduler(conf, transport, bootEpochMillis);
     this.metrics = new ConsensusServerMetrics(this);
   }
 
@@ -209,18 +203,6 @@ public final class ConsensusServer
     return transport;
   }
 
-  /** Returns the underlying durable log store. */
-  @NonNull
-  public UnifiedRaftStore getLogStore() {
-    return logStore;
-  }
-
-  /** Returns the underlying heartbeat scheduler. */
-  @NonNull
-  public SweepingHeartbeatScheduler getHeartbeatScheduler() {
-    return scheduler;
-  }
-
   /** Returns the underlying multi-group executor. */
   @NonNull
   public MultiGroupExecutor getExecutor() {
@@ -239,12 +221,6 @@ public final class ConsensusServer
     return metrics;
   }
 
-  /** Returns this server's hadoop {@link Configuration}. */
-  @NonNull
-  public Configuration getConfiguration() {
-    return conf;
-  }
-
   /** Returns a point-in-time snapshot of this server's lifecycle counters. */
   @NonNull
   public ConsensusServerStatus getServerStatus() {
@@ -259,7 +235,7 @@ public final class ConsensusServer
    * <ol>
    * <li>{@link UnifiedRaftStore#load()} (one whole-disk replay).</li>
    * <li>{@link CoalescingTransport#start()}.</li>
-   * <li>{@link SweepingHeartbeatScheduler#start()}.</li>
+   * <li>{@link BulkHeartbeatScheduler#start()}.</li>
    * <li>Flag {@link ConsensusServerStatus.State#RUNNING}; {@link #addGroup} becomes legal.</li>
    * </ol>
    * @throws IOException           if the durable log fails to open or replay
@@ -427,12 +403,18 @@ public final class ConsensusServer
     requireNonNull(spi, "spi");
     requireRunning();
 
+    // Normalise to an immutable GroupId at the API boundary so all downstream consumers (registry,
+    // wire codec, executor, log store) see the same canonical value handle with a cached
+    // ByteString view. Legacy callers that pass arbitrary Objects route through the configured
+    // groupIdEncoder so the wire bytes still match the deployment-specific encoding.
+    final GroupId canonicalGroupId = toGroupId(groupId);
+
     // Atomic compute that rejects duplicates + enforces maxgroups in one pass.
     final IOException[] ioHolder = { null };
     final RuntimeException[] rtHolder = { null };
     final boolean[] addedNew = { false };
     long startMs = EnvironmentEdgeManager.currentTime();
-    GroupHandle handle = groups.compute(groupId, (gid, existing) -> {
+    GroupHandle handle = groups.compute(canonicalGroupId, (gid, existing) -> {
       if (existing != null) {
         return existing;
       }
@@ -441,7 +423,7 @@ public final class ConsensusServer
         return null;
       }
       try {
-        GroupHandle built = buildAndStartGroup(gid, initialMembers, spi);
+        GroupHandle built = buildAndStartGroup((GroupId) gid, initialMembers, spi);
         addedNew[0] = true;
         return built;
       } catch (IOException ioe) {
@@ -476,12 +458,9 @@ public final class ConsensusServer
    * concurrent {@link #addGroup} calls for the same id are linearised through the
    * {@link ConcurrentHashMap}'s per-bin lock.
    */
-  private GroupHandle buildAndStartGroup(Object groupId, Collection<RaftEndpoint> initialMembers,
+  private GroupHandle buildAndStartGroup(GroupId groupId, Collection<RaftEndpoint> initialMembers,
     ConsensusSpi spi) throws IOException {
-    byte[] groupIdBytes = groupIdEncoder.apply(groupId);
-    if (groupIdBytes == null) {
-      throw new IllegalStateException("groupIdEncoder returned null for " + groupId);
-    }
+    byte[] groupIdBytes = groupId.bytes();
     RaftStore raftStore = logStore.newGroupStore(groupIdBytes);
     RestoredRaftState restored =
       restoredStates.get(ByteBuffer.wrap(groupIdBytes).asReadOnlyBuffer());
@@ -493,7 +472,13 @@ public final class ConsensusServer
     RaftNode.RaftNodeBuilder builder =
       RaftNode.newBuilder().setGroupId(groupId).setExecutor(groupExec).setTransport(transport)
         .setStateMachine(adapter).setStore(raftStore).setRaftNodeReportListener(listener)
-        .setHeartbeatScheduler(scheduler).setConfig(defaultRaftConfig);
+        .setHeartbeatScheduler(scheduler).setConfig(defaultRaftConfig)
+        // Feed the per-follower election-timer randomization formula the host server's active group
+        // count so the upper end of the interval widens with simultaneous-follower density.
+        .setActiveGroupCountSupplier(executor::activeGroups)
+        // Hand every group the same server-wide credit pool so the leader-side propose admission
+        // gate enforces a single aggregate byte budget, not N independent per-group budgets.
+        .setPendingBytesBudget(pendingBytesBudget);
     if (restored != null) {
       builder.setRestoredState(restored);
     } else {
@@ -515,8 +500,8 @@ public final class ConsensusServer
     }
 
     try {
-      // Register before start so the very first leader heartbeat tick is dispatched on the next
-      // sweep.
+      // Register before start so the very first wheel tick aggregates this group into its
+      // outbound bulk frame.
       scheduler.register((RaftNodeImpl) node);
     } catch (RuntimeException e) {
       try {
@@ -544,7 +529,23 @@ public final class ConsensusServer
       releaseGroupExecutor(groupExec);
       throw e;
     }
-    return new GroupHandle(groupId, node, spi);
+    return new GroupHandle(groupId, node);
+  }
+
+  /**
+   * Normalises {@code groupId} to a {@link GroupId} value handle. {@link GroupId} instances are
+   * returned as-is; everything else is routed through the configured {@link #groupIdEncoder} so the
+   * deployment-specific wire encoding is preserved, then wrapped in a fresh {@link GroupId}.
+   */
+  private GroupId toGroupId(Object groupId) {
+    if (groupId instanceof GroupId) {
+      return (GroupId) groupId;
+    }
+    byte[] bytes = groupIdEncoder.apply(groupId);
+    if (bytes == null) {
+      throw new IllegalStateException("groupIdEncoder returned null for " + groupId);
+    }
+    return GroupId.of(bytes);
   }
 
   /**
@@ -566,6 +567,7 @@ public final class ConsensusServer
   @Override
   public boolean removeGroup(@NonNull Object groupId) {
     requireNonNull(groupId, "groupId");
+    GroupId canonicalGroupId = toGroupId(groupId);
     long startMs = EnvironmentEdgeManager.currentTime();
     // Hold the per-key bin lock for the entire teardown by tearing down inside the compute
     // callback. This serializes against any concurrent addGroup() on the same key, so a racing
@@ -574,7 +576,7 @@ public final class ConsensusServer
     // future terminate of it). The CHM bin lock may briefly block addGroup of another id that
     // happens to share the same bin; in practice the teardown is short.
     final boolean[] removed = { false };
-    groups.compute(groupId, (gid, handle) -> {
+    groups.compute(canonicalGroupId, (gid, handle) -> {
       if (handle == null) {
         return null;
       }
@@ -597,12 +599,14 @@ public final class ConsensusServer
   @Nullable
   @Override
   public GroupHandle getGroup(@NonNull Object groupId) {
-    return groups.get(requireNonNull(groupId, "groupId"));
+    requireNonNull(groupId, "groupId");
+    return groups.get(toGroupId(groupId));
   }
 
   @Override
   public boolean hasGroup(@NonNull Object groupId) {
-    return groups.containsKey(requireNonNull(groupId, "groupId"));
+    requireNonNull(groupId, "groupId");
+    return groups.containsKey(toGroupId(groupId));
   }
 
   @Override
@@ -613,7 +617,7 @@ public final class ConsensusServer
   @NonNull
   @Override
   public Iterable<GroupHandle> groups() {
-    return Collections.unmodifiableCollection(new ArrayList<>(groups.values()));
+    return new ArrayList<>(groups.values());
   }
 
   @Override
@@ -647,7 +651,7 @@ public final class ConsensusServer
     @NonNull RaftEndpoint target) {
     requireNonNull(groupId, "groupId");
     requireNonNull(target, "target");
-    GroupHandle h = groups.get(groupId);
+    GroupHandle h = groups.get(toGroupId(groupId));
     if (h == null) {
       throw new IllegalArgumentException("Unknown groupId: " + groupId);
     }
@@ -660,7 +664,7 @@ public final class ConsensusServer
   @Override
   public CompletableFuture<Ordered<RaftNodeReport>> status(@NonNull Object groupId) {
     requireNonNull(groupId, "groupId");
-    GroupHandle h = groups.get(groupId);
+    GroupHandle h = groups.get(toGroupId(groupId));
     if (h == null) {
       throw new IllegalArgumentException("Unknown groupId: " + groupId);
     }

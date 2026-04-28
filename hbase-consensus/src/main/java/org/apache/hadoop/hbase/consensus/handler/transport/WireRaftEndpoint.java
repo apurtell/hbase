@@ -18,39 +18,37 @@
 package org.apache.hadoop.hbase.consensus.handler.transport;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import org.apache.hadoop.hbase.consensus.raft.EndpointId;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
 
 /**
- * Thin {@link RaftEndpoint} reconstructed from the wire. The id is the UTF-8 bytes of the
- * producer's {@code String.valueOf(endpoint.getId())}; equality is over those bytes so wire
- * endpoints compare equal to each other when they share an id, which is sufficient for the inbound
+ * Thin {@link RaftEndpoint} reconstructed from the wire. Wraps a single cached {@link EndpointId}
+ * which carries the id bytes, the cached {@link ByteString} view, and a pre-built
+ * {@code RaftEndpointPB}. Equality is delegated to the cached {@link EndpointId}, so wire endpoints
+ * compare equal to each other when they share an id, which is sufficient for the inbound
  * dispatcher's keying.
  */
 @InterfaceAudience.Private
 public final class WireRaftEndpoint implements RaftEndpoint {
-  private final byte[] id;
-  private final String stringId;
+  private final EndpointId endpointId;
 
-  private WireRaftEndpoint(byte[] id) {
-    this.id = id;
-    this.stringId = new String(id, StandardCharsets.UTF_8);
+  private WireRaftEndpoint(EndpointId endpointId) {
+    this.endpointId = endpointId;
   }
 
   /** Builds a {@link WireRaftEndpoint} from the bytes carried in {@code RaftEndpointPB}. */
   @NonNull
   public static WireRaftEndpoint fromBytes(@NonNull ByteString id) {
-    return new WireRaftEndpoint(id.toByteArray());
+    return new WireRaftEndpoint(EndpointId.fromWire(id));
   }
 
-  /** Builds a {@link WireRaftEndpoint} from the bytes carried in {@code RaftEndpointPB}. */
+  /** Builds a {@link WireRaftEndpoint} from a copy of the supplied id bytes. */
   @NonNull
   public static WireRaftEndpoint fromBytes(@NonNull byte[] id) {
-    return new WireRaftEndpoint(id.clone());
+    return new WireRaftEndpoint(EndpointId.of(id));
   }
 
   /**
@@ -58,13 +56,19 @@ public final class WireRaftEndpoint implements RaftEndpoint {
    */
   @NonNull
   public static ByteString toBytes(@NonNull RaftEndpoint endpoint) {
-    return ByteString.copyFromUtf8(String.valueOf(endpoint.getId()));
+    return endpoint.endpointId().byteString();
   }
 
   @Override
   @NonNull
   public Object getId() {
-    return stringId;
+    return endpointId;
+  }
+
+  @Override
+  @NonNull
+  public EndpointId endpointId() {
+    return endpointId;
   }
 
   @Override
@@ -75,19 +79,16 @@ public final class WireRaftEndpoint implements RaftEndpoint {
     if (!(o instanceof RaftEndpoint)) {
       return false;
     }
-    if (o instanceof WireRaftEndpoint) {
-      return Arrays.equals(id, ((WireRaftEndpoint) o).id);
-    }
-    return stringId.equals(String.valueOf(((RaftEndpoint) o).getId()));
+    return endpointId.equals(((RaftEndpoint) o).endpointId());
   }
 
   @Override
   public int hashCode() {
-    return stringId.hashCode();
+    return endpointId.hashCode();
   }
 
   @Override
   public String toString() {
-    return "WireRaftEndpoint{id=" + stringId + '}';
+    return "WireRaftEndpoint{id=" + endpointId + '}';
   }
 }

@@ -17,7 +17,6 @@
  */
 package org.apache.hadoop.hbase.consensus.raft.exception;
 
-import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNode;
@@ -25,20 +24,15 @@ import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Thrown when a Raft node's current commit index is smaller than the commit index specified in a
- * {@link RaftNode#query(Object, QueryPolicy, Optional, Optional)} call. This exception means that
- * the Raft node instance cannot execute the given query by preserving the monotonicity of the
- * observed state. Please see the <i>Section: 6.4 Processing read-only queries more efficiently</i>
- * of the Raft dissertation for more details.
+ * {@link RaftNode#query(Object, QueryPolicy, long, long)} call. This exception means that the Raft
+ * node instance cannot execute the given query by preserving the monotonicity of the observed
+ * state. Please see the <i>Section: 6.4 Processing read-only queries more efficiently</i> of the
+ * Raft dissertation for more details.
  */
 @InterfaceAudience.Private
 public class LaggingCommitIndexException extends RaftException {
   private static final long serialVersionUID = -2244714904905721002L;
 
-  /**
-   * Creates an instance of this exception. The current commit index of the RaftNode which throws
-   * this exception the commit index expected by the caller the leader endpoint if it is known, or
-   * null otherwise.
-   */
   public LaggingCommitIndexException(long commitIndex, long expectedCommitIndex,
     RaftEndpoint leader) {
     super(

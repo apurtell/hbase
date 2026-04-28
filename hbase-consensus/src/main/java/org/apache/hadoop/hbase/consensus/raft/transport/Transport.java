@@ -75,4 +75,23 @@ public interface Transport {
    * @return true if given endpoint is reachable, false otherwise
    */
   boolean isReachable(@NonNull RaftEndpoint endpoint);
+
+  /**
+   * Sends a bulk heartbeat envelope from the local node to {@code target}.
+   * <p>
+   * The bulk path bypasses the per-{@link RaftMessage} {@link #send} pipeline so that the heartbeat
+   * tick can emit one envelope per peer per tick. Implementations must serialize the envelope level
+   * keepalive header (sender / epoch / tick) plus the carried per group entries on the wire, or,
+   * for the in-process transport, dispatch each per-group entry to the addressed local node
+   * directly. The call must not block the caller. Failures are absorbed silently. The next tick
+   * will retry.
+   */
+  void sendBulkHeartbeat(@NonNull RaftEndpoint target, @NonNull BulkHeartbeatFrame frame);
+
+  /**
+   * Sends a bulk heartbeat-ack envelope from the local node back to {@code target}, mirroring an
+   * inbound {@link BulkHeartbeatFrame} the receiver acks. Same non-blocking and best-effort
+   * semantics as {@link #sendBulkHeartbeat}.
+   */
+  void sendBulkHeartbeatAck(@NonNull RaftEndpoint target, @NonNull BulkHeartbeatAckFrame frame);
 }

@@ -21,7 +21,6 @@ import static java.util.Objects.requireNonNull;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Map;
-import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
 import org.apache.hadoop.hbase.consensus.raft.RaftRole;
@@ -45,14 +44,14 @@ public final class RaftNodeReportImpl implements RaftNodeReport {
   private final RaftTerm term;
   private final RaftLogStats log;
   private final Map<RaftEndpoint, Long> heartbeatTimestamps;
-  private final Optional<Long> quorumHeartbeatTimestamp;
-  private final Optional<Long> leaderHeartbeatTimestamp;
+  private final long quorumHeartbeatTimestamp;
+  private final long leaderHeartbeatTimestamp;
 
   public RaftNodeReportImpl(RaftNodeReportReason reason, Object groupId, RaftEndpoint localEndpoint,
     RaftGroupMembers initialMembers, RaftGroupMembers committedMembers,
     RaftGroupMembers effectiveMembers, RaftRole role, RaftNodeStatus status, RaftTerm term,
-    RaftLogStats log, Map<RaftEndpoint, Long> heartbeatTimestamps,
-    Optional<Long> quorumHeartbeatTimestamp, Optional<Long> leaderHeartbeatTimestamp) {
+    RaftLogStats log, Map<RaftEndpoint, Long> heartbeatTimestamps, long quorumHeartbeatTimestamp,
+    long leaderHeartbeatTimestamp) {
     this.reason = requireNonNull(reason);
     this.groupId = requireNonNull(groupId);
     this.localEndpoint = requireNonNull(localEndpoint);
@@ -64,8 +63,8 @@ public final class RaftNodeReportImpl implements RaftNodeReport {
     this.term = requireNonNull(term);
     this.log = requireNonNull(log);
     this.heartbeatTimestamps = requireNonNull(heartbeatTimestamps);
-    this.quorumHeartbeatTimestamp = requireNonNull(quorumHeartbeatTimestamp);
-    this.leaderHeartbeatTimestamp = requireNonNull(leaderHeartbeatTimestamp);
+    this.quorumHeartbeatTimestamp = quorumHeartbeatTimestamp;
+    this.leaderHeartbeatTimestamp = leaderHeartbeatTimestamp;
   }
 
   @NonNull
@@ -134,15 +133,13 @@ public final class RaftNodeReportImpl implements RaftNodeReport {
     return heartbeatTimestamps;
   }
 
-  @NonNull
   @Override
-  public Optional<Long> getQuorumHeartbeatTimestamp() {
+  public long getQuorumHeartbeatTimestamp() {
     return quorumHeartbeatTimestamp;
   }
 
-  @NonNull
   @Override
-  public Optional<Long> getLeaderHeartbeatTimestamp() {
+  public long getLeaderHeartbeatTimestamp() {
     return leaderHeartbeatTimestamp;
   }
 
@@ -153,8 +150,8 @@ public final class RaftNodeReportImpl implements RaftNodeReport {
       + committedMembers + ", effectiveMembers=" + effectiveMembers + ", role=" + role + ", status="
       + status + ", term=" + term + ", log=" + log + ", heartbeatTimestamps=" + heartbeatTimestamps
       + ", quorumHeartbeatTimestamp="
-      + (quorumHeartbeatTimestamp.isPresent() ? quorumHeartbeatTimestamp.get() : "-")
+      + (quorumHeartbeatTimestamp > 0 ? quorumHeartbeatTimestamp : "-")
       + ", leaderHeartbeatTimestamp="
-      + (leaderHeartbeatTimestamp.isPresent() ? leaderHeartbeatTimestamp.get() : "-") + '}';
+      + (leaderHeartbeatTimestamp > 0 ? leaderHeartbeatTimestamp : "-") + '}';
   }
 }

@@ -21,12 +21,18 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
+import org.apache.hbase.thirdparty.com.google.protobuf.UnsafeByteOperations;
 
 /**
  * Default user {@link OperationCodec}: identity over {@code byte[]}.
  * <p>
  * Reserved type id {@code 2}. Use this when callers replicate raw byte payloads (e.g. tests, or
  * when the operation has been pre-serialised by the caller's state machine layer).
+ * <p>
+ * {@link #encode(Object)} uses {@link UnsafeByteOperations#unsafeWrap(byte[])} on the supplied byte
+ * array. Callers MUST treat the byte array passed to {@code encode} as immutable for the lifetime
+ * of the encoded {@link ByteString}. State-machine layers that cannot guarantee this should clone
+ * the buffer before handing it to {@code encode}.
  */
 @InterfaceAudience.Private
 public final class IdentityByteCodec implements OperationCodec {
@@ -49,7 +55,8 @@ public final class IdentityByteCodec implements OperationCodec {
       throw new IllegalArgumentException(
         "IdentityByteCodec only handles byte[] but got " + operation.getClass());
     }
-    return ByteString.copyFrom((byte[]) operation);
+    // See class javadoc: zero-copy wrap; caller relinquishes mutation rights on the byte[].
+    return UnsafeByteOperations.unsafeWrap((byte[]) operation);
   }
 
   @Override

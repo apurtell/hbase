@@ -21,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import org.apache.hadoop.hbase.consensus.raft.executor.RaftNodeExecutor;
 import org.apache.hadoop.hbase.consensus.raft.test.util.TestBase;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
@@ -55,9 +56,8 @@ public class TestMultiGroupExecutorIsolation extends TestBase {
 
     a.execute(() -> {
       aStarted.countDown();
-      try {
-        Thread.sleep(blockMillis);
-      } catch (InterruptedException e) {
+      LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(blockMillis));
+      if (Thread.interrupted()) {
         Thread.currentThread().interrupt();
       }
     });

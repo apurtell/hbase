@@ -21,8 +21,6 @@ import static org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus.INITIAL;
 import static org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus.isTerminal;
 import static org.apache.hadoop.hbase.consensus.raft.RaftRole.LEADER;
 
-import java.time.Duration;
-import java.util.Optional;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftNodeStatus;
 import org.apache.hadoop.hbase.consensus.raft.exception.RaftException;
@@ -38,11 +36,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Scheduled by {@link RaftNodeImpl#query(Object, QueryPolicy, long)} to perform a query on the
- * {@link StateMachine}.
+ * Scheduled by {@link RaftNodeImpl#query(Object, QueryPolicy, long, long)} to perform a query on
+ * the {@link StateMachine}.
  * @see QueryPolicy
  */
 @InterfaceAudience.Private
+@SuppressWarnings("rawtypes")
 public final class QueryTask implements Runnable {
   private static final Logger LOG = LoggerFactory.getLogger(QueryTask.class);
   private final RaftNodeImpl raftNode;
@@ -50,28 +49,30 @@ public final class QueryTask implements Runnable {
   private final Object operation;
   private final QueryPolicy queryPolicy;
   private final long minCommitIndex;
-  private final Optional<Duration> timeout;
+  private final long timeoutMillis;
   private final OrderedFuture future;
 
   public QueryTask(RaftNodeImpl raftNode, Object operation, QueryPolicy policy, long minCommitIndex,
-    Optional<Duration> timeout, OrderedFuture future) {
+    long timeoutMillis, OrderedFuture future) {
     this.raftNode = raftNode;
     this.state = raftNode.state();
     this.operation = operation;
     this.queryPolicy = policy;
     this.minCommitIndex = minCommitIndex;
-    this.timeout = timeout;
+    this.timeoutMillis = timeoutMillis;
     this.future = future;
   }
 
   @Override
   public void run() {
     try {
-      LOG.trace(
-        "TRACE> {} QueryTask.run policy={} operation={} role={} status={} commitIndex={}"
-          + " minCommitIndex={}",
-        raftNode.localEndpointStr(), queryPolicy, operation, state.role(), raftNode.getStatus(),
-        state.commitIndex(), minCommitIndex);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace(
+          "TRACE> {} QueryTask.run policy={} operation={} role={} status={} commitIndex={}"
+            + " minCommitIndex={}",
+          raftNode.localEndpointStr(), queryPolicy, operation, state.role(), raftNode.getStatus(),
+          state.commitIndex(), minCommitIndex);
+      }
       if (!verifyOperation() || !verifyRaftNodeStatus()) {
         return;
       }
@@ -116,18 +117,23 @@ public final class QueryTask implements Runnable {
       LOG.debug(raftNode.localEndpointStr() + " Querying: " + operation + " with policy: "
         + queryPolicy + " in term: " + state.term());
     }
-    raftNode.runOrScheduleQuery(new QueryContainer(operation, future), minCommitIndex, timeout);
+    raftNode.runOrScheduleQuery(new QueryContainer(operation, future), minCommitIndex,
+      timeoutMillis);
   }
 
   private void queryWithLinearizability() {
     if (state.role() != LEADER) {
-      LOG.trace("TRACE> {} queryWithLinearizability NOT LEADER role={}",
-        raftNode.localEndpointStr(), state.role());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("TRACE> {} queryWithLinearizability NOT LEADER role={}",
+          raftNode.localEndpointStr(), state.role());
+      }
       future.fail(raftNode.newNotLeaderException());
       return;
     } else if (!raftNode.canQueryLinearizable()) {
-      LOG.trace("TRACE> {} queryWithLinearizability cannot query linearizable",
-        raftNode.localEndpointStr());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("TRACE> {} queryWithLinearizability cannot query linearizable",
+          raftNode.localEndpointStr());
+      }
       future.fail(raftNode.newCannotReplicateException());
       return;
     }
@@ -138,10 +144,12 @@ public final class QueryTask implements Runnable {
     }
     if (state.logReplicationQuorumSize() > 1) {
       QueryState queryState = state.leaderState().queryState();
-      LOG.trace(
-        "TRACE> {} queryWithLinearizability addQuery commitIndex={} curQsn={} quorumSize={}",
-        raftNode.localEndpointStr(), commitIndex, queryState.querySequenceNumber(),
-        state.logReplicationQuorumSize());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace(
+          "TRACE> {} queryWithLinearizability addQuery commitIndex={} curQsn={} quorumSize={}",
+          raftNode.localEndpointStr(), commitIndex, queryState.querySequenceNumber(),
+          state.logReplicationQuorumSize());
+      }
       if (queryState.addQuery(commitIndex, operation, future)) {
         raftNode.broadcastAppendEntriesRequest();
       }

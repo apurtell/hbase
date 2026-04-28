@@ -54,6 +54,12 @@ public final class DefaultLogStoreSerializer implements LogStoreSerializer {
 
   private final DefaultRaftModelFactory factory;
   private final RaftModelPbCodecs modelCodecs;
+  private final Serializer<RaftGroupMembersView> raftGroupMembersViewSerializer;
+  private final Serializer<RaftEndpoint> raftEndpointSerializer;
+  private final Serializer<LogEntry> logEntrySerializer;
+  private final Serializer<SnapshotChunk> snapshotChunkSerializer;
+  private final Serializer<RaftEndpointPersistentState> raftEndpointPersistentStateSerializer;
+  private final Serializer<RaftTermPersistentState> raftTermPersistentStateSerializer;
 
   public DefaultLogStoreSerializer() {
     this(new DefaultRaftModelFactory(), OperationCodecs.defaultCodecs(),
@@ -64,189 +70,207 @@ public final class DefaultLogStoreSerializer implements LogStoreSerializer {
     @NonNull OperationCodec operationCodec, @NonNull PayloadCompressor compressor) {
     this.factory = factory;
     this.modelCodecs = new RaftModelPbCodecs(factory, operationCodec, compressor);
+    this.raftGroupMembersViewSerializer = new RaftGroupMembersViewSerializer();
+    this.raftEndpointSerializer = new RaftEndpointSerializer();
+    this.logEntrySerializer = new LogEntrySerializer();
+    this.snapshotChunkSerializer = new SnapshotChunkSerializer();
+    this.raftEndpointPersistentStateSerializer = new RaftEndpointPersistentStateSerializer();
+    this.raftTermPersistentStateSerializer = new RaftTermPersistentStateSerializer();
   }
 
   @Override
   public Serializer<RaftGroupMembersView> raftGroupMembersViewSerializer() {
-    return new Serializer<>() {
-      @NonNull
-      @Override
-      public byte[] serialize(@NonNull RaftGroupMembersView element) {
-        return RaftModelPbCodecs.toMembersViewPB(element).toByteArray();
-      }
-
-      @NonNull
-      @Override
-      public RaftGroupMembersView deserialize(@NonNull byte[] element) {
-        try {
-          return modelCodecs
-            .fromMembersViewPB(ConsensusProtos.RaftGroupMembersViewPB.parseFrom(element));
-        } catch (InvalidProtocolBufferException e) {
-          throw new IllegalArgumentException("Malformed RaftGroupMembersViewPB payload", e);
-        }
-      }
-    };
+    return raftGroupMembersViewSerializer;
   }
 
   @Override
   public Serializer<RaftEndpoint> raftEndpointSerializer() {
-    return new Serializer<>() {
-      @NonNull
-      @Override
-      public byte[] serialize(@NonNull RaftEndpoint element) {
-        return RaftModelPbCodecs.toEndpointPB(element).toByteArray();
-      }
-
-      @NonNull
-      @Override
-      public RaftEndpoint deserialize(@NonNull byte[] element) {
-        try {
-          return RaftModelPbCodecs
-            .fromEndpointPB(ConsensusProtos.RaftEndpointPB.parseFrom(element));
-        } catch (InvalidProtocolBufferException e) {
-          throw new IllegalArgumentException("Malformed RaftEndpointPB payload", e);
-        }
-      }
-    };
+    return raftEndpointSerializer;
   }
 
   @Override
   public Serializer<LogEntry> logEntrySerializer() {
-    return new Serializer<>() {
-      @NonNull
-      @Override
-      public byte[] serialize(@NonNull LogEntry element) {
-        return modelCodecs.toLogEntryPB(element).toByteArray();
-      }
-
-      @NonNull
-      @Override
-      public LogEntry deserialize(@NonNull byte[] element) {
-        try {
-          return modelCodecs.fromLogEntryPB(ConsensusProtos.LogEntryPB.parseFrom(element));
-        } catch (InvalidProtocolBufferException e) {
-          throw new IllegalArgumentException("Malformed LogEntryPB payload", e);
-        }
-      }
-    };
+    return logEntrySerializer;
   }
 
   @Override
   public Serializer<SnapshotChunk> snapshotChunkSerializer() {
-    return new Serializer<>() {
-      @NonNull
-      @Override
-      public byte[] serialize(@NonNull SnapshotChunk element) {
-        return modelCodecs.toSnapshotChunkPB(element).toByteArray();
-      }
-
-      @NonNull
-      @Override
-      public SnapshotChunk deserialize(@NonNull byte[] element) {
-        try {
-          return modelCodecs
-            .fromSnapshotChunkPB(ConsensusProtos.SnapshotChunkPB.parseFrom(element));
-        } catch (InvalidProtocolBufferException e) {
-          throw new IllegalArgumentException("Malformed SnapshotChunkPB payload", e);
-        }
-      }
-    };
+    return snapshotChunkSerializer;
   }
 
   @Override
   public Serializer<RaftEndpointPersistentState> raftEndpointPersistentStateSerializer() {
-    return new Serializer<>() {
-      @NonNull
-      @Override
-      public byte[] serialize(@NonNull RaftEndpointPersistentState element) {
-        byte[] idBytes = endpointIdBytes(element.getLocalEndpoint());
-        ByteBuffer buf =
-          ByteBuffer.allocate(StreamUtils.vintSize(idBytes.length) + idBytes.length + 1);
-        StreamUtils.writeRawVInt32(buf, idBytes.length);
-        buf.put(idBytes);
-        buf.put((byte) (element.isVoting() ? 1 : 0));
-        buf.flip();
-        byte[] out = new byte[buf.remaining()];
-        buf.get(out);
-        return out;
-      }
-
-      @NonNull
-      @Override
-      public RaftEndpointPersistentState deserialize(@NonNull byte[] element) {
-        ByteBuffer buf = ByteBuffer.wrap(element);
-        int idLen;
-        try {
-          idLen = StreamUtils.readRawVarint32(buf);
-        } catch (IOException e) {
-          throw new IllegalArgumentException("Malformed RaftEndpointPersistentState payload", e);
-        }
-        if (idLen < 0 || idLen > buf.remaining()) {
-          throw new IllegalArgumentException(
-            "RaftEndpointPersistentState id length out of range: " + idLen);
-        }
-        byte[] id = new byte[idLen];
-        buf.get(id);
-        if (buf.remaining() != 1) {
-          throw new IllegalArgumentException(
-            "RaftEndpointPersistentState trailing voting byte missing or extra bytes present");
-        }
-        boolean voting = buf.get() != 0;
-        RaftEndpoint ep = WireRaftEndpoint.fromBytes(id);
-        return factory.createRaftEndpointPersistentStateBuilder().setLocalEndpoint(ep)
-          .setVoting(voting).build();
-      }
-    };
+    return raftEndpointPersistentStateSerializer;
   }
 
   @Override
   public Serializer<RaftTermPersistentState> raftTermPersistentStateSerializer() {
-    return new Serializer<>() {
-      @NonNull
-      @Override
-      public byte[] serialize(@NonNull RaftTermPersistentState element) {
-        byte[] idBytes =
-          element.getVotedFor() == null ? new byte[0] : endpointIdBytes(element.getVotedFor());
-        long termAsUnsigned = element.getTerm() & 0xFFFFFFFFL;
-        ByteBuffer buf = ByteBuffer.allocate(StreamUtils.vintSize(termAsUnsigned)
-          + StreamUtils.vintSize(idBytes.length) + idBytes.length);
-        StreamUtils.writeRawVInt64(buf, termAsUnsigned);
-        StreamUtils.writeRawVInt32(buf, idBytes.length);
-        buf.put(idBytes);
-        buf.flip();
-        byte[] out = new byte[buf.remaining()];
-        buf.get(out);
-        return out;
-      }
+    return raftTermPersistentStateSerializer;
+  }
 
-      @NonNull
-      @Override
-      public RaftTermPersistentState deserialize(@NonNull byte[] element) {
-        ByteBuffer buf = ByteBuffer.wrap(element);
-        long termLong;
-        int idLen;
-        try {
-          termLong = StreamUtils.readRawVarint64(buf);
-          idLen = StreamUtils.readRawVarint32(buf);
-        } catch (IOException e) {
-          throw new IllegalArgumentException("Malformed RaftTermPersistentState payload", e);
-        }
-        int term = (int) (termLong & 0xFFFFFFFFL);
-        if (idLen < 0 || idLen > buf.remaining()) {
-          throw new IllegalArgumentException(
-            "RaftTermPersistentState voted_for id length out of range: " + idLen);
-        }
-        @Nullable
-        RaftEndpoint votedFor = null;
-        if (idLen > 0) {
-          byte[] id = new byte[idLen];
-          buf.get(id);
-          votedFor = WireRaftEndpoint.fromBytes(id);
-        }
-        return factory.createRaftTermPersistentStateBuilder().setTerm(term).setVotedFor(votedFor)
-          .build();
+  private final class RaftGroupMembersViewSerializer implements Serializer<RaftGroupMembersView> {
+    @NonNull
+    @Override
+    public byte[] serialize(@NonNull RaftGroupMembersView element) {
+      return RaftModelPbCodecs.toMembersViewPB(element).toByteArray();
+    }
+
+    @NonNull
+    @Override
+    public RaftGroupMembersView deserialize(@NonNull byte[] element) {
+      try {
+        return modelCodecs
+          .fromMembersViewPB(ConsensusProtos.RaftGroupMembersViewPB.parseFrom(element));
+      } catch (InvalidProtocolBufferException e) {
+        throw new IllegalArgumentException("Malformed RaftGroupMembersViewPB payload", e);
       }
-    };
+    }
+  }
+
+  private static final class RaftEndpointSerializer implements Serializer<RaftEndpoint> {
+    @NonNull
+    @Override
+    public byte[] serialize(@NonNull RaftEndpoint element) {
+      return RaftModelPbCodecs.toEndpointPB(element).toByteArray();
+    }
+
+    @NonNull
+    @Override
+    public RaftEndpoint deserialize(@NonNull byte[] element) {
+      try {
+        return RaftModelPbCodecs.fromEndpointPB(ConsensusProtos.RaftEndpointPB.parseFrom(element));
+      } catch (InvalidProtocolBufferException e) {
+        throw new IllegalArgumentException("Malformed RaftEndpointPB payload", e);
+      }
+    }
+  }
+
+  private final class LogEntrySerializer implements Serializer<LogEntry> {
+    @NonNull
+    @Override
+    public byte[] serialize(@NonNull LogEntry element) {
+      return modelCodecs.toLogEntryPB(element).toByteArray();
+    }
+
+    @NonNull
+    @Override
+    public LogEntry deserialize(@NonNull byte[] element) {
+      try {
+        return modelCodecs.fromLogEntryPB(ConsensusProtos.LogEntryPB.parseFrom(element));
+      } catch (InvalidProtocolBufferException e) {
+        throw new IllegalArgumentException("Malformed LogEntryPB payload", e);
+      }
+    }
+  }
+
+  private final class SnapshotChunkSerializer implements Serializer<SnapshotChunk> {
+    @NonNull
+    @Override
+    public byte[] serialize(@NonNull SnapshotChunk element) {
+      return modelCodecs.toSnapshotChunkPB(element).toByteArray();
+    }
+
+    @NonNull
+    @Override
+    public SnapshotChunk deserialize(@NonNull byte[] element) {
+      try {
+        return modelCodecs.fromSnapshotChunkPB(ConsensusProtos.SnapshotChunkPB.parseFrom(element));
+      } catch (InvalidProtocolBufferException e) {
+        throw new IllegalArgumentException("Malformed SnapshotChunkPB payload", e);
+      }
+    }
+  }
+
+  private final class RaftEndpointPersistentStateSerializer
+    implements Serializer<RaftEndpointPersistentState> {
+    @NonNull
+    @Override
+    public byte[] serialize(@NonNull RaftEndpointPersistentState element) {
+      byte[] idBytes = endpointIdBytes(element.getLocalEndpoint());
+      ByteBuffer buf =
+        ByteBuffer.allocate(StreamUtils.vintSize(idBytes.length) + idBytes.length + 1);
+      StreamUtils.writeRawVInt32(buf, idBytes.length);
+      buf.put(idBytes);
+      buf.put((byte) (element.isVoting() ? 1 : 0));
+      buf.flip();
+      byte[] out = new byte[buf.remaining()];
+      buf.get(out);
+      return out;
+    }
+
+    @NonNull
+    @Override
+    public RaftEndpointPersistentState deserialize(@NonNull byte[] element) {
+      ByteBuffer buf = ByteBuffer.wrap(element);
+      int idLen;
+      try {
+        idLen = StreamUtils.readRawVarint32(buf);
+      } catch (IOException e) {
+        throw new IllegalArgumentException("Malformed RaftEndpointPersistentState payload", e);
+      }
+      if (idLen < 0 || idLen > buf.remaining()) {
+        throw new IllegalArgumentException(
+          "RaftEndpointPersistentState id length out of range: " + idLen);
+      }
+      byte[] id = new byte[idLen];
+      buf.get(id);
+      if (buf.remaining() != 1) {
+        throw new IllegalArgumentException(
+          "RaftEndpointPersistentState trailing voting byte missing or extra bytes present");
+      }
+      boolean voting = buf.get() != 0;
+      RaftEndpoint ep = WireRaftEndpoint.fromBytes(id);
+      return factory.createRaftEndpointPersistentStateBuilder().setLocalEndpoint(ep)
+        .setVoting(voting).build();
+    }
+  }
+
+  private final class RaftTermPersistentStateSerializer
+    implements Serializer<RaftTermPersistentState> {
+    @NonNull
+    @Override
+    public byte[] serialize(@NonNull RaftTermPersistentState element) {
+      byte[] idBytes =
+        element.getVotedFor() == null ? new byte[0] : endpointIdBytes(element.getVotedFor());
+      long termAsUnsigned = element.getTerm() & 0xFFFFFFFFL;
+      ByteBuffer buf = ByteBuffer.allocate(StreamUtils.vintSize(termAsUnsigned)
+        + StreamUtils.vintSize(idBytes.length) + idBytes.length);
+      StreamUtils.writeRawVInt64(buf, termAsUnsigned);
+      StreamUtils.writeRawVInt32(buf, idBytes.length);
+      buf.put(idBytes);
+      buf.flip();
+      byte[] out = new byte[buf.remaining()];
+      buf.get(out);
+      return out;
+    }
+
+    @NonNull
+    @Override
+    public RaftTermPersistentState deserialize(@NonNull byte[] element) {
+      ByteBuffer buf = ByteBuffer.wrap(element);
+      long termLong;
+      int idLen;
+      try {
+        termLong = StreamUtils.readRawVarint64(buf);
+        idLen = StreamUtils.readRawVarint32(buf);
+      } catch (IOException e) {
+        throw new IllegalArgumentException("Malformed RaftTermPersistentState payload", e);
+      }
+      int term = (int) (termLong & 0xFFFFFFFFL);
+      if (idLen < 0 || idLen > buf.remaining()) {
+        throw new IllegalArgumentException(
+          "RaftTermPersistentState voted_for id length out of range: " + idLen);
+      }
+      @Nullable
+      RaftEndpoint votedFor = null;
+      if (idLen > 0) {
+        byte[] id = new byte[idLen];
+        buf.get(id);
+        votedFor = WireRaftEndpoint.fromBytes(id);
+      }
+      return factory.createRaftTermPersistentStateBuilder().setTerm(term).setVotedFor(votedFor)
+        .build();
+    }
   }
 
   private static byte[] endpointIdBytes(RaftEndpoint endpoint) {

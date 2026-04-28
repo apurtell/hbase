@@ -22,7 +22,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletionException;
 import org.apache.hadoop.hbase.consensus.raft.QueryPolicy;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
@@ -94,7 +93,7 @@ public class TestNetworkPartition extends TestBase {
       assertThat(firstLeader.getTerm().getLeaderEndpoint())
         .isEqualTo(secondLeader.getLocalEndpoint());
       String value = firstLeader.<String> query(SimpleStateMachine.queryLastValue(),
-        QueryPolicy.EVENTUAL_CONSISTENCY, Optional.empty(), Optional.empty()).join().getResult();
+        QueryPolicy.EVENTUAL_CONSISTENCY, 0L, 0L).join().getResult();
       assertThat(value).isEqualTo(value2);
     });
   }

@@ -59,6 +59,20 @@ public interface RaftNodeExecutor {
   void execute(@NonNull Runnable task);
 
   /**
+   * Executes a latency-sensitive ("control-class") task — vote / pre-vote / heartbeat /
+   * heartbeat-ack handlers that must not be head-of-line blocked behind bulk
+   * {@code AppendEntriesRequest} work under high group counts.
+   * <p>
+   * Implementations are free to route control tasks through a dedicated lane or priority mechanism.
+   * The default delegates to {@link #execute(Runnable)} so single-lane implementations (e.g.
+   * {@code DefaultRaftNodeExecutor}, in-test fixtures, {@code LocalTransport}) keep their existing
+   * FIFO semantics.
+   */
+  default void executeControl(@NonNull Runnable task) {
+    execute(task);
+  }
+
+  /**
    * Submits the given task for execution.
    * <p>
    * If the caller is already on the thread that runs the Raft node, the given task cannot be
@@ -75,4 +89,16 @@ public interface RaftNodeExecutor {
    * between given tasks of the Raft node.
    */
   void schedule(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit);
+
+  /**
+   * Schedules a latency-sensitive ("control-class") task to be executed after the given delay. The
+   * canonical caller is the periodic heartbeat tick. Both its leader-side firing of
+   * {@link org.apache.hadoop.hbase.consensus.raft.model.message.LeaderHeartbeat LeaderHeartbeat}s
+   * and its follower-side election-timer check must not be head-of-line blocked behind a bulk burst
+   * of {@link org.apache.hadoop.hbase.consensus.raft.model.message.AppendEntriesRequest
+   * AppendEntriesRequest}s on the per-group mailbox.
+   */
+  default void scheduleControl(@NonNull Runnable task, long delay, @NonNull TimeUnit timeUnit) {
+    schedule(task, delay, timeUnit);
+  }
 }
