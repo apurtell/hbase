@@ -22,7 +22,7 @@ Safety properties (expressed with `[]`) assert that bad things never happen. Tho
 
 Liveness properties (expressed with `<>` and `~>`) assert that good things eventually happen. Liveness requires fairness conditions, the assumption that the system does not indefinitely starve enabled actions.
 
-In TLA+, a single step of the system is an action, a predicate over the current  state and the next state. The `Next` relation is the disjunction of all actions, meaning that at each step, any enabled action may fire. This naturally models the non-determinism inherent in distributed systems: message arrival order, scheduling decisions, and failure timing are all left unspecified, so the model checker explores every possible interleaving.
+In TLA+, a single step of the system is an action, a predicate over the current state and the next state. The `Next` relation is the disjunction of all actions, meaning that at each step, any enabled action may fire. This naturally models the non-determinism inherent in distributed systems. Message arrival order, scheduling decisions, and failure timing are all left unspecified, so the model checker explores every possible interleaving.
 
 ## Overview
 
@@ -33,7 +33,7 @@ The base spec exports parameterized building-block operators that collect all si
 Dual-group compositions (`MultiGroupRaftRegionReplica.tla` and `MergeRaftRegionReplica.tla`) share common infrastructure via `DualGroupBase.tla`, which provides per-group variable declarations, INSTANCE blocks, variable tuples, and the `PerGroupSafety` invariant. Single-group MC configurations share common constants via `MCRaftRegionReplica_base.tla`.
 
 The specification intentionally abstracts several features of `hbase-consensus` that do not change the safety / liveness story at this level. These are documented in detail in the spec header (`RaftRegionReplica.tla`, "Implementation features intentionally abstracted") and listed here for orientation:
-- The wire-level distinction between `LeaderHeartbeat` (lightweight, steady-state liveness) and `AppendEntriesRequest` (log replication, snapshot trigger, `matchIndex` discovery, membership-op preparation): the spec has a single atomic `LeaderHeartbeat` action that simultaneously resets responder election timers and refreshes the leader's lease. The implementation splits the round across two wire messages (`LeaderHeartbeat` broadcast + per-follower `LeaderHeartbeatAck`) for performance, but at this abstraction level the round must be modeled atomically because the `LeaseExpiresBeforeElection` argument requires the lease refresh and follower timer-resets to be causally bound by the same round-trip. Log replication is folded into the atomic `RAFTCommitWrite` / `FlushRAFTPropose` / `ProposeMarker` actions.
+- The wire-level distinction between `LeaderHeartbeat` (lightweight, steady-state liveness) and `AppendEntriesRequest` (log replication, snapshot trigger, `matchIndex` discovery, membership-op preparation). The spec has a single atomic `LeaderHeartbeat` action that simultaneously resets responder election timers and refreshes the leader's lease. The implementation splits the round across two wire messages (`LeaderHeartbeat` broadcast + per-follower `LeaderHeartbeatAck`) for performance, but at this abstraction level the round must be modeled atomically because the `LeaseExpiresBeforeElection` argument requires the lease refresh and follower timer-resets to be causally bound by the same round-trip. Log replication is folded into the atomic `RAFTCommitWrite` / `FlushRAFTPropose` / `ProposeMarker` actions.
 - The `lastVerifiedLogIndex` clamp on commit-index advancement from heartbeats — unnecessary at this abstraction level because `RAFTCommitWrite` is atomic.
 - Linearizable queries (`QueryState`, `querySequenceNumber`, the fail-pending-and-bump-QSN-on-leader-self-removal handling). Reads do not flow through the consensus layer in the spec.
 - `REMOVE_MEMBER` / `ADD_LEARNER` / `ADD_OR_PROMOTE_TO_FOLLOWER` `UpdateRaftGroupMembersOp` entries as replicated log entries, including leader self-removal that drives the node into `RaftNodeStatus.TERMINATED`. Membership in the spec is the static `CONSTANT Members` set.
@@ -76,26 +76,26 @@ The specification also defines 6 liveness properties checked under fairness cons
 | 5 | `CatchUpCompletion` | `LiveSpecLocal` | A catching-up follower eventually finishes |
 | 6 | `EventualWake` | `LiveSpecLocal` | A quiescent leader eventually wakes (Wake fires) or transitions out of leadership |
 
-Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-6 are local and require only weak fairness (WF) on local actions — network instability cannot block them.  `EventualWake` is in this category because `Wake` and `LeaderKeepalive` are local actions; `BaseFairness` includes `WF_vars(Wake(m))` and `WF_vars(LeaderKeepalive(m))`.
+Properties 1-3 are network-dependent and require strong fairness (SF) on network recovery and RAFT communication actions.  Properties 4-6 are local and require only weak fairness (WF) on local actions, since network instability cannot block them.  `EventualWake` is in this category because `Wake` and `LeaderKeepalive` are local actions.  `BaseFairness` includes `WF_vars(Wake(m))` and `WF_vars(LeaderKeepalive(m))`.
 
-Fairness is factored into `BaseFairness` (WF for the 19 local actions, including `MasterConfirmPromotion`, `Wake`, and `LeaderKeepalive`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)` — a deterministic action that forces full network recovery — rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
+Fairness is factored into `BaseFairness` (WF for the 19 local actions, including `MasterConfirmPromotion`, `Wake`, and `LeaderKeepalive`) plus per-property SF additions (`ElectionSF`, `WriteSF`, `FlushSF`).  Network recovery uses `SF_vars(HealAllPartitions)`, a deterministic action that forces full network recovery, rather than `SF_vars(HealPartition)`, because `HealPartition`'s internal `\E` nondeterminism allows TLC to always heal the same unhelpful link while leaving other members isolated.
 
 ### Idle-group quiescence
 
-The specification models idle-group quiescence (see the `Quiesce`, `Wake`, and `LeaderKeepalive` actions in the spec header).  When a leader's group is fully caught up and the lease is valid, `Quiesce` atomically marks the leader and every reachable responder quiescent, the leader's lease is refreshed one final time, and per-group `LeaderHeartbeat` actions stop firing.  Per-tick failure detection switches to the per-server `LeaderKeepalive` action that refreshes the leader's lease and resets responders' election timers without touching per-group state.  Any leader-side propose action (`BeginWrite`, `ProposeMarker`, `FlushStart`, `ProposeSplitMarker`, `ProposeMergeMarker_*`) is gated on `~groupQuiescent[leader]` and the leader must explicitly `Wake` first; `Wake` is also the only path that clears `groupQuiescent` and `laggingOnQuiesce` in steady state.  Crash-restart, role transitions (`Timeout`, `RequestVote`, `BecomeLeader`, `StepDown`, `LeaderLeaseExpiry`), and partition healing all reset `groupQuiescent` to `FALSE` on the affected member.
+The specification models idle-group quiescence (see the `Quiesce`, `Wake`, and `LeaderKeepalive` actions in the spec header).  When a leader's group is fully caught up and the lease is valid, `Quiesce` atomically marks the leader and every reachable responder quiescent, the leader's lease is refreshed one final time, and per-group `LeaderHeartbeat` actions stop firing.  Per-tick failure detection switches to the per-server `LeaderKeepalive` action that refreshes the leader's lease and resets responders' election timers without touching per-group state.  Any leader-side propose action (`BeginWrite`, `ProposeMarker`, `FlushStart`, `ProposeSplitMarker`, `ProposeMergeMarker_*`) is gated on `~groupQuiescent[leader]` and the leader must explicitly `Wake` first.  `Wake` is also the only path that clears `groupQuiescent` and `laggingOnQuiesce` in steady state.  Crash-restart, role transitions (`Timeout`, `RequestVote`, `BecomeLeader`, `StepDown`, `LeaderLeaseExpiry`), and partition healing all reset `groupQuiescent` to `FALSE` on the affected member.
 
 The five new safety invariants capture the implementation contract:
 - `QuiesceImpliesAllAcked` — for a quiescent leader, every quiescent responder agrees with the leader on the committed prefix of the RAFT log.
 - `QuiesceImpliesNoPendingWrite` — no in-flight write on a quiescent leader.
 - `QuiesceImpliesIdleFlush` — no in-flight flush on a quiescent leader.
 - `QuiesceImpliesTermConsistency` — every quiescent member agrees with the quiescent leader on `currentTerm`.
-- `WakeBeforePropose` — propose-pipeline state (write Pending/Applied, flush FlushStarted/HFilesCommitted/RAFTProposed/RAFTCommitted) is unreachable while the leader is quiescent; every propose path goes through `Wake` first.
+- `WakeBeforePropose` — propose-pipeline state is unreachable while the leader is quiescent. Every propose path goes through `Wake` first.
 
-`EventualWake` (liveness) ensures a quiescent leader eventually unquiesces (via `Wake`, role transition, or lease expiry); without it, weak fairness on `Wake` would not exclude infinite-quiescence executions.
+`EventualWake` (liveness) ensures a quiescent leader eventually unquiesces.  Without it, weak fairness on `Wake` would not exclude infinite-quiescence executions.
 
 ## Latest Results
 
-The table below reflects the most recent run on the merged spec (with idle-group quiescence integrated into the base spec and all five quiescence invariants wired into every safety configuration).  Numbers without an explicit timestamp note are pre-quiescence baselines retained for reference; quiescence runs are scheduled after the implementation lands.
+The table below reflects the most recent run on the merged spec.  Numbers without an explicit timestamp note are pre-quiescence baselines retained for reference.  Quiescence runs are scheduled after the implementation lands.
 
 | # | Configuration | Module (+ config file) | States generated | Wall time | Result |
 |---|---|---|---|---|---|
@@ -113,7 +113,7 @@ The table below reflects the most recent run on the merged spec (with idle-group
 | 12 | Liveness: catchup | `MCRaftRegionReplica_liveness` (`_liveness_catchup.cfg`) | 106,405,908 | 15m | Pass (pre-quiescence) |
 | 13 | Liveness: quiescence | `MCRaftRegionReplica_liveness` (`_liveness_quiescence.cfg`) | TBD | TBD | TBD (`EventualWake`) |
 
-Across the twelve pre-quiescence configurations, approximately 5.17 billion distinct states were explored with no invariant violations and no liveness counterexamples.  After merging the quiescence model the merged spec passes SANY parsing on every module and a 3-second simulation smoke run on `MCRaftRegionReplica.cfg` (≈119k states) without any invariant violation.  Full re-runs of all 12+1 configurations are scheduled as part of the build-verify task; results will be back-filled into this table when complete.
+Across the twelve pre-quiescence configurations, approximately 5.17 billion distinct states were explored with no invariant violations and no liveness counterexamples.  After merging the quiescence model the merged spec passes SANY parsing on every module and a 3-second simulation smoke run on `MCRaftRegionReplica.cfg` (≈119k states) without any invariant violation.  Full re-runs of all 12+1 configurations are scheduled as part of the build-verify task.  Results will be back-filled into this table when complete.
 
 ## Verification Strategy
 
@@ -131,7 +131,7 @@ Splits the exhaustive state space into two domains that can run concurrently, co
 
 #### Datapath Domain (`MCRaftRegionReplica_datapath`)
 
-This domain retains full data-path depth (MaxSeqId = 3) while collapsing the timing dimension: MaxClockDrift = 0 forces all member clocks to advance in lockstep, and ElectionTimeoutMin and MaxClock are reduced to 2 accordingly (the lease inequality 1 < 2 - 0 still holds). Partitions are constrained to at most one link failure.
+This domain retains full data-path depth (MaxSeqId = 3) while collapsing the timing dimension. MaxClockDrift = 0 forces all member clocks to advance in lockstep, and ElectionTimeoutMin and MaxClock are reduced to 2 accordingly. Partitions are constrained to at most one link failure.
 
 #### Election Domain (`MCRaftRegionReplica_election`)
 
@@ -139,7 +139,7 @@ This domain preserves full timing parameters (MaxClockDrift = 1, ElectionTimeout
 
 ### Multi-Group (`MCRaftRegionReplica_multigroup`)
 
-Verifies that two RAFT groups sharing the same ConsensusServer (clock, network, unified log) do not violate each other's safety invariants.  Uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared-impact actions (ClockTick, CrashRestart, Create/HealPartition) using factored guard + effect operators and a `UnifiedLogGC` action modeling cross-group log segment deletion.  Group 1 is designated as the META group and Group 2 as a non-META group.  Group 2's `MasterConfirmPromotion` is gated on `MetaReady` (a derived operator: true when some G1 member has `promotionPhase = "Complete"`), modeling the META availability ordering constraint from the design document's "META Region Self-Promotion Bootstrap" section.  Group 1 uses the base spec's `MasterConfirmPromotion` unmodified (the master confirms META via an in-memory-only path with no META write dependency).  META promotion ordering is structural (enforced by the gate), not a state-based invariant.  All 14 invariants are checked per-group; `CatchUpDataIntegrity` is the key cross-group invariant verifying that unified log GC does not delete entries needed for catch-up.
+Verifies that two RAFT groups sharing the same ConsensusServer (clock, network, unified log) do not violate each other's safety invariants.  Uses `MultiGroupRaftRegionReplica.tla`, which composes two INSTANCE copies of the base spec with shared-impact actions using factored guard + effect operators and a `UnifiedLogGC` action modeling cross-group log segment deletion.  Group 1 is designated as the META group and Group 2 as a non-META group.  Group 2's `MasterConfirmPromotion` is gated on `MetaReady`, modeling the META availability ordering constraint from the design document's "META Region Self-Promotion Bootstrap" section.  Group 1 uses the base spec's `MasterConfirmPromotion` unmodified. META promotion ordering is enforced by the gate not a state-based invariant. All 14 invariants are checked per-group.  `CatchUpDataIntegrity` is the key cross-group invariant verifying that unified log GC does not delete entries needed for catch-up.
 
 The two-group cross-product produces a large state space.  Exhaustive BFS requires a large machine.  Simulation mode provides high-confidence coverage locally.
 
@@ -199,7 +199,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ### Step 5: Multi-Group Exhaustive
 
-BFS proof of multi-group safety.  The two-group cross-product produces billions of distinct states; requires a large machine.
+BFS proof of multi-group safety.  The two-group cross-product produces billions of distinct states and requires a large machine.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -208,7 +208,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ### Step 6: Split Lifecycle Simulation (30 min, local)
 
-Verify that the region split protocol preserves `NoKeyRangeOverlap` and all 14 parent-group safety invariants.  Uses `SplitRaftRegionReplica.tla`, which gates the parent group's write path and RAFT operations per-member after the split marker is applied (write-closure).  The parent's read path (frozen-parent read continuation) is not modeled because Timeline reads do not flow through the consensus layer; `NoKeyRangeOverlap` constrains write-active groups only.
+Verify that the region split protocol preserves `NoKeyRangeOverlap` and all 14 parent-group safety invariants.  Uses `SplitRaftRegionReplica.tla`, which gates the parent group's write path and RAFT operations per-member after the split marker is applied. The parent's read path is not modeled because Timeline reads do not flow through the consensus layer.  `NoKeyRangeOverlap` constrains write-active groups only.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -218,7 +218,7 @@ java -XX:+UseParallelGC -cp tla2tools.jar \
 
 ### Step 7: Merge Lifecycle Simulation (30 min, local)
 
-Verify that the region merge protocol preserves `NoKeyRangeOverlapMerge` and all 14 per-group safety invariants for both parent groups.  Uses `MergeRaftRegionReplica.tla`, which gates each parent group's write path and RAFT operations independently after their respective merge markers are applied (write-closure).  As with split, the frozen-parent read continuation is not modeled; `NoKeyRangeOverlapMerge` constrains write-active groups only.
+Verify that the region merge protocol preserves `NoKeyRangeOverlapMerge` and all 14 per-group safety invariants for both parent groups.  Uses `MergeRaftRegionReplica.tla`, which gates each parent group's write path and RAFT operations independently after their respective merge markers are applied. As with split, the frozen-parent read continuation is not modeled.  `NoKeyRangeOverlapMerge` constrains write-active groups only.
 
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar \
@@ -324,7 +324,7 @@ java -XX:+UseParallelGC -Xmx8g -cp tla2tools.jar \
 
 `GroupExecutorFairness.tla` is a standalone, single-group model of the two-lane (control / bulk) `GroupExecutor` mailbox in `GroupExecutor.java`. It models bounded producers, per-task `ServiceCost` (wall-clock), the cap-then-resubmit drain rule (up to `ControlBatchCap` control tasks per pass before yielding to up to `BulkBatchCap` bulk tasks, then re-submitting the drain runnable if either lane has remaining work), and a `headArrival` bit on every enqueue marking tasks that found an empty lane mailbox at enqueue time. Both the JCTools `MpscUnboundedArrayQueue` semantics and the single-threaded drain critical section are abstracted into the same shape the implementation actually uses.
 
-Composition with `RaftRegionReplica.tla` is by *assumption*, not `INSTANCE`: the consensus spec models per-group message dispatch as atomic actions and assumes mailbox handoff is "fast enough" relative to `leaderHeartbeatTimeoutMillis`. `GroupExecutorFairness.tla` proves a tight value for that "fast enough" — `BoundedControlLatency(L)` with `L = BulkBatchCap × ServiceCost` for *head-arrival* control tasks (those that find an empty control mailbox at enqueue) — that the implementation must respect. The bound is asymmetric: head-arrival control-lane wait is bounded by the bulk burst cost, and head-arrival bulk-lane wait is bounded by the control burst cost. Tasks queued behind earlier head-of-line peers in the same lane have an unbounded queue-depth-dominated wait and are not what the cap-then-resubmit rule is designed to bound. As long as the configured `hbase.consensus.executor.control.batch.cap` plus the worst-case observed bulk-task wallclock keeps the head-arrival p99 well below `leaderHeartbeatTimeoutMillis / 4`, the leader-election liveness story in the main spec carries over at high group counts.
+Composition with `RaftRegionReplica.tla` is by *assumption*, not `INSTANCE`. The consensus spec models per-group message dispatch as atomic actions and assumes mailbox handoff is "fast enough" relative to `leaderHeartbeatTimeoutMillis`. `GroupExecutorFairness.tla` proves a tight value for that "fast enough", namely `BoundedControlLatency(L)` with `L = BulkBatchCap × ServiceCost` for *head-arrival* control tasks, that the implementation must respect. The bound is asymmetric. Head-arrival control-lane wait is bounded by the bulk burst cost, and head-arrival bulk-lane wait is bounded by the control burst cost. Tasks queued behind earlier head-of-line peers in the same lane have an unbounded queue-depth-dominated wait and are not what the cap-then-resubmit rule is designed to bound. As long as the configured `hbase.consensus.executor.control.batch.cap` plus the worst-case observed bulk-task wallclock keeps the head-arrival p99 well below `leaderHeartbeatTimeoutMillis / 4`, the leader-election liveness story in the main spec carries over at high group counts.
 
 | Configuration | Module | Constants | Purpose | States | Result |
 |---|---|---|---|---|---|
@@ -336,19 +336,19 @@ Composition with `RaftRegionReplica.tla` is by *assumption*, not `INSTANCE`: the
 The verification fed three concrete decisions back into the implementation plan:
 
 1. **The tight bound is `BulkBatchCap × ServiceCost` (not `ControlBatchCap × ServiceCost`)** — the asymmetric drain rule means the control lane's head-arrival wait is set by *bulk-burst tail*, not by the control batch cap. Bounding the worst-case bulk-task wallclock (chunking long-running handlers) is therefore the primary lever for control-lane latency. A symmetric bound on the bulk lane (`ControlBatchCap × ServiceCost`) follows automatically.
-2. **The bound applies only to *head-arrival* tasks** — control tasks queued behind earlier control peers have an unbounded queue-depth-dominated wait (FIFO, `k × ServiceCost` for `k` tasks ahead). The model marks every enqueue with a `headArrival` flag and restricts `BoundedControlLatency` to `headArrival = TRUE`; any operational measurement of "control mailbox latency" must distinguish the two populations the same way to be comparable to the proved bound.
+2. **The bound applies only to *head-arrival* tasks** — control tasks queued behind earlier control peers have an unbounded queue-depth-dominated wait (FIFO, `k × ServiceCost` for `k` tasks ahead). The model marks every enqueue with a `headArrival` flag and restricts `BoundedControlLatency` to `headArrival = TRUE`. Any operational measurement of "control mailbox latency" must distinguish the two populations the same way to be comparable to the proved bound.
 3. **Default `hbase.consensus.executor.control.batch.cap = 32`** — pinned by the `BulkBatchCap × ServiceCost` analysis on realistic constants. With `BulkBatchCap = 64` (`hbase.consensus.executor.drain.batch.cap`) and bulk-task wallclock budgeted at ~1 ms (chunked) the proved head-arrival bound stays well within the `leaderHeartbeatTimeoutMillis / 4` operational budget for control-lane latency.
 
 #### Counterexample log
 
-The TLC iteration that produced the model also produced a small list of "would-have-been-bug" traces. All were closed by tightening the model rather than the implementation; none required a Java code change.
+The TLC iteration that produced the model also produced a small list of "would-have-been-bug" traces. All were closed by tightening the model rather than the implementation, and none required a Java code change.
 
 | # | Counterexample | Triage | Fix |
 |---|---|---|---|
 | 1 | `ServiceControlTask` / `ServiceBulkTask` / `EnterBulkPhase` could fire from the idle (no-latch-held) state. | Modeling artifact — the implementation's drain body only runs while `drainLock` is held. | Added `draining` precondition to `ControlDrainable` and `BulkDrainable`. |
-| 2 | `TypeOK` failed because `serviceUntil = clock + ServiceCost` could exceed `MaxClock` when service started at `clock = MaxClock`. | Modeling artifact — the type bound was too tight at the horizon. | Widened `serviceUntil` type bound to `0..(MaxClock + ServiceCost)`; `MaxClockHonoursDrain` constraint pins the model horizon so no started-but-unfinished drain wedges the model at the boundary. |
-| 3 | `BoundedControlLatency` was violated for any `L` under deep control-lane backlog. | Real semantic gap — the cap-then-resubmit rule does NOT bound wait for tasks queued behind earlier control peers. The bound applies only to *head-arrival* tasks (those that find an empty control mailbox at enqueue). | Added `headArrival : BOOLEAN` to `TaskRec` / `DeliveredRec`; restricted `BoundedControlLatency` to `headArrival = TRUE`. |
-| 4 | Loose `L = ControlBatchCap × ServiceCost` was conservative but not tight; TLC found the tight `L = BulkBatchCap × ServiceCost`. | Real refinement — the asymmetric drain rule means the control lane's wait is bounded by the bulk burst cost, not the control batch cap. | Updated module header and `BoundedControlLatency` rationale to reflect that the bulk batch cap, not the control batch cap, is the lever for control head-arrival latency. |
+| 2 | `TypeOK` failed because `serviceUntil = clock + ServiceCost` could exceed `MaxClock` when service started at `clock = MaxClock`. | Modeling artifact — the type bound was too tight at the horizon. | Widened `serviceUntil` type bound to `0..(MaxClock + ServiceCost)`. The `MaxClockHonoursDrain` constraint pins the model horizon so no started-but-unfinished drain wedges the model at the boundary. |
+| 3 | `BoundedControlLatency` was violated for any `L` under deep control-lane backlog. | Real semantic gap — the cap-then-resubmit rule does NOT bound wait for tasks queued behind earlier control peers. The bound applies only to *head-arrival* tasks (those that find an empty control mailbox at enqueue). | Added `headArrival : BOOLEAN` to `TaskRec` / `DeliveredRec` and restricted `BoundedControlLatency` to `headArrival = TRUE`. |
+| 4 | Loose `L = ControlBatchCap × ServiceCost` was conservative but not tight. TLC found the tight `L = BulkBatchCap × ServiceCost`. | Real refinement — the asymmetric drain rule means the control lane's wait is bounded by the bulk burst cost, not the control batch cap. | Updated module header and `BoundedControlLatency` rationale to reflect that the bulk batch cap, not the control batch cap, is the lever for control head-arrival latency. |
 
 #### Running
 
