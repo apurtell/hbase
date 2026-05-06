@@ -805,6 +805,25 @@ public final class RaftNodeImpl implements RaftNode {
       }
       return;
     }
+    // Reserve credit for the deserialized payload bytes this message pins on the heap before we
+    // queue it on the per-group executor. This bounds the worst-case mailbox footprint of every
+    // role on the host against the same server-wide budget the leader side propose path already
+    // borrows from. On rejection the message is dropped silently. The leader will retry on the
+    // next heartbeat driven catch up tick and will succeed once the follower drains its in-flight
+    // payloads. The gate is restricted to payload-bearing message kinds. Control traffic is
+    // constant size and never enters the credit accounting. Gating it would couple admission
+    // failures to the leader election critical path.
+    long inboundBytes = 0L;
+    if (isPayloadBearing(message)) {
+      inboundBytes = inboundPayloadBytes(message);
+      if (inboundBytes > 0L && !pendingBytesBudget.tryAcquire(inboundBytes)) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("{} dropping inbound {} ({} bytes) due to PendingBytesBudget exhaustion",
+            localEndpointStr, message.getClass().getSimpleName(), inboundBytes);
+        }
+        return;
+      }
+    }
     Runnable handler;
     if (message instanceof AppendEntriesRequest) {
       handler = new AppendEntriesRequestHandler(this, (AppendEntriesRequest) message);
@@ -829,17 +848,106 @@ public final class RaftNodeImpl implements RaftNode {
     } else if (message instanceof TriggerLeaderElectionRequest) {
       handler = new TriggerLeaderElectionHandler(this, (TriggerLeaderElectionRequest) message);
     } else {
+      if (inboundBytes > 0L) {
+        pendingBytesBudget.release(inboundBytes);
+      }
       throw new IllegalArgumentException("Invalid Raft msg: " + message);
     }
+    Runnable wrapped = inboundBytes > 0L
+      ? new InboundCreditReleasingRunnable(handler, pendingBytesBudget, inboundBytes)
+      : handler;
+    boolean submitted = false;
     try {
       if (isControlLaneMessage(message)) {
-        executor.executeControl(handler);
+        executor.executeControl(wrapped);
       } else {
-        executor.execute(handler);
+        executor.execute(wrapped);
       }
+      submitted = true;
     } catch (Throwable t) {
       if (LOG.isDebugEnabled()) {
         LOG.error(localEndpointStr + " could not handle " + message, t);
+      }
+    } finally {
+      if (!submitted && inboundBytes > 0L) {
+        pendingBytesBudget.release(inboundBytes);
+      }
+    }
+  }
+
+  /**
+   * Returns {@code true} if {@code message} is a payload-bearing message kind that the inbound
+   * admission gate must consult. Only {@link AppendEntriesRequest} (which carries log entry
+   * payloads) and {@link InstallSnapshotRequest} (which carries snapshot chunk payloads) are
+   * payload-bearing. Every other Raft message is constant-size control traffic and bypasses the
+   * gate so an exhausted budget cannot couple to the leader-election critical path.
+   * <p>
+   * Visible for unit tests that pin down the gate's surface area.
+   */
+  public static boolean isPayloadBearing(@NonNull RaftMessage message) {
+    return message instanceof AppendEntriesRequest || message instanceof InstallSnapshotRequest;
+  }
+
+  /**
+   * Returns the deserialized payload byte footprint of {@code message} that pins heap once the
+   * message has been parsed off the wire and is awaiting (or undergoing) handling on the per-group
+   * executor. Only meaningful for payload-bearing messages (see
+   * {@link #isPayloadBearing(RaftMessage)}). Returns {@code 0} for any other message kind.
+   * <p>
+   * This counts only the dominant heap-pinned bytes: log entry {@code byte[]} operations carried by
+   * an {@link AppendEntriesRequest} batch, and the {@code byte[]} operation of any snapshot chunk
+   * on an {@link InstallSnapshotRequest}. Entries / chunks whose operation is not a {@code byte[]}
+   * (e.g. {@code RaftGroupOp}) contribute {@code 0}, matching the leader-side propose accountant.
+   * <p>
+   * Visible for unit tests that exercise the inbound admission gate.
+   */
+  public static long inboundPayloadBytes(@NonNull RaftMessage message) {
+    if (message instanceof AppendEntriesRequest) {
+      AppendEntriesRequest req = (AppendEntriesRequest) message;
+      long total = 0L;
+      for (LogEntry e : req.getLogEntries()) {
+        Object op = e.getOperation();
+        if (op instanceof byte[]) {
+          total += ((byte[]) op).length;
+        }
+      }
+      return total;
+    }
+    if (message instanceof InstallSnapshotRequest) {
+      SnapshotChunk chunk = ((InstallSnapshotRequest) message).getSnapshotChunk();
+      if (chunk != null) {
+        Object op = chunk.getOperation();
+        if (op instanceof byte[]) {
+          return ((byte[]) op).length;
+        }
+      }
+      return 0L;
+    }
+    return 0L;
+  }
+
+  /**
+   * Wraps a per-message handler so the credit reserved at admission time is returned to the
+   * server-wide {@link PendingBytesBudget} as soon as the handler finishes normally or
+   * exceptionally.
+   */
+  private static final class InboundCreditReleasingRunnable implements Runnable {
+    private final Runnable delegate;
+    private final PendingBytesBudget budget;
+    private final long bytes;
+
+    InboundCreditReleasingRunnable(Runnable delegate, PendingBytesBudget budget, long bytes) {
+      this.delegate = delegate;
+      this.budget = budget;
+      this.bytes = bytes;
+    }
+
+    @Override
+    public void run() {
+      try {
+        delegate.run();
+      } finally {
+        budget.release(bytes);
       }
     }
   }
@@ -1105,6 +1213,111 @@ public final class RaftNodeImpl implements RaftNode {
   @NonNull
   public Runnable resetLeaderAndTryTriggerPreVoteTask() {
     return resetLeaderAndTryTriggerPreVoteTask;
+  }
+
+  /**
+   * Synthesises a flush boundary on this idle leader and follows it with a snapshot dispatch so the
+   * unified log can reclaim every segment that this group still pins.
+   * <p>
+   * Caller must already have established that the group looks idle (see
+   * {@link LeaderState#lastReplicateActivityMillis()} against
+   * {@link RaftConfig#getIdleFlushIntervalMillis()}). This method is invoked on the per-group
+   * executor's control lane by the bulk-heartbeat wheel; it re-runs the eligibility checks against
+   * the live executor-thread view of the state because the wheel walks volatile snapshots that may
+   * have moved between sample and dispatch.
+   * <p>
+   * On the executor:
+   * <ol>
+   * <li>Re-checks role, status, lease, snapshot-vs-applied, and per-group rate-limit.</li>
+   * <li>Stamps {@link LeaderState#lastIdleFlushTriggerMillis(long)} so a follow-up tick within the
+   * same idle window does not dogpile a second proposal.</li>
+   * <li>Calls {@link #replicate(Object)} with the supplied marker. The replicate path runs
+   * {@code wake()} which refreshes {@code lastReplicateActivityMillis}, then admits and appends the
+   * marker as a normal log entry. Followers see the marker as part of regular replication and apply
+   * it through their own {@link StateMachine}, so the application-side flush boundary is committed
+   * across the quorum.</li>
+   * <li>On successful commit, dispatches {@link #takeSnapshot()}. The snapshot path advances the
+   * {@link RaftLog#snapshotIndex()} and emits a {@code TRUNCATE_UNTIL} record into the
+   * {@code UnifiedRaftStore}'s per-group GC frontier, which is what unblocks reclamation of the
+   * segments this group last touched.</li>
+   * </ol>
+   * The caller-supplied {@code marker} is opaque to the Raft engine and must round-trip cleanly
+   * through the configured {@link StateMachine}. The canonical embedding-side payload is
+   * {@code handler.statemachine.FlushMarker}, but the engine itself does not import that type.
+   * @param marker the flush operation. Must be non-null and accepted by this node's
+   *               {@link StateMachine}
+   */
+  public void proposeIdleFlush(@NonNull Object marker) {
+    requireNonNull(marker, "marker");
+    if (isTerminal(status)) {
+      return;
+    }
+    executor.executeControl(() -> proposeIdleFlushOnExecutor(marker));
+  }
+
+  /**
+   * Per-group executor body for {@link #proposeIdleFlush(Object)}. Mutates {@link LeaderState} and
+   * dispatches via {@link #replicate(Object)} / {@link #takeSnapshot()}.
+   */
+  private void proposeIdleFlushOnExecutor(Object marker) {
+    if (state.role() != LEADER || isTerminal(status)) {
+      return;
+    }
+    LeaderState leaderState = state.leaderState();
+    if (leaderState == null) {
+      return;
+    }
+    long now = clock.millis();
+    long leaseExpiry = leaderState.leaseExpiryMillis();
+    if (leaseExpiry <= 0L || leaseExpiry <= now) {
+      return;
+    }
+    long interval = config.getIdleFlushIntervalMillis();
+    if (now - leaderState.lastReplicateActivityMillis() < interval) {
+      // The group accepted a fresh propose between the wheel's pre-check and our executor turn;
+      // back off and let the next idle window re-evaluate.
+      return;
+    }
+    if (now - leaderState.lastIdleFlushTriggerMillis() < interval) {
+      // A previous flush already dispatched within this idle window.
+      return;
+    }
+    long lastApplied = state.lastApplied();
+    long snapshotIndex = state.log().snapshotIndex();
+    if (lastApplied <= snapshotIndex) {
+      // Snapshot already covers everything the group has applied; emitting another flush boundary
+      // would not advance the per-group GC frontier.
+      return;
+    }
+    leaderState.lastIdleFlushTriggerMillis(now);
+    LOG.debug("{} dispatching idle flush at lastApplied={} snapshotIndex={}", localEndpointStr,
+      lastApplied, snapshotIndex);
+    replicate(marker).whenComplete((ord, err) -> onIdleFlushReplicateComplete(err));
+  }
+
+  /**
+   * Invoked when the idle flush {@link #replicate(Object)} future completes. On success the leader
+   * dispatches {@link #takeSnapshot()} so the freshly-applied flush boundary advances the per-group
+   * GC frontier in the unified log. On failure (step-down, log full, terminate) the dispatch is
+   * dropped because the next idle window will re-evaluate from scratch.
+   */
+  private void onIdleFlushReplicateComplete(@Nullable Throwable err) {
+    if (err != null) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("{} idle flush replicate failed: {}", localEndpointStr, err.toString());
+      }
+      return;
+    }
+    try {
+      takeSnapshot().whenComplete((ord, snapErr) -> {
+        if (snapErr != null && LOG.isDebugEnabled()) {
+          LOG.debug("{} idle flush snapshot dispatch failed: {}", localEndpointStr,
+            snapErr.toString());
+        }
+      });
+    } catch (RuntimeException re) {
+      LOG.debug("{} idle flush snapshot dispatch threw", localEndpointStr, re);
+    }
   }
 
   /**
@@ -1545,6 +1758,13 @@ public final class RaftNodeImpl implements RaftNode {
    * {@link RaftConfig#getPauseToleranceCapMillis()}. Called once per per-server timing-wheel tick
    * for every registered node so a JVM resuming from a stop-the-world pause does not see its lease
    * appear instantly expired.
+   * <p>
+   * {@code pauseHintMillis} is a duration produced by the per-server pause detector from a
+   * {@link System#nanoTime() monotonic} inter-tick reading and is therefore immune to wall-clock
+   * manipulation; treating it as a duration means it can be added to fields stored as wall-clock
+   * millis without losing that property at this layer.
+   * @param now             ignored at this layer (kept for ABI stability of the method signature
+   *                        and for diagnostic call sites that supply a wall-clock stamp)
    * @param pauseHintMillis externally-observed JVM-pause delta in milliseconds, or {@code 0} for a
    *                        no-op
    */

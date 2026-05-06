@@ -49,8 +49,10 @@ import org.junit.jupiter.api.Timeout;
 @Tag(SmallTests.TAG)
 public class TestBulkHeartbeatSchedulerLeaderBroadcast extends TestBase {
 
+  // Long heartbeat period + timeout so the elected leader stays stable for the test wheel's
+  // measurement window.
   private static final RaftConfig CONFIG =
-    RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(60_000)
+    RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(2_000)
       .setLeaderHeartbeatPeriodMillis(60_000).setLeaderHeartbeatTimeoutMillis(120_000).build();
 
   private LocalRaftGroup group;

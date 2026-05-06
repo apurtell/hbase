@@ -353,7 +353,16 @@
  * CatchUpDataIntegrity's majority-raftLog or HFiles-on-HDFS recovery
  * paths.  The WAL provides additional protection for catastrophic
  * correlated faults that simultaneously destroy a majority's RAFT
- * logs.
+ * logs.  This safety net is what the design's "Conditional WAL
+ * Splitting Bypass" operates against in production. When
+ * NoCorrelatedUnfsyncedMajorityLoss holds, ServerCrashProcedure
+ * bypasses WAL splitting and recovery goes through the consensus
+ * layer paths the model proves correct. When it does not hold, SCP
+ * falls back per-region to the legacy HBase WAL-splitting and
+ * recovered-edits replay path, which is outside the scope of this
+ * spec.  The bypass decision itself (a per-region comparison of
+ * groupMaxRaftSeqId against walMaxSeqId) lives entirely on the
+ * master above the consensus layer and is not modeled here.
  *
  * ============================================================
  * State variables
@@ -459,6 +468,22 @@
  *
  *   - DurableLogStore on-disk files.  Safety-relevant consequences
  *     captured via CrashRestartWithLogLoss.
+ *
+ *   - ServerCrashProcedure (SCP) and the master-side coordination
+ *     of failover.  The spec models the consensus-visible effects of
+ *     master coordination via MasterConfirmPromotion (a
+ *     nondeterministic oracle with term fencing) and
+ *     NewMemberBootstrap (total state loss recovered from a
+ *     surviving leader).  SCP's bookkeeping, replacement-replica
+ *     scheduling, and per-region conditional WAL splitting bypass
+ *     decision are master-side coordination above the consensus
+ *     layer and are not state in this spec. Under the
+ *     NoCorrelatedUnfsyncedMajorityLoss assumption every
+ *     RAFT-committed entry is already recoverable through the paths
+ *     the model proves correct, so the bypass is the path the model
+ *     covers. NewMemberBootstrap further requires a surviving leader,
+ *     so the cold-restart trace is not reachable in this model by
+ *     design.
  *
  * ============================================================
  * Safety properties (18 invariants)
@@ -1447,6 +1472,13 @@ LeaderLeaseExpiry(m) ==
 \* Advance member m's local clock by one tick.  Guarded by the bounded-drift
 \* constraint: m's clock must not move more than MaxClockDrift ahead of
 \* any other member's clock.
+\*
+\* This action only ever advances clocks by +1 and never decrements them.
+\* There is deliberately NO ClockStep action that would let a member's
+\* clock jump discontinuously forward or backward.  This captures the
+\* operational requirement that the time-synchronization daemon on every
+\* RegionServer host MUST always slew (smear) corrections continuously
+\* and MUST NEVER step the system clock.
 \*
 \* Also guarded by the no-pending-leader constraint: no candidate with
 \* majority votes is waiting to become leader.  In the real protocol,
@@ -2830,8 +2862,22 @@ FollowerFlushMemstoreDrop ==
 \* The invariant verifies that no path can add a seqId to
 \* flushMarkerEntries without it first being in hdfsHFiles.  This is
 \* a prerequisite for the FollowerApplyMarker guard (nextEntry \in
-\* hdfsHFiles), which models the follower's "Confirm HFiles are
-\* accessible" step with retry-with-backoff.
+\* hdfsHFiles), which models the implementation's "confirm HFiles are
+\* accessible" step.  In the implementation that step runs on a
+\* dedicated apply-offload thread pool, NOT on the consensus actor
+\* pool.  The actor-side apply callback captures the marker payload
+\* and immediately submits the HFile-open work to the offload pool;
+\* the in-memory memstore drop and RAFT-log GC run as a follow-up
+\* runnable on this group's serial channel after the offload step
+\* succeeds.  The retry-with-backoff loop on transient HDFS failures
+\* therefore lives entirely off the actor pool, which is why a slow
+\* NameNode degrades flush-marker finalization on affected groups
+\* without stalling heartbeat or append-entries processing for any
+\* group on the host.  This model abstracts that asynchrony into a
+\* single FollowerApplyMarker step gated by hdfsHFiles membership,
+\* which is sound because the model only needs to verify the
+\* eventual completion of the apply step, not its concurrency
+\* structure.
 HFilesBeforeFlushMarker ==
     \A s \in flushMarkerEntries : s \in hdfsHFiles
 

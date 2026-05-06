@@ -30,8 +30,10 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.Waiter;
 import org.apache.hadoop.hbase.consensus.handler.server.util.CountingConsensusSpi;
 import org.apache.hadoop.hbase.consensus.handler.server.util.InJvmConsensusServerTopology;
 import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
@@ -84,10 +86,10 @@ public class TestConsensusServerClosedLoop extends TestBase {
     Configuration conf = InJvmConsensusServerTopology.defaultConf();
     topo = InJvmConsensusServerTopology.builder().setNodeCount(3).setBaseDir(tmp, false)
       .setBaseConf(conf).build();
-    runClosedLoopReplicateScenario();
+    runClosedLoopReplicateScenario(conf);
   }
 
-  private void runClosedLoopReplicateScenario() throws Exception {
+  private void runClosedLoopReplicateScenario(Configuration conf) throws Exception {
     final List<InJvmConsensusServerTopology.Node> nodes = topo.nodes();
     final List<RaftEndpoint> members = topo.endpoints();
     final CountingConsensusSpi[] spis = new CountingConsensusSpi[nodes.size()];
@@ -115,16 +117,26 @@ public class TestConsensusServerClosedLoop extends TestBase {
     assertThat(elected).as("leader elected on g0 within 20 s").isTrue();
 
     // Resolve the current leader handle.
-    GroupHandle leaderHandle = null;
-    for (GroupHandle h : handlesByServer) {
-      RaftNodeReport report = h.getRaftNode().getReport().join().getResult();
-      if (report.getRole() == RaftRole.LEADER) {
-        leaderHandle = h;
-        break;
+    AtomicReference<GroupHandle> leaderRef = new AtomicReference<>();
+    Waiter.waitFor(conf, 15_000L, new Waiter.ExplainingPredicate<Exception>() {
+      @Override
+      public boolean evaluate() {
+        for (GroupHandle h : handlesByServer) {
+          RaftNodeReport report = h.getRaftNode().getReport().join().getResult();
+          if (report.getRole() == RaftRole.LEADER) {
+            leaderRef.set(h);
+            return true;
+          }
+        }
+        return false;
       }
-    }
-    assertThat(leaderHandle).as("leader handle resolved").isNotNull();
-    final GroupHandle leader = leaderHandle;
+
+      @Override
+      public String explainFailure() {
+        return "no node reported RaftRole.LEADER for g0 after the SPI election latch fired";
+      }
+    });
+    final GroupHandle leader = leaderRef.get();
 
     // Closed-loop drivers. Pick a random small payload, replicate, block on get(), increment a
     // counter. Two drivers are enough to wedge the cluster if commit-quorum stalls.

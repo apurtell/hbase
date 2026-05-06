@@ -63,6 +63,13 @@ message UpdateRaftGroupMembersOpPB {
   optional ChangeMode mode = 4;
 }
 
+// Wire encoding for handler.statemachine.FlushMarker.
+message FlushMarkerPB {
+  optional int64 flush_op_seq_id     = 1;
+  optional int64 snapshot_max_seq_id = 2;
+  optional bytes metadata            = 3;
+}
+
 // Per-group payloads (envelope-bundled below)
 message GroupAppendEntriesPB {
   optional bytes group_id = 1;

@@ -54,6 +54,10 @@ public final class RaftConfig {
   public static final boolean DEFAULT_QUIESCENCE_ENABLED = false;
   /** The default value for {@link #quiescenceGraceMillis}. */
   public static final long DEFAULT_QUIESCENCE_GRACE_MILLIS = 1000;
+  /** The default value for {@link #idleFlushEnabled}. */
+  public static final boolean DEFAULT_IDLE_FLUSH_ENABLED = false;
+  /** The default value for {@link #idleFlushIntervalMillis} (5 minutes). */
+  public static final long DEFAULT_IDLE_FLUSH_INTERVAL_MILLIS = 5L * 60L * 1000L;
   /**
    * The default value for {@link #electionRandomizationGroupScale}. The receiver fairness formula
    * widens the upper bound of the per-follower election-timer randomization interval as
@@ -66,10 +70,10 @@ public final class RaftConfig {
   public static final double DEFAULT_ELECTION_RANDOMIZATION_GROUP_SCALE = 0.1;
   /**
    * The default value for {@link #pauseDetectionThresholdMillis}. The detector treats an inter-tick
-   * wall-clock delta exceeding {@code expected_period + threshold} as a possible JVM pause. Below
-   * this floor we charge the latency to ordinary scheduling jitter, leave timestamps alone, and let
-   * the normal lease / election-timer logic run. 1 s is well above any clean G1 young-gen pause and
-   * below the smallest credible stop-the-world budget that should still preserve leadership.
+   * monotonic delta (sampled with {@link System#nanoTime()}) exceeding
+   * {@code expected_period + threshold} as a possible JVM pause. Below this floor we charge the
+   * latency to ordinary scheduling jitter, leave timestamps alone, and let the normal lease /
+   * election-timer logic run.
    */
   public static final long DEFAULT_PAUSE_DETECTION_THRESHOLD_MILLIS = 1000;
   /**
@@ -165,13 +169,34 @@ public final class RaftConfig {
    */
   private final long quiescenceGraceMillis;
   /**
+   * Whether time-based idle-flush forcing is enabled. When true, a leader that holds its lease, has
+   * been idle for {@link #idleFlushIntervalMillis} milliseconds, and still has uncovered
+   * application data above its current snapshot index will have the bulk-heartbeat wheel synthesise
+   * a {@code FlushMarker} on its behalf and follow the flush-marker's commit with a
+   * {@code takeSnapshot()} dispatch. The synthesised flush boundary fires
+   * {@link org.apache.hadoop.hbase.consensus.handler.statemachine.ConsensusSpi#onFlushComplete} so
+   * the embedding can durably flush its in-memory state, and the snapshot dispatch advances the
+   * per-group GC frontier in the {@code UnifiedRaftStore} so segments that only the dormant group
+   * still references can be reclaimed.
+   */
+  private final boolean idleFlushEnabled;
+  /**
+   * Idle interval (ms) after which the bulk-heartbeat wheel synthesises a {@code FlushMarker} on an
+   * idle leader. Measured against {@link LeaderState#lastReplicateActivityMillis()}; rate- limited
+   * per-group via {@code LeaderState.lastIdleFlushTriggerMillis()} so that a single idle window
+   * produces at most one synthetic flush. Has no effect unless {@link #idleFlushEnabled} is
+   * {@code true}. See {@link #DEFAULT_IDLE_FLUSH_INTERVAL_MILLIS}.
+   */
+  private final long idleFlushIntervalMillis;
+  /**
    * Receiver fairness scaling factor for the per-follower election-timer randomization upper bound.
    * See {@link #DEFAULT_ELECTION_RANDOMIZATION_GROUP_SCALE} for the formula.
    */
   private final double electionRandomizationGroupScale;
   /**
-   * Floor (ms) on observed inter-tick wall-clock delta above the expected sweep period at which the
-   * heartbeat tick treats the gap as a JVM pause. See
+   * Floor (ms) on observed inter-tick monotonic delta above the expected sweep period at which the
+   * heartbeat tick treats the gap as a JVM pause. The delta is sampled with
+   * {@link System#nanoTime()} so the detector is immune to wall-clock manipulation. See
    * {@link #DEFAULT_PAUSE_DETECTION_THRESHOLD_MILLIS}.
    */
   private final long pauseDetectionThresholdMillis;
@@ -186,7 +211,8 @@ public final class RaftConfig {
     long leaderHeartbeatTimeoutMillis, long maxClockDriftMillis, int appendEntriesRequestBatchSize,
     int commitCountToTakeSnapshot, int maxPendingLogEntryCount,
     boolean transferSnapshotsFromFollowersEnabled, int raftNodeReportPublishPeriodSecs,
-    boolean quiescenceEnabled, long quiescenceGraceMillis, double electionRandomizationGroupScale,
+    boolean quiescenceEnabled, long quiescenceGraceMillis, boolean idleFlushEnabled,
+    long idleFlushIntervalMillis, double electionRandomizationGroupScale,
     long pauseDetectionThresholdMillis, long pauseToleranceCapMillis) {
     this.leaderElectionTimeoutMillis = leaderElectionTimeoutMillis;
     this.leaderHeartbeatPeriodMillis = leaderHeartbeatPeriodMillis;
@@ -199,6 +225,8 @@ public final class RaftConfig {
     this.raftNodeReportPublishPeriodSecs = raftNodeReportPublishPeriodSecs;
     this.quiescenceEnabled = quiescenceEnabled;
     this.quiescenceGraceMillis = quiescenceGraceMillis;
+    this.idleFlushEnabled = idleFlushEnabled;
+    this.idleFlushIntervalMillis = idleFlushIntervalMillis;
     this.electionRandomizationGroupScale = electionRandomizationGroupScale;
     this.pauseDetectionThresholdMillis = pauseDetectionThresholdMillis;
     this.pauseToleranceCapMillis = pauseToleranceCapMillis;
@@ -307,6 +335,19 @@ public final class RaftConfig {
     return quiescenceGraceMillis;
   }
 
+  /** Return whether time-based idle-flush forcing is enabled. */
+  public boolean isIdleFlushEnabled() {
+    return idleFlushEnabled;
+  }
+
+  /**
+   * Return the idle interval after which the bulk-heartbeat wheel synthesizes a flush marker on a
+   * leader that has otherwise gone silent.
+   */
+  public long getIdleFlushIntervalMillis() {
+    return idleFlushIntervalMillis;
+  }
+
   /**
    * @return the election timer randomization group scale factor
    * @see #electionRandomizationGroupScale
@@ -316,7 +357,7 @@ public final class RaftConfig {
   }
 
   /**
-   * @return floor (ms) on observed inter-tick wall-clock delta above the expected sweep period at
+   * @return floor (ms) on observed inter-tick monotonic delta above the expected sweep period at
    *         which the heartbeat tick treats the gap as a JVM pause
    * @see #pauseDetectionThresholdMillis
    */
@@ -343,10 +384,11 @@ public final class RaftConfig {
       + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
       + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs
       + ", quiescenceEnabled=" + quiescenceEnabled + ", quiescenceGraceMillis="
-      + quiescenceGraceMillis + ", electionRandomizationGroupScale="
-      + electionRandomizationGroupScale + ", pauseDetectionThresholdMillis="
-      + pauseDetectionThresholdMillis + ", pauseToleranceCapMillis=" + pauseToleranceCapMillis
-      + '}';
+      + quiescenceGraceMillis + ", idleFlushEnabled=" + idleFlushEnabled
+      + ", idleFlushIntervalMillis=" + idleFlushIntervalMillis
+      + ", electionRandomizationGroupScale=" + electionRandomizationGroupScale
+      + ", pauseDetectionThresholdMillis=" + pauseDetectionThresholdMillis
+      + ", pauseToleranceCapMillis=" + pauseToleranceCapMillis + '}';
   }
 
   /** Builder for Raft config. */
@@ -363,6 +405,8 @@ public final class RaftConfig {
     private int raftNodeReportPublishPeriodSecs = DEFAULT_RAFT_NODE_REPORT_PUBLISH_PERIOD_SECS;
     private boolean quiescenceEnabled = DEFAULT_QUIESCENCE_ENABLED;
     private long quiescenceGraceMillis = DEFAULT_QUIESCENCE_GRACE_MILLIS;
+    private boolean idleFlushEnabled = DEFAULT_IDLE_FLUSH_ENABLED;
+    private long idleFlushIntervalMillis = DEFAULT_IDLE_FLUSH_INTERVAL_MILLIS;
     private double electionRandomizationGroupScale = DEFAULT_ELECTION_RANDOMIZATION_GROUP_SCALE;
     private long pauseDetectionThresholdMillis = DEFAULT_PAUSE_DETECTION_THRESHOLD_MILLIS;
     private long pauseToleranceCapMillis = DEFAULT_PAUSE_TOLERANCE_CAP_MILLIS;
@@ -499,6 +543,24 @@ public final class RaftConfig {
       return this;
     }
 
+    /** Toggles time-based idle-flush forcing. */
+    public RaftConfigBuilder setIdleFlushEnabled(boolean idleFlushEnabled) {
+      this.idleFlushEnabled = idleFlushEnabled;
+      return this;
+    }
+
+    /**
+     * Sets the idle interval (ms) after which the bulk-heartbeat wheel synthesizes a flush marker
+     * on a leader that has otherwise gone silent. Must be positive.
+     * @return the builder object for fluent calls
+     * @see RaftConfig#idleFlushIntervalMillis
+     */
+    public RaftConfigBuilder setIdleFlushIntervalMillis(long idleFlushIntervalMillis) {
+      checkPositive(idleFlushIntervalMillis, "idle flush interval millis must be positive!");
+      this.idleFlushIntervalMillis = idleFlushIntervalMillis;
+      return this;
+    }
+
     /**
      * Sets the election timer randomization group-scale factor. Must be non-negative. {@code 0.0}
      * disables the per-group widening.
@@ -516,9 +578,10 @@ public final class RaftConfig {
     }
 
     /**
-     * Sets the pause-detection threshold in milliseconds. Inter-tick wall-clock deltas above the
-     * expected sweep period plus this threshold are treated as JVM pauses. Must be non-negative.
-     * {@code 0} disables the floor and treats any positive jitter as a pause.
+     * Sets the pause-detection threshold in milliseconds. Inter-tick deltas (sampled with
+     * {@link System#nanoTime()}, so immune to wall-clock manipulation) above the expected sweep
+     * period plus this threshold are treated as JVM pauses. Must be non-negative. {@code 0}
+     * disables the floor and treats any positive jitter as a pause.
      * @return the builder object for fluent calls
      * @see RaftConfig#pauseDetectionThresholdMillis
      */
@@ -567,8 +630,9 @@ public final class RaftConfig {
       return new RaftConfig(leaderElectionTimeoutMillis, leaderHeartbeatPeriodMillis,
         leaderHeartbeatTimeoutMillis, maxClockDriftMillis, appendEntriesRequestBatchSize,
         commitCountToTakeSnapshot, maxPendingLogEntryCount, transferSnapshotsFromFollowersEnabled,
-        raftNodeReportPublishPeriodSecs, quiescenceEnabled, quiescenceGraceMillis,
-        electionRandomizationGroupScale, pauseDetectionThresholdMillis, pauseToleranceCapMillis);
+        raftNodeReportPublishPeriodSecs, quiescenceEnabled, quiescenceGraceMillis, idleFlushEnabled,
+        idleFlushIntervalMillis, electionRandomizationGroupScale, pauseDetectionThresholdMillis,
+        pauseToleranceCapMillis);
     }
 
     @Override
@@ -582,10 +646,11 @@ public final class RaftConfig {
         + ", transferSnapshotsFromFollowersEnabled=" + transferSnapshotsFromFollowersEnabled
         + ", raftNodeReportPublishPeriodSecs=" + raftNodeReportPublishPeriodSecs
         + ", quiescenceEnabled=" + quiescenceEnabled + ", quiescenceGraceMillis="
-        + quiescenceGraceMillis + ", electionRandomizationGroupScale="
-        + electionRandomizationGroupScale + ", pauseDetectionThresholdMillis="
-        + pauseDetectionThresholdMillis + ", pauseToleranceCapMillis=" + pauseToleranceCapMillis
-        + '}';
+        + quiescenceGraceMillis + ", idleFlushEnabled=" + idleFlushEnabled
+        + ", idleFlushIntervalMillis=" + idleFlushIntervalMillis
+        + ", electionRandomizationGroupScale=" + electionRandomizationGroupScale
+        + ", pauseDetectionThresholdMillis=" + pauseDetectionThresholdMillis
+        + ", pauseToleranceCapMillis=" + pauseToleranceCapMillis + '}';
     }
   }
 }

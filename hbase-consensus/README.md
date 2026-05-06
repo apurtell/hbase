@@ -763,16 +763,18 @@ The engine and the embedding catch up across two cleanly separated channels, and
 The full SPI is small:
 
 - `onCommit(byte[] groupId, List<CommittedEntry> entries)` -- called when one or more consensus entries are committed and applied. On the leader this signals that the write-path barrier is satisfied (the consensus side is complete); on followers it delivers the full batch of committed entries for application as a unit.
-- `onFlushComplete(byte[] groupId, FlushMarker marker)` -- called when a flush-complete marker is committed. The embedding refreshes its store-file view and drops memstore entries below the flush sequence id.
+- `onFlushComplete(byte[] groupId, FlushMarker marker)` -- called when a flush-complete marker is committed. The embedding records the marker payload, schedules any potentially blocking work onto its own thread pool, and arranges for the in-memory drop of state below the snapshot boundary to run as a follow up on this group's serial channel.
 - `onLeaderElected(byte[] groupId, long term, RaftEndpoint leader)`, `onNoLeader(byte[] groupId)`, default `onFollowerLagging(byte[] groupId, RaftEndpoint peer)` -- leader-lifecycle notifications.
 - `byte[] takeStateSnapshot(byte[] groupId, long commitIndex)`, `installStateSnapshot(byte[] groupId, long commitIndex, byte[] state)` -- opaque application-state round-trip.
 - default `Object getNewTermOperation()` -- optional override of the no-op entry the new leader appends on election.
+
+**Non-blocking SPI contract.** Every `ConsensusSpi` method that the engine fires synchronously is invoked on a worker from the shared `MultiGroupExecutor` actor pool. That pool sizes its workers as O(cores) and multiplexes them across every Raft group hosted by the `ConsensusServer`. Blocking I/O of any kind inside a synchronous SPI call is forbidden. Embeddings whose apply work is intrinsically blocking must offload that work to their own thread pool. The recommended pattern is for the SPI implementation to capture the marker payload synchronously, hand the slow work to its dedicated offload pool, and have the offload thread submit a finalization runnable back to this group's `RaftNodeExecutor` via `ConsensusServer.getExecutor().executorFor(groupId).execute(Runnable)`. Submitting through the group executor keeps the finalization step serialized with subsequent committed entries on the same group, so per group ordering and the engine's serial execution contract are preserved end-to-end.
 
 ### `StateMachineAdapter` apply lifecycle
 
 `runOperation(commitIndex, operation)`:
 
-- If `operation instanceof FlushMarker`: drain any buffered `byte[]` ops to `ConsensusSpi.onCommit`, then fire `ConsensusSpi.onFlushComplete(...)`. The flush-complete callback timing is recorded in `flushCompleteTime` if metrics are present.
+- If `operation instanceof FlushMarker`: drain any buffered `byte[]` ops to `ConsensusSpi.onCommit`, then fire `ConsensusSpi.onFlushComplete(...)`. The flush-complete callback timing is recorded in `flushCompleteTime` if metrics are present. Embeddings whose flush-complete handling is blocking must honor the non-blocking SPI contract above and offload that work, otherwise the actor pool stalls.
 - If `operation instanceof byte[]`: append to a per-group `pending` buffer as a `CommittedEntry(commitIndex, payload)` (no defensive copy of the payload), and bump `pendingBytes`. No SPI call here -- the adapter waits for the apply-batch boundary so that bulk applies are amortized.
 - Otherwise the adapter throws `IllegalArgumentException`. The adapter accepts only `byte[]` or `FlushMarker` ops. Any other type the embedding tries to propose is a programming error and is rejected at admission time.
 

@@ -18,15 +18,18 @@
 package org.apache.hadoop.hbase.consensus.raft.impl;
 
 import static org.apache.hadoop.hbase.consensus.raft.impl.local.SimpleStateMachine.applyValue;
-import static org.apache.hadoop.hbase.consensus.raft.test.util.AssertionUtils.eventually;
 import static org.apache.hadoop.hbase.consensus.raft.test.util.RaftTestUtils.getCommitIndex;
 import static org.apache.hadoop.hbase.consensus.raft.test.util.RaftTestUtils.readRaftState;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.Waiter;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
+import org.apache.hadoop.hbase.consensus.raft.RaftEndpoint;
 import org.apache.hadoop.hbase.consensus.raft.impl.local.LocalRaftGroup;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.FollowerState;
 import org.apache.hadoop.hbase.consensus.raft.impl.state.LeaderState;
@@ -48,6 +51,10 @@ public class TestSendCatchupAppendsIfNeeded extends TestBase {
     RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(60_000)
       .setLeaderHeartbeatPeriodMillis(60_000).setLeaderHeartbeatTimeoutMillis(120_000).build();
 
+  private static final Configuration WAITER_CONF = new Configuration(false);
+  private static final long WAITER_TIMEOUT_MS = 60_000L;
+  private static final long EXECUTOR_BARRIER_TIMEOUT_S = 30L;
+
   @AfterEach
   public void tearDown() {
     if (group != null) {
@@ -56,8 +63,8 @@ public class TestSendCatchupAppendsIfNeeded extends TestBase {
   }
 
   @Test
-  @Timeout(value = 120, unit = TimeUnit.SECONDS)
-  public void testNoCatchupWhenAllFollowersAreUpToDate() {
+  @Timeout(value = 240, unit = TimeUnit.SECONDS)
+  public void testNoCatchupWhenAllFollowersAreUpToDate() throws Exception {
     group = LocalRaftGroup.newBuilder(3).setConfig(CONFIG).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     List<RaftNodeImpl> followers = group.<RaftNodeImpl> getNodesExcept(leader.getLocalEndpoint());
@@ -73,23 +80,47 @@ public class TestSendCatchupAppendsIfNeeded extends TestBase {
     aeCount.set(0);
     leader.getExecutor().execute(leader::sendCatchupAppendsIfNeeded);
     leader.getExecutor().execute(leader::sendCatchupAppendsIfNeeded);
-    leader.getExecutor().execute(() -> assertThat(aeCount.get()).isEqualTo(0));
+    // Drain the executor on the test thread so the trailing assertion runs (and an AssertionError
+    // surfaces) on the test thread itself rather than getting silently swallowed by the executor.
+    drainExecutor(leader);
+    assertThat(aeCount.get())
+      .as("no AppendEntries should have been sent when every follower is already up to date")
+      .isEqualTo(0);
   }
 
   @Test
-  @Timeout(value = 120, unit = TimeUnit.SECONDS)
+  @Timeout(value = 240, unit = TimeUnit.SECONDS)
   public void testCatchupFiresWhenFollowerLags() throws Exception {
     group = LocalRaftGroup.newBuilder(3).setConfig(CONFIG).start();
     RaftNodeImpl leader = group.waitUntilLeaderElected();
     leader.replicate(applyValue("v1")).join();
     leader.replicate(applyValue("v2")).join();
-    eventually(() -> {
-      for (RaftNodeImpl follower : group.<RaftNodeImpl> getNodesExcept(leader.getLocalEndpoint())) {
-        assertThat(getCommitIndex(follower)).isEqualTo(getCommitIndex(leader));
+    long leaderCommit = getCommitIndex(leader);
+    List<RaftNodeImpl> followers = group.<RaftNodeImpl> getNodesExcept(leader.getLocalEndpoint());
+    Waiter.waitFor(WAITER_CONF, WAITER_TIMEOUT_MS, new Waiter.ExplainingPredicate<Exception>() {
+      @Override
+      public boolean evaluate() {
+        for (RaftNodeImpl follower : followers) {
+          if (getCommitIndex(follower) != leaderCommit) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      @Override
+      public String explainFailure() {
+        StringBuilder sb =
+          new StringBuilder("not every follower caught up to leader commit ").append(leaderCommit);
+        for (RaftNodeImpl follower : followers) {
+          sb.append("; follower ").append(follower.getLocalEndpoint()).append("=")
+            .append(getCommitIndex(follower));
+        }
+        return sb.toString();
       }
     });
-    List<RaftNodeImpl> followers = group.<RaftNodeImpl> getNodesExcept(leader.getLocalEndpoint());
     RaftNodeImpl laggingFollower = followers.get(0);
+    RaftNodeImpl caughtUpFollower = followers.get(1);
     AtomicInteger aeToLagging = new AtomicInteger();
     AtomicInteger aeToCaughtUp = new AtomicInteger();
     group.alterMessagesTo(leader.getLocalEndpoint(), laggingFollower.getLocalEndpoint(), msg -> {
@@ -98,7 +129,7 @@ public class TestSendCatchupAppendsIfNeeded extends TestBase {
       }
       return msg;
     });
-    group.alterMessagesTo(leader.getLocalEndpoint(), followers.get(1).getLocalEndpoint(), msg -> {
+    group.alterMessagesTo(leader.getLocalEndpoint(), caughtUpFollower.getLocalEndpoint(), msg -> {
       if (msg instanceof AppendEntriesRequest) {
         aeToCaughtUp.incrementAndGet();
       }
@@ -106,16 +137,46 @@ public class TestSendCatchupAppendsIfNeeded extends TestBase {
     });
     aeToLagging.set(0);
     aeToCaughtUp.set(0);
+    final RaftEndpoint laggingEndpoint = laggingFollower.getLocalEndpoint();
     readRaftState(leader, () -> {
       LeaderState ls = leader.state().leaderState();
-      FollowerState fs = ls.getFollowerStateOrNull(laggingFollower.getLocalEndpoint());
+      FollowerState fs = ls.getFollowerStateOrNull(laggingEndpoint);
       fs.matchIndex(0L);
       fs.nextIndex(1L);
       fs.resetRequestBackoff();
       return null;
     });
     leader.getExecutor().execute(leader::sendCatchupAppendsIfNeeded);
-    eventually(() -> assertThat(aeToLagging.get()).isGreaterThanOrEqualTo(1));
-    leader.getExecutor().execute(() -> assertThat(aeToCaughtUp.get()).isEqualTo(0));
+    Waiter.waitFor(WAITER_CONF, WAITER_TIMEOUT_MS, new Waiter.ExplainingPredicate<Exception>() {
+      @Override
+      public boolean evaluate() {
+        return aeToLagging.get() >= 1;
+      }
+
+      @Override
+      public String explainFailure() {
+        return "no catch-up AppendEntries was observed to the lagging follower " + laggingEndpoint
+          + " (aeToLagging=" + aeToLagging.get() + ")";
+      }
+    });
+    // Drain the executor on the test thread so the trailing assertion runs (and an AssertionError
+    // surfaces) on the test thread itself rather than getting silently swallowed by the executor.
+    drainExecutor(leader);
+    assertThat(aeToCaughtUp.get())
+      .as("no AppendEntries should have been sent to the already-caught-up follower %s",
+        caughtUpFollower.getLocalEndpoint())
+      .isEqualTo(0);
+  }
+
+  /**
+   * Submits a no-op task on the leader's executor and blocks on its completion, providing a
+   * happens-before barrier for the test thread to read state mutated by previously submitted
+   * executor tasks (such as message-counting interceptors triggered by
+   * {@code sendCatchupAppendsIfNeeded}).
+   */
+  private static void drainExecutor(RaftNodeImpl leader) throws Exception {
+    CompletableFuture<Void> drained = new CompletableFuture<>();
+    leader.getExecutor().execute(() -> drained.complete(null));
+    drained.get(EXECUTOR_BARRIER_TIMEOUT_S, TimeUnit.SECONDS);
   }
 }

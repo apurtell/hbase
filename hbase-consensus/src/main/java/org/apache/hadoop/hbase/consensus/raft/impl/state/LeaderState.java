@@ -76,6 +76,17 @@ public final class LeaderState {
    */
   private boolean groupQuiescent;
   /**
+   * Wall-clock time (ms) at which the bulk-heartbeat wheel last submitted a synthetic idle-flush
+   * proposal for this leader's group. Used by the wheel as a per-group rate-limit so that a single
+   * idle window produces at most one synthetic flush; the gate trips again only after
+   * {@code RaftConfig.getIdleFlushIntervalMillis()} have elapsed since this stamp. Initialised to
+   * construction time so a freshly elected leader does not synthesise a flush immediately.
+   * <p>
+   * Updated only by the per-group executor thread that owns this {@code LeaderState}, so accessors
+   * do not need to be volatile or synchronized.
+   */
+  private long lastIdleFlushTriggerMillis;
+  /**
    * Followers the leader believes are not live at the moment of {@code Quiesce} (master's most
    * recent live-server view did not include them, or {@code matchIndex < lastLogOrSnapshotIndex}
    * after recent replication). Carried into the quiesce notice so receiving followers can refuse to
@@ -91,6 +102,7 @@ public final class LeaderState {
     flushedLogIndex = lastLogIndex;
     leaseExpiryMillis = 0L;
     lastReplicateActivityMillis = currentTimeMillis;
+    lastIdleFlushTriggerMillis = currentTimeMillis;
     groupQuiescent = false;
   }
 
@@ -278,5 +290,25 @@ public final class LeaderState {
   /** Records the lagging-on-quiesce set captured at the {@code Quiesce} transition. */
   public void laggingOnQuiesce(Collection<RaftEndpoint> lagging) {
     this.laggingOnQuiesce = lagging.isEmpty() ? Collections.emptySet() : new HashSet<>(lagging);
+  }
+
+  /**
+   * Returns the wall-clock time (ms) at which the bulk-heartbeat wheel last submitted a synthetic
+   * idle-flush proposal for this group. The wheel uses the gap between this stamp and {@code now}
+   * as a per-group rate-limit on the synthetic flush path.
+   */
+  public long lastIdleFlushTriggerMillis() {
+    return lastIdleFlushTriggerMillis;
+  }
+
+  /**
+   * Updates the last idle-flush-trigger timestamp via a monotonic-max accumulator. The wheel stamps
+   * this whenever it dispatches a synthetic flush so a follow-up tick within the same idle interval
+   * skips its check rather than dogpiling another flush onto an already-pending one.
+   */
+  public void lastIdleFlushTriggerMillis(long currentTimeMillis) {
+    if (currentTimeMillis > this.lastIdleFlushTriggerMillis) {
+      this.lastIdleFlushTriggerMillis = currentTimeMillis;
+    }
   }
 }

@@ -52,9 +52,11 @@ public class TestRunHeartbeatTick extends TestBase {
   private LocalRaftGroup group;
   private BulkHeartbeatScheduler wheel;
 
-  // Long election + heartbeat timeouts so transient ticks do not race the test wheel.
+  // Long heartbeat period + timeout so the elected leader stays stable for the test wheel's
+  // measurement window. Election round timeout stays short so a first-round split-vote recovers
+  // in ~2 s instead of stretching the test out to the heartbeat-timeout horizon.
   private static final RaftConfig CONFIG =
-    RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(60_000)
+    RaftConfig.newBuilder().setLeaderElectionTimeoutMillis(2_000)
       .setLeaderHeartbeatPeriodMillis(60_000).setLeaderHeartbeatTimeoutMillis(120_000).build();
 
   @AfterEach

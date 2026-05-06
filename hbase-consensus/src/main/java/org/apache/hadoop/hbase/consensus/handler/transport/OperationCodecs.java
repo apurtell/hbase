@@ -29,13 +29,21 @@ public final class OperationCodecs {
   }
 
   /**
-   * Returns the standard wiring. Built-in {@link UpdateRaftGroupMembersOpCodec} plus
-   * {@link IdentityByteCodec} for raw byte payloads. Suitable for tests and any caller whose user
-   * operations are already serialised to {@code byte[]}.
+   * Returns the standard wiring. Built-in {@link UpdateRaftGroupMembersOpCodec},
+   * {@link FlushMarkerCodec}, and {@link IdentityByteCodec} for raw byte payloads. Suitable for
+   * tests and any caller whose user operations are already serialised to {@code byte[]}.
+   * <p>
+   * The flush-marker codec is included unconditionally because the consensus runtime itself can
+   * synthesize a {@link org.apache.hadoop.hbase.consensus.handler.statemachine.FlushMarker} on a
+   * dormant leader (see
+   * {@link org.apache.hadoop.hbase.consensus.raft.RaftConfig#isIdleFlushEnabled()}); without the
+   * codec that synthetic operation would fail at the wire-encode step on the leader's replicate
+   * path before any follower could observe it.
    */
   @NonNull
   public static OperationCodec defaultCodecs() {
-    return composite(new UpdateRaftGroupMembersOpCodec(), new IdentityByteCodec());
+    return composite(new UpdateRaftGroupMembersOpCodec(), new FlushMarkerCodec(),
+      new IdentityByteCodec());
   }
 
   /**

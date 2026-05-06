@@ -38,13 +38,16 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.consensus.handler.executor.MultiGroupExecutor;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.ConsensusSpi;
+import org.apache.hadoop.hbase.consensus.handler.statemachine.FlushMarker;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.LeaderReportListener;
 import org.apache.hadoop.hbase.consensus.handler.statemachine.StateMachineAdapter;
 import org.apache.hadoop.hbase.consensus.handler.store.LogStoreConfig;
 import org.apache.hadoop.hbase.consensus.handler.store.UnifiedRaftStore;
 import org.apache.hadoop.hbase.consensus.handler.transport.CoalescingTransport;
 import org.apache.hadoop.hbase.consensus.handler.transport.EndpointResolver;
+import org.apache.hadoop.hbase.consensus.handler.transport.FlushMarkerCodec;
 import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodec;
+import org.apache.hadoop.hbase.consensus.handler.transport.OperationCodecs;
 import org.apache.hadoop.hbase.consensus.raft.GroupId;
 import org.apache.hadoop.hbase.consensus.raft.Ordered;
 import org.apache.hadoop.hbase.consensus.raft.PendingBytesBudget;
@@ -176,11 +179,39 @@ public final class ConsensusServer
       this.ownsExecutor = true;
     }
     this.logStore = new UnifiedRaftStore(new LogStoreConfig(conf));
-    this.transport = new CoalescingTransport(localEndpoint, bindAddress, resolver, operationCodec,
+    // The consensus runtime can synthesize FlushMarker operations on dormant leaders (see the
+    // idle-flush wiring below). Layer FlushMarkerCodec on top of the embedder-supplied codec so
+    // that synthetic-flush replicates always have a working wire encoder/decoder, regardless of
+    // what user-operation codec the embedder passed in.
+    OperationCodec runtimeCodec = operationCodec.handles(SAMPLE_FLUSH_MARKER)
+      && operationCodec.handlesTypeId(FlushMarkerCodec.TYPE_ID)
+        ? operationCodec
+        : OperationCodecs.composite(operationCodec, new FlushMarkerCodec());
+    this.transport = new CoalescingTransport(localEndpoint, bindAddress, resolver, runtimeCodec,
       conf, bootEpochMillis);
     this.scheduler = new BulkHeartbeatScheduler(conf, transport, bootEpochMillis);
+    // Time-based idle-flush dispatching is gated server-wide by the embedding-supplied flush
+    // marker factory and per-group by RaftConfig.isIdleFlushEnabled(). The wheel consults this
+    // supplier when the per-group config opts in, so installing it here is safe and lets each group
+    // decide independently.
+    this.scheduler
+      .setIdleFlushOperationSupplier(() -> new FlushMarker(0L, 0L, EMPTY_IDLE_FLUSH_METADATA));
     this.metrics = new ConsensusServerMetrics(this);
   }
+
+  /**
+   * Per-process empty-byte-array singleton used as the {@code metadata} payload of every idle flush
+   * {@link FlushMarker}.
+   */
+  private static final byte[] EMPTY_IDLE_FLUSH_METADATA = new byte[0];
+
+  /**
+   * Sentinel {@link FlushMarker} probed against the embedder-supplied {@link OperationCodec} on
+   * construction to test whether the embedder already wired a {@link FlushMarkerCodec} into their
+   * composite.
+   */
+  private static final FlushMarker SAMPLE_FLUSH_MARKER =
+    new FlushMarker(0L, 0L, EMPTY_IDLE_FLUSH_METADATA);
 
   /** Returns this server's local Raft endpoint. */
   @NonNull

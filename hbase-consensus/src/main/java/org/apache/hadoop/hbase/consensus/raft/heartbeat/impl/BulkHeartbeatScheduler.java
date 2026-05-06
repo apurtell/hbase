@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.consensus.raft.heartbeat.impl;
 import static java.util.Objects.requireNonNull;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.Nullable;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -35,6 +36,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.conf.ConfigKey;
 import org.apache.hadoop.hbase.consensus.raft.RaftConfig;
@@ -66,9 +68,9 @@ import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFacto
  * <p>
  * On each tick the wheel thread:
  * <ol>
- * <li>computes the wall-clock JVM-pause delta against the configured detection band and applies it
- * lock-free to every registered node's heartbeat / election / lease accumulators (no per-group
- * executor task);</li>
+ * <li>computes the JVM-pause delta from a {@link System#nanoTime() monotonic} inter-tick reading
+ * against the configured detection band and applies it lock-free to every registered node's
+ * heartbeat / election / lease accumulators;</li>
  * <li>walks every registered {@link RaftNodeImpl} reading volatile / atomic snapshot fields only
  * (no per-group executor task);</li>
  * <li>for each leader group's committed remote member, appends a per-group entry into that peer's
@@ -100,8 +102,9 @@ public final class BulkHeartbeatScheduler
   public static final int TIMER_THREADS_DEFAULT = 1;
 
   /**
-   * Floor (ms) on observed inter-tick wall-clock delta above the expected interval at which the
-   * wheel attests a JVM pause to its registered nodes. Mirrors
+   * Floor (ms) on observed inter-tick monotonic delta above the expected interval at which the
+   * wheel attests a JVM pause to its registered nodes. The delta is measured with
+   * {@link System#nanoTime()}, which is local-monotonic. Mirrors
    * {@link RaftConfig#getPauseDetectionThresholdMillis()}.
    */
   public static final String PAUSE_DETECTION_THRESHOLD_MS_KEY =
@@ -138,10 +141,17 @@ public final class BulkHeartbeatScheduler
   private final AtomicLong tickCounter = new AtomicLong();
   private final Object lifecycleLock = new Object();
   /**
-   * Wall-clock millis at which the most recent {@link #tick()} began, or {@code 0} until the second
-   * tick fires. Read and written exclusively from the wheel thread.
+   * {@link System#nanoTime()} reading captured at the start of the most recent {@link #tick()}.
+   * Used exclusively by the JVM-pause detector. Local-monotonic. Read and written exclusively from
+   * the wheel thread; meaningful only while {@link #lastTickStartedAtNanosSet} is {@code true}.
    */
-  private long lastTickStartedAtMillis;
+  private long lastTickStartedAtNanos;
+  /**
+   * Set to {@code true} after the wheel records its first tick. Required because {@code 0L} is a
+   * valid {@link System#nanoTime()} return value. Read and written exclusively from the wheel
+   * thread.
+   */
+  private boolean lastTickStartedAtNanosSet;
   /**
    * Per-tick scratch accumulator from peer to the per-group heartbeat list aimed at that peer.
    * Reused across {@link #tick()} invocations.
@@ -151,6 +161,16 @@ public final class BulkHeartbeatScheduler
   private volatile ScheduledFuture<?> tickFuture;
   private volatile boolean started;
   private volatile boolean closed;
+  /**
+   * Optional embedding-supplied factory of idle flush operations. When non-null and the leader walk
+   * decides a group has been idle past {@link RaftConfig#getIdleFlushIntervalMillis()}, the wheel
+   * asks the supplier for a fresh marker and dispatches it via
+   * {@link RaftNodeImpl#proposeIdleFlush(Object)}. The supplier runs on the wheel thread and must
+   * be cheap and non-blocking. Held {@code volatile} because it is set on the constructing thread
+   * and read on the wheel thread.
+   */
+  @Nullable
+  private volatile Supplier<Object> idleFlushOperationSupplier;
 
   public BulkHeartbeatScheduler(@NonNull Configuration conf, @NonNull Transport transport) {
     this(conf, transport, EnvironmentEdgeManager.currentTime());
@@ -214,6 +234,28 @@ public final class BulkHeartbeatScheduler
   /** Boot-epoch millis stamped into every emitted bulk frame's keepalive header. */
   public long bootEpochMillis() {
     return bootEpochMillis;
+  }
+
+  /**
+   * Installs an embedding-supplied factory of idle flush operations. When set, the wheel's leader
+   * walk gates each group on {@link RaftConfig#isIdleFlushEnabled()} and the per group
+   * {@link RaftConfig#getIdleFlushIntervalMillis()}, asks the supplier for a fresh marker on each
+   * idle trip, and dispatches it via {@link RaftNodeImpl#proposeIdleFlush(Object)} on the group's
+   * control lane. Pass {@code null} to disable. The supplier runs on the wheel thread once per
+   * per-group dispatch, so it must be cheap and nonblocking. The latest value wins from the next
+   * tick.
+   */
+  public void setIdleFlushOperationSupplier(@Nullable Supplier<Object> supplier) {
+    this.idleFlushOperationSupplier = supplier;
+  }
+
+  /**
+   * Returns the currently-installed synthetic flush operation supplier, or {@code null} if
+   * idle-flush dispatching is disabled. Exposed primarily for tests.
+   */
+  @Nullable
+  public Supplier<Object> getIdleFlushOperationSupplier() {
+    return idleFlushOperationSupplier;
   }
 
   @Override
@@ -305,9 +347,14 @@ public final class BulkHeartbeatScheduler
     if (closed) {
       return;
     }
+    // Sample the monotonic clock for pause detection BEFORE the wall clock so the inter-tick
+    // delta captures only elapsed-on-this-CPU time. The wall clock is still required below for
+    // lease / activity / quiesce-grace comparisons against fields stored as wall-clock millis.
+    long nowNanos = System.nanoTime();
+    long pauseHintMillis = computePauseHint(nowNanos);
+    lastTickStartedAtNanos = nowNanos;
+    lastTickStartedAtNanosSet = true;
     long now = EnvironmentEdgeManager.currentTime();
-    long pauseHintMillis = computePauseHint(now);
-    lastTickStartedAtMillis = now;
     if (pauseHintMillis > 0L) {
       LOG.warn(
         "Detected JVM pause of {} ms on bulk-heartbeat wheel; emitting pause hint to {} groups "
@@ -405,7 +452,66 @@ public final class BulkHeartbeatScheduler
     if (anyFollowerLagging) {
       submitControl(node, node.sendCatchupAppendsIfNeededTask(), "sendCatchupAppendsIfNeeded");
     }
+    maybeProposeIdleFlush(node, state, leaderState, now, leaseExpired);
     maybeQuiesce(node, state, leaderState, now, leaseExpired, allFollowersCaughtUp);
+  }
+
+  /**
+   * Decides whether the leader should synthesize a flush boundary on this group's behalf so that
+   * the {@code UnifiedRaftStore}'s per-group GC frontier can advance even when the application is
+   * not driving any traffic. Gated by {@link RaftConfig#isIdleFlushEnabled()} and the presence of
+   * an embedding-supplied {@link #idleFlushOperationSupplier}; when both are present, the wheel
+   * dispatches when (a) the leader holds a valid lease, (b) at least
+   * {@link RaftConfig#getIdleFlushIntervalMillis()} have elapsed since the last propose / wake, (c)
+   * at least the same interval has elapsed since the last synthetic dispatch on this group
+   * (rate-limit), and (d) the per-group last-applied has moved past the current snapshot index
+   * (otherwise a fresh flush would not produce a new GC frontier). The wheel does the cheap
+   * volatile-snapshot pre-check; the per-group executor body in
+   * {@link RaftNodeImpl#proposeIdleFlush(Object)} re-runs every check against the live executor
+   * view before issuing the actual {@link RaftNodeImpl#replicate(Object) replicate} +
+   * {@link RaftNodeImpl#takeSnapshot()} pair, which is what is needed to handle the case where the
+   * snapshot or activity timestamp moved between the wheel's sample and the executor turn.
+   * <p>
+   * Quiescent groups are eligible. The wake will cause a brief departure from quiescence.
+   * {@link #maybeQuiesce} re-evaluates each tick and will return the group to quiescent on the next
+   * tick after the idle flush replicate + snapshot completes.
+   */
+  private void maybeProposeIdleFlush(@NonNull RaftNodeImpl node, @NonNull RaftState state,
+    @NonNull LeaderState leaderState, long now, boolean leaseExpired) {
+    Supplier<Object> supplier = idleFlushOperationSupplier;
+    if (supplier == null) {
+      return;
+    }
+    RaftConfig cfg = node.getConfig();
+    if (!cfg.isIdleFlushEnabled()) {
+      return;
+    }
+    if (leaseExpired || leaderState.leaseExpiryMillis() <= 0L) {
+      return;
+    }
+    long interval = cfg.getIdleFlushIntervalMillis();
+    if (now - leaderState.lastReplicateActivityMillis() < interval) {
+      return;
+    }
+    if (now - leaderState.lastIdleFlushTriggerMillis() < interval) {
+      return;
+    }
+    long lastApplied = state.lastApplied();
+    long snapshotIndex = state.log().snapshotIndex();
+    if (lastApplied <= snapshotIndex) {
+      return;
+    }
+    Object marker;
+    try {
+      marker = supplier.get();
+    } catch (RuntimeException ex) {
+      LOG.warn("idle flush operation supplier threw for group {}", node.getGroupId(), ex);
+      return;
+    }
+    if (marker == null) {
+      return;
+    }
+    submitControl(node, () -> node.proposeIdleFlush(marker), "proposeIdleFlush");
   }
 
   /**
@@ -480,20 +586,28 @@ public final class BulkHeartbeatScheduler
 
   /**
    * Returns the pause delta (ms) to attest to nodes on this tick, or {@code 0} if no pause was
-   * detected. Returns {@code 0} on the first tick after start (no baseline) and on any tick whose
-   * inter-tick wall-clock delta is below the configured threshold or above the configured cap.
+   * detected. The inter-tick delta is computed from {@link System#nanoTime()} readings so the
+   * detector is immune to wall-clock manipulation. The delta is then converted to milliseconds for
+   * the threshold / cap comparison and the emitted hint, which is consumed by
+   * {@code RaftNodeImpl.absorbPauseIfDetected}. Returns {@code 0} on the first tick after start and
+   * on any tick whose inter-tick delta is below the configured threshold or above the cap.
+   * @param nowNanos the current {@link System#nanoTime()} reading captured at the top of
+   *                 {@link #tick()}
    */
-  private long computePauseHint(long now) {
-    if (lastTickStartedAtMillis <= 0L) {
+  private long computePauseHint(long nowNanos) {
+    if (!lastTickStartedAtNanosSet) {
       return 0L;
     }
-    long delta = (now - lastTickStartedAtMillis) - intervalMs;
-    if (delta < pauseDetectionThresholdMs) {
+    // Subtraction is correct under nanoTime wraparound (two's complement).
+    long elapsedNanos = nowNanos - lastTickStartedAtNanos;
+    long deltaNanos = elapsedNanos - TimeUnit.MILLISECONDS.toNanos(intervalMs);
+    long deltaMillis = TimeUnit.NANOSECONDS.toMillis(deltaNanos);
+    if (deltaMillis < pauseDetectionThresholdMs) {
       return 0L;
     }
-    if (delta > pauseToleranceCapMs) {
+    if (deltaMillis > pauseToleranceCapMs) {
       return 0L;
     }
-    return delta;
+    return deltaMillis;
   }
 }
