@@ -1,0 +1,1609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tuning for Recovery, with Replicas and Partial Recovery Deferral — HBase AZ-Loss Capacity Model (Companion)</title>
+
+<!-- KaTeX: LaTeX-quality math rendering, fast, self-contained after load -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous"></script>
+<script>
+  document.addEventListener("DOMContentLoaded", function() {
+    renderMathInElement(document.body, {
+      delimiters: [
+        {left: "$$", right: "$$", display: true},
+        {left: "\\[", right: "\\]", display: true},
+        {left: "$",  right: "$",  display: false},
+        {left: "\\(", right: "\\)", display: false}
+      ],
+      throwOnError: false
+    });
+  });
+</script>
+
+<style>
+  :root {
+    --bg: #fafaf7;
+    --fg: #1d1d1b;
+    --muted: #555;
+    --accent: #8b2635;
+    --accent-soft: #f3e6e8;
+    --rule: #d8d4cc;
+    --code-bg: #f1ede4;
+    --code-fg: #2a2a28;
+    --note-bg: #fff8e1;
+    --note-border: #d6b656;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: "Charter", "Iowan Old Style", "Source Serif Pro", Georgia, serif;
+    font-size: 17px;
+    line-height: 1.6;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 3em 2em 6em;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  h1, h2, h3, h4 {
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.25;
+    color: var(--fg);
+  }
+  h1 {
+    font-size: 2.0em;
+    margin: 0 0 0.2em 0;
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 0.3em;
+  }
+  h2 {
+    font-size: 1.45em;
+    margin-top: 2.2em;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.2em;
+  }
+  h3 { font-size: 1.15em; margin-top: 1.6em; }
+  h4 { font-size: 1.0em; margin-top: 1.2em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .subtitle {
+    color: var(--muted);
+    font-style: italic;
+    margin: 0.4em 0 2em 0;
+  }
+  code, pre, kbd, samp {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    line-height: 1.45;
+    border-left: 3px solid var(--accent);
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    margin: 1em 0;
+    width: 100%;
+    font-size: 0.95em;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.5em 0.75em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--accent-soft);
+    font-weight: 600;
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+  }
+  tbody tr:nth-child(even) { background: rgba(0,0,0,0.02); }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1em 0;
+    padding: 0.4em 1em;
+    color: var(--muted);
+    background: var(--accent-soft);
+    font-style: italic;
+  }
+  .note {
+    background: var(--note-bg);
+    border-left: 4px solid var(--note-border);
+    padding: 0.8em 1em;
+    margin: 1em 0;
+    border-radius: 4px;
+    font-size: 0.96em;
+  }
+  .note .label {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.85em;
+    color: #8a6d00;
+    margin-right: 0.5em;
+  }
+  .meta {
+    font-size: 0.9em;
+    color: var(--muted);
+    margin-top: 1em;
+  }
+  .toc {
+    background: var(--code-bg);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+    margin: 1.5em 0 2.5em 0;
+    font-size: 0.95em;
+  }
+  .toc ol { margin: 0.3em 0 0.3em 1.2em; padding: 0; }
+  .toc li { margin: 0.15em 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .param-name { font-family: "JetBrains Mono", monospace; font-size: 0.9em; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--rule);
+    margin: 3em 0;
+  }
+  .pipeline {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.85em;
+    line-height: 1.4;
+    white-space: pre;
+    background: var(--code-bg);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+  }
+  .katex-display { margin: 1.2em 0; }
+  .katex { font-size: 1.05em; }
+  @media print {
+    .page-break { break-before: page; page-break-before: always; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Tuning for Recovery — with Replicas and Partial Recovery Deferral</h1>
+<p class="subtitle">A capacity-model companion to <a href="TUNING_FOR_RECOVERY.html">TUNING_FOR_RECOVERY.html</a> covering active region replicas, the master-hosted Correlated Failure Detector, and Partial Recovery Deferral mode.</p>
+<p class="meta">Cluster reference point: 500 RegionServers, 1,500 primary regions/RS, $\text{RF}=3$ with AZ-affinity placement, AZ loss $=1/3$. <strong>Scope: single-AZ failure only.</strong></p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#abstract">Abstract</a></li>
+    <li><a href="#workload">Workload Model — extended</a></li>
+    <li><a href="#recovery-work">Recovery-Work Model — extended</a></li>
+    <li><a href="#az-assumptions">HDFS dependencies and placement assumptions</a>
+      <ol>
+        <li><a href="#az-counts">Derived counts at the reference workload</a></li>
+        <li><a href="#az-derating">AZ-loss-window multipliers</a></li>
+      </ol>
+    </li>
+    <li><a href="#framework">Mathematical Framework — extended</a></li>
+    <li><a href="#per-stage">Per-Stage Derivations — extended</a></li>
+    <li><a href="#capacity">Surviving-Cohort Capacity Model</a></li>
+    <li><a href="#pk">Bulk-Service Queueing under Deferral</a></li>
+    <li><a href="#summary-table">Summary — extended</a></li>
+    <li><a href="#hdfs-pipeline">HDFS write pipeline tuning for degraded dependencies</a>
+      <ol>
+        <li><a href="#hdfs-pipeline-model">The embedded HDFS client write pipeline</a></li>
+        <li><a href="#hdfs-pipeline-detection">Partial-failure detection windows</a></li>
+        <li><a href="#hdfs-pipeline-fshlog">FSHLog: traditional DFSClient pipeline recovery</a></li>
+        <li><a href="#hdfs-pipeline-asyncfs">AsyncFSWAL: fan-out pipeline and ExcludeDatanodeManager</a></li>
+        <li><a href="#hdfs-pipeline-hbase-mitigation">HBase WAL-level mitigations</a></li>
+        <li><a href="#hdfs-pipeline-tune-hdfs">Recommended HDFS-side tuning</a></li>
+        <li><a href="#hdfs-pipeline-tune-hbase">Recommended HBase-side tuning</a></li>
+        <li><a href="#hdfs-pipeline-cross-impact">Cross-section impact under strict one-replica-per-AZ placement</a></li>
+        <li><a href="#hdfs-pipeline-limits">Limitations of the partial-failure model</a></li>
+      </ol>
+    </li>
+    <li><a href="#unifying">Unifying Picture — extended</a></li>
+    <li><a href="#limitations">Limitations of the Model — extended</a></li>
+    <li><a href="#future">Future Work — extended</a></li>
+  </ol>
+</div>
+
+<h2 id="abstract">1. Abstract</h2>
+
+<p>
+This document is a companion to <a href="TUNING_FOR_RECOVERY.html">TUNING_FOR_RECOVERY.html</a>, which remains the authoritative baseline for the $\text{RF}=1$ / no-deferral case. The original model implicitly assumes no replicas are deployed (the field reality today) and no master-hosted Correlated Failure Detector. This companion layers three additions on top:
+</p>
+
+<ol>
+  <li>The effect of having active region replicas (any of the in-sync, timeline-consistent, or RAFT-based designs in <a href="PROMOTABLE_CONSISTENT_REPLICA_SET.html">PROMOTABLE_CONSISTENT_REPLICA_SET.md</a>, <a href="PROMOTABLE_TIMELINE_CONSISTENT_REPLICAS.md">PROMOTABLE_TIMELINE_CONSISTENT_REPLICAS.md</a>, and <a href="RAFT_REGION_REPLICAS.md">RAFT_REGION_REPLICAS.md</a>) deployed at $\text{RF}=3$ with AZ-affinity placement.</li>
+  <li>A master-hosted Correlated Failure Detector (CFD) in the system architecture (see <a href="CORRELATED_FAILURE_DETECTOR.md">CORRELATED_FAILURE_DETECTOR.md</a>) whose trip latency and recovery-confirm window enter the timing model.</li>
+  <li>A CFD-driven Partial Recovery Deferral mode that suppresses whole-domain replacement work until the failed domain is observed to return to service, and the surviving-cohort capacity (per-RS headroom) required to absorb the data-plane load shift on AZ loss without saturating the surviving cohort.</li>
+</ol>
+
+<p>
+<strong>Scope.</strong> The deferred recovery model is designed for <em>single-AZ failure</em>: $\text{RF}=3$ with AZ-affinity placement and $f = 1/3$. Multi-AZ failure is out of scope; the per-design quorum/ISR/membership semantics in the three design documents define cluster behavior under loss of more than one AZ but are not modeled here. The model also presumes uniform $\text{RF}=3$ across all tables (no mixed-RF tables).
+</p>
+
+<p>
+The pipeline structure, the Little's-Law-per-stage decomposition, and the bulk-service queueing argument from the baseline carry over unchanged. What this companion adds is (a) a workload count that distinguishes <em>primary promotions</em> from <em>secondary replacements</em>, (b) a CFD timing term whose contribution to the critical path is shown to be zero, (c) a deferral lever that drops the recovery-window TRSP count by ~3× relative to the eager-replacement upper bound, and (d) a steady-state utilization ceiling on surviving RegionServers that bounds the per-RS sizing required to absorb the data-plane shift.
+</p>
+
+<p>
+The companion inherits the baseline's HDFS placement and WAL-provider assumptions. WAL blocks are placed with one replica per AZ across the cluster's three AZs (registered as racks), and the recommended WAL provider is <strong>AsyncWAL</strong>, selected by <code>hbase.wal.provider = asyncfs</code>. All per-stage values in this companion are evaluated at the AZ-loss-window <em>derated</em> rates from <a href="#az-derating">§4.2</a>, with the underlying cross-section derivation in <a href="#hdfs-pipeline-cross-impact">§10.8</a>. The full HDFS write pipeline tuning treatment lives in <a href="#hdfs-pipeline">§10</a>, restated here so the companion stands alone.
+</p>
+
+<h2 id="workload">2. Workload Model — extended</h2>
+
+<p>
+The baseline cluster topology and AZ-loss inputs from <a href="TUNING_FOR_RECOVERY.html#workload">TUNING_FOR_RECOVERY.html §2</a> are restated for reference and then extended with replica-aware quantities.
+</p>
+
+<table>
+  <thead><tr><th>Symbol</th><th>Meaning</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>$N$</td><td>cluster size (total RegionServers)</td><td>500</td></tr>
+    <tr><td>$R$</td><td>primary regions per RS</td><td>1,500</td></tr>
+    <tr><td>$f$</td><td>fraction of cluster lost in an AZ outage</td><td>$\tfrac{1}{3}$</td></tr>
+    <tr><td>$t_{\text{TRSP}}$</td><td>state transitions per TRSP (cold-open, baseline)</td><td>≈ 6</td></tr>
+    <tr><td>$t_{\text{SCP}}$</td><td>state transitions per SCP (server-crash procedure)</td><td>≈ 9</td></tr>
+  </tbody>
+</table>
+
+<p>The new with-replicas symbols:</p>
+
+<table>
+  <thead><tr><th>Symbol</th><th>Meaning</th><th>Value at $\text{RF}=3$</th></tr></thead>
+  <tbody>
+    <tr><td>$\text{RF}$</td><td>replication factor (uniform across tables; baseline assumes $\text{RF}=1$)</td><td>3</td></tr>
+    <tr><td>$R_{\text{prim}}$</td><td>primary regions per RS, unchanged from baseline</td><td>≈ 1,500</td></tr>
+    <tr><td>$R_{\text{sec}}$</td><td>$=(\text{RF}-1)\,R_{\text{prim}}$, secondary replicas per RS</td><td>≈ 3,000</td></tr>
+    <tr><td>$R_{\text{total}}$</td><td>$=\text{RF}\,R_{\text{prim}}$, total replica slots per RS</td><td>≈ 4,500</td></tr>
+    <tr><td>$N_{\text{slots,dead}}$</td><td>$=N_{\text{dead}}\,R_{\text{total}}$, replica slots in the failed domain</td><td>≈ 750,000</td></tr>
+  </tbody>
+</table>
+
+<p>Derived TRSP counts under AZ loss:</p>
+
+$$
+\begin{aligned}
+N_{\text{dead}}             &= fN                                   \approx 167                                                            \\
+N_{\text{alive}}            &= (1-f)N                               \approx 333                                                            \\
+M_{\text{TRSP,promote}}     &= N_{\text{dead}} \cdot R_{\text{prim}} \approx 250{,}000  &&\text{(primary-promotion TRSPs)}                  \\
+M_{\text{TRSP,replace}}     &= N_{\text{dead}} \cdot R_{\text{sec}}  \approx 500{,}000  &&\text{(secondary-replacement TRSPs)}              \\
+M_{\text{TRSP}}^{\text{eager}} &= M_{\text{TRSP,promote}} + M_{\text{TRSP,replace}} \approx 750{,}000  &&\text{(eager upper bound, $3\times$ baseline)} \\
+M_{\text{TRSP}}^{\text{deferred}} &= M_{\text{TRSP,promote}} \approx 250{,}000  &&\text{(deferral retains promotions only)}              \\
+\lambda_{\text{RS}}^{\text{deferred}} &= \frac{M_{\text{TRSP}}^{\text{deferred}}}{N_{\text{alive}}} \approx 750     &&\text{(promotion dispatches per surviving RS)} \\
+\lambda_{\text{RS}}^{\text{eager}}   &= \frac{M_{\text{TRSP}}^{\text{eager}}}{N_{\text{alive}}}   \approx 2{,}250  &&\text{(if eager replacement runs in-window)}
+\end{aligned}
+$$
+
+<p>
+The headline observation is that <em>the deferred workload equals the original baseline workload</em>: $M_{\text{TRSP}}^{\text{deferred}} \approx M_{\text{TRSP}}^{\text{baseline}} \approx 250{,}000$. Deploying replicas without deferral would multiply the TRSP count by ~3×; deploying replicas <em>with</em> deferral keeps the in-window count at the original baseline level.
+</p>
+
+<h4>Placement assumption</h4>
+
+<p>
+AZ-affinity placement (1 primary + 1 secondary in each of $\text{RF}-1$ other AZs) ensures that for every region whose primary is lost, the surviving cohort has at least one in-cluster secondary that is a valid promotion candidate. Non-AZ-affinity placements (rack-affinity-only, random) violate this assumption and require separate workload accounting; see <a href="#limitations">§12</a>.
+</p>
+
+<h2 id="recovery-work">3. Recovery-Work Model — extended</h2>
+
+<p>
+The baseline recovery work is $W_{\text{total}} = M_{\text{TRSP}} \cdot t_{\text{TRSP}} \approx 1.5 \times 10^{6}$ state transitions when every TRSP is a cold open. With replicas the per-TRSP transition count splits by phase:
+</p>
+
+<ul>
+  <li>$t_{\text{TRSP,open}} \approx 6$ — original cold-open transition count (no replica available; full HDFS bootstrap).</li>
+  <li>$t_{\text{TRSP,promote}}$ — per-design promotion-transition count; depends on the design.</li>
+  <li>$t_{\text{TRSP,replace}} \approx 6$ — secondary bootstrap on a surviving RS is a cold open with the same per-procedure cost as $t_{\text{TRSP,open}}$.</li>
+</ul>
+
+<p>
+The per-design $t_{\text{TRSP,promote}}$ values are derived from the per-design docs at write-time. The companion does not invent transition counts; it consumes whatever those docs enumerate. The current values, sourced from the recovery-impact subsection of <a href="AZ_LOSS_SCALING.md">AZ_LOSS_SCALING.md</a> ("the promotion mechanism … shifts the per-TRSP transition count modestly (~6 for ISR, ~9 for catch-up, ~3 for RAFT master-mediated)"):
+</p>
+
+<table>
+  <thead><tr><th>Design</th><th>$t_{\text{TRSP,promote}}$</th><th>Rationale (per design doc)</th></tr></thead>
+  <tbody>
+    <tr><td>ISR (in-sync replica set)</td><td>≈ 6</td><td>SCP_PROMOTE_REGIONS rank step + META mutation of <code>info:isr</code> and <code>info:primaryReplicaId</code> + RS-side promotion confirmation. No HDFS WAL split because surviving members hold the synchronously-committed prefix.</td></tr>
+    <tr><td>Catch-up (timeline-consistent)</td><td>≈ 9</td><td>SCP_PROMOTE_REGIONS rank step + <code>BoundedLeaseRecovery</code> + tail-replay handoff against surviving HDFS WALs + META mutation + RS-side promotion confirmation. The extra transitions are the WAL-tail catch-up phase that Catch-up's promotion path cannot avoid.</td></tr>
+    <tr><td>RAFT (master-mediated)</td><td>≈ 3</td><td>Election fires inside the RAFT group (no master TRSP), then <code>ReportLeaderElection</code> from new leader to master + master-side <code>LeaderChangeHandler</code> META update + master confirmation back to leader. Most of the work happens inside the consensus layer rather than in master TRSPs.</td></tr>
+  </tbody>
+</table>
+
+<p>If a future per-design doc enumerates its promotion-path transitions to a different granularity, the companion's row for that design is updated and the arithmetic below is re-evaluated. Where the per-design doc does not enumerate transitions to the granularity of a TRSP step count, the companion uses a conservative upper bound of $t_{\text{TRSP,open}}$ and flags the gap; this case does not currently apply to any of the three designs.</p>
+
+<p>The recovery-work model becomes:</p>
+
+$$
+\begin{aligned}
+W_{\text{recovery}}^{\text{(deferred)}} &= M_{\text{TRSP,promote}} \cdot t_{\text{TRSP,promote}}, \\[2pt]
+W_{\text{recovery}}^{\text{(eager)}}    &= M_{\text{TRSP,promote}} \cdot t_{\text{TRSP,promote}} + M_{\text{TRSP,replace}} \cdot t_{\text{TRSP,replace}}.
+\end{aligned}
+$$
+
+<p>Numerical values per design at the reference workload:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Design</th>
+      <th>$W_{\text{recovery}}^{\text{(deferred)}}$ (250K promotions)</th>
+      <th>$W_{\text{recovery}}^{\text{(eager)}}$ (250K promotions + 500K replacements)</th>
+      <th>Eager / deferred ratio</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>ISR</td><td>$1.5 \times 10^{6}$</td><td>$1.5\!\times\!10^{6} + 3.0\!\times\!10^{6} = 4.5\!\times\!10^{6}$</td><td>3.0×</td></tr>
+    <tr><td>Catch-up</td><td>$2.25 \times 10^{6}$</td><td>$2.25\!\times\!10^{6} + 3.0\!\times\!10^{6} = 5.25\!\times\!10^{6}$</td><td>2.3×</td></tr>
+    <tr><td>RAFT</td><td>$0.75 \times 10^{6}$</td><td>$0.75\!\times\!10^{6} + 3.0\!\times\!10^{6} = 3.75\!\times\!10^{6}$</td><td>5.0×</td></tr>
+  </tbody>
+</table>
+
+<p>
+ISR matches the baseline exactly (the original model already used $t_{\text{TRSP}} \approx 6$). Catch-up runs ~50% above baseline on the deferred path because of the WAL tail-replay handoff; this is the structural cost of timeline-consistent replicas, and the deferral lever is what keeps Catch-up from ballooning to ~3.5× baseline under eager replacement. RAFT pays the lowest TRSP transition count of the three designs because the election work happens inside the consensus layer rather than in master TRSPs; the deferral lever still earns RAFT a 5× saving by removing the ~500K follower-replacement <code>ConfChange</code>s from the in-window workload.
+</p>
+
+<h2 id="az-assumptions">4. HDFS dependencies and placement assumptions</h2>
+
+<p>
+The reference deployment colocates RegionServers and DataNodes one-to-one across three availability zones. WAL blocks are placed in each of the cluster's three AZs (registered as racks). The loss of one AZ therefore reduces every active write pipeline cluster-wide simultaneously. With $\text{RF}=3$ region replicas under AZ-affinity placement, the same constraint also pins every region's replica set to one slot per AZ, so a single-AZ loss removes one slot from every replica set in the cluster.
+</p>
+
+<p>
+The WAL provider is <strong>AsyncWAL</strong> (<code>hbase.wal.provider = asyncfs</code>). AsyncFSWAL's single-block-per-file design sidesteps several issues with the legacy FSHLog provider when an AZ is lost. The rest of this companion assumes AsyncWAL as the provider, and the recommended pipeline tuning of <a href="#hdfs-pipeline-tune-hdfs">§10.6</a> and <a href="#hdfs-pipeline-tune-hbase">§10.7</a> is applied throughout.
+</p>
+
+<h3 id="az-counts">4.1 Derived counts at the reference workload</h3>
+
+<p>
+At the reference workload ($N = 500$ colocated RS+DN hosts, $f = 1/3$ AZ-loss fraction), the strict placement constraint pins the cluster-wide partial failure footprint to four numbers used throughout the rest of the document:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Symbol</th><th>Meaning</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>$N_{\text{alive}}$</td><td>surviving RegionServers (and DataNodes)</td><td>333</td></tr>
+    <tr><td>$N_{\text{dead}}$</td><td>DataNodes in the lost AZ</td><td>$\lceil 500/3 \rceil = 167$</td></tr>
+    <tr><td>$N_{\text{pipelines-degraded}}$</td><td>WAL pipelines reduced to width 2 at the moment of AZ loss</td><td>$N_{\text{alive}} = 333$</td></tr>
+    <tr><td>$N_{\text{abort}}$</td><td>RegionServer aborts expected on the surviving AZs (upper bound)</td><td>$\lesssim 3$ (derived in <a href="#hdfs-pipeline-cross-impact">§10.8</a>)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="az-derating">4.2 AZ-loss-window multipliers</h3>
+
+<p>
+Cross-section service times degrade during the AZ-loss window because the same per-RS write traffic is now served by 333 surviving DataNodes instead of 500. Per-DN write rate is unchanged ($3 \cdot \lambda / 500 = 2 \cdot \lambda / 333.\overline{3}$ under strict placement, since each write drops from three replicas to two), but per-DN read rate increases $\approx 50\%$ because HFile reads now satisfy from two surviving replicas rather than three. The full derivation lives in <a href="#hdfs-pipeline-cross-impact">§10.8</a>; the resulting multipliers are used throughout <a href="#per-stage">§6</a>, <a href="#pk">§8</a>, and <a href="#summary-table">§9</a>:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Quantity</th><th>Steady state</th><th>AZ-loss window</th><th>Factor</th><th>Derived in</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>$\bar{h}$ (proc-store hflush latency)</td><td>10 ms</td><td>15 ms</td><td>$1.5\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+    <tr><td>$\mu_{\text{proc}}$ (proc-store throughput)</td><td>25.6 K w/s</td><td>20.5 K w/s</td><td>$0.80\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+    <tr><td>$T_{\text{proc-drain}}$ (per 1.5M-transition workload)</td><td>59 s</td><td>73 s</td><td>$1.24\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+    <tr><td>$C_S^{2}$ (service-time variance coefficient)</td><td>0.16</td><td>0.23</td><td>$1.44\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+    <tr><td>$\rho_{\max}$ (sustainable proc-store utilization)</td><td>0.65</td><td>0.61</td><td>$0.94\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+    <tr><td>$W_{\text{open}}$ (per-region cold-open time)</td><td>base</td><td>$1.5\times$ base</td><td>$1.5\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+    <tr><td>$T_{\text{WAL}}$ (WAL-split drain time)</td><td>base</td><td>$1.5\times$ base</td><td>$1.5\times$</td><td><a href="#hdfs-pipeline-cross-impact">§10.8</a></td></tr>
+  </tbody>
+</table>
+
+<p>
+All seven multipliers stem from the surviving-DataNode read load rise of $\approx 50\%$ during the recovery window. NameNode op-throughput is unaffected at this scale — the WAL roll burst at the moment of AZ loss adds $\approx 55$ <code>addBlock</code>/s for $\approx 6$ s, negligible against $C_{\text{NN}} \approx 3 \times 10^{5}\,\text{op/s}$. The per-stage derivations in <a href="#per-stage">§6</a> are stated at the AZ-loss-window values, since the recovery scenario is the only context in which they are evaluated.
+</p>
+
+<p>
+<strong>Promotion-path vs. cold-open exemption.</strong> The $W_{\text{open}}^{\text{AZ}} = 1.5\times$ multiplier applies to cold opens that traverse the surviving DataNodes' HFile fan-in (eager replacement under <a href="#per-stage">§6</a>, baseline RF=1 recovery). Promotion-path opens land on replicas whose HFiles are already open and block-cache is warm, so they do not pay the $1.5\times$ inflation. <a href="#per-stage">§6.2</a> evaluates each $W_{\text{promote}}$ accordingly.
+</p>
+
+<h2 id="framework">5. Mathematical Framework — extended</h2>
+
+<h3>5.1 The CFD detection stage</h3>
+
+<p>
+$T_{\text{CFD}}$ is the wall-clock time from first ephemeral-node loss to CFD blacklist publication, measured at the master:
+</p>
+
+$$
+T_{\text{CFD}} \;=\; T_{\text{trip}} \;+\; T_{\text{publish}}.
+$$
+
+<p>
+$T_{\text{trip}}$ is the time the CFD takes to recognize that the loss pattern crosses its trip threshold; $T_{\text{publish}}$ is the time to write the updated blacklist to its persistence layer and notify subscribers. Sourcing the CFD's defaults from <a href="CORRELATED_FAILURE_DETECTOR.md">CORRELATED_FAILURE_DETECTOR.md</a>:
+</p>
+
+<ul>
+  <li>Default trip threshold: <strong>≈ 100 lost servers within a 10 s window</strong>. At the reference workload's $N_{\text{dead}} \approx 167$, the threshold is crossed inside the first ~6 s of the loss event (assuming the failure manifests as a roughly uniform burst of ephemeral-node expirations).</li>
+  <li>Default recovery-confirm window: <strong>≈ 60 s</strong>. The CFD removes a domain from the blacklist only after this window of continuous recovery has elapsed; the window is the dominant term in the disengage timeline rather than the engage timeline.</li>
+  <li>$T_{\text{publish}}$: small (single-digit seconds at most) because publication is a single write to the CFD's persistence layer plus subscriber notification.</li>
+</ul>
+
+<p>
+Putting the engage-side numbers together yields $T_{\text{CFD}} \approx 10\,\text{s}$ in the engage direction. The disengage direction is dominated by the 60 s recovery-confirm window and is not on the recovery-critical path (it gates only the post-deferral rebalance, which runs paced; see <a href="#pk">§8</a>).
+</p>
+
+<h3>5.2 Timing claim: $T_{\text{CFD}}$ does not extend the critical path</h3>
+
+<p>
+The recovery wall-clock under deferral has the same max-of-stages envelope as the baseline:
+</p>
+
+$$
+T_{\text{recovery}}^{\text{(deferred)}} \;\approx\;
+\max\!\big(T_{\text{proc}},\,T_{\text{WAL}},\,T_{\text{RS-open}},\,T_{\text{NN}}\big) \;+\; T_{\text{pipe}}
+$$
+
+<p>
+evaluated at $M_{\text{TRSP}} = M_{\text{TRSP,promote}}$ and $t_{\text{TRSP}} = t_{\text{TRSP,promote}}$. The eager envelope substitutes $M_{\text{TRSP}} = M_{\text{TRSP}}^{\text{eager}}$ and the per-component $t$ values from <a href="#recovery-work">§3</a>; under eager every per-stage drain time scales by approximately the eager/deferred ratio in the table above (3× for ISR, 2.3× for Catch-up, 5× for RAFT). All values are evaluated at the AZ-loss-window derated rates from <a href="#az-derating">§4.2</a>.
+</p>
+
+<p>
+$T_{\text{CFD}}$ does <em>not</em> appear additively in this envelope because of two overlapping observations:
+</p>
+
+<ol>
+  <li><strong>SCP fan-out and per-RS open-executor warmup take on the order of $T_{\text{CFD}}$ to begin landing TRSP transitions in the procedure store.</strong> The original model accounts for $T_{\text{create}} \approx 5\text{–}10\,\text{s}$ for the SCP burst (<a href="TUNING_FOR_RECOVERY.html#offered">TUNING_FOR_RECOVERY.html §6.7</a>); during this window the procedure store sees offered load but the per-RS open executors have not yet started clearing it. $T_{\text{CFD}} \approx 10\,\text{s}$ overlaps with $T_{\text{create}}$ at the engage edge of the timeline rather than serializing with it.</li>
+  <li><strong>The per-design recovery action engages on the same blacklist publication, so subsequent SCP work is already filtered.</strong> The action runs once on engage (master-coalesced META mutations to mark dead-AZ slots suppressed) and the SCP path consults the blacklist before scheduling each replacement TRSP. The few replacement TRSPs that may have been created in the brief window before the action engages are dropped or reclassified by the action's idempotent processing pass; they do not survive into the procedure store as new in-flight work.</li>
+</ol>
+
+<p>
+The cost of $T_{\text{CFD}}$ is therefore absorbed into the SCP fan-out window and does not appear as an additive term in the recovery-time envelope. (This proof lives only here; the per-design "Recovery-time impact" subsections cite this result rather than restating it.)
+</p>
+
+<h2 id="per-stage">6. Per-Stage Derivations — extended</h2>
+
+<p>
+For each of the four stages that bind the recovery wall-clock — $T_{\text{proc}}$, $T_{\text{WAL}}$, $T_{\text{RS-open}}$, $T_{\text{NN}}$ — give the side-by-side numeric envelope under (a) the baseline RF=1 model from <a href="TUNING_FOR_RECOVERY.html">TUNING_FOR_RECOVERY.html</a>, (b) with-replicas + deferral, and (c) with-replicas + eager replacement. All numbers are evaluated at the AZ-loss-window derated rates from <a href="#az-derating">§4.2</a>, since the recovery scenario is the only context in which they are evaluated.
+</p>
+
+<h3>6.1 $T_{\text{proc}}$ — master procedure store</h3>
+
+<p>
+At the recommended sizing of <a href="TUNING_FOR_RECOVERY.html#pk">TUNING_FOR_RECOVERY.html §7.2</a>, steady-state throughput is $\mu_{\text{proc}} \approx 25.6\,\text{K w/s}$ with $\rho_{\max}\,\mu_{\text{proc}} \approx 16.6\,\text{K w/s}$. During the AZ-loss window the derated values from <a href="#az-derating">§4.2</a> apply, so $\mu_{\text{proc}}^{\text{AZ}} \approx 20.5\,\text{K w/s}$ and $\rho_{\max}^{\text{AZ}}\,\mu_{\text{proc}}^{\text{AZ}} \approx 12.5\,\text{K w/s}$. The drain time follows from $T_{\text{proc}} = W_{\text{recovery}} / \mu_{\text{proc}}^{\text{AZ}}$:
+</p>
+
+<table>
+  <thead><tr><th>Design</th><th>$T_{\text{proc}}$ baseline (RF=1)</th><th>$T_{\text{proc}}$ deferred (RF=3)</th><th>$T_{\text{proc}}$ eager (RF=3)</th></tr></thead>
+  <tbody>
+    <tr><td>ISR</td><td>≈ 73 s</td><td>≈ 73 s</td><td>≈ 220 s (~3.7 min)</td></tr>
+    <tr><td>Catch-up</td><td>(n/a)</td><td>≈ 110 s (~1.8 min)</td><td>≈ 256 s (~4.3 min)</td></tr>
+    <tr><td>RAFT</td><td>(n/a)</td><td>≈ 37 s</td><td>≈ 183 s (~3.1 min)</td></tr>
+  </tbody>
+</table>
+
+<p>
+The ISR/deferred row matches the baseline's AZ-loss-window $T_{\text{proc-drain}}^{\text{AZ}}$ from <a href="#az-derating">§4.2</a>, which is the right comparison since the recovery scenario is when this number matters. The eager rows are the cost of running secondary replacement on the recovery-critical path; the procedure store alone becomes the dominant term and pushes $T_{\text{recovery}}$ from ~75–110 s into the multi-minute range. Deferral keeps the procedure store inside the AZ-loss-window envelope for ISR and RAFT, and within ~50% of it for Catch-up.
+</p>
+
+<h3>6.2 $T_{\text{RS-open}}$ — per-RS open executor (re-cast as $T_{\text{RS-promote}}$)</h3>
+
+<p>
+With replicas, the per-RS dispatch count is the count of <em>promotions</em> the RS receives, not the count of cold opens. The renamed quantity is $T_{\text{RS-promote}}$:
+</p>
+
+$$
+T_{\text{RS-promote}} \;=\; \frac{M_{\text{TRSP,promote}}\,W_{\text{promote}}}{N_{\text{alive}}\,T_{\text{open}}},
+\qquad
+\lambda_{\text{RS}}^{\text{deferred}} \approx 750,
+\;
+\lambda_{\text{RS}}^{\text{eager}} \approx 2{,}250.
+$$
+
+<p>
+Each promotion dispatch is shorter than a cold open because store-file handles and block-cache warmth survive on the promoted replica:
+</p>
+
+<ul>
+  <li>$W_{\text{promote}}^{\text{ISR}} \approx 100\text{–}200\,\text{ms}$: surviving member's memstore and block cache are already warm; only a META roundtrip and a state flip are required.</li>
+  <li>$W_{\text{promote}}^{\text{catch-up}} \approx 0.5\text{–}1.5\,\text{s}$: bounded lease recovery against the dead primary's WAL plus a tail-replay phase; bounded above by the catch-up sink's normal lag (sub-second to a few seconds in steady state).</li>
+  <li>$W_{\text{promote}}^{\text{RAFT}} \approx 100\text{–}300\,\text{ms}$: election plus commit-index advance plus master notification; no HDFS reads on the promotion path.</li>
+</ul>
+
+<p>
+At the recommended $T_{\text{open}} = 32$ and $N_{\text{alive}} = 333$, $T_{\text{RS-promote}}$ stays sub-second to a few seconds across all three designs in the deferred case. The promotion path does <em>not</em> pay the AZ-loss-window $W_{\text{open}}^{\text{AZ}} = 1.5\times$ multiplier from <a href="#az-derating">§4.2</a> — the promoted replica's HFiles are already open and its block-cache is warm, so the per-promotion $W_{\text{promote}}$ is unchanged from the values above.
+</p>
+
+<p>
+Under eager replacement, the additional 500K secondary cold-opens drive $W$ back to the baseline cold-open path, which <em>does</em> pay the $1.5\times$ multiplier: $W_{\text{open}}^{\text{AZ}} \approx 1.5\,\text{s}$ at realistic stress. $T_{\text{RS-open}}$ then scales by the eager ratio per design <em>and</em> by the $1.5\times$ AZ-loss-window factor (full derivation in <a href="#hdfs-pipeline-cross-impact">§10.8</a>).
+</p>
+
+<h3>6.3 $T_{\text{NN}}$ — HDFS NameNode</h3>
+
+<p>
+With active replicas, steady-state NN load already runs at ~RF× the baseline because every replica opens its own HFiles. Under recovery, the master-side NN fan-in for promotions is near zero — the promoted replica's HFiles are already open and its block-cache is warm — so $T_{\text{NN}}$ for promotion-only work is <em>lower</em> than the baseline:
+</p>
+
+$$
+T_{\text{NN}}^{\text{deferred}} \;\approx\; 0
+\quad\text{(promotion path opens no new files; cited from the per-design docs).}
+$$
+
+<p>
+Under eager replacement, the additional 500K secondary cold-opens drive NN fan-in back above the baseline envelope. At the original $\omega \approx 30$ ops per cold open and $C_{\text{NN}} \approx 3 \times 10^{5}$ op/s:
+</p>
+
+$$
+T_{\text{NN}}^{\text{eager}}
+\;=\; \frac{M_{\text{TRSP,replace}}\,\omega}{C_{\text{NN}}}
+\;=\; \frac{500{,}000 \cdot 30}{3 \times 10^{5}}
+\;\approx\; 50\,\text{s.}
+$$
+
+<p>
+Deferral keeps the NN at its steady-state with-replicas operating point, with no recovery-window spike. NameNode op-throughput is not derated in the AZ-loss window (see <a href="#az-derating">§4.2</a>).
+</p>
+
+<h3>6.4 $T_{\text{WAL}}$ — distributed WAL splitting</h3>
+
+<p>
+Per-design behavior diverges from the baseline:
+</p>
+
+<ul>
+  <li><strong>ISR.</strong> Synchronous fsync to surviving members means the in-flight prefix is already on the surviving cohort's local disk at the moment of primary loss. No HDFS-WAL split is required for the promoted regions:
+    $$T_{\text{WAL}}^{\text{ISR}} \;\to\; 0 \quad \text{(promotion path).}$$
+  </li>
+  <li><strong>Catch-up.</strong> The replica's last-tailed position dictates how much WAL tail must be replayed against the dead primary's HDFS-resident WAL at promotion. Bounded by the catch-up sink's normal lag (sub-second to seconds in steady state):
+    $$T_{\text{tail-replay}}^{\text{catch-up}} \;\ll\; T_{\text{WAL,baseline}}.$$
+    The original $T_{\text{WAL}}$ formula still applies as an upper bound when the sink lag has grown to many WALs (a stressed-load case). Under the AZ-loss-window multiplier $T_{\text{WAL}}^{\text{AZ}} = 1.5 \cdot T_{\text{WAL}}$ from <a href="#az-derating">§4.2</a>, that stressed-load upper bound is itself inflated by $1.5\times$; deferral does not change the structural form of this term.
+  </li>
+  <li><strong>RAFT.</strong> No HDFS WAL exists on the promotion path; the RAFT log on the surviving group is the source of truth. $T_{\text{WAL}}$ collapses to a commit-index advance on election, on the order of a single per-group RPC roundtrip:
+    $$T_{\text{WAL}}^{\text{RAFT}} \;\to\; 0 \quad \text{(promotion path).}$$
+  </li>
+</ul>
+
+<p>
+Under eager replacement, the secondary-bootstrap path may re-read the surviving primary's WAL or HFiles to seed each new replica; this load is in addition to the promotion-path costs above. Deferral pushes it past the recovery-critical window.
+</p>
+
+<h2 id="capacity">7. Surviving-Cohort Capacity Model</h2>
+
+<p>
+Where <a href="#per-stage">§6</a> bounds <em>how fast recovery can complete</em>, this section bounds <em>what cluster sizing is feasible</em> given the recovery target. Active replicas shift data-plane load from the failed AZ onto the surviving cohort at the moment of AZ loss, and that shift must be absorbed by the surviving RegionServers' steady-state headroom because in-window scale-up is too slow to help (see <a href="#scaling">§7.6</a>).
+</p>
+
+<h3 id="util">7.1 Per-RS steady-state utilization</h3>
+
+<p>
+Define $U_{\text{steady}}$ as the per-RS steady-state utilization at the cluster's normal operating point. $U_{\text{steady}}$ is a vector across CPU, memory bandwidth, network bandwidth, and disk IOPS; the binding component varies with workload mix. The cost-to-serve floor — operators want the cluster to consume the smallest possible fleet — pushes $U_{\text{steady}} \to 1$. This section derives the safe ceiling $U_{\text{safe}}$ above which AZ loss cannot be absorbed without saturating the surviving cohort.
+</p>
+
+<h3 id="readshift">7.2 Read-load shift on AZ loss</h3>
+
+<p>
+With active replicas serving reads, the surviving cohort absorbs the dead-AZ replica fan-out. With $f = 1/3$, surviving-cohort read load multiplies by $1/(1-f) = 1.5\times$. The shift is parameterized per design via $r_{\text{replica}} \in \{0, 1\}$:
+</p>
+
+<table>
+  <thead><tr><th>Design</th><th>$r_{\text{replica}}$</th><th>Read shift on surviving cohort at $f = 1/3$</th></tr></thead>
+  <tbody>
+    <tr><td>ISR</td><td>0 (passive secondaries; primary serves all reads)</td><td>1.0× (primary reads stay on the new primary, which is in the surviving cohort by construction)</td></tr>
+    <tr><td>Catch-up</td><td>1 (timeline-consistent reads served by every replica)</td><td>1.5× (dead-AZ replicas' read share redistributes across surviving replicas)</td></tr>
+    <tr><td>RAFT</td><td>1 (lease-bounded follower reads from any member)</td><td>1.5× (same redistribution as Catch-up)</td></tr>
+  </tbody>
+</table>
+
+<p>
+ISR has no read-side amplification on AZ loss: read traffic was on primaries, primary placement remains uniform across surviving AZs (modulo the in-flight promotions whose loads land on the surviving secondaries that promoted them). The read shift is the dominant capacity term for Catch-up and RAFT but is zero for ISR.
+</p>
+
+<h3 id="writeshift">7.3 Write-load shift from promoted primaries</h3>
+
+<p>
+Each surviving RS gains $\approx M_{\text{TRSP,promote}} / N_{\text{alive}} \approx 750$ newly-primary regions on top of its baseline $\approx 1{,}500$ — a ~50% growth in primary count. Per-design write-load delta (sourced from the per-design recovery sections):
+</p>
+
+<table>
+  <thead><tr><th>Design</th><th>Per-write fan-out under deferral</th><th>$\delta_{\text{write}}$ (per-RS write CPU/IO growth on AZ loss)</th></tr></thead>
+  <tbody>
+    <tr><td>ISR</td><td>Synchronous fsync to one surviving secondary (down from two pre-loss).</td><td>≈ 0.5 — primary growth dominates; per-write fan-out reduction partially offsets.</td></tr>
+    <tr><td>Catch-up</td><td>Asynchronous tail-source push; resumes from last persisted position. Per-write CPU is dominated by the local commit, not by replication.</td><td>≈ 0.5 — primary growth alone; no per-write penalty.</td></tr>
+    <tr><td>RAFT</td><td>Leader handles client writes + AppendEntries to surviving follower (down from two pre-loss). Consensus serializes through the per-region serial executor.</td><td>≈ 0.6 — primary growth dominates; consensus per-write CPU sits between ISR and pure-async.</td></tr>
+  </tbody>
+</table>
+
+<p>
+The companion derives a single representative $\delta_{\text{write}}$ per design at write-time by reading the per-design docs. The values above are conservative engineering estimates pending per-design micro-benchmarks; the headline conclusion (all three designs sit in the $\delta_{\text{write}} \approx 0.5\text{–}0.6$ range) is robust across plausible variations because the primary-count growth is the dominant term.
+</p>
+
+<h3 id="memory">7.4 Memory pressure</h3>
+
+<p>
+Block-cache hit rate degrades as the working set per surviving RS grows. The per-RS read working set scales by $1/(1-f) = 1.5\times$ for the read-replica designs (Catch-up, RAFT) and by ~1.5× for the promoted-primary working set across all three designs. Memstore footprint grows linearly with promoted-primary count (~50% growth at $f = 1/3$). RAFT state machines and ISR sequence-number tracking add a per-region constant contribution that scales with the new primary count. The companion gives a per-component memory delta keyed to the per-RS heap and off-heap budgets:
+</p>
+
+<table>
+  <thead><tr><th>Component</th><th>Pre-loss footprint per RS</th><th>Post-loss footprint per RS at $f = 1/3$</th></tr></thead>
+  <tbody>
+    <tr><td>Block cache (working set)</td><td>baseline</td><td>$\times \,1.5$ (Catch-up, RAFT); $\times\,1.0$ (ISR)</td></tr>
+    <tr><td>Memstore (active primaries)</td><td>$\propto R_{\text{prim}}$</td><td>$\propto 1.5\,R_{\text{prim}}$ (all designs)</td></tr>
+    <tr><td>Per-region constants (ISR seq tracking, RAFT state machines)</td><td>$\propto R_{\text{total}}$</td><td>$\propto R_{\text{total}}$ (suppressed slots retain their constant footprint pending rejoin/replace)</td></tr>
+  </tbody>
+</table>
+
+<p>
+The dominant memory term is the block-cache working-set growth for the read-replica designs; ISR avoids it.
+</p>
+
+<h3 id="headroom">7.5 Headroom budget: $U_{\text{safe}}$</h3>
+
+<p>
+Define $U_{\text{safe}}$ as the steady-state utilization ceiling that keeps post-loss surviving-cohort utilization $U_{\text{surviving}} \le 1$:
+</p>
+
+$$
+U_{\text{surviving}} \;\le\; \frac{U_{\text{steady}} \cdot (1 + \delta_{\text{write}}) \cdot (1 + r_{\text{replica}}\,(1/(1-f) - 1))}{1 - f},
+$$
+
+<p>
+where the numerator is the per-RS load post-loss (write growth $\times$ read growth applied to the steady-state load) and the denominator $1 - f$ accounts for the surviving cohort being smaller. Setting $U_{\text{surviving}} \le 1$ and solving for $U_{\text{steady}}$:
+</p>
+
+$$
+U_{\text{safe}} \;\le\; \frac{1 - f}{(1 + \delta_{\text{write}}) \cdot (1 + r_{\text{replica}}\,(1/(1-f) - 1))} \;-\; \epsilon_{\text{margin}}.
+$$
+
+<p>Numerical values at $f = 1/3$ (so $1 - f = 2/3$ and $1/(1-f) - 1 = 0.5$):</p>
+
+<table>
+  <thead><tr><th>Design</th><th>$\delta_{\text{write}}$</th><th>$r_{\text{replica}}$</th><th>$U_{\text{safe}}$ (before $\epsilon_{\text{margin}}$)</th></tr></thead>
+  <tbody>
+    <tr><td>ISR</td><td>0.5</td><td>0</td><td>$\tfrac{2/3}{1.5 \cdot 1.0} = \tfrac{4}{9} \approx 0.44$</td></tr>
+    <tr><td>Catch-up</td><td>0.5</td><td>1</td><td>$\tfrac{2/3}{1.5 \cdot 1.5} = \tfrac{8}{27} \approx 0.30$</td></tr>
+    <tr><td>RAFT</td><td>0.6</td><td>1</td><td>$\tfrac{2/3}{1.6 \cdot 1.5} = \tfrac{5}{18} \approx 0.28$</td></tr>
+  </tbody>
+</table>
+
+<p>
+The headline figures are sobering: <strong>baseline per-RS utilization should not exceed ~30% for the read-replica designs</strong>, and ~40% for ISR, if the cluster is to absorb single-AZ loss without saturating. These are tighter than the often-cited "size to 2/3 of capacity for $f = 1/3$" rule of thumb, because that rule ignores the per-RS write-load growth from promoted primaries and the read-load growth from the dead AZ's serving share.
+</p>
+
+<p>
+The safety margin $\epsilon_{\text{margin}}$ is the explicit dial between cost (smaller margin → tighter sizing → less idle capacity) and recovery feasibility (larger margin → safer headroom → more idle cost). Inputs that determine the appropriate value: measurement noise on the steady-state utilization metric (typically ±5%), GC pressure under sustained burst load (typically +5–10%), and autoscale lag if the operator is running with a non-zero autoscale cushion (see <a href="#scaling">§7.6</a>). A typical operator value is $\epsilon_{\text{margin}} \approx 0.05\text{–}0.10$.
+</p>
+
+<h3 id="scaling">7.6 Limited and deferred autoscaling</h3>
+
+<p>
+Cloud autoscaling could in principle add capacity to absorb the load shift, but $T_{\text{scale}}$ — the wall-clock from scale-up trigger to fully-warm new RS in the cluster — is dominated by:
+</p>
+
+<ul>
+  <li>Instance provisioning: 30–120 s for an EC2 launch, more for instance types in short supply or for cluster-spread placements.</li>
+  <li>RegionServer startup and ZK registration: 10–30 s.</li>
+  <li>Region balancing onto the new RS: minutes (one TRSP per region, paced by the balancer).</li>
+  <li>Block-cache warmth: minutes-to-tens-of-minutes; reads against a cold RS run at HDFS DataNode speeds rather than memory speeds.</li>
+</ul>
+
+<p>
+Even the optimistic case gives $T_{\text{scale}}$ on the order of $5\text{–}15\,\text{min}$, which is $5\text{–}15\times$ the recovery-critical window of $T_{\text{recovery}} \approx 70\,\text{s}$. <strong>Autoscaling does not help during the recovery-critical window.</strong> The surviving cohort must absorb the load on its own at $U_{\text{steady}} \le U_{\text{safe}}$.
+</p>
+
+<p>Two operator-facing variants of the autoscaling lever:</p>
+
+<ul>
+  <li><strong>Limited autoscaling</strong> caps scale-up at an operator-configured ceiling to bound cost. The model accepts this as an operator constraint and treats the ceiling as $N_{\text{alive}}^{\text{max}}$ in the headroom formula above.</li>
+  <li><strong>Deferred autoscaling</strong> holds scale-up off until the CFD's recovery-confirm window has elapsed. This avoids contributing to the recovery storm (a new RS coming up during recovery would itself burn HDFS NN ops on its initial open pass, competing with the promotion-path opens) and provides post-recovery sustained capacity once the topology has stabilized. <em>Recommendation:</em> defer scale-up to post-recovery rather than relying on in-window provisioning.</li>
+</ul>
+
+<p>
+The operator-facing recommendation is therefore: <strong>size the steady-state cluster for $U_{\text{steady}} \le U_{\text{safe}}$ rather than relying on in-window autoscaling.</strong> This is a meaningful cost line: at ~30% steady-state utilization the cluster is paying for ~3× the fleet that would suffice at peak. The safety margin $\epsilon_{\text{margin}}$ is the dial that prices recovery feasibility against fleet cost.
+</p>
+
+<h2 id="pk">8. Bulk-Service Queueing under Deferral</h2>
+
+<p>
+The bulk-service queueing analysis from <a href="TUNING_FOR_RECOVERY.html#pk">TUNING_FOR_RECOVERY.html §7</a> applies unchanged in structure to the in-window workload. Under the AZ-loss-window derating from <a href="#az-derating">§4.2</a>, the operating constants are $\rho_{\max}^{\text{AZ}} \approx 0.61$ and $\mu_{\text{proc}}^{\text{AZ}} \approx 20.5\,\text{K w/s}$, giving a post-burst sustainable rate of $\rho_{\max}^{\text{AZ}}\,\mu_{\text{proc}}^{\text{AZ}} \approx 12.5\,\text{K w/s}$ (down from the steady-state $\rho_{\max}\,\mu_{\text{proc}} \approx 16.6\,\text{K w/s}$). The post-deferral rebalance adds one new constraint.
+</p>
+
+<h3>8.1 Post-deferral pacing</h3>
+
+<p>
+The recovery throttle $C_{\text{paced}}$ (= <code>hbase.replica.deferred.recovery.max.in.flight</code>, default 1,000) bounds the post-deferral rebalance at:
+</p>
+
+$$
+\mu_{\text{paced}} \;=\; \frac{C_{\text{paced}}}{t_{\text{boot}}} \;\approx\; \frac{1{,}000}{1\,\text{s}} \;=\; 1{,}000\,\text{regions/s.}
+$$
+
+<p>
+At the AZ-loss-window post-burst sustainable rate $\rho_{\max}^{\text{AZ}}\,\mu_{\text{proc}}^{\text{AZ}} \approx 12.5\,\text{K w/s}$, $\mu_{\text{paced}}$ is ~8% of the procedure-store ceiling — comfortably below saturation. The cap cannot re-saturate the master even during the AZ-loss window. Disengage runs <em>after</em> the CFD's recovery-confirm window has elapsed, by which point the surviving DataNodes have shed the read-load amplification and the operating point has returned to its steady-state values; the 8% margin is therefore a worst-case bound rather than the operating-point ratio.
+</p>
+
+<h3>8.2 Post-deferral drain time</h3>
+
+<p>The total post-deferral drain time for the deferred secondary-replacement workload is:</p>
+
+$$
+T_{\text{post-deferral}} \;=\; \frac{M_{\text{TRSP,replace}}}{\mu_{\text{paced}}} \;=\; \frac{500{,}000}{1{,}000} \;\approx\; 500\,\text{s} \;\approx\; 8\,\text{min.}
+$$
+
+<p>
+This is well outside the recovery-critical window. The post-deferral phase begins at $t \approx T_{\text{recovery}} + T_{\text{recovery-confirm}} \approx 75\text{–}110 + 60 \approx 135\text{–}170\,\text{s}$ after the loss event, runs for ~8 min, and ends with the cluster restored to its pre-loss replica topology.
+</p>
+
+<h2 id="summary-table">9. Summary — extended</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Quantity</th>
+      <th>RF=1 baseline (no replicas, no CFD)</th>
+      <th>RF=3 + deferral</th>
+      <th>RF=3 + eager (no CFD)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>$M_{\text{TRSP}}$</td><td>≈ 250K</td><td>≈ 250K</td><td>≈ 750K</td></tr>
+    <tr><td>$W_{\text{recovery}}$ (ISR / Catch-up / RAFT)</td><td>1.5M / — / —</td><td>1.5M / 2.25M / 0.75M</td><td>4.5M / 5.25M / 3.75M</td></tr>
+    <tr><td>$T_{\text{proc}}$ (ISR / Catch-up / RAFT)</td><td>≈ 73 s / — / —</td><td>≈ 73 s / 110 s / 37 s</td><td>≈ 220 s / 256 s / 183 s</td></tr>
+    <tr><td>$T_{\text{NN}}$ (promotion path)</td><td>≈ 25 s</td><td>≈ 0 (warm replicas)</td><td>≈ 50 s (cold secondaries)</td></tr>
+    <tr><td>$T_{\text{recovery}}$ envelope (typical)</td><td>≈ 73 s</td><td>≈ 73–110 s (Catch-up sets the ceiling)</td><td>≈ 3.5–4.5 min</td></tr>
+    <tr><td>Post-deferral pacing budget</td><td>(n/a)</td><td>$C_{\text{paced}} = 1{,}000$, $\mu_{\text{paced}} \approx 1{,}000\,\text{r/s}$, $T_{\text{post-deferral}} \approx 8\,\text{min}$</td><td>(n/a — runs in-window and saturates)</td></tr>
+    <tr><td>$U_{\text{safe}}$ (ISR / Catch-up / RAFT)</td><td>$\approx 2/3$ (rule of thumb; primaries only)</td><td colspan="2">≈ 0.44 / 0.30 / 0.28 (before $\epsilon_{\text{margin}}$)</td></tr>
+  </tbody>
+</table>
+
+<p>
+The headline message is that <strong>deferral keeps the recovery wall-clock inside the AZ-loss-window envelope</strong> ($T_{\text{recovery}} \approx 73\text{–}110\,\text{s}$ instead of $\approx 3.5\text{–}4.5\,\text{min}$ for eager) <strong>at no additional master sizing cost</strong>; the pacing budget for the deferred workload sits well below the procedure-store post-burst ceiling and runs entirely outside the recovery-critical window. The cost the operator pays is on the headroom side: $U_{\text{safe}}$ is materially tighter than the naïve $1 - f = 2/3$ rule of thumb.
+</p>
+
+<h2 id="hdfs-pipeline" class="page-break">10. HDFS write pipeline tuning for degraded dependencies</h2>
+
+<p>
+This section addresses a related failure mode where a number of DataNodes are degraded rather than completely offline, perhaps due to EBS level degradation during an AZ outage or partial outage. Embedded HDFS clients inside the RegionServers keep selecting these DataNodes for new WAL pipelines, resulting in a sustained tax on WAL hflush latency that propagates to client visible tail latency for every region whose WAL passes through a sick pipeline.
+</p>
+
+<p>
+FSHLog's <code>DFSOutputStream</code> reacts to a pipeline drop by invoking <code>ReplaceDatanodeOnFailure</code>, which adds complexity and latency to the write path during AZ loss. AsyncFSWAL takes a different tack and instead each WAL file is exactly one block long, so on any DataNode error the upper layer immediately rolls the WAL and opens a fresh file with a fresh <code>addBlock</code>. The NameNode satisfies the new pipeline at width 2 (subject to <code>dfs.namenode.replication.min</code>), and the writer continues. The document therefore recommends AsyncWAL and the quantitative cross-impacts in <a href="#hdfs-pipeline-cross-impact">&sect;10.8</a> assume it.
+</p>
+
+<p>
+The section is organized as a one-paragraph model of the embedded client write pipeline (<a href="#hdfs-pipeline-model">&sect;10.1</a>), the detection window arithmetic that explains why a degraded DN keeps being picked (<a href="#hdfs-pipeline-detection">&sect;10.2</a>), the divergent pipeline recovery behavior of the two HBase WAL providers (<a href="#hdfs-pipeline-fshlog">&sect;10.3</a>, <a href="#hdfs-pipeline-asyncfs">&sect;10.4</a>), the HBase-side circuit breakers (<a href="#hdfs-pipeline-hbase-mitigation">&sect;10.5</a>), and tuning recommendations at the HDFS layer (<a href="#hdfs-pipeline-tune-hdfs">&sect;10.6</a>) and HBase layer (<a href="#hdfs-pipeline-tune-hbase">&sect;10.7</a>).
+</p>
+
+<h3 id="hdfs-pipeline-model">10.1 The embedded HDFS client write pipeline</h3>
+
+<p>
+Every WAL append crosses an embedded HDFS write pipeline of <code>replication</code> DataNodes (3 in the reference deployment). Pipeline construction is performed by the NameNode's <code>BlockPlacementPolicy</code> at <code>addBlock</code> time, honoring the client-supplied <code>excludedNodes</code> set. Pipeline recovery is governed by a client-side state machine that differs sharply between the two HBase WAL providers. The provider is selected by <code>hbase.wal.provider</code> (default <code>defaultProvider</code> &asymp; <code>asyncfs</code>, alternative <code>filesystem</code> &asymp; FSHLog).
+</p>
+
+<div class="pipeline">                       NameNode
+                          &uarr; addBlock(src, excludedNodes)
+                          |   returns LocatedBlock[DN1, DN2, DN3]
+                          |
+   RS WAL writer          |
+        |                 |
+        v                 v
+   DFSClient ------------------------------------------------------+
+                                                                   |
+                       data                                        |
+        DN1 head  ------------->  DN2 mirror  ------------->  DN3 tail
+            ^                         ^                            |
+            |                         |                            |
+            +-------- ack ------------+----------- ack ------------+
+
+   FSHLog/DFSClient chained-pipeline topology shown.
+   AsyncFSWAL's FanOutOneBlockAsyncDFSOutput replaces the
+   head-&gt;mirror-&gt;tail chain with parallel client-&gt;DN channels;
+   the NameNode-side addBlock half is identical.
+</div>
+
+<p>
+On FSHLog the writer is a stock <code>DFSOutputStream</code>. Pipeline failures trigger HDFS's pipeline recovery machinery. On AsyncFSWAL the writer is HBase's own <code>FanOutOneBlockAsyncDFSOutput</code>, which avoids the complexity and latency of pipeline recovery by only ever writing files the length of a single block. This allows it to open a Netty channel per replica, fan packets out in parallel, and immediately recover at the HBase level with a WAL roll.
+</p>
+
+<h3 id="hdfs-pipeline-detection">10.2 Partial-failure detection windows</h3>
+
+<p>
+Various NameNode-side mechanisms can keep a degraded DN out of new pipelines. At HDFS defaults each has a different detection window and a different set of opt-ins.
+</p>
+
+<h4>Dead-DN window</h4>
+
+<p>
+The NameNode declares a DN dead only after a long no-heartbeat window:
+</p>
+
+$$
+T_{\text{dead}} \;=\; 2\,t_{\text{recheck}} \;+\; 10\,t_{\text{hb}}.
+$$
+
+<p>
+With defaults <code>dfs.namenode.heartbeat.recheck-interval</code> = 5 min and <code>dfs.heartbeat.interval</code> = 3 s, this is <strong>10 min 30 s</strong> (computed in <code>DatanodeManager</code> at construction, checked in <code>isDatanodeDead</code>). Until the dead window expires, the DN remains <code>IN_SERVICE</code> and the placement policy will keep proposing it.
+</p>
+
+<h4>Stale-DN window</h4>
+
+<p>
+<code>dfs.namenode.stale.datanode.interval</code> (default 30 s) marks a DN stale after a missed heartbeat or two. Stale DNs are avoided as targets for new pipelines if <code>dfs.namenode.avoid.write.stale.datanode</code> is true. In this production deployment that switch is set, so the 30 s window is active and the placement policy excludes a DN as soon as it misses heartbeats long enough to go stale. A safety hatch (<code>dfs.namenode.write.stale.datanode.ratio</code>, default 0.5) disables stale-DN avoidance when more than half the cluster is stale, so during a broad partition the protection disengages exactly when it matters most.
+</p>
+
+<p>
+The stale-DN avoidance only fires when a DN actually misses heartbeats. A degraded DN continues to heartbeat normally and never goes stale. The slow-peer graylist below is the only NN-side mechanism that catches this case.
+</p>
+
+<h4>Slow-peer graylist</h4>
+
+<p>
+Each DN computes an outlier set over its downstream send latencies (<code>DataNodePeerMetrics</code> with <code>OutlierDetector</code>) and ships them in heartbeats. The NameNode aggregates votes in <code>SlowPeerTracker</code>, a periodic daemon materializes a UUID set, and <code>BlockPlacementPolicyDefault.isGoodDatanode</code> rejects DNs in that set during placement. Three opt-ins are required, <em>all default false</em>: <code>dfs.datanode.peer.stats.enabled</code> (DN-side reporting), <code>dfs.namenode.block-placement-policy.exclude-slow-nodes.enabled</code> (NN-side enforcement), and a non-zero <code>dfs.namenode.slowpeer.collect.interval</code> on the materialization daemon. Worst-case time from when the DN begins to misbehave to when the DN appears in the graylist:
+</p>
+
+$$
+T_{\text{graylist}} \;\lesssim\; 3\,t_{\text{outliers.report.interval}} \;+\; t_{\text{slowpeer.collect.interval}}.
+$$
+
+<p>
+At defaults (<code>30m</code>, <code>30m</code>) this is &asymp; <strong>2 hours</strong>. Even with peer stats enabled, the exclude-slow-nodes switch controls whether the NN actually refuses the DN. Out of the box the NN sees the slow-peer reports but does nothing with them.
+</p>
+
+<h4>Load-based exclusion</h4>
+
+<p>
+<code>dfs.namenode.redundancy.considerLoad</code> (default true, factor 2.0) skips a DN whose <code>xceiverCount</code> exceeds the cluster average by the factor. A DN with a hot disk or facing network degradation slows packet acks without inflating xceiver counts.
+</p>
+
+<h4>Summary of detection windows</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Mechanism</th>
+      <th>Window at HDFS defaults</th>
+      <th>Window at recommended settings (<a href="#hdfs-pipeline-tune-hdfs">&sect;10.6</a>)</th>
+      <th>Opt-ins required at defaults</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Dead-DN ($T_{\text{dead}}$)</td>
+      <td>10 min 30 s</td>
+      <td>2 min 30 s (<code>recheck</code> &rarr; 60 s)</td>
+      <td>Always on</td>
+    </tr>
+    <tr>
+      <td>Stale-DN (heartbeat-missing DNs only)</td>
+      <td>30 s (production has <code>avoid.write.stale.datanode</code> set; off at stock HDFS defaults)</td>
+      <td>30 s (no change &mdash; already enabled)</td>
+      <td>Already set in this deployment</td>
+    </tr>
+    <tr>
+      <td>Slow-peer graylist ($T_{\text{graylist}}$)</td>
+      <td>~2 h (and not actually enforced &mdash; exclude switch off)</td>
+      <td>~3 min</td>
+      <td>Three opt-ins, all off by default</td>
+    </tr>
+    <tr>
+      <td>Load-based</td>
+      <td>Trips only at $\geq 2\times$ cluster-average xceivers</td>
+      <td>Same (no useful lever for "slow-not-busy")</td>
+      <td>On, but blind to latency outliers</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+If neither dead-DN nor graylist fires inside the lifetime of a single WAL file, all of the pipeline-recovery mechanisms in &sect;&sect;10.3&ndash;10.4 are operating on stale topology.
+</p>
+
+<h3 id="hdfs-pipeline-fshlog">10.3 FSHLog: traditional DFSClient pipeline recovery</h3>
+
+<p>
+For deployments still on FSHLog (i.e. those that have not yet switched to the AsyncWAL provider recommended in <a href="#az-assumptions">&sect;4</a>), the writer is a stock <code>DFSOutputStream</code> / <code>DataStreamer</code> and inherits HDFS's pipeline-recovery state machine. This subsection documents that machinery and the FSHLog-side configuration that controls it. The cross-section impact numbers in <a href="#hdfs-pipeline-cross-impact">&sect;10.8</a> assume AsyncWAL.
+</p>
+
+<p>
+The client maintains a per-stream <code>excludedNodes</code> cache, populated whenever a pipeline DN fails and passed into the next <code>addBlock</code> call so the NameNode's placement policy skips the bad DN when allocating the next block. Entries expire after <code>dfs.client.write.exclude.nodes.cache.expiry.interval.millis</code> (default 10 min), giving a freshly-failed DN a window to demonstrate it is back to health before being reconsidered.
+</p>
+
+<p>
+The replace-datanode-on-failure policy (governed by the four keys <code>dfs.client.block.write.replace-datanode-on-failure.{enable, policy, min-replication, best-effort}</code>) decides what to do when a DN drops mid-write. The client can ask the NameNode for an additional DN via <code>getAdditionalDatanode</code> and grow the surviving pipeline back to a chosen replication floor, instead of continuing to stream against a shrunken set.
+</p>
+
+<p>
+After a DN failure the client drives a generation-stamp recovery by calling <code>updateBlockForPipeline</code>. The NameNode bumps the block's generation stamp and persists the new expected-locations set to the edit log; the client then opens a new pipeline with the bumped GS on the surviving DNs (plus any replacement obtained in step two) and resumes streaming. The block itself is not abandoned, and append throughput is interrupted only for the duration of the RPC round-trips rather than restarted from a roll.
+</p>
+
+<p>
+The state machine that ties these together lives in <code>DataStreamer</code>:
+</p>
+
+<div class="pipeline">  STREAMING                           [normal: streaming packets to all DNs]
+      |
+      | ack with ERROR  /  socket timeout  /  closed peer
+      v
+  DATA_STREAMER_ERROR_STATE
+      |
+      | handleBadDatanode() &mdash; drop the failed DN from `nodes[]`
+      v
+      |---&gt; (surviving &ge; replace-datanode-min)
+      |        |
+      |        |  setupPipelineForAppendOrRecovery()
+      |        |     |
+      |        |     |--- dtpReplaceDatanodeOnFailure.satisfy() = true
+      |        |     |        |
+      |        |     |        |  addDatanode2ExistingPipeline()
+      |        |     |        |     getAdditionalDatanode(excludedNodes &cup; failed DN)
+      |        |     |        v
+      |        |     |  transfer replica to the new DN
+      |        |     v
+      |        |  updateBlockForPipeline() / updatePipeline() &mdash; bump GS
+      |        v
+      |     STREAMING (resumed on new pipeline)
+      |
+      `---&gt; (surviving &lt; replace-datanode-min) and best-effort = false
+                 v
+              FAIL &mdash; throw IOException upward; HBase WAL.sync() fails
+</div>
+
+<p>
+The relevant client-side knobs all live in <code>HdfsClientConfigKeys.BlockWrite.ReplaceDatanodeOnFailure</code>. Defaults: <code>enable = true</code>, <code>policy = DEFAULT</code>, <code>min-replication = 0</code>, <code>best-effort = false</code>. The <code>DEFAULT</code> policy attempts a replacement when the pipeline shrinks below the original replication factor on a non-append write. <code>ALWAYS</code> attempts on every failure. <code>NEVER</code> disables replacement entirely.
+</p>
+
+<p>
+FSHLog tolerates a partial pipeline failure provided the NN can find a replacement DN. The cost is one GS bump and one extra <code>addBlock</code> round-trip. The WAL file does not need to roll, and append throughput is briefly interrupted (one packet round-trip plus the GS-bump RPC) rather than restarted.
+</p>
+<p>
+Otherwise, <code>FSHLog.doCheckLogLowReplication</code> forces a roll when the current block has fewer than <code>hbase.regionserver.hlog.tolerable.lowreplication</code> live replicas. This catches the case where the pipeline silently degrades below that floor. The key defaults to the cluster replication factor (typically 3), which during an AZ-loss event interacts badly with the NameNode's block placement. Roll churn is bounded by <code>hbase.regionserver.hlog.lowreplication.rolllimit</code> (default 5), so the mechanism cannot loop forever. Lowering the floor to 2 (see <a href="#hdfs-pipeline-tune-hbase">&sect;10.7</a>) eliminates the WAL roll storm.
+</p>
+
+<h3 id="hdfs-pipeline-asyncfs">10.4 AsyncFSWAL: fan-out pipeline and <code>ExcludeDatanodeManager</code></h3>
+
+<p>
+AsyncFSWAL replaces the stock client with <code>FanOutOneBlockAsyncDFSOutput</code>, in <code>hbase-asyncfs</code>. Each WAL file is bounded to exactly one HDFS block, sidestepping the entire chained pipeline construction and pipeline recovery machinery of the standard HDFS client. HBase's custom client opens one Netty channel per replica and streams packets to all DNs in parallel. There is no head/mirror/tail relationship between the DNs. The healthy-case benefit is that hflush wait drops by a small constant factor, because there is no serial-hop tail latency, and the recovery case is greatly simplified.
+</p>
+
+<p>
+AsyncFSWAL ignores <code>dfs.client.block.write.replace-datanode-on-failure.*</code>. On any DN error, all pending acks fail, and the upper layer immediately rolls the WAL. Because each WAL file is one block, this is as simple as closing the broken block-as-file, opening a fresh file with a fresh <code>addBlock</code>, and starting a fresh fan-out.
+</p>
+
+<p>
+For the roll to be productive, <code>hbase-asyncfs</code> carries its own degradation tracker. <code>StreamSlowMonitor</code> observes per-packet ack latency on each in-flight WAL writer and decides when a DN's behavior is degraded enough to act on, and <code>ExcludeDatanodeManager</code> holds the resulting per-RegionServer registry of DNs to avoid.
+</p>
+
+<p>
+The slow-packet decision in <code>StreamSlowMonitor.checkProcessTimeAndSpeed</code> uses two thresholds keyed off packet size, on the principle that small packets are bounded by per-RPC latency while large packets are bounded by throughput. Packets below <code>hbase.regionserver.async.wal.datanode.slow.check.speed.packet.data.length.min</code> (default 64 KiB) are judged against <code>hbase.regionserver.async.wal.datanode.slow.packet.process.time.millis</code> (default <strong>6 000 ms</strong>). Larger packets are judged against <code>hbase.regionserver.async.wal.datanode.slow.packet.speed.min.kbs</code> (default 20 KB/s). Either threshold being crossed contributes one observation against the DN.
+</p>
+
+<p>
+The design assumes any DN can have an occasional bad packet under GC or transient network jitter. Observations are accumulated per DN in a sliding deque whose validity window is <code>hbase.regionserver.async.wal.slow.detect.data.ttl.ms</code> (default 10 min), and only when a DN accumulates <code>hbase.regionserver.async.wal.min.slow.detect.count</code> (default 3) live observations is it promoted to the exclude registry. The result is a quorum of slow packets across a sliding window, not an instantaneous reaction to any single bad packet, a deliberate trade-off of detection latency against false-positive immunity.
+</p>
+
+<p>
+<code>ExcludeDatanodeManager</code> holds at most <code>hbase.regionserver.async.wal.max.exclude.datanode.count</code> (default <strong>3</strong>) DataNodes, each retained for <code>hbase.regionserver.async.wal.exclude.datanode.info.ttl.hour</code> (default <strong>6 hours</strong>) before automatic eviction. On each subsequent WAL roll the current registry contents are passed as the <code>excludedNodes</code> argument to the NameNode's <code>addBlock</code> call, so the placement policy is barred from returning those DNs in the new file's pipeline.
+</p>
+
+<p>
+Because <code>ExcludeDatanodeManager</code> is instantiated per RegionServer process, a bad DN is rediscovered independently by each surviving RegionServer, once the slow packet quorum has accumulated against that DN from <em>that</em> RS's own WAL traffic, so cluster-wide convergence takes as many independent detections as there are RegionServers writing through the bad DN, with the per RS detection latency set by <code>min.slow.detect.count = 3</code> divided by that RS's per-DN slow packet rate. The NameNode graylist (&sect;10.2) is the only mechanism with true cluster-wide scope.
+</p>
+
+<p>
+Also, the registry is merely a bounded cache. With <code>max.exclude.datanode.count = 3</code>, only three DataNodes can be suppressed at any moment, and a wider incident causes thrashing as newly detected bad DNs evict additional bad ones from the cache. The cap is appropriate for the steady state assumption that DN failures are uncorrelated and few at a time, but it is the wrong approach for an AZ-scoped incident. To be resilient against wider scale failures, the cap should be raised (see <a href="#hdfs-pipeline-tune-hbase">&sect;10.7</a>) so that the registry can hold the full set of concurrently degraded DNs without losing coverage.
+</p>
+
+<h3 id="hdfs-pipeline-hbase-mitigation">10.5 HBase WAL-level mitigations</h3>
+
+<p>
+Independent of the WAL provider, <code>AbstractFSWAL</code> implements three circuit breakers against a sick pipeline and one terminal watchdog. All four interact with the detection-window arithmetic of &sect;10.2: they decide what HBase does when a single sync is slow, regardless of whether the NN has yet classified the responsible DN as bad.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Mechanism</th>
+      <th>Config key</th>
+      <th>Default</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Slow-sync log/metric</td>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.ms</span></td>
+      <td>100 ms</td>
+      <td>Single sync above this threshold logs a warning and increments the slow-sync metric. No action.</td>
+    </tr>
+    <tr>
+      <td>Roll on single slow sync</td>
+      <td><span class="param-name">hbase.regionserver.wal.roll.on.sync.ms</span></td>
+      <td>10 000 ms (10 s)</td>
+      <td>A single sync exceeding this forces an immediate <code>requestLogRoll(SLOW_SYNC)</code>. Closes the current pipeline and opens a fresh one.</td>
+    </tr>
+    <tr>
+      <td>Roll on sustained slow syncs</td>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.roll.threshold</span> in <span class="param-name">hbase.regionserver.wal.slowsync.roll.interval.ms</span></td>
+      <td>100 events in 60 000 ms</td>
+      <td>Cumulative slow-sync count crossing the threshold inside the window triggers a roll.</td>
+    </tr>
+    <tr>
+      <td>Sync-timeout watchdog</td>
+      <td><span class="param-name">hbase.regionserver.wal.sync.timeout</span></td>
+      <td>300 000 ms (5 min)</td>
+      <td><code>blockOnSync</code> throws <code>WALSyncTimeoutIOException</code>; <code>HRegion.doWALAppend</code> calls <code>rsServices.abort("WAL sync timeout, forcing server shutdown", ioe)</code>. The RegionServer terminates and its regions enter recovery (&sect;&sect;1&ndash;8).</td>
+    </tr>
+    <tr>
+      <td>Low-replication roll (FSHLog only)</td>
+      <td><span class="param-name">hbase.regionserver.hlog.tolerable.lowreplication</span> / <span class="param-name">hbase.regionserver.hlog.lowreplication.rolllimit</span></td>
+      <td>=replication / 5</td>
+      <td><code>FSHLog.doCheckLogLowReplication</code> rolls when the block replication factor of the WAL file is below the floor. Disables after <code>rolllimit</code> consecutive triggers to avoid roll storms during a broad outage (see <a href="#hdfs-pipeline-tune-hbase">&sect;10.7</a>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The pertinent question is the time, from the moment a DN starts misbehaving, before HBase reacts. At defaults the answer is bounded by the slow-sync roll path:
+</p>
+
+$$
+T_{\text{react, single sync}} \;\leq\; \texttt{roll.on.sync.ms} \;=\; 10\,\text{s,}
+$$
+
+<p>
+and the terminal watchdog at
+</p>
+
+$$
+T_{\text{react, watchdog}} \;\leq\; \texttt{wal.sync.timeout} \;=\; 300\,\text{s.}
+$$
+
+<p>
+A 5-minute black hole on the watchdog is excessive. By then every region whose WAL is on the sick pipeline has been blocked for 5 minutes, and the RS abort triggers an SCP per &sect;&sect;1&ndash;8 anyway. The recommended settings in &sect;10.7 compress the single-sync roll to 5 seconds and the watchdog to 60 seconds, sized so that the watchdog fires only on a genuinely unrecoverable pipeline.
+</p>
+
+<h3 id="hdfs-pipeline-tune-hdfs">10.6 Recommended HDFS-side tuning</h3>
+
+<p>
+Three layers of HDFS knobs interact in a partial-failure window. The NameNode governs placement decisions and dead-DN classification, the DataNode governs the slow-peer reports that feed those decisions, and embedded client (governs in-place recovery on FSHLog).
+</p>
+
+<h4>NameNode</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.namenode.heartbeat.recheck-interval</span></td>
+      <td>300000 ms</td>
+      <td>60000 ms</td>
+      <td>Shrinks $T_{\text{dead}}$ from 10 minutes 30 seconds to 2 minutes 30 seconds. The NN sweep interval shortens proportionally.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.avoid.write.stale.datanode</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>Already enabled, listed for completeness. Activates the 30 second stale-DN window on the write path. Note that stale-DN avoidance only fires on heartbeat misses. It does not cover the degraded-but-alive case targeted by the slow peer graylist below.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.avoid.read.stale.datanode</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>Already enabled, listed for completeness. Symmetric for the read path.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.block-placement-policy.exclude-slow-nodes.enabled</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>The actual switch that makes <code>BlockPlacementPolicyDefault.isGoodDatanode</code> refuse a graylisted DN. Without this, the graylist is observed but not enforced for placement.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.avoid.read.slow.datanode</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>Symmetric on the read path. Avoids graylisted DNs in <code>sortLocatedBlocks</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.slowpeer.collect.interval</span></td>
+      <td>30 minutes</td>
+      <td>1 minute</td>
+      <td>Period of the daemon that refreshes the UUID set the placement policy reads. Shortens the second additive term in $T_{\text{graylist}}$.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.replication.min</span></td>
+      <td>1</td>
+      <td>2</td>
+      <td>Without this, <code>addBlock</code> returns successfully with one good DN and <code>complete</code> closes a half-broken WAL. Raising to 2 makes the NN refuse to allocate or close a block on a single surviving DN.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>DataNode</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.datanode.peer.stats.enabled</span></td>
+      <td>false</td>
+      <td>true</td>
+      <td>Master switch for slow-peer detection. Without it, no DN ships outlier reports and the graylist never populates.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.outliers.report.interval</span></td>
+      <td>30 minutes</td>
+      <td>1 minute</td>
+      <td>Period the DN re-runs its outlier detector and ships fresh reports. Shrinks the first additive term in $T_{\text{graylist}}$. <code>SlowPeerTracker</code> validates each report for $3\,\times$ this interval, so the staleness of the NN's view also shortens proportionally.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.min.outlier.detection.nodes</span></td>
+      <td>10</td>
+      <td>10 (keep)</td>
+      <td>Minimum peer count for the outlier detector to run at all. Lowering risks false positives on small clusters; raising disables detection in small deployments.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.slowpeer.low.threshold.ms</span></td>
+      <td>5 ms</td>
+      <td>5 ms (keep)</td>
+      <td>Noise floor: a peer with average mirror-send latency below this is never called slow. Conservative default appropriate for SSD/NVMe DataNodes.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.slow.io.warning.threshold.ms</span></td>
+      <td>300 ms</td>
+      <td>300 ms (keep, but consider monitoring)</td>
+      <td>Per-packet log-only threshold. Increments slow-write and slow-ack metrics. Treat as an early warning metric for alerting.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.max.transfer.threads</span></td>
+      <td>4096 (default)</td>
+      <td>4096 (or higher)</td>
+      <td>Hard cap on concurrent <code>DataXceiver</code> threads. Exceeding it throws on <code>accept()</code> and the pipeline-construction fails; the client treats this as a DN error and excludes it. The default is comfortable for the reference instance.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>Embedded client (set in <code>hbase-site.xml</code> on RegionServers)</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.enable</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>FSHLog-only. AsyncFSWAL ignores this key entirely.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.policy</span></td>
+      <td>DEFAULT</td>
+      <td>ALWAYS</td>
+      <td>FSHLog-only. <code>ALWAYS</code> attempts a replacement on every DN failure, not just the conditions <code>DEFAULT</code> covers. Pairs with raising <code>replication.min</code> below.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.min-replication</span></td>
+      <td>0</td>
+      <td>2</td>
+      <td>FSHLog-only. Client demands a replacement when the surviving pipeline falls below this count, instead of continuing best-effort on a thin pipeline.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.best-effort</span></td>
+      <td>false</td>
+      <td>false (keep)</td>
+      <td>FSHLog-only. With this false, the client fails the write if it cannot meet the min replication floor, which propagates upward as a <code>WAL.sync()</code> failure rather than silently continuing on a one-replica pipeline.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.write.exclude.nodes.cache.expiry.interval.millis</span></td>
+      <td>600000 ms (10 min)</td>
+      <td>600000 ms (keep)</td>
+      <td>FSHLog-only. How long a failed DN stays in the client's per-stream exclude set. Longer values trade exclusion duration for occasional unnecessary re-exclusion.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.socket-timeout</span></td>
+      <td>60000 ms (60 s)</td>
+      <td>60000 ms (keep)</td>
+      <td>Per-hop ack-read timeout (extended by $5\,\text{s}$ per pipeline target via <code>READ_TIMEOUT_EXTENSION</code>). Lower values risk false positives on a healthy but momentarily busy pipeline; raising delays detection of a hung DN.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The combined effect on $T_{\text{graylist}}$ at the recommended DataNode and NameNode settings is:
+</p>
+
+$$
+T_{\text{graylist}}^{\text{(recommended)}} \;\lesssim\; 3 \cdot 60\,\text{s} \;+\; 60\,\text{s} \;=\; 4\,\text{min,}
+$$
+
+<p>
+compared to ${\sim}2\,$h at defaults. $T_{\text{dead}}$ shrinks to 2 minutes and 30 seconds, and the stale-DN write avoidance window continues to provide a 30 seconds safety valve for DNs that miss heartbeats.
+</p>
+
+<h3 id="hdfs-pipeline-tune-hbase">10.7 Recommended HBase-side tuning</h3>
+
+<h4>WAL circuit breakers (both providers)</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.ms</span></td>
+      <td>100 ms</td>
+      <td>100 ms (keep, alert)</td>
+      <td>Treat as a monitoring threshold, not a tuning lever. Alert on the slow-sync metric crossing this threshold per WAL.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.roll.on.sync.ms</span></td>
+      <td>10000 ms (10 s)</td>
+      <td>5000 ms (5 s)</td>
+      <td>Single-sync circuit breaker. A 5 second sync forces a roll, which opens a new pipeline. Tighter values risk roll churn under transient pipeline blips. 5 seconds is conservative for a healthy P99 sync of $\leq 25\,$ms.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.roll.threshold</span></td>
+      <td>100 events</td>
+      <td>25 events</td>
+      <td>Cumulative-slowness circuit breaker. Tightening to 25 events in the same 60 second window catches sustained mild degradation that never trips the single-sync threshold.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.roll.interval.ms</span></td>
+      <td>60000 ms (60 s)</td>
+      <td>60000 ms (keep)</td>
+      <td>Window for the cumulative threshold. The pairing with the threshold above gives an effective sustained-slowness rate of $\geq 0.42\,$events/s.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.sync.timeout</span></td>
+      <td>300000 ms (5 min)</td>
+      <td>60000 ms (60 s)</td>
+      <td>Watchdog. Sized to dominate the recommended single-sync roll threshold and the recommended $T_{\text{graylist}}$, so the watchdog only fires on a pipeline that is genuinely unrecoverable. Avoids a 5-minute black hole before RS abort.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>FSHLog-only</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.hlog.tolerable.lowreplication</span></td>
+      <td>= cluster replication factor (typically 3)</td>
+      <td>2</td>
+      <td>The default tracks the cluster replication factor. Pinning the floor at 2 eliminates any WAL roll storm during an AZ-loss window while preserving the safety net for in-flight degradation.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.hlog.lowreplication.rolllimit</span></td>
+      <td>5</td>
+      <td>5 (keep)</td>
+      <td>Bounds roll churn during a broad outage. After 5 consecutive low replication rolls, the path disables until a healthy pipeline is observed.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>AsyncFSWAL-only</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.max.exclude.datanode.count</span></td>
+      <td>3</td>
+      <td>256</td>
+      <td>Cache size for the per-RS exclude list. Default 3 cannot represent a wide-blast-radius incident. In the reference deployment of 500 colocated RegionServer+DataNode hosts spread over three AZs, an AZ loss removes up to $\lceil 500/3 \rceil \approx 167$ DataNodes simultaneously, all of which must be held in the registry until the NameNode-side stale and dead pathways (&sect;10.2) catch up.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.exclude.datanode.info.ttl.hour</span></td>
+      <td>6</td>
+      <td>6 (keep)</td>
+      <td>TTL of the exclude cache. Generous enough to outlast operator repair windows on a DataNode disk swap.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.datanode.slow.packet.process.time.millis</span></td>
+      <td>6000 ms</td>
+      <td>2000 ms</td>
+      <td>Threshold above which a single small packet's ack time counts as "slow" toward the exclude-list quorum.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.min.slow.detect.count</span></td>
+      <td>3</td>
+      <td>3 (keep)</td>
+      <td>Slow-packet observations a DN must accumulate before being added to the exclude list. Lower values risk false positives on transient blips.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.slow.detect.data.ttl.ms</span></td>
+      <td>600000 ms</td>
+      <td>600000 ms (keep)</td>
+      <td>Sliding-window length for the slow-packet counter. Longer windows accumulate more evidence but lag transient repairs.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Combining HDFS and HBase settings at the recommended values, the time-to-react on a degraded DN is bounded by two paths:
+</p>
+
+$$
+T_{\text{react}} \;\approx\; \min\!\Big(
+  \underbrace{T_{\text{roll.on.sync}}}_{5\,\text{s, per-sync}},\;\;
+  \underbrace{T_{\text{graylist}}}_{{\sim}4\,\text{min, NN-side}}
+\Big).
+$$
+
+<p>
+The per-sync path bounds the time before HBase abandons the current pipeline. The graylist path bounds the time before the NN stops handing the bad DN out for new pipelines. At HDFS and HBase defaults the corresponding numbers are <strong>10 seconds and ${\sim}2\,$hours</strong>, respectively, with no NN-side enforcement at all in the typical case.
+</p>
+
+<p>
+The values above are simple detection window arithmetic plus engineering judgement on the false positive rate at the recommended thresholds. They should be validated against production's observed sync latency P50/P99 distribution and slow-sync metric volume before broad rollout. A too-aggressive <code>roll.on.sync.ms</code> in particular can produce a roll storm that itself increases sync tail latency.
+</p>
+
+<h3 id="hdfs-pipeline-cross-impact">10.8 Cross-section impact under strict one-replica-per-AZ placement</h3>
+
+<p>
+The HDFS-side mechanics in <a href="#hdfs-pipeline-model">&sect;10.1</a>&ndash;<a href="#hdfs-pipeline-tune-hbase">&sect;10.7</a> explain what happens to one degraded pipeline. The cluster-wide impact summarized in <a href="#az-assumptions">&sect;4</a> and used as inline callouts in <a href="#per-stage">&sect;6</a> and <a href="#pk">&sect;8</a> follows from combining that mechanics with the strict one-replica-per-AZ placement constraint and an upper bound on the immediate WAL roll burst. This subsection derives those numbers end-to-end.
+</p>
+
+<h4>Setup</h4>
+
+<p>
+At the moment one of three AZs is lost, $N_{\text{dead}} = 167$ DataNodes vanish, and every active WAL pipeline cluster-wide instantly drops one replica. Because each pipeline started at width $r = 3$ with one replica per AZ, $N_{\text{pipelines-degraded}} = N_{\text{alive}} = 333$ &mdash; every surviving RegionServer's open WAL is affected simultaneously. AsyncFSWAL's <code>StreamSlowMonitor</code> sees the IO failure on the lost-AZ replica, the upper layer closes the current width-3 file via <a href="#hdfs-pipeline-hbase-mitigation">&sect;10.5</a>'s low-replication and slow-sync paths, opens a fresh width-2 file via <code>addBlock</code>, and resumes appending. Recommended tuning (<a href="#hdfs-pipeline-tune-hbase">&sect;10.7</a>) keeps the new pipeline acceptable to both the NameNode (<code>dfs.namenode.replication.min = 2</code>) and the low-replication-roll guard (<code>hbase.regionserver.hlog.tolerable.lowreplication = 2</code>), so the surviving cluster reaches a steady state of width-2 WAL writers within seconds of the AZ loss.
+</p>
+
+<h4>WAL roll burst at AZ loss</h4>
+
+<p>
+Detection-to-roll latency on the lost-AZ replica is bounded by <a href="#hdfs-pipeline-hbase-mitigation">&sect;10.5</a>'s AsyncFSWAL slow-packet ladder. Three consecutive packets at the slow-packet threshold trip <code>StreamSlowMonitor</code>, after which the upper layer rolls on the next sync. At the recommended <code>async.wal.datanode.slow.packet.process.time.millis = 2000</code> and <code>async.wal.min.slow.detect.count = 3</code>:
+</p>
+
+$$
+T_{\text{roll-trigger}} \;\approx\; N_{\text{min}} \cdot T_{\text{slow-packet}} \;=\; 3 \cdot 2\,\text{s} \;=\; 6\,\text{s.}
+$$
+
+<p>
+$N_{\text{pipelines-degraded}} = 333$ surviving RegionServers each issue exactly one <code>addBlock</code> RPC over that interval, giving a cluster-wide burst rate:
+</p>
+
+$$
+\lambda_{\text{addBlock}}^{\text{burst}} \;\approx\; \frac{N_{\text{alive}}}{T_{\text{roll-trigger}}} \;=\; \frac{333}{6\,\text{s}} \;\approx\; 55\,\text{addBlock/s.}
+$$
+
+<p>
+This is negligible against the tuned NameNode ceiling $C_{\text{NN}} \approx 3 \times 10^{5}\,\text{op/s}$ (<a href="TUNING_FOR_RECOVERY.html#nn-tune">TUNING_FOR_RECOVERY.html &sect;8.3</a>). It does, however, transition the cluster's WAL writers from width 3 to width 2 in a single bounded interval, which sets the stage for the read-load delta and abort budget below.
+</p>
+
+<h4>Bounded RS abort count</h4>
+
+<p>
+A surviving RegionServer aborts when an in-flight WAL sync fails to acknowledge within <code>hbase.regionserver.wal.sync.timeout</code> (see <a href="#hdfs-pipeline-hbase-mitigation">&sect;10.5</a>). Under AsyncWAL the bad-replica error surfaces within $T_{\text{roll-trigger}} \approx 6\,\text{s}$ and the writer rolls onto a healthy width-2 pipeline, well below the recommended <code>wal.sync.timeout</code> of 60 seconds, so the watchdog ordinarily never fires. An abort therefore requires the residual case where the slow-tail conditions persist through the roll and the new pipeline also fails to ack within the watchdog window. Bounding this by the steady state slow-sync tail probability $P_{\text{slow-sync}} \lesssim 0.01$, a generous upper bound on the recommended tuning P99:
+</p>
+
+$$
+P_{\text{at-risk}} \;\lesssim\; P_{\text{slow-sync}} \;\approx\; 0.01, \qquad
+N_{\text{abort}} \;\lesssim\; N_{\text{alive}} \cdot P_{\text{at-risk}} \;\approx\; 333 \cdot 0.01 \;\lesssim\; 3.
+$$
+
+<p>
+That is, the operator's tail-risk budget for the surviving AZs is on the order of a small constant, not a $\rho$-of-cluster fraction, provided <code>wal.sync.timeout</code> is set comfortably above $T_{\text{roll-trigger}}$ and AsyncWAL is in use. Any abort that does occur triggers an SCP for that RS and folds back into the main recovery pipeline of <a href="#unifying">&sect;11</a>; for $N_{\text{abort}} \lesssim 3$ the additional SCP load is dominated by ordinary noise and does not materially extend $T_{\text{recovery}}$.
+</p>
+
+<h4>HDFS-side load delta during the recovery window</h4>
+
+<p>
+The cluster-wide write rate from RegionServer WAL traffic is unchanged after AZ loss. The same offered $\lambda_{\text{wal}}$ now writes two replicas instead of three, and $333.\overline{3}$ surviving DataNodes carry it instead of $500$. The per-DataNode write rate therefore stays at $\lambda_{\text{wal}} \cdot 3 / 500 = \lambda_{\text{wal}} \cdot 2 / 333.\overline{3}$. Per-DataNode read rate is a different story. HFile and recovered-edit reads were striped across three replicas with locality preference, and now stripe across two with the same preference. The per-DN read rate climbs $\approx 50\%$:
+</p>
+
+$$
+\Delta \lambda_{\text{DN-read}} \;\approx\; \frac{r}{r-1} - 1 \;=\; \frac{3}{2} - 1 \;=\; 0.5.
+$$
+
+<p>
+Hflush latency on a surviving DN rises because DN disks and DN handler threads are more contended, and that latency feeds directly into $\bar{h}$ for the procedure-store WAL, into $W_{\text{open}}$ for HFile opens, and into $T_{\text{WAL}}$ for split-WAL reads. NameNode throughput is sufficient and unaffected at this scale. The addBlock burst from the WAL roll cascade ($\approx 55$/s for $\approx 6\,\text{s}$) and the heartbeat-handler load from missed-heartbeat processing on $N_{\text{dead}} = 167$ DataNodes (a one-off burst sized by <code>dfs.namenode.heartbeat.recheck-interval</code> $\approx 5\,\text{min}$ at $\approx N_{\text{dead}}/300\,\text{s} \approx 0.6$ events/s averaged, with bursts an order of magnitude higher inside the recheck window) are negligible compared to $C_{\text{NN}}$.
+</p>
+
+<h4>Cross-stage P99 impacts</h4>
+
+<p>
+Translating $\Delta \lambda_{\text{DN-read}} \approx +50\%$ into the per-stage formulas of <a href="#per-stage">&sect;6</a> and <a href="#pk">&sect;8</a> gives the derated service rates summarized in <a href="#az-derating">&sect;4.2</a>. The full derivations are:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Formula</th><th>Steady-state value</th><th>AZ-loss-window value</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Procedure-store hflush <br/>(<a href="TUNING_FOR_RECOVERY.html#proc-store">baseline &sect;6.6</a>)</td>
+      <td>$\bar{h}^{\text{AZ}} = (1 + \Delta \lambda_{\text{DN-read}}) \cdot \bar{h}$ via DN-side queue inflation</td>
+      <td>$\bar{h} \approx 10\,\text{ms}$</td>
+      <td>$\bar{h}^{\text{AZ}} \approx 15\,\text{ms}$</td>
+    </tr>
+    <tr>
+      <td>Procedure-store throughput <br/>(<a href="TUNING_FOR_RECOVERY.html#proc-store">baseline &sect;6.6</a>)</td>
+      <td>$\mu_{\text{proc}}^{\text{AZ}} = N / (w + \bar{h}^{\text{AZ}})$ at $N = 512$, $w = 10\,\text{ms}$</td>
+      <td>$\mu_{\text{proc}} \approx 25.6\,\text{K w/s}$</td>
+      <td>$\mu_{\text{proc}}^{\text{AZ}} \approx 20.5\,\text{K w/s}$</td>
+    </tr>
+    <tr>
+      <td>Procedure-store drain time <br/>(<a href="TUNING_FOR_RECOVERY.html#pk">baseline &sect;7.2</a>)</td>
+      <td>$T_{\text{proc-drain}}^{\text{AZ}} = W_{\text{total}} / \mu_{\text{proc}}^{\text{AZ}}$</td>
+      <td>$T_{\text{proc-drain}} \approx 59\,\text{s}$</td>
+      <td>$T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$</td>
+    </tr>
+    <tr>
+      <td>Service-time variance <br/>(<a href="TUNING_FOR_RECOVERY.html#pk">baseline &sect;7.1</a>)</td>
+      <td>$C_S^{2,\text{AZ}} = (\sigma_h^{\text{AZ}} / \bar{h}^{\text{AZ}})^2$ with $\sigma_h$ scaling roughly in proportion to $\bar{h}$</td>
+      <td>$C_S^{2} \approx 0.16$</td>
+      <td>$C_S^{2,\text{AZ}} \approx 0.23$</td>
+    </tr>
+    <tr>
+      <td>Sustainable utilization <br/>(<a href="TUNING_FOR_RECOVERY.html#pk">baseline &sect;7.1</a>)</td>
+      <td>$\rho_{\max}^{\text{AZ}} \approx 1/\!\left(1 + 1.33\,|C_S^{\text{AZ}}|\right)$, large-$N$ form of the bulk-cycle variance bound $N \geq \mu_A + 1.33\,\sigma_A$</td>
+      <td>$\rho_{\max} \approx 0.65$</td>
+      <td>$\rho_{\max}^{\text{AZ}} \approx 0.61$</td>
+    </tr>
+    <tr>
+      <td>RS region-open time <br/>(<a href="TUNING_FOR_RECOVERY.html#rs-open">baseline &sect;6.8</a>)</td>
+      <td>$W_{\text{open}}^{\text{AZ}} = W_{\text{open}} \cdot (1 + \Delta \lambda_{\text{DN-read}})$ via HFile read contention</td>
+      <td>$W_{\text{open}} \approx 1\,\text{s}$</td>
+      <td>$W_{\text{open}}^{\text{AZ}} \approx 1.5\,\text{s}$</td>
+    </tr>
+    <tr>
+      <td>WAL split drain <br/>(<a href="TUNING_FOR_RECOVERY.html#walsplit">baseline &sect;6.10</a>)</td>
+      <td>$T_{\text{WAL}}^{\text{AZ}} = T_{\text{WAL}} \cdot (1 + \Delta \lambda_{\text{DN-read}})$ via split-WAL read load</td>
+      <td>$T_{\text{WAL}}$ base</td>
+      <td>$T_{\text{WAL}}^{\text{AZ}} \approx 1.5 \cdot T_{\text{WAL}}$</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Composed via the <a href="#unifying">&sect;11</a> recovery-pipeline max formula, the AZ-loss-window $T_{\text{recovery}}^{\text{AZ}}$ is dominated by $T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$. The $W_{\text{open}}^{\text{AZ}}$ and $T_{\text{WAL}}^{\text{AZ}}$ inflations push $T_{\text{RS-open}}^{\text{AZ}}$ and $T_{\text{WAL-split}}^{\text{AZ}}$ up by the same $1.5\times$, but they remain below $T_{\text{proc-drain}}^{\text{AZ}}$ at the reference workload. The master procedure store remains the bottleneck stage. Under the deferred workload of <a href="#workload">&sect;2</a> the same arithmetic gives the per-design envelope shown in <a href="#per-stage">&sect;6.1</a> and the summary in <a href="#summary-table">&sect;9</a>.
+</p>
+
+<h3 id="hdfs-pipeline-limits">10.9 Limitations of the partial-failure model</h3>
+
+<p>
+Note the stale-DN write avoidance disengages when more than <code>dfs.namenode.write.stale.datanode.ratio</code> (default 0.5) of DNs is stale, and the slow-peer graylist cannot grow beyond <code>dfs.namenode.max.slowpeer.collect.nodes</code>. During an AZ-loss event the partial-failure protections are partially disabled exactly when the failure footprint is largest.
+</p>
+
+<h2 id="unifying" class="page-break">11. Unifying Picture — extended</h2>
+
+<div class="pipeline">┌─ CFD lane ─────────────────────────────────────────────────────────────┐
+│  t=0       t≈10s         ...         t≈73–110s         t≈135–170s     │
+│  AZ loss → CFD trip → blacklist published   recovery-confirm window   │
+│            (engage)                         expires → blacklist clear │
+└───────────────────────────────────────────────────────────────────────┘
+          │                                              │
+          ▼ engage                                       ▼ disengage
+┌─ Promotion lane ──────────────────────────────────────────────────────┐
+│  t≈10s              t≈73–110s                                         │
+│  SCP fan-out → master promotes → per-design promotion path completes  │
+│  T_RS-promote, T_tail-replay (Catch-up), election storm (RAFT)        │
+└───────────────────────────────────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+┌─ Paced rebalance lane ────────────────────────────────────────────────┐
+│  t≈135–170s                                          t≈635–670s       │
+│  Disengage → IsrRecoveryDeferralAction /             (≈10.5–11.2 min) │
+│              CatchupRecoveryDeferralAction /                          │
+│              RaftRecoveryDeferralAction runs rejoin/replace at        │
+│              C_paced = 1,000 in-flight; ~8 min drain                  │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ Surviving-cohort utilization lane ───────────────────────────────────┐
+│  t<0          t=0 to ≈110s        t≈110s to ≈Tscale      t>Tscale     │
+│  U_steady  → U_steady·(1+shift) → step persists until    autoscaling  │
+│             (read+write growth)   autoscale completes →  catches up   │
+└───────────────────────────────────────────────────────────────────────┘</div>
+
+<p>
+The CFD lane shows the trip event at $t \approx 10\,\text{s}$ and the disengage event at $t \approx 73\text{–}110\,\text{s}$ (the AZ-loss-window recovery envelope from <a href="#summary-table">§9</a>) plus the 60 s recovery-confirm window, landing at $t \approx 135\text{–}170\,\text{s}$. The promotion lane runs concurrently and binds the recovery wall-clock as in the baseline, with the AZ-loss-window envelope of <a href="#per-stage">§6</a>. The paced-rebalance lane begins on disengage and runs at the throttle cap. The surviving-cohort utilization lane shows the step from $U_{\text{steady}}$ to $U_{\text{steady}} \cdot (1 + \text{shift})$ on AZ loss and the recovery to a new steady state once autoscaling has caught up; the cluster runs above $U_{\text{steady}}$ throughout the recovery-critical window, which is exactly the scenario $U_{\text{safe}}$ from <a href="#headroom">§7.5</a> bounds.
+</p>
+
+<h2 id="limitations">12. Limitations of the Model — extended</h2>
+
+<h4>AsyncWAL is assumed throughout</h4>
+<p>
+The cross-section math from <a href="#az-assumptions">§4</a> onward, and the AZ-loss-window derating multipliers of <a href="#az-derating">§4.2</a>, all assume <code>hbase.wal.provider = asyncfs</code> (AsyncWAL). The FSHLog pipeline-recovery mechanics in <a href="#hdfs-pipeline-fshlog">§10.3</a> are documented for reference and for operators who have not yet migrated, but the deferral/replica math is not extended into the FSHLog case. Sites still on FSHLog should treat the AZ-loss-window envelope of <a href="#summary-table">§9</a> as a lower bound on $T_{\text{recovery}}$; the additional latency of FSHLog's <code>ReplaceDatanodeOnFailure</code> path during a width-3-to-width-2 transition is not modeled here.
+</p>
+
+<h4>Replication factor ≠ 3 or non-AZ-affinity placement</h4>
+<p>
+The workload arithmetic in <a href="#workload">§2</a> assumes $\text{RF}=3$ with one secondary in each of two other AZs, and uniform RF across all tables. RF=2 (no AZ-affinity placement is possible at $f=1/3$ without losing both replicas), RF=5, or rack-affinity-only placements need separate accounting. Mixed-RF tables also fall outside this model; the companion presumes uniform $\text{RF}=3$ everywhere.
+</p>
+
+<h4>Per-design promotion costs are derived from the per-design docs at write-time</h4>
+<p>
+$t_{\text{TRSP,promote}}$ per design and $\delta_{\text{write}}$ per design are derived from the per-design docs at write-time. Where a per-design doc does not enumerate its promotion-path transitions or write-amplification factors to the granularity used here, the companion uses conservative upper bounds ($t_{\text{TRSP,open}} \approx 6$ for transitions; $\delta_{\text{write}} \approx 0.6$ for write growth) and flags the gap. The current per-design $t_{\text{TRSP,promote}}$ values (~6 / ~9 / ~3) are sourced from <a href="AZ_LOSS_SCALING.md">AZ_LOSS_SCALING.md</a> and are coarse engineering estimates rather than profiled measurements.
+</p>
+
+<h4>Master failover during deferral</h4>
+<p>
+A recovering master inherits the CFD's persisted blacklist and re-invokes the per-design recovery action idempotently; the action reconstructs its per-region state from META rather than from any in-memory state on the failed master. The additional time cost is bounded by master failover itself (~10–30 s) and does not appear as a new additive term in $T_{\text{recovery}}$. The companion does not separately model master failover during deferral.
+</p>
+
+<h4>Domain that never returns</h4>
+<p>
+Deferral assumes the failed domain returns to service within an operator-determined giveup horizon. At that horizon, the per-design replace path takes over and the eager-replacement envelope from <a href="#per-stage">§6</a> applies. The deferred model is a budget for the recovery-critical window, not a guarantee for the entire outage; an outage that exceeds the giveup horizon spends the eager budget after the horizon expires.
+</p>
+
+<h4>In-window autoscaling</h4>
+<p>
+The <a href="#capacity">§7</a> model treats autoscaling as too slow to help inside the recovery-critical window ($T_{\text{scale}} \gg T_{\text{recovery}}$). Aggressive in-window scale-up — e.g., warm-pool instances pre-provisioned and pre-warmed against a representative working set — could relax the $U_{\text{safe}}$ ceiling, but the warm-pool provisioning pattern is not modeled here and is not an HBase parameter. Operators who deploy warm pools should re-derive $U_{\text{safe}}$ at their effective in-window $N_{\text{alive}}$, not the cold $N_{\text{alive}}$.
+</p>
+
+<h4>Read-traffic head-room is folded into $U_{\text{safe}}$, not modeled per stage</h4>
+<p>
+The read-load shift on AZ loss enters the model only through $r_{\text{replica}}$ in the headroom formula of <a href="#headroom">§7.5</a>. The model does not derive a separate per-stage drain time for client reads against the surviving cohort, and treats client read latency as governed by the surviving-cohort capacity rather than by any HBase-side queue. Operators whose read SLOs depend on tail-latency rather than throughput should re-derive the effective read $U_{\text{safe}}$ at their tail-latency point rather than at saturation.
+</p>
+
+<h4>Multi-AZ failure</h4>
+<p>
+Out of scope. The per-design quorum/ISR/membership semantics define cluster behavior under loss of more than one AZ but are not modeled here. The CFD continues to publish the multi-domain blacklist and the per-design actions process it idempotently, but the workload arithmetic in <a href="#workload">§2</a> and the headroom budget in <a href="#headroom">§7.5</a> would need separate derivations at $f > 1/3$.
+</p>
+
+<h2 id="future">13. Future Work — extended</h2>
+
+<h4>Dynamic $C_{\text{paced}}$ tied to live $\rho$ measurements</h4>
+<p>
+The static throttle cap $C_{\text{paced}} = 1{,}000$ is sized conservatively against the procedure-store post-burst ceiling. A dynamic governor that observes live procedure-store $\rho$ and ramps $C_{\text{paced}}$ up to $\rho_{\max}$ would shorten the post-deferral drain time from ~8 min toward the procedure-store-bound floor of ~30 s, without re-saturating the master.
+</p>
+
+<h4>CFD trip-threshold tuning per fault-domain size</h4>
+<p>
+The default CFD trip threshold (~100 lost servers in 10 s) is sized for $N_{\text{dead}} \approx 167$ at the reference workload. Smaller fault domains (small racks, multi-AZ deployments at smaller $f$) need lower trip thresholds to engage deferral inside the recovery-critical window; larger fault domains can afford higher thresholds and avoid spurious engagement. A per-domain trip threshold derived from the deployment topology would reduce false-engagement rate at no recovery-time cost.
+</p>
+
+<h4>Per-region recovery-action prioritization for hot tables</h4>
+<p>
+The per-design recovery actions process regions in undefined order during the post-deferral rebalance pass. A hot-table-first ordering — driven by per-table read/write rate observed at steady state — would restore replica-count availability for the highest-impact tables earliest, at no aggregate throughput cost.
+</p>
+
+<h4>Quantitative model for warm-pool / in-window autoscaling</h4>
+<p>
+The <a href="#capacity">§7</a> model treats autoscaling as too slow to help in-window. A warm-pool model that accounts for pre-provisioned, pre-warmed instances would relax the $U_{\text{safe}}$ ceiling and let operators trade warm-pool fleet cost against steady-state fleet cost; the trade-off is currently treated as outside the model.
+</p>
+
+</body>
+</html>

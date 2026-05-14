@@ -1,0 +1,2351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tuning for Recovery — HBase AZ-Loss Capacity Model</title>
+
+<!-- KaTeX: LaTeX-quality math rendering, fast, self-contained after load -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous"></script>
+<script>
+  document.addEventListener("DOMContentLoaded", function() {
+    renderMathInElement(document.body, {
+      delimiters: [
+        {left: "$$", right: "$$", display: true},
+        {left: "\\[", right: "\\]", display: true},
+        {left: "$",  right: "$",  display: false},
+        {left: "\\(", right: "\\)", display: false}
+      ],
+      throwOnError: false
+    });
+  });
+</script>
+
+<style>
+  :root {
+    --bg: #fafaf7;
+    --fg: #1d1d1b;
+    --muted: #555;
+    --accent: #8b2635;
+    --accent-soft: #f3e6e8;
+    --rule: #d8d4cc;
+    --code-bg: #f1ede4;
+    --code-fg: #2a2a28;
+    --note-bg: #fff8e1;
+    --note-border: #d6b656;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: "Charter", "Iowan Old Style", "Source Serif Pro", Georgia, serif;
+    font-size: 17px;
+    line-height: 1.6;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 3em 2em 6em;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  h1, h2, h3, h4 {
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.25;
+    color: var(--fg);
+  }
+  h1 {
+    font-size: 2.0em;
+    margin: 0 0 0.2em 0;
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 0.3em;
+  }
+  h2 {
+    font-size: 1.45em;
+    margin-top: 2.2em;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.2em;
+  }
+  h3 { font-size: 1.15em; margin-top: 1.6em; }
+  h4 { font-size: 1.0em; margin-top: 1.2em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .subtitle {
+    color: var(--muted);
+    font-style: italic;
+    margin: 0.4em 0 2em 0;
+  }
+  code, pre, kbd, samp {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    line-height: 1.45;
+    border-left: 3px solid var(--accent);
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    margin: 1em 0;
+    width: 100%;
+    font-size: 0.95em;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.5em 0.75em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--accent-soft);
+    font-weight: 600;
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+  }
+  tbody tr:nth-child(even) { background: rgba(0,0,0,0.02); }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1em 0;
+    padding: 0.4em 1em;
+    color: var(--muted);
+    background: var(--accent-soft);
+    font-style: italic;
+  }
+  .note {
+    background: var(--note-bg);
+    border-left: 4px solid var(--note-border);
+    padding: 0.8em 1em;
+    margin: 1em 0;
+    border-radius: 4px;
+    font-size: 0.96em;
+  }
+  .note .label {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.85em;
+    color: #8a6d00;
+    margin-right: 0.5em;
+  }
+  .meta {
+    font-size: 0.9em;
+    color: var(--muted);
+    margin-top: 1em;
+  }
+  .toc {
+    background: var(--code-bg);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+    margin: 1.5em 0 2.5em 0;
+    font-size: 0.95em;
+  }
+  .toc ol { margin: 0.3em 0 0.3em 1.2em; padding: 0; }
+  .toc li { margin: 0.15em 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .param-name { font-family: "JetBrains Mono", monospace; font-size: 0.9em; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--rule);
+    margin: 3em 0;
+  }
+  .pipeline {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.85em;
+    line-height: 1.4;
+    white-space: pre;
+    background: var(--code-bg);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+  }
+  .katex-display { margin: 1.2em 0; }
+  .katex { font-size: 1.05em; }
+  @media print {
+    .page-break { break-before: page; page-break-before: always; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Tuning for Recovery</h1>
+<p class="subtitle">A capacity model for HBase master throughput under AZ-loss recovery storms.</p>
+<p class="meta">Cluster reference point: 500 RegionServers, 1,500 regions/RS, AZ loss = 1/3.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#abstract">Abstract</a></li>
+    <li><a href="#workload">Workload Model</a></li>
+    <li><a href="#recovery-work">Recovery-Work Model</a></li>
+    <li><a href="#az-assumptions">HDFS dependencies and placement assumptions</a></li>
+    <li><a href="#framework">Mathematical Framework</a></li>
+    <li><a href="#per-stage">Per-Stage Derivations</a>
+      <ol>
+        <li><a href="#serverops">serverops executor (burst concurrency)</a></li>
+        <li><a href="#dispatcher">Remote dispatcher pool (burst concurrency)</a></li>
+        <li><a href="#openregion">Master openregion executor (Little's Law on META)</a></li>
+        <li><a href="#metahandler">Master metahandler pool (Little's Law on RPCs)</a></li>
+        <li><a href="#dwell">Dispatcher dwell tax</a></li>
+        <li><a href="#proc-store">Procedure-store WAL (closed-loop throughput)</a></li>
+        <li><a href="#offered">Offered vs. sustained load</a></li>
+        <li><a href="#rs-open">RegionServer open executor (per-RS bottleneck)</a></li>
+        <li><a href="#hdfs">HDFS NameNode &amp; DataNode bound</a></li>
+        <li><a href="#walsplit">Distributed WAL splitting</a></li>
+      </ol>
+    </li>
+    <li><a href="#pk">Bulk-service queueing analysis of the procedure store</a></li>
+    <li><a href="#summary-table">Summary: recommended settings</a></li>
+    <li><a href="#hdfs-pipeline">HDFS pipeline tuning for degraded dependencies</a></li>
+    <li><a href="#unifying">Unifying picture</a></li>
+    <li><a href="#limitations">Limitations of the model</a></li>
+    <li><a href="#future">Future work</a></li>
+  </ol>
+</div>
+
+<h2 id="abstract">1. Abstract</h2>
+
+<p>
+This document captures a capacity model for tuning the HBase master to absorb a sudden loss of an availability zone. The reference workload is a 500-node cluster with 1,500 regions per RegionServer, suffering simultaneous loss of one third of its RegionServers (≈167 dead, ≈333 surviving), generating ≈250,000 region transitions and ≈1.5 million procedure state transitions over the recovery window.
+</p>
+
+<p>
+The model is fundamentally Little's Law, $L = \lambda W$ applied independently at each stage of the recovery pipeline, together with a small number of burst-concurrency lower bounds, one closed-loop throughput equation for the procedure store, and a bulk-service queueing analysis that bounds utilization on the procedure store under realistic service-time variance. Each tuning parameter is sized so that no single stage becomes the bottleneck at the target arrival rate.
+</p>
+
+<p>
+The pipeline extends past the master. A procedure state transition is not CPU bound. Each TRSP yields on a remote RPC wait while a RegionServer opens or closes the region, and that RS side work is in turn gated by HDFS NameNode and DataNode latencies for opening store files (and, under AZ loss, replaying recovered edits).
+</p>
+
+<p>
+The model further assumes WAL blocks are placed with one replica per AZ. Under that constraint the document recommends <strong>AsyncWAL</strong> as the WAL provider and assumes it throughout. The HDFS dependencies are stated up front in <a href="#az-assumptions">&sect;4</a>; the full pipeline derivation is in <a href="#hdfs-pipeline">&sect;9</a>.
+</p>
+
+<h2 id="workload">2. Workload Model</h2>
+
+<p>Define the cluster topology and AZ-loss inputs:</p>
+
+<table>
+  <thead><tr><th>Symbol</th><th>Meaning</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>$N$</td><td>cluster size (total RegionServers)</td><td>500</td></tr>
+    <tr><td>$R$</td><td>regions per RS</td><td>1,500</td></tr>
+    <tr><td>$f$</td><td>fraction of cluster lost in an AZ outage</td><td>$\tfrac{1}{3}$</td></tr>
+    <tr><td>$t_{\text{TRSP}}$</td><td>state transitions per TRSP (region transition procedure)</td><td>≈ 6</td></tr>
+    <tr><td>$t_{\text{SCP}}$</td><td>state transitions per SCP (server-crash procedure)</td><td>≈ 9</td></tr>
+  </tbody>
+</table>
+
+<p>Derived quantities:</p>
+
+$$
+\begin{aligned}
+N_{\text{dead}}     &= fN                          \approx 167 \\
+N_{\text{alive}}    &= (1-f)N                      \approx 333 \\
+M_{\text{TRSP}}     &= N_{\text{dead}} \cdot R     \approx 250{,}000 \quad \text{(region transitions)} \\
+\lambda_{\text{RS}} &= \frac{M_{\text{TRSP}}}{N_{\text{alive}}} \approx 750 \quad \text{(dispatches per surviving RS)}
+\end{aligned}
+$$
+
+<h2 id="recovery-work">3. Recovery-Work Model</h2>
+
+<p>
+The TRSP term dominates the SCP term by three orders of magnitude, so the total work performed by the procedure executor during recovery is well approximated by the TRSP transitions alone:
+</p>
+
+$$
+W_{\text{total}}
+\;\approx\; M_{\text{TRSP}} \cdot t_{\text{TRSP}}
+\;\approx\; 1.5 \times 10^{6} \;\;\text{state transitions.}
+$$
+
+<p>
+Sizing decisions therefore key off the TRSP arrival rate. The SCP burst matters only as an instantaneous concurrency lower bound (see <a href="#serverops">§6.1</a>).
+</p>
+
+<h2 id="az-assumptions">4. HDFS dependencies and placement assumptions</h2>
+
+<p>
+The reference deployment colocates RegionServers and DataNodes one-to-one across three availability zones. WAL blocks are placed in each of the cluster's three AZs (registered as racks). The loss of one AZ therefore reduces every active write pipeline cluster-wide simultaneously.
+</p>
+
+<p>
+The WAL provider should be <strong>AsyncWAL</strong>, selected by <code>hbase.wal.provider = asyncfs</code>. AsyncFSWAL's single-block-per-file design sidesteps several issues with the legacy FSHLog provider when an AZ is lost. The rest of this document assumes AsyncWAL as the provider and the recommended tuning is applied throughout (full table in <a href="#hdfs-pipeline-tune-hdfs">&sect;9.6</a> and <a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>).
+</p>
+
+<h3 id="az-counts">4.1 Derived counts at the reference workload</h3>
+
+<p>
+At the reference workload ($N = 500$ colocated RS+DN hosts, $f = 1/3$ AZ-loss fraction), the strict placement constraint pins the cluster-wide partial failure footprint to four numbers used throughout the rest of the document:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Symbol</th><th>Meaning</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>$N_{\text{alive}}$</td><td>surviving RegionServers (and DataNodes)</td><td>333</td></tr>
+    <tr><td>$N_{\text{dead}}$</td><td>DataNodes in the lost AZ</td><td>$\lceil 500/3 \rceil = 167$</td></tr>
+    <tr><td>$N_{\text{pipelines-degraded}}$</td><td>WAL pipelines reduced to width 2 at the moment of AZ loss</td><td>$N_{\text{alive}} = 333$</td></tr>
+    <tr><td>$N_{\text{abort}}$</td><td>RegionServer aborts expected on the surviving AZs (upper bound)</td><td>$\lesssim 3$ (derived in <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="az-derating">4.2 AZ-loss-window multipliers</h3>
+
+<p>
+Cross-section service times degrade during the AZ-loss window because the same per-RS write traffic is now served by 333 surviving DataNodes instead of 500. Per-DN write rate is unchanged ($3 \cdot \lambda / 500 = 2 \cdot \lambda / 333.\overline{3}$ under strict placement, since each write drops from three replicas to two), but per-DN read rate increases $\approx 50\%$ because HFile reads now satisfy from two surviving replicas rather than three. The full derivation lives in <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>; the resulting multipliers, used as inline callouts in <a href="#proc-store">&sect;6.6</a>, <a href="#rs-open">&sect;6.8</a>, <a href="#walsplit">&sect;6.10</a>, <a href="#pk">&sect;7.1</a>, and <a href="#nn-tune">&sect;8.3</a>, are:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Quantity</th><th>Steady state</th><th>AZ-loss window</th><th>Factor</th><th>Derived in</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>$\bar{h}$ (proc-store hflush latency)</td><td>10 ms</td><td>15 ms</td><td>$1.5\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+    <tr><td>$\mu_{\text{proc}}$ (proc-store throughput)</td><td>25.6 K w/s</td><td>20.5 K w/s</td><td>$0.80\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+    <tr><td>$T_{\text{proc-drain}}$</td><td>59 s</td><td>73 s</td><td>$1.24\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+    <tr><td>$C_S^{2}$ (service-time variance coefficient)</td><td>0.16</td><td>0.23</td><td>$1.44\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+    <tr><td>$\rho_{\max}$ (sustainable proc-store utilization)</td><td>0.65</td><td>0.61</td><td>$0.94\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+    <tr><td>$W_{\text{open}}$ (per-region open time)</td><td>base</td><td>$1.5\times$ base</td><td>$1.5\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+    <tr><td>$T_{\text{WAL}}$ (WAL-split drain time)</td><td>base</td><td>$1.5\times$ base</td><td>$1.5\times$</td><td><a href="#hdfs-pipeline-cross-impact">&sect;9.8</a></td></tr>
+  </tbody>
+</table>
+
+<p>
+All seven multipliers stem from the surviving DataNode read load rise of $\approx 50\%$ during the recovery window. NameNode op-throughput will be unaffected &mdash; the WAL roll burst at the moment of AZ loss adds $\approx 55$ <code>addBlock</code>/s for $\approx 6$ s, negligible against $C_{\text{NN}} \approx 3 \times 10^{5}\,\text{op/s}$ (see the load-window subsection in <a href="#nn-tune">&sect;8.3</a>). The <a href="#per-stage">&sect;6</a> and <a href="#pk">&sect;7</a> derivations that follow are stated at the steady-state values, with the AZ-loss-window value shown as an inline callout at each affected formula and a cross-reference back to this table.
+</p>
+
+<p>
+The seven multipliers above are <em>mean-latency</em> figures derived from the +50% per-DN read-load delta (the queueing-load argument of <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>). They are independent of how individual readers handle the queueing stretched tail. The worst case wall-clock an embedded <code>DFSClient</code> can spend on a not yet classified as dead replica or a hung previously active NameNode is derived in <a href="#hdfs-readpath-cross-impact">&sect;9.12</a> and depends on the read path tuning of <a href="#hdfs-read-path">&sect;9.10</a> and the NN RPC tuning of <a href="#hdfs-nn-rpc">&sect;9.11</a>. Both components compose into <a href="#unifying">&sect;10</a>'s recovery pipeline max formula.
+</p>
+
+<h2 id="framework">5. Mathematical Framework</h2>
+
+<p>
+Every per-stage decision in this document is one of three uses of Little's Law:
+</p>
+
+$$
+L \;=\; \lambda\, W
+$$
+
+<p>where</p>
+<ul>
+  <li>$L$ = number of items concurrently in the stage (workers, handlers, threads in use),</li>
+  <li>$\lambda$ = arrival rate at the stage,</li>
+  <li>$W$ = time each item spends in the stage (service or hold time).</li>
+</ul>
+
+<p>
+$L = \lambda W$ is solved for whichever variable is unknown: for thread-pool sizing $L$ is the unknown (<span class="param-name">metahandler.count</span>, <span class="param-name">openregion.threads</span>, <span class="param-name">procedure.threads</span>); for the procedure-store WAL it is $\lambda$ (sustained throughput).
+</p>
+
+<p>
+Recovery-window arguments use a separate identity, the fluid-flow drain time
+</p>
+
+$$
+T_{\text{drain}} \;=\; \frac{W_{\text{total}}}{\mu},
+$$
+
+<p>
+where $W_{\text{total}}$ is the aggregate workload through the stage during recovery and $\mu$ is the stage's service rate. Throughout this document, Little's Law is used to size <em>concurrency</em> (the in-flight population $L$ at each stage) and the fluid-flow equation is used to bound <em>recovery time</em> (how long it takes a stage to drain a known workload). The two are kept notationally distinct: $L$ always denotes a concurrent population, $W$ a per-item time, and $W_{\text{total}}$ a cumulative workload.
+</p>
+
+<p>
+A handful of stages are not flow-balance problems but instantaneous burst-concurrency problems. For those the rule is simply $L \geq$ (simultaneous events in the burst) + margin.
+</p>
+
+<h2 id="per-stage">6. Per-Stage Derivations</h2>
+
+<h3 id="serverops">6.1 <code>hbase.master.executor.serverops.threads</code> — burst concurrency</h3>
+
+<p>
+The <code>serverops</code> executor handles inbound server-lifecycle events. At AZ loss, ≈167 dead-server notifications fire near-simultaneously and each must dispatch into an SCP without queuing. This is not a flow problem; it is a one-shot burst:
+</p>
+
+$$
+L_{\text{serverops}} \;\geq\; N_{\text{dead}} \;\approx\; 167
+\quad\Rightarrow\quad 256 \;\text{(next power of two, with margin).}
+$$
+
+<p>
+At the default of 5, the burst is processed effectively serially.
+</p>
+
+<h3 id="dispatcher">6.2 <code>hbase.procedure.remote.dispatcher.threadpool.size</code> — burst concurrency</h3>
+
+<p>
+The remote-dispatcher pool runs the per-RS dispatch loops that flush batched RPCs. Concurrency must cover all destinations simultaneously:
+</p>
+
+$$
+L_{\text{disp}} \;\geq\; N_{\text{alive}} \;\approx\; 333
+\quad\Rightarrow\quad 512 \;\text{(headroom for retries on transient failures).}
+$$
+
+<p>
+Below ~333 the dispatcher itself becomes a bottleneck independent of any other tuning.
+</p>
+
+<h3 id="openregion">6.3 <code>hbase.master.executor.openregion.threads</code> — Little's Law against META</h3>
+
+<p>
+This executor processes <code>reportRegionStateTransition</code> OPEN events. The downstream constraint is the META write rate. With a sustainable META write rate $\lambda_{\text{META}} \approx 5{,}000\,\text{w/s}$ and per-handler hold time $W_{\text{handler}} \approx 50\,\text{ms}$:
+</p>
+
+$$
+L_{\text{open}}
+\;=\; \lambda_{\text{META}} \cdot W_{\text{handler}}
+\;=\; 5{,}000 \cdot 0.050
+\;\approx\; 250.
+$$
+
+<p>
+Anything less and META is left under-utilized. The recommended <code>256</code> sits one power of two above this.
+</p>
+
+<h3 id="metahandler">6.4 <code>hbase.regionserver.metahandler.count</code> on the master — Little's Law on RPCs</h3>
+
+<p>
+All inbound traffic from RegionServers during recovery is tagged HIGH_QOS by <code>MasterAnnotationReadingPriorityFunction</code> and lands in the master's priority handler pool. Handlers hold for a procedure-store hflush plus region-lock acquisition (≈25 ms typical). Arrival rate during the steepest portion of the recovery curve is ≈5–10K events/sec:
+</p>
+
+$$
+L_{\text{rpc}}
+\;=\; \lambda_{\text{rpc}} \cdot W_{\text{hold}}
+\;\approx\; (5\text{–}10) \times 10^{3}\,\text{s}^{-1} \times 0.025\,\text{s}
+\;\approx\; 125\text{–}250.
+$$
+
+<p>
+The recommended <code>256</code> covers the upper end with margin.
+</p>
+
+<h3 id="dwell">6.5 <code>hbase.procedure.remote.dispatcher.delay.msec</code> — dwell tax</h3>
+
+<p>
+The dispatcher's dwell timer $d$ is the time it waits to accumulate per-RS RPCs into a single batched flush. During recovery, each remote callable's completion is a serialization point for the next procedure transition, so the dwell tax is paid <em>per transition, per region</em>:
+</p>
+
+$$
+\Delta_{\text{dwell, worst-case}} \;=\; d \cdot t_{\text{TRSP}}.
+$$
+
+<p>Concretely:</p>
+
+<table>
+  <thead><tr><th>$d$</th><th>Worst-case dwell per region</th></tr></thead>
+  <tbody>
+    <tr><td>150 ms (default)</td><td>≈ 0.9 s</td></tr>
+    <tr><td>50 ms (recommended)</td><td>≈ 0.3 s</td></tr>
+  </tbody>
+</table>
+
+<p>
+Above ~100 ms the cumulative dispatcher dwell becomes a measurable contribution to recovery latency on its own.
+</p>
+
+<h3 id="proc-store">6.6 <code>hbase.procedure.store.wal.sync.wait.msec</code> &amp; <code>hbase.master.procedure.threads</code> — closed-loop throughput</h3>
+
+<p>
+The procedure store is a single-writer log (a <code>MasterRegion</code> with an <code>AsyncFSWAL</code>). Each procedure thread blocks once per persist. With $N$ procedure threads, $w$ = sync-wait, and $h$ = hflush latency under stress (≈10 ms), the closed-loop, work-conserving throughput is:
+</p>
+
+$$
+\mu_{\text{proc}}
+\;\approx\; \frac{N}{w + h}
+\quad\text{(writes/second).}
+$$
+
+<p>The drain time for the recovery work follows directly:</p>
+
+$$
+T_{\text{drain}}
+\;=\; \frac{W_{\text{total}}}{\mu_{\text{proc}}}
+\;=\; \frac{W_{\text{total}}\,(w + h)}{N}.
+$$
+
+<p>
+At the HBase defaults ($N = 16$, $w = 100\,\text{ms}$, $h = 10\,\text{ms}$), $\mu_{\text{proc}} \approx 145\,\text{w/s}$ — orders of magnitude below the offered rate of the next subsection. The deterministic formula is enough to confirm that $N$ and $w$ must change by orders of magnitude; the actual operating point is set in <a href="#pk">§7</a>, where service-time variance enters the picture.
+</p>
+
+<p>
+Surviving DataNode read load rises $\approx 50\%$ during the recovery window. The DN-side queue inflation pushes the procedure store hflush latency from $\bar{h} \approx 10\,\text{ms}$ to $\bar{h}^{\text{AZ}} \approx 15\,\text{ms}$, derating closed-loop throughput to $\mu_{\text{proc}}^{\text{AZ}} \approx 20.5\,\text{K w/s}$ and the corresponding drain time to $T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$ (full derivation in <a href="#hdfs-pipeline-cross-impact">§9.8</a>, summary in <a href="#az-derating">§4.2</a>).
+</p>
+<p>
+  The procedure store remains the bottleneck stage.
+</p>
+
+<h3 id="offered">6.7 Offered vs. sustained load</h3>
+
+<p>
+The instantaneous offered rate during the SCP fan-out is:
+</p>
+
+$$
+\lambda_{\text{offered}}
+\;\approx\; \frac{M_{\text{TRSP}}}{T_{\text{create}}}
+\;=\; \frac{2.5 \times 10^{5}}{5\text{–}10\,\text{s}}
+\;=\; 25\text{–}50\,\text{K/s.}
+$$
+
+<p>
+At the upper end, this exceeds the recommended sustained throughput $\mu_{\text{proc}} \approx 25.6\,\text{K/s}$ (<a href="#pk">§7.2</a>). The offered burst exceeds the sink for ~5–10 s and the resulting backlog drains over the remainder of the recovery window. The design constraint is that the sink drains $W_{\text{total}}$ within the chosen recovery window.
+</p>
+
+<h3 id="rs-open">6.8 <code>hbase.regionserver.executor.openregion.threads</code> — the per-RS bottleneck</h3>
+
+<p>
+Each surviving RegionServer maintains its own pool to execute <code>RS_OPEN_REGION</code> events (and a parallel pool for <code>RS_CLOSE_REGION</code>). The default is <code>3</code>. During AZ-loss recovery, each surviving RS receives ≈750 OPEN dispatches, and the work each executor thread does for one open is dominated by HDFS reads, not CPU.
+</p>
+
+<p>Per-RS open throughput:</p>
+
+$$
+\mu_{\text{open}}^{\text{(per RS)}}
+\;=\; \frac{T_{\text{open}}}{W_{\text{open}}}
+\quad\text{(regions/sec/RS),}
+$$
+
+<p>where $T_{\text{open}}$ is the configured thread count and $W_{\text{open}}$ is the per-region open time. Cluster-wide:</p>
+
+$$
+\mu_{\text{open}}^{\text{(cluster)}}
+\;=\; N_{\text{alive}} \cdot \mu_{\text{open}}^{\text{(per RS)}}
+\;=\; \frac{N_{\text{alive}} \cdot T_{\text{open}}}{W_{\text{open}}}.
+$$
+
+<p>Numerically, with $N_{\text{alive}} = 333$:</p>
+
+<table>
+  <thead>
+    <tr><th>$T_{\text{open}}$</th><th>$W_{\text{open}}$</th><th>$\mu_{\text{open}}^{\text{(cluster)}}$</th><th>$T_{\text{drain}}$ for 250K opens</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>3 (default)</td><td>1 s (HDFS stress)</td><td>1,000/s</td><td>250 s (4 min)</td></tr>
+    <tr><td>32 (recommended)</td><td>1 s</td><td>10,700/s</td><td>23 s</td></tr>
+    <tr><td>32 (recommended)</td><td>5 s</td><td>2,100/s</td><td>119 s (HDFS-bound, see <a href="#hdfs">§6.9</a>)</td></tr>
+  </tbody>
+</table>
+
+<p>
+With the master-side recommendations of §§6.1–6.7 applied but $T_{\text{open}}$ left at its default of 3, the per-RS open executor is the cluster-wide bottleneck during AZ-loss recovery. The master can persist at 25K/s and dispatch at line-rate, but it pushes into 333 per-RS queues that drain at ≈3 regions/s each at $W_{\text{open}} \approx 1\,\text{s}$ (≈1,000/s cluster-wide; see table above). Effective recovery time is on the order of ≈4 minutes at default $T_{\text{open}}$, and proportionally worse as $W_{\text{open}}$ grows under HDFS stress.
+</p>
+
+<p>
+Raising $T_{\text{open}}$ to <strong>32</strong> matches the master's throughput at $W_{\text{open}} \approx 1\,\text{s}$ (the realistic-stress case) and over-provisions the healthy case. The close-region executor should follow symmetrically:
+</p>
+
+<p>
+<code>hbase.regionserver.executor.openregion.threads</code>: <strong>3 → 32</strong><br>
+<code>hbase.regionserver.executor.closeregion.threads</code>: <strong>3 → 32</strong>
+</p>
+
+<p>
+The priority-region and meta-region executors operate on a much smaller working set (META replicas plus a handful of system regions) and need only modest bumps:
+</p>
+
+<p>
+<code>hbase.regionserver.executor.openpriorityregion.threads</code>: <strong>3 → 8</strong><br>
+</p>
+
+<p>
+Inbound RPC handling on the RegionServer also needs headroom during recovery, since the master is sending OPEN/CLOSE RPCs at the new higher rate:
+</p>
+
+<p>
+<code>hbase.regionserver.handler.count</code>: <strong>30 → 60</strong>
+</p>
+
+<p>
+Note that $T_{\text{open}} = 32$ is matched to the NameNode saturation point at the reference $\omega$ and $C_{\text{NN}}$ (<a href="#hdfs">§6.9</a>, <a href="#nn-tune">§8.3</a>): at higher thread counts $W_{\text{open}}$ self-adjusts upward to keep the NN at capacity, with no throughput gain.
+</p>
+
+<p>
+The same $\approx 50\%$ DataNode read-load delta of <a href="#az-assumptions">§4</a> inflates per-region open time to $W_{\text{open}}^{\text{AZ}} \approx 1.5 \cdot W_{\text{open}}$, and the close-region path symmetrically. At $T_{\text{open}} = 32$ this puts the realistic-stress $W_{\text{open}}$ at $\approx 1.5\,\text{s}$, dropping cluster-wide open throughput to $\approx 7{,}100$/s and extending the 250K-open drain time to $\approx 35\,\text{s}$. Under the recommended tuning this still sits below the AZ-loss-window procedure-store drain ($T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$. Full derivation in <a href="#hdfs-pipeline-cross-impact">§9.8</a>; multiplier summary in <a href="#az-derating">§4.2</a>.
+</p>
+
+<p>
+The 1.5&times; inflation above is the mean latency figure. Per region open time has a heavy tail driven by HFile metadata reads from DataNodes. Without read path tuning, an open that picks a not yet classified as dead replica can stall for a full <code>dfs.client.socket-timeout</code> (60 seconds default) before falling back, pushing $W_{\text{open}}$ into multi-second territory and shifting $T_{\text{RS-open}}$ past $T_{\text{proc-drain}}^{\text{AZ}}$ as the cluster wide bottleneck. Hedged reads + JVM-shared <code>DeadNodeDetector</code> (<a href="#hdfs-read-path">&sect;9.10</a>) bound the tail at $\theta + p_{50,\text{alt}} \approx 150\,\text{ms}$, keeping $W_{\text{open}}$ close to its mean and the stage subordinate to the procedure store. See <a href="#hdfs-readpath-cross-impact">&sect;9.12</a> for the per-RS amortized bound.
+</p>
+
+<h3 id="hdfs">6.9 HDFS NameNode &amp; DataNode — the cluster-wide concurrency ceiling</h3>
+
+<p>
+RegionServer-side parallelism is bounded above by HDFS. A region open is HDFS-heavy: roughly $\omega \approx 30$ NameNode operations (one <code>getFileInfo</code> + one <code>getBlockLocations</code> per HFile, multiplied across HFiles per column family per region) plus per-block reads from DataNodes for footers, indexes, and bloom filters. Under AZ loss it also includes WAL-split recovered edits.
+</p>
+
+<p>
+Treat the NameNode as a single shared resource with op-throughput ceiling $C_{\text{NN}}$. At $C_{\text{NN}} \approx 3 \times 10^{5}\,\text{op/s}$ (see <a href="#nn-tune">§8.3</a>) and $\omega = 30$, the cluster sustains $\approx 10{,}000$ concurrent opens at $W_{\text{open}} = 1\,\text{s}$, about 30 per surviving RS, so $T_{\text{open}} = 32$ is matched to the NameNode saturation point. Pushing $T_{\text{open}}$ higher does not increase throughput. $W_{\text{open}}$ self-adjusts upward to keep the NN at capacity, and the system finds its own fixed point at that operating limit.
+</p>
+
+<p>
+The HDFS contribution to recovery time at the NN saturation limit is
+</p>
+
+$$
+T_{\text{NN}}
+\;=\; \frac{M_{\text{TRSP}} \cdot \omega}{C_{\text{NN}}}
+\;=\; \frac{2.5 \times 10^{5} \cdot 30}{3 \times 10^{5}}
+\;\approx\; 25\,\text{s.}
+$$
+
+<p>
+At the recommended HBase tuning the master procedure store contributes $T_{\text{proc}} \approx 59\,\text{s}$ (<a href="#pk">§7.2</a>), so HDFS sits below the system-wide bottleneck at the reference workload. The recommended deployment (<a href="#nn-tune">§8.3</a>) is sized to keep $T_{\text{NN}} < T_{\text{proc}}$ at the reference $\omega$.
+</p>
+
+<p>
+$T_{\text{NN}}$ as derived above is the throughput bound contribution at NN saturation. It does not include the per call wait that the embedded <code>DFSClient</code> spends on a hung previously active NN during HDFS HA failover, which is governed at the client side by <code>ipc.client.rpc-timeout.ms</code> (default $120\,\text{s}$, tuned $30\,\text{s}$ in <a href="#hdfs-nn-rpc">&sect;9.11</a>) rather than by <code>dfs.client.failover.*</code>. The HDFS side failover wall clock time is unchanged by anything in <code>hbase-site.xml</code>. See the <a href="#bounded">&sect;8.4</a> "with NN failover" bracket. <a href="#hdfs-nn-rpc">&sect;9.11</a> presents the layered budget that combines both terms.
+</p>
+
+<h3 id="walsplit">6.10 <code>hbase.regionserver.wal.max.splitters</code> — distributed WAL splitting</h3>
+
+<p>
+Each dead RS leaves an unarchived WAL set that the master must split before its regions can be reassigned. Per dead RS, the master enumerates the files in <code>WALs/&lt;server&gt;-splitting/</code>, creates one <code>SplitWALProcedure</code> per WAL, and dispatches each as a child <code>SplitWALRemoteProcedure</code> to a worker chosen by the <code>WorkerAssigner</code>. The worker runs the split on its <code>RS_LOG_REPLAY_OPS</code> executor: a sequential HDFS read of the WAL plus 3-replicated writes of the per-region <code>recovered.edits</code> files. The master polls for completion (the source WAL no longer existing at its splitting-dir path) before dispatching the corresponding TRSPs.
+</p>
+
+<p>
+The same configuration key, <code>hbase.regionserver.wal.max.splitters</code> (default <strong>2</strong>), gates two things: the per-RS slot count tracked by the <code>WorkerAssigner</code> on the master, and the core pool size of the <code>RS_LOG_REPLAY_OPS</code> executor on each RS. Cluster-wide split parallelism is therefore:
+</p>
+
+$$
+P_{\text{split}} \;=\; N_{\text{alive}} \cdot K,
+\qquad K \,=\, \texttt{hbase.regionserver.wal.max.splitters}.
+$$
+
+<p>These quantities define the WAL workload:</p>
+
+<ul>
+  <li>$N_{\text{wal/RS}}$ — unarchived WAL files per dead RS at outage time. Workload-dependent, capped above by <code>hbase.regionserver.maxlogs</code> (default $\geq 32$).</li>
+  <li>$M_{\text{wal}} = N_{\text{dead}} \cdot N_{\text{wal/RS}}$ — total WAL files to split. At the reference workload, $M_{\text{wal}}$ ranges from $\approx 1{,}300$ (typical write load, $N_{\text{wal/RS}} \approx 8$) to $\approx 5{,}300$ (write-heavy, $N_{\text{wal/RS}}$ approaching <code>maxlogs</code>).</li>
+  <li>$W_{\text{split}}$ — per-WAL split service time, HDFS-bound by a sequential read of $S$ bytes plus 3-replicated <code>recovered.edits</code> writes of up to $S$ bytes, with $S$ bounded above by <code>logrollsize</code> (default $\approx 128\,\text{MiB}$). Empirically $\approx 3\,\text{s}$ with healthy DataNodes, rising to $\approx 15\,\text{s}$ under DataNode contention.</li>
+</ul>
+
+<p>
+Applying Little's Law to the split-slot pool — $M_{\text{wal}}$ items of mean service $W_{\text{split}}$ through $P_{\text{split}}$ servers — the WAL-splitting drain time is:
+</p>
+
+$$
+T_{\text{WAL}}
+\;=\; \frac{M_{\text{wal}} \cdot W_{\text{split}}}{P_{\text{split}}}
+\;=\; \frac{N_{\text{dead}} \cdot N_{\text{wal/RS}} \cdot W_{\text{split}}}{N_{\text{alive}} \cdot K}.
+$$
+
+<p>Numerical points at $N_{\text{dead}} = 167$, $N_{\text{alive}} = 333$:</p>
+
+<table>
+  <thead>
+    <tr><th>$K$</th><th>$N_{\text{wal/RS}}$</th><th>$W_{\text{split}}$</th><th>$T_{\text{WAL}}$</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>2 (default)</td><td>8</td><td>5 s</td><td>≈ 10 s</td></tr>
+    <tr><td>2 (default)</td><td>32</td><td>10 s</td><td>≈ 80 s</td></tr>
+    <tr><td>8 (recommended)</td><td>8</td><td>5 s</td><td>≈ 2.5 s</td></tr>
+    <tr><td>8 (recommended)</td><td>32</td><td>10 s</td><td>≈ 20 s</td></tr>
+  </tbody>
+</table>
+
+<p>
+At typical write loads ($N_{\text{wal/RS}} \approx 8$) WAL splitting at default $K = 2$ contributes ≈ 10 s — comparable to the SCP-burst pipeline allowance but still well below $T_{\text{proc}}$. Under sustained write load ($N_{\text{wal/RS}}$ approaching <code>maxlogs</code>) the default contributes ${\sim}80\,$s and rivals the master procedure store as the dominant term. Raising $K$ from 2 to 8 quadruples per-RS split parallelism while keeping per-RS HDFS bandwidth in budget: each split slot does one sequential read plus a 3-replicated write at sustained ≈ 50–100 MB/s, so eight concurrent slots remain comfortably inside the 25 Gbps NIC envelope of the reference instance.
+</p>
+
+<p>
+$W_{\text{split}}$ is an exogenous, HDFS-bound cost that HBase cannot directly tune. It is reduced indirectly by smaller WAL roll size (more files of smaller $W_{\text{split}}$ each, with $T_{\text{WAL}}$ unchanged in aggregate) or by holding $N_{\text{wal/RS}}$ down via more aggressive flush policy.
+</p>
+
+<p>
+WAL splitting and region opens overlap at the cluster level. SCPs run independently, so once an early dead RS finishes splitting its WALs its regions can be assigned and opened while later SCPs are still splitting. Both stages draw on the same surviving DataNodes for HDFS bandwidth, so a higher $T_{\text{WAL}}$ inflates the effective $W_{\text{open}}$ during the WAL-split window. The model treats $T_{\text{WAL}}$ as a parallel stage in the recovery max (<a href="#bounded">§8.4</a>) rather than additive to $T_{\text{RS-open}}$.
+</p>
+
+<p>
+Surviving DataNodes carry $\approx 50\%$ more read traffic, which inflates split-WAL read latency and the parallel HFile-open reads in the same proportion. The aggregate WAL-split drain time scales to $T_{\text{WAL}}^{\text{AZ}} \approx 1.5 \cdot T_{\text{WAL}}$, and the resulting effective $W_{\text{open}}$ during the WAL-split window picks up the same factor on top of any baseline inflation (<a href="#rs-open">§6.8</a>'s callout). Full derivation in <a href="#hdfs-pipeline-cross-impact">§9.8</a>. Multiplier summary in <a href="#az-derating">§4.2</a>.
+</p>
+
+<p>
+The 1.5&times; multiplier captures the queueing inflation on the surviving DataNodes&rsquo; sequential read throughput. The tail is what produces the $W_{\text{split}} \approx 15\,\text{s}$ "DataNode contention" entry in the third bullet of this subsection, a sequential WAL read that picks a not-yet-classified-dead replica blocks for a full <code>dfs.client.socket-timeout</code> before falling back, even when the average DN throughput would have completed the read in $\approx 5\,\text{s}$. Read-path tuning (<a href="#hdfs-read-path">&sect;9.10</a>) does not change the +50% mean-throughput cost, because the surviving DNs still carry the same aggregate read traffic, but it does collapse the tail back toward the healthy $W_{\text{split}} \approx 3\text{--}5\,\text{s}$ regime by capping individual slow reads at $\theta + p_{50,\text{alt}} \approx 150\,\text{ms}$ via hedged reads. The cross section impact is in <a href="#hdfs-readpath-cross-impact">&sect;9.12</a>.
+</p>
+
+<h2 id="pk">7. Bulk-service queueing analysis of the procedure store</h2>
+
+<p>
+The closed-loop throughput formula in <a href="#proc-store">§6.6</a> treats service time as deterministic, which is sufficient to size $\mu$ but not to size headroom. The procedure-store hflush is not deterministic: $p_{50} \approx 7$ ms, $p_{99} \gtrsim 25$ ms under stress. Since each flush cycle serves up to $N$ writes in bulk, the right model is an $M/G^{[N]}/1$ bulk-service queue, and the design rule must guard against per-cycle arrival overspill rather than per-write wait.
+</p>
+
+<p>The cycle-level service-time setup is:</p>
+
+<ul>
+  <li>Service time per cycle: $S = w + h$, where $w$ is the dwell wait (deterministic) and $h$ is the hflush latency (random).</li>
+  <li>$E[S] = w + \bar{h}$, $\;\text{Var}(S) = \sigma_h^{2}$, $\;C_S^{2} = \sigma_h^{2}/(w+\bar{h})^{2}$.</li>
+  <li>Each cycle serves up to $N$ procedure writes. Cluster throughput: $\mu = N / E[S]$. Per-write utilization: $\rho = \lambda E[S] / N$.</li>
+</ul>
+
+<p>For $w = 10\,\text{ms}$, $\bar{h} = 10\,\text{ms}$, $\sigma_h \approx 8\,\text{ms}$ (consistent with $p_{99} \approx 30\,\text{ms}$):</p>
+
+$$
+E[S] = 20\,\text{ms},\quad C_S^{2} = \frac{64}{400} = 0.16.
+$$
+
+<h3>7.1 Design rule: bulk-cycle variance bound</h3>
+
+<p>
+In a bulk queue, macroscopic queueing delay (multi-cycle backlog) only occurs if the number of arrivals during a single flush cycle exceeds $N$, causing writes to spill over into the next cycle. The relevant tail to bound is therefore the per-cycle arrival overflow probability, not the per-write residual wait.
+</p>
+
+<p>
+To bound sustainable utilization, size the headroom such that capacity $N$ covers the expected arrivals per cycle plus a safety margin to absorb variance in hflush latency. For a cycle of random length $S = w + h$, the number of Poisson arrivals $A$ during the cycle satisfies:
+</p>
+
+<ul>
+  <li>Mean: $\mu_A = \lambda\,E[S] = \rho N$.</li>
+  <li>Variance: $\sigma_A^{2} = \lambda\,E[S] + \lambda^{2}\sigma_h^{2} = \rho N + \rho^{2} N^{2} C_S^{2}$ (Poisson term plus the law of total variance contribution from random $S$).</li>
+</ul>
+
+<p>
+Adopt the design rule that capacity $N$ must cover the mean plus a $1.33\sigma$ safety margin (so $\approx 90\%$ of cycles clear completely without spillover, even during slow flushes):
+</p>
+
+$$
+N \;\geq\; \mu_A + 1.33\,\sigma_A.
+$$
+
+<p>
+Substituting $N = 512$ and $C_S^{2} = 0.16$, evaluate at a target utilization of $\rho = 0.65$:
+</p>
+
+$$
+\begin{aligned}
+\mu_A     &= 0.65 \cdot 512 \;\approx\; 333,                                   \\
+\sigma_A^{2} &= 333 + (0.65)^{2}(512)^{2}(0.16) \;\approx\; 18{,}054
+            \;\Longrightarrow\; \sigma_A \;\approx\; 134,                      \\
+\mu_A + 1.33\,\sigma_A &= 333 + 1.33 \cdot 134 \;\approx\; 511.2 \;\leq\; 512.
+\end{aligned}
+$$
+
+<p>
+This pins the maximum sustainable steady-state utilization to $\rho_{\max} \approx 0.65$. Operating above this threshold sharply increases the probability of multi-cycle overspill: as $\rho \to 1$ the arrival mean approaches $N$ while $\sigma_A$ continues to grow, so an increasing fraction of cycles spill into the next, and macroscopic backlog accumulates. The same $\rho_{\max} \approx 0.65$ engineering target is also the right margin to absorb physical jitter (JVM GC pauses, transient DataNode pipeline stalls) that inflate $\sigma_h$ above its nominal value.
+</p>
+
+<p>
+Under the strict one-replica-per-AZ placement of <a href="#az-assumptions">§4</a>, the inflated DataNode read load pushes $\bar{h}$ to $\bar{h}^{\text{AZ}} \approx 15\,\text{ms}$ and $\sigma_h$ up roughly in proportion, so $C_S^{2}$ rises from 0.16 to $C_S^{2,\text{AZ}} \approx 0.23$. Re-evaluating the variance bound at $N = 512$ and $C_S^{2,\text{AZ}} = 0.23$ shrinks the maximum sustainable utilization to $\rho_{\max}^{\text{AZ}} \approx 0.61$, about $0.94\times$ the steady-state value. Full derivation in <a href="#hdfs-pipeline-cross-impact">§9.8</a>; multiplier summary in <a href="#az-derating">§4.2</a>.
+</p>
+
+<h3>7.2 Recommended sizing</h3>
+
+<p>
+Under static thread-pool sizing, $N$ is chosen to bound the procedure-store drain time at saturation:
+</p>
+
+$$
+T_{\text{proc-drain}} \;=\; \frac{W_{\text{total}}\,(w+h)}{N}.
+$$
+
+<p>
+Targeting $T_{\text{proc-drain}} \approx 60\,\text{s}$ at $w = h = 10\,\text{ms}$ gives $N \approx 500$. Rounded to the nearest power of two, the recommended operating point is
+</p>
+
+$$
+N \;=\; 512,\quad w \;=\; 10\,\text{ms},\quad \bar{h} \;=\; 10\,\text{ms,}
+\quad\Longrightarrow\quad
+\mu_{\text{proc}} \;\approx\; 25.6\,\text{K w/s,}\;\;
+T_{\text{proc-drain}} \;\approx\; 59\,\text{s.}
+$$
+
+<p>
+The bulk-cycle variance bound (<a href="#pk">§7.1</a>) caps the sustainable post-burst arrival rate at $\lambda \leq \rho_{\max}\mu = 0.65 \cdot 25.6\,\text{K} \approx 16.6\,\text{K w/s}$. During the SCP fan-out transient (<a href="#offered">§6.7</a>) the procedure store runs at $\rho \approx 1$ — burst arrivals briefly exceed $\mu$ for 5–10 s and the resulting queue empties over the next ~60 s. The variance bound applies to the post-burst steady state. The drain-time bound applies during the transient.
+</p>
+
+<p>
+This is the upper bound for static sizing. The longer-term direction is core/overflow dynamic sizing (<a href="#future">§12</a>) with the static value here as the cap.
+</p>
+
+<h2 id="summary-table">8. Summary: recommended settings</h2>
+
+<h3>8.1 Master-side</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Math principle</th>
+      <th>Driving quantity</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.master.procedure.threads</span></td>
+      <td>16</td>
+      <td>512</td>
+      <td>Drain-time target with bulk-cycle variance bound</td>
+      <td>$T_{\text{proc-drain}} \approx 59\,\text{s}$ at $\mu_{\text{proc}} \approx 25.6\,\text{K w/s}$; see <a href="#pk">§7.2</a></td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.master.executor.serverops.threads</span></td>
+      <td>5</td>
+      <td>256</td>
+      <td>Burst concurrency</td>
+      <td>$N_{\text{dead}} \approx 167$</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.master.executor.openregion.threads</span></td>
+      <td>5</td>
+      <td>256</td>
+      <td>Little's Law on META</td>
+      <td>$\lambda_{\text{META}} \cdot W_{\text{handler}} \approx 250$</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.master.executor.closeregion.threads</span></td>
+      <td>5</td>
+      <td>256</td>
+      <td>Symmetric to <code>openregion</code></td>
+      <td>Avoids secondary bottleneck under balancer-driven moves.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.procedure.remote.dispatcher.threadpool.size</span></td>
+      <td>128</td>
+      <td>512</td>
+      <td>Burst concurrency</td>
+      <td>$N_{\text{alive}} \approx 333$ + retry headroom</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.procedure.remote.dispatcher.delay.msec</span></td>
+      <td>150</td>
+      <td>50</td>
+      <td>Dwell tax $d \cdot t_{\text{TRSP}}$</td>
+      <td>Per-region serialization through transitions</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.procedure.store.wal.sync.wait.msec</span></td>
+      <td>100</td>
+      <td>10</td>
+      <td>Closed-loop $\mu = N/(w+h)$</td>
+      <td>Procedure-store sustained throughput</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.metahandler.count</span> (master)</td>
+      <td>20</td>
+      <td>256</td>
+      <td>Little's Law on inbound RPCs</td>
+      <td>$\lambda_{\text{rpc}} \cdot W_{\text{hold}} \approx 250$</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>8.2 RegionServer-side</h3>
+
+<p>
+These are the most important and most under-set defaults during AZ-loss recovery. Once the master-side recommendations of §7.1 are applied, the per-RS open executor becomes the cluster-wide bottleneck.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Math principle</th>
+      <th>Driving quantity</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.executor.openregion.threads</span></td>
+      <td>3</td>
+      <td>32</td>
+      <td>Per-RS Little's Law against $W_{\text{open}}$</td>
+      <td>Match master throughput at $W_{\text{open}} \approx 1\,\text{s}$ stress</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.executor.closeregion.threads</span></td>
+      <td>3</td>
+      <td>32</td>
+      <td>Symmetric to <code>openregion</code></td>
+      <td>Avoid asymmetric stalls during balancer-driven moves</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.executor.openpriorityregion.threads</span></td>
+      <td>3</td>
+      <td>8</td>
+      <td>Burst concurrency</td>
+      <td>System-region opens (META replicas + sysregions)</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.max.splitters</span></td>
+      <td>2</td>
+      <td>8</td>
+      <td>Little's Law on the cluster split-slot pool</td>
+      <td>$P_{\text{split}} = N_{\text{alive}} \cdot K$; bound $T_{\text{WAL}}$ in write-heavy clusters. See <a href="#walsplit">§6.10</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="nn-tune">8.3 HDFS NameNode capacity</h3>
+
+<p>
+HDFS NameNode op-throughput sets the cluster-wide concurrency ceiling for region opens (<a href="#hdfs">§6.9</a>). $C_{\text{NN}}$ depends on instance sizing, JVM and HDFS configuration, and namespace topology, and is tunable from outside HBase before it becomes the bottleneck.
+</p>
+
+<h4>Instance</h4>
+
+<p>
+Run the active NameNode on <strong>m7g.16xlarge</strong> (64 vCPU AWS Graviton3, 256 GB DDR5-4800, 30 Gbps network, 20 Gbps EBS bandwidth). Three properties of this instance matter for region-open bursts:
+</p>
+
+<ul>
+  <li>64 vCPUs support a 128-thread IPC handler pool (<code>dfs.namenode.handler.count = 128</code>) and a wide reader pool, so RPC processing parallelism scales with the concurrent open-RPC fan-in.</li>
+  <li>256 GB of DDR5 hosts a ~200 GB JVM heap, enough to keep the full namespace in memory at reference scale, with headroom for off-heap structures and OS page cache.</li>
+  <li>DDR5-4800 memory bandwidth is what bounds the in-memory inode-tree traversal that dominates <code>getFileInfo</code> and <code>getBlockLocations</code>, the two operations that together account for the $\omega \approx 30$ region-open footprint.</li>
+</ul>
+
+<h4>HDFS tuning</h4>
+
+<ul>
+  <li><code>dfs.namenode.fslock.fair = false</code> — allows reads to barge past contending writers, which is appropriate when region-open traffic dominates.</li>
+  <li><code>dfs.namenode.handler.count = 128</code> and <code>ipc.server.read.threadpool.size = 16</code>, so handler-pool width is not the bottleneck below the lock.</li>
+  <li>JournalNodes' local edits directory on NVMe (instance store or io2), isolated from HBase DataNode block storage, so JN edit-log fsyncs do not contend with the DataNode block write/close traffic from the HBase WAL pipeline.</li>
+</ul>
+
+<h4>Sustained throughput</h4>
+
+<p>
+With the instance and tuning above, a single active NameNode sustains
+</p>
+
+$$
+C_{\text{NN}} \;\approx\; 3 \times 10^{5}\,\text{op/s}
+\quad\text{(read-heavy, single active NameNode, tuned).}
+$$
+
+<p>
+This is the value used throughout the model.
+</p>
+
+<h4>Load during the partial-failure window</h4>
+
+<p>
+At the moment of AZ loss the NameNode sees a brief synchronous burst of <code>addBlock</code> RPCs as every surviving RegionServer rolls its WAL onto a fresh width-2 pipeline. The roll cascade completes within $T_{\text{roll-trigger}} \approx 6\,\text{s}$ (the AsyncFSWAL slow-packet ladder derived in <a href="#hdfs-pipeline-cross-impact">§9.8</a>), so the cluster-wide rate peaks at $\lambda_{\text{addBlock}}^{\text{burst}} \approx 55$/s. Against the tuned ceiling $C_{\text{NN}} \approx 3 \times 10^{5}\,\text{op/s}$ this is under 0.02% utilization and disappears below the noise floor; it is a transient blip rather than a sustained load shift.
+</p>
+
+<p>
+On a longer timescale the NameNode absorbs the consequences of $N_{\text{dead}} = 167$ DataNodes ceasing to heartbeat. Each lost DN is marked dead only after <code>dfs.namenode.heartbeat.recheck-interval</code> $\approx 5\,\text{min}$, at which point the per-DN dead transition fires the block-management callbacks that scan its blocks and queue them for re-replication. Averaged over the recheck window this is $\approx N_{\text{dead}} / 300\,\text{s} \approx 0.6$ dead-DN events per second. The actual arrivals are bunched at the back end of the window as the staggered heartbeat timeouts come due, but even the local burst is small relative to $C_{\text{NN}}$ and well within the NameNode's handler-pool width.
+</p>
+
+<p>
+The dead-DN scans produce a re-replication backlog corresponding to the lost AZ's share of the namespace. The NameNode schedules transfer commands at no more than <code>dfs.namenode.replication.max-streams-hard-limit</code> per surviving DataNode, so the NameNode-side scheduler load is bounded by that throttle regardless of backlog size and likewise stays well clear of $C_{\text{NN}}$.
+</p>
+
+<p>
+The aggregate of these additions is comfortably below $C_{\text{NN}}$ at the reference workload.
+</p>
+
+<h4>Recovery-time contribution</h4>
+
+<p>
+At the reference $\omega = 30$ and $C_{\text{NN}} = 3 \times 10^{5}\,\text{op/s}$:
+</p>
+
+$$
+T_{\text{NN}}
+\;=\; \frac{M_{\text{TRSP}}\,\omega}{C_{\text{NN}}}
+\;=\; \frac{2.5 \times 10^{5} \cdot 30}{3 \times 10^{5}}
+\;\approx\; 25\,\text{s.}
+$$
+
+<p>
+$T_{\text{NN}}$ sits below the master procedure store drain time $T_{\text{proc}} \approx 59\,\text{s}$ (<a href="#pk">§7.2</a>), so HDFS is not the system-wide bottleneck at the reference workload.
+</p>
+
+<h3 id="bounded">8.4 Bounded recovery-time estimates</h3>
+
+<p>
+Recovery time is the max of per-stage drain times plus a small pipeline overhead, so the model gives a closed-form bound at the reference workload ($N=500$, $R=1{,}500$, $f=\tfrac{1}{3}$, $M_{\text{TRSP}}=250{,}000$, $W_{\text{total}}=1.5\times 10^{6}$). At the recommended settings of §7.1–§7.2, four stage rates set the operating bound:
+</p>
+
+$$
+\begin{aligned}
+T_{\text{proc}}     &= \frac{W_{\text{total}}(w+h)}{N_{\text{proc}}}
+                     = \frac{1.5\times 10^{6}\cdot 0.020}{512}
+                     \;\approx\; 59\,\text{s,}                                  \\[2pt]
+T_{\text{WAL}}      &= \frac{N_{\text{dead}}\, N_{\text{wal/RS}}\, W_{\text{split}}}{N_{\text{alive}}\, K}
+                     = \frac{167\, N_{\text{wal/RS}}\, W_{\text{split}}}{333 \cdot 8}
+                     \;\approx\; 0.063\,N_{\text{wal/RS}}\, W_{\text{split}}\,\text{s,}     \\[2pt]
+T_{\text{RS-open}}  &= \frac{M_{\text{TRSP}}\,W_{\text{open}}}{N_{\text{alive}}\,T_{\text{open}}}
+                     = \frac{250{,}000\,W_{\text{open}}}{333\cdot 32}
+                     \;\approx\; 23.5\,W_{\text{open}}\,\text{s,}               \\[2pt]
+T_{\text{NN}}       &= \frac{M_{\text{TRSP}}\,\omega}{C_{\text{NN}}}.
+\end{aligned}
+$$
+
+<p>
+$T_{\text{proc}}$ is fixed by tuning. $T_{\text{WAL}}$ depends on the workload-driven WAL count per dead RS and the HDFS-bound per-WAL service time. $T_{\text{RS-open}}$ and $T_{\text{NN}}$ are both functions of the HDFS operating point ($\omega$, $C_{\text{NN}}$, $W_{\text{open}}$), and $W_{\text{open}}$ rises until either the NN saturates or the per-RS thread pool fills, so in practice the larger of $T_{\text{RS-open}}$ and $T_{\text{NN}}$ binds. WAL splitting and region opens overlap at the cluster level (see <a href="#walsplit">§6.10</a>), so $T_{\text{WAL}}$ enters the recovery max as a parallel stage rather than additively. With a small allowance $T_{\text{pipe}} \approx 10\,\text{s}$ for the SCP fan-out burst:
+</p>
+
+$$
+T_{\text{recovery}} \;\approx\; \max\!\big(T_{\text{proc}},\,T_{\text{WAL}},\,T_{\text{RS-open}},\,T_{\text{NN}}\big) \;+\; T_{\text{pipe}}.
+$$
+
+<p>Three operating-point bounds anchor the range:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Scenario</th>
+      <th>$W_{\text{open}}$</th>
+      <th>$(\omega,\;C_{\text{NN}})$</th>
+      <th>$(N_{\text{wal/RS}},\;W_{\text{split}})$</th>
+      <th>$T_{\text{proc}}$</th>
+      <th>$T_{\text{WAL}}$</th>
+      <th>$T_{\text{RS-open}}$</th>
+      <th>$T_{\text{NN}}$</th>
+      <th>Bottleneck</th>
+      <th>$T_{\text{recovery}}$</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Light HDFS load — well-compacted regions, healthy DataNodes, typical write load</td>
+      <td>≈ 200 ms</td>
+      <td>(15, 300K op/s)</td>
+      <td>(8, 5 s)</td>
+      <td>58 s</td>
+      <td>≈ 2.5 s</td>
+      <td>≈ 5 s</td>
+      <td>≈ 13 s</td>
+      <td>Master procedure store</td>
+      <td><strong>≈ 70 s</strong></td>
+    </tr>
+    <tr>
+      <td>Typical AZ loss — moderate stress, moderate write load</td>
+      <td>≈ 1 s</td>
+      <td>(30, 300K op/s)</td>
+      <td>(8, 5 s)</td>
+      <td>58 s</td>
+      <td>≈ 2.5 s</td>
+      <td>≈ 23 s</td>
+      <td>≈ 25 s</td>
+      <td>Master procedure store</td>
+      <td><strong>≈ 70 s</strong></td>
+    </tr>
+    <tr>
+      <td>Stressed — write-heavy, large recovered-edits, many HFiles per region</td>
+      <td>≈ 3–5 s</td>
+      <td>(50, 300K op/s)</td>
+      <td>(32, 10 s)</td>
+      <td>58 s</td>
+      <td>≈ 20 s</td>
+      <td>≈ 70–120 s</td>
+      <td>≈ 42 s</td>
+      <td>RS open executor (DataNode-/replay-bound $W_{\text{open}}$)</td>
+      <td><strong>≈ 80–130 s</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The range across realistic operating points is roughly 1 to 2 minutes at recommended settings. The dominant term in the typical cases is the master procedure store at $T_{\text{proc}} \approx 59\,\text{s}$. HDFS contributes $T_{\text{NN}} \approx 25\,\text{s}$ at $C_{\text{NN}} = 3 \times 10^{5}\,\text{op/s}$, $\omega = 30$, and WAL splitting at the recommended $K = 8$ contributes single-digit seconds in the typical case and ${\sim}20\,$s in the stressed case, both well below $T_{\text{proc}}$. Reducing the typical case further would require raising $N_{\text{proc}}$ above the static-sizing recommendation (<a href="#future">§12</a>).
+</p>
+
+<p>
+The <em>Stressed</em> row's $T_{\text{RS-open}} \approx 70\text{–}120\,\text{s}$ figure assumes the read-path tuning of <a href="#hdfs-read-path">&sect;9.10</a> (hedged reads + JVM-shared <code>DeadNodeDetector</code> + 15 s <code>dfs.client.socket-timeout</code>) is in effect. Without it, every region open or WAL split that picks a not yet classified as dead replica adds up to 60 s to its $W_{\text{open}}$ before the embedded <code>DFSClient</code> falls back. The per-RS amortized cost (<a href="#hdfs-readpath-cross-impact">&sect;9.12</a>) reaches $\le 339\,\text{s}$ at HDFS defaults, which alone dominates $T_{\text{recovery}}$.
+</p>
+
+<h4>With NameNode failover</h4>
+
+<p>
+The scenarios above assume the active HDFS NameNode survives the AZ outage. If the active was in the failed AZ, HA failover to the standby in a surviving AZ sits on the critical path before HBase recovery can make meaningful progress, because region opens depend on <code>getFileInfo</code>/<code>getBlockLocations</code> from a healthy NameNode. Community operational experience with production HDFS HA at comparable cluster size places the failover wall-clock in the bracket
+</p>
+
+$$
+T_{\text{NN-failover}} \;\approx\; 90\text{–}180\,\text{s,}
+$$
+
+<p>
+dominated by ZKFC fencing and ZK session expiry (~30 s at a standard 30-second ZK session timeout), standby promotion and edit-log catch-up (~10–20 s for a current standby), and DataNode block-report quorum to the new active before safe-mode exit (~60–120 s; scaling with total block count, the dominant variable at this cluster size). When the NameNode is also lost, the operational recovery wall-clock for the typical case is therefore
+</p>
+
+$$
+T_{\text{recovery}}^{\text{(typical, with NN failover)}}
+\;\approx\; T_{\text{NN-failover}} + T_{\text{recovery}}^{\text{(typical)}}
+\;\approx\; \mathbf{2.5\text{–}4.5\,\text{min.}}
+$$
+
+<p>
+The lower end of this bracket corresponds to a fast HA failover (current standby, prompt block reports) followed by a procedure-store-bound HBase recovery in ~70 s. The upper end is a slow block-report quorum (~2 min) followed by a procedure-store-bound recovery in ~90 s.
+</p>
+
+<p>
+$T_{\text{NN-failover}}$ above is the HDFS side wall clock time only. The HBase side impact also includes the client side residual that the embedded <code>DFSClient</code> spends stuck on the hung old-active before <code>RetryPolicies.failoverOnNetworkException</code> advances the proxy, bounded by <code>ipc.client.rpc-timeout.ms</code>. At HDFS defaults this adds up to $120\,\text{s}$ per stuck call to the bracket. With the recommended <a href="#hdfs-nn-rpc">&sect;9.11</a> tuning ($30\,\text{s}$ RPC timeout, $5\,\text{s}$ connect timeout) the residual collapses to ${\le}\,30\,\text{s}$.
+</p>
+
+<h4>Sensitivity to load-line inputs</h4>
+
+<p>
+The bounds in the scenarios table are derived from inputs that sit on the achievable side of their published range, not the median. Additional inputs are properties of the deployment (storage media, instance load, compaction policy, WAL-split coordination):
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Input</th>
+      <th>Value used</th>
+      <th>Median-deployment value</th>
+      <th>Operational precondition for the optimistic value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>$\mu_{\text{proc}}$ (procedure-store throughput)</td>
+      <td>25.6 K w/s</td>
+      <td>12–18 K w/s</td>
+      <td>DataNode pipelines responsive under recovery-storm load and master JVM not GC-pressured (otherwise $\bar{h}$ degrades from 10 ms to 20–40 ms)</td>
+    </tr>
+    <tr>
+      <td>$C_{\text{NN}}$ (NameNode op rate)</td>
+      <td>$3 \times 10^{5}$ op/s</td>
+      <td>$1\text{–}1.5 \times 10^{5}$ op/s</td>
+      <td>NameNode on the recommended instance (§7.3); no concurrent metadata-heavy foreground load</td>
+    </tr>
+    <tr>
+      <td>$\omega$ (NN ops per region open)</td>
+      <td>30</td>
+      <td>50–80</td>
+      <td>Regions well-compacted: a few HFiles per column family at recovery time</td>
+    </tr>
+    <tr>
+      <td>$N_{\text{wal/RS}}$ (WAL files per dead RS)</td>
+      <td>8</td>
+      <td>16–32</td>
+      <td>Healthy flush cadence keeps unarchived WAL count near the typical operating range; otherwise approaches <code>maxlogs</code> ≈ 32</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Re-evaluating the typical case at the median-deployment value of each input — and including NameNode failover — yields a recovery wall-clock on the order of <strong>5–8 minutes</strong>. This is the appropriate externally-facing figure when those four preconditions are not directly verified in the deployment. The 70–90 s and 2.5–4.5 min bounds in the tables above are the targets that the recommendations <em>enable</em>; closing the gap from the median to the target is a measurement-and-verification exercise on the inputs, not a matter of further HBase parameter tuning.
+</p>
+
+<h4>Comparison: defaults</h4>
+
+<p>
+Evaluated at HBase defaults rather than the recommended settings, the master procedure store alone sets the bound: $\mu_{\text{proc}} = 16/(0.100+0.010) \approx 145\,\text{w/s}$, giving
+</p>
+
+$$
+T_{\text{recovery}}^{\text{(defaults)}} \;\gtrsim\; \frac{W_{\text{total}}}{\mu_{\text{proc}}}
+\;=\; \frac{1.5\times 10^{6}}{145}
+\;\approx\; 10{,}300\,\text{s}
+\;\approx\; \mathbf{2.9\;\text{hours.}}
+$$
+
+<p>
+The recommended settings compress recovery from hours to single-digit minutes, with the master procedure store as the dominant remaining term at the reference workload.
+</p>
+
+<h2 id="hdfs-pipeline" class="page-break">9. HDFS pipeline tuning for degraded dependencies</h2>
+
+<p>
+This section addresses a related failure mode where a number of DataNodes are degraded rather than completely offline, perhaps due to EBS level degradation during an AZ outage or partial outage. Embedded HDFS clients inside the RegionServers keep selecting these DataNodes for new WAL pipelines, resulting in a sustained tax on WAL hflush latency that propagates to client visible tail latency for every region whose WAL passes through a sick pipeline.
+</p>
+
+<p>
+FSHLog's <code>DFSOutputStream</code> reacts to a pipeline drop by invoking <code>ReplaceDatanodeOnFailure</code>, which adds complexity and latency to the write path during AZ loss. AsyncFSWAL takes a different tack and instead each WAL file is exactly one block long, so on any DataNode error the upper layer immediately rolls the WAL and opens a fresh file with a fresh <code>addBlock</code>. The NameNode satisfies the new pipeline at width 2 (subject to <code>dfs.namenode.replication.min</code>), and the writer continues. The document therefore recommends AsyncWAL and the quantitative cross-impacts in <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a> assume it.
+</p>
+
+<p>
+The section is organized as a one-paragraph model of the embedded client write pipeline (<a href="#hdfs-pipeline-model">&sect;9.1</a>), the detection window arithmetic that explains why a degraded DN keeps being picked (<a href="#hdfs-pipeline-detection">&sect;9.2</a>), the divergent pipeline recovery behavior of the two HBase WAL providers (<a href="#hdfs-pipeline-fshlog">&sect;9.3</a>, <a href="#hdfs-pipeline-asyncfs">&sect;9.4</a>), the HBase-side circuit breakers (<a href="#hdfs-pipeline-hbase-mitigation">&sect;9.5</a>), tuning recommendations at the HDFS layer (<a href="#hdfs-pipeline-tune-hdfs">&sect;9.6</a>) and HBase layer (<a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>), the cross-section impact under strict one-replica-per-AZ placement (<a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>) and its limitations (<a href="#hdfs-pipeline-limits">&sect;9.9</a>), and the symmetric read-path tuning (<a href="#hdfs-read-path">&sect;9.10</a>), NameNode-RPC tuning (<a href="#hdfs-nn-rpc">&sect;9.11</a>), and read-path cross-section impact (<a href="#hdfs-readpath-cross-impact">&sect;9.12</a>) that bound the slow-tail residual the &sect;9.8 mean-latency analysis cannot capture.
+</p>
+
+<h3 id="hdfs-pipeline-model">9.1 The embedded HDFS client write pipeline</h3>
+
+<p>
+Every WAL append crosses an embedded HDFS write pipeline of <code>replication</code> DataNodes (3 in the reference deployment). Pipeline construction is performed by the NameNode's <code>BlockPlacementPolicy</code> at <code>addBlock</code> time, honoring the client-supplied <code>excludedNodes</code> set. Pipeline recovery is governed by a client-side state machine that differs sharply between the two HBase WAL providers. The provider is selected by <code>hbase.wal.provider</code> (default <code>defaultProvider</code> &asymp; <code>asyncfs</code>, alternative <code>filesystem</code> &asymp; FSHLog).
+</p>
+
+<div class="pipeline">                       NameNode
+                          &uarr; addBlock(src, excludedNodes)
+                          |   returns LocatedBlock[DN1, DN2, DN3]
+                          |
+   RS WAL writer          |
+        |                 |
+        v                 v
+   DFSClient ------------------------------------------------------+
+                                                                   |
+                       data                                        |
+        DN1 head  ------------->  DN2 mirror  ------------->  DN3 tail
+            ^                         ^                             |
+            |                         |                             |
+            +-------- ack ------------+----------- ack --------------+
+
+   FSHLog/DFSClient chained-pipeline topology shown.
+   AsyncFSWAL's FanOutOneBlockAsyncDFSOutput replaces the
+   head-&gt;mirror-&gt;tail chain with parallel client-&gt;DN channels;
+   the NameNode-side addBlock half is identical.
+</div>
+
+<p>
+On FSHLog the writer is a stock <code>DFSOutputStream</code>. Pipeline failures trigger HDFS's pipeline recovery machinery. On AsyncFSWAL the writer is HBase's own <code>FanOutOneBlockAsyncDFSOutput</code>, which avoids the complexity and latency of pipeline recovery by only ever writing files the length of a single block. This allows it to open a Netty channel per replica, fan packets out in parallel, and immediately recover at the HBase level with a WAL roll.
+</p>
+
+<h3 id="hdfs-pipeline-detection">9.2 Partial-failure detection windows</h3>
+
+<p>
+Various NameNode-side mechanisms can keep a degraded DN out of new pipelines. At HDFS defaults each has a different detection window and a different set of opt-ins.
+</p>
+
+<h4>Dead-DN window</h4>
+
+<p>
+The NameNode declares a DN dead only after a long no-heartbeat window:
+</p>
+
+$$
+T_{\text{dead}} \;=\; 2\,t_{\text{recheck}} \;+\; 10\,t_{\text{hb}}.
+$$
+
+<p>
+With defaults <code>dfs.namenode.heartbeat.recheck-interval</code> = 5 min and <code>dfs.heartbeat.interval</code> = 3 s, this is <strong>10 min 30 s</strong> (computed in <code>DatanodeManager</code> at construction, checked in <code>isDatanodeDead</code>). Until the dead window expires, the DN remains <code>IN_SERVICE</code> and the placement policy will keep proposing it.
+</p>
+
+<h4>Stale-DN window</h4>
+
+<p>
+<code>dfs.namenode.stale.datanode.interval</code> (default 30 s) marks a DN stale after a missed heartbeat or two. Stale DNs are avoided as targets for new pipelines if <code>dfs.namenode.avoid.write.stale.datanode</code> is true. In this production deployment that switch is set, so the 30 s window is active and the placement policy excludes a DN as soon as it misses heartbeats long enough to go stale. A safety hatch (<code>dfs.namenode.write.stale.datanode.ratio</code>, default 0.5) disables stale-DN avoidance when more than half the cluster is stale, so during a broad partition the protection disengages exactly when it matters most.
+</p>
+
+<p>
+The stale-DN avoidance only fires when a DN actually misses heartbeats. A degraded DN continues to heartbeat normally and never goes stale. The slow-peer graylist below is the only NN-side mechanism that catches this case.
+</p>
+
+<h4>Slow-peer graylist</h4>
+
+<p>
+Each DN computes an outlier set over its downstream send latencies (<code>DataNodePeerMetrics</code> with <code>OutlierDetector</code>) and ships them in heartbeats. The NameNode aggregates votes in <code>SlowPeerTracker</code>, a periodic daemon materializes a UUID set, and <code>BlockPlacementPolicyDefault.isGoodDatanode</code> rejects DNs in that set during placement. Three opt-ins are required, <em>all default false</em>: <code>dfs.datanode.peer.stats.enabled</code> (DN-side reporting), <code>dfs.namenode.block-placement-policy.exclude-slow-nodes.enabled</code> (NN-side enforcement), and a non-zero <code>dfs.namenode.slowpeer.collect.interval</code> on the materialization daemon. Worst-case time from when the DN begins to misbehave to when the DN appears in the graylist:
+</p>
+
+$$
+T_{\text{graylist}} \;\lesssim\; 3\,t_{\text{outliers.report.interval}} \;+\; t_{\text{slowpeer.collect.interval}}.
+$$
+
+<p>
+At defaults (<code>30m</code>, <code>30m</code>) this is &asymp; <strong>2 hours</strong>. Even with peer stats enabled, the exclude-slow-nodes switch controls whether the NN actually refuses the DN. Out of the box the NN sees the slow-peer reports but does nothing with them.
+</p>
+
+<h4>Load-based exclusion</h4>
+
+<p>
+<code>dfs.namenode.redundancy.considerLoad</code> (default true, factor 2.0) skips a DN whose <code>xceiverCount</code> exceeds the cluster average by the factor. A DN with a hot disk or facing network degradation slows packet acks without inflating xceiver counts.
+</p>
+
+<h4>Summary of detection windows</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Mechanism</th>
+      <th>Window at HDFS defaults</th>
+      <th>Window at recommended settings (<a href="#hdfs-pipeline-tune-hdfs">&sect;9.6</a>)</th>
+      <th>Opt-ins required at defaults</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Dead-DN ($T_{\text{dead}}$)</td>
+      <td>10 min 30 s</td>
+      <td>2 min 30 s (<code>recheck</code> &rarr; 60 s)</td>
+      <td>Always on</td>
+    </tr>
+    <tr>
+      <td>Stale-DN (heartbeat-missing DNs only)</td>
+      <td>30 s (production has <code>avoid.write.stale.datanode</code> set; off at stock HDFS defaults)</td>
+      <td>30 s (no change &mdash; already enabled)</td>
+      <td>Already set in this deployment</td>
+    </tr>
+    <tr>
+      <td>Slow-peer graylist ($T_{\text{graylist}}$)</td>
+      <td>~2 h (and not actually enforced &mdash; exclude switch off)</td>
+      <td>~3 min</td>
+      <td>Three opt-ins, all off by default</td>
+    </tr>
+    <tr>
+      <td>Load-based</td>
+      <td>Trips only at $\geq 2\times$ cluster-average xceivers</td>
+      <td>Same (no useful lever for "slow-not-busy")</td>
+      <td>On, but blind to latency outliers</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+If neither dead-DN nor graylist fires inside the lifetime of a single WAL file, all of the pipeline-recovery mechanisms in &sect;&sect;9.3&ndash;9.4 are operating on stale topology.
+</p>
+
+<h3 id="hdfs-pipeline-fshlog">9.3 FSHLog: traditional DFSClient pipeline recovery</h3>
+
+<p>
+For deployments still on FSHLog (i.e. those that have not yet switched to the AsyncWAL provider recommended in <a href="#az-assumptions">&sect;4</a>), the writer is a stock <code>DFSOutputStream</code> / <code>DataStreamer</code> and inherits HDFS's pipeline-recovery state machine. This subsection documents that machinery and the FSHLog-side configuration that controls it. The cross-section impact numbers in <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a> assume AsyncWAL.
+</p>
+
+<p>
+The client maintains a per-stream <code>excludedNodes</code> cache, populated whenever a pipeline DN fails and passed into the next <code>addBlock</code> call so the NameNode's placement policy skips the bad DN when allocating the next block. Entries expire after <code>dfs.client.write.exclude.nodes.cache.expiry.interval.millis</code> (default 10 min), giving a freshly-failed DN a window to demonstrate it is back to health before being reconsidered.
+</p>
+
+<p>
+The replace-datanode-on-failure policy (governed by the four keys <code>dfs.client.block.write.replace-datanode-on-failure.{enable, policy, min-replication, best-effort}</code>) decides what to do when a DN drops mid-write. The client can ask the NameNode for an additional DN via <code>getAdditionalDatanode</code> and grow the surviving pipeline back to a chosen replication floor, instead of continuing to stream against a shrunken set.
+</p>
+
+<p>
+After a DN failure the client drives a generation-stamp recovery by calling <code>updateBlockForPipeline</code>. The NameNode bumps the block's generation stamp and persists the new expected-locations set to the edit log; the client then opens a new pipeline with the bumped GS on the surviving DNs (plus any replacement obtained in step two) and resumes streaming. The block itself is not abandoned, and append throughput is interrupted only for the duration of the RPC round-trips rather than restarted from a roll.
+</p>
+
+<p>
+The state machine that ties these together lives in <code>DataStreamer</code>:
+</p>
+
+<div class="pipeline">  STREAMING                           [normal: streaming packets to all DNs]
+      |
+      | ack with ERROR  /  socket timeout  /  closed peer
+      v
+  DATA_STREAMER_ERROR_STATE
+      |
+      | handleBadDatanode() &mdash; drop the failed DN from `nodes[]`
+      v
+      |---&gt; (surviving &ge; replace-datanode-min)
+      |        |
+      |        |  setupPipelineForAppendOrRecovery()
+      |        |     |
+      |        |     |--- dtpReplaceDatanodeOnFailure.satisfy() = true
+      |        |     |        |
+      |        |     |        |  addDatanode2ExistingPipeline()
+      |        |     |        |     getAdditionalDatanode(excludedNodes &cup; failed DN)
+      |        |     |        v
+      |        |     |  transfer replica to the new DN
+      |        |     v
+      |        |  updateBlockForPipeline() / updatePipeline() &mdash; bump GS
+      |        v
+      |     STREAMING (resumed on new pipeline)
+      |
+      `---&gt; (surviving &lt; replace-datanode-min) and best-effort = false
+                 v
+              FAIL &mdash; throw IOException upward; HBase WAL.sync() fails
+</div>
+
+<p>
+The relevant client-side knobs all live in <code>HdfsClientConfigKeys.BlockWrite.ReplaceDatanodeOnFailure</code>. Defaults: <code>enable = true</code>, <code>policy = DEFAULT</code>, <code>min-replication = 0</code>, <code>best-effort = false</code>. The <code>DEFAULT</code> policy attempts a replacement when the pipeline shrinks below the original replication factor on a non-append write. <code>ALWAYS</code> attempts on every failure. <code>NEVER</code> disables replacement entirely.
+</p>
+
+<p>
+FSHLog tolerates a partial pipeline failure provided the NN can find a replacement DN. The cost is one GS bump and one extra <code>addBlock</code> round-trip. The WAL file does not need to roll, and append throughput is briefly interrupted (one packet round-trip plus the GS-bump RPC) rather than restarted.
+</p>
+<p>
+Otherwise, <code>FSHLog.doCheckLogLowReplication</code> forces a roll when the current block has fewer than <code>hbase.regionserver.hlog.tolerable.lowreplication</code> live replicas. This catches the case where the pipeline silently degrades below that floor. The key defaults to the cluster replication factor (typically 3), which during an AZ-loss event interacts badly with the NameNode's block placement. Roll churn is bounded by <code>hbase.regionserver.hlog.lowreplication.rolllimit</code> (default 5), so the mechanism cannot loop forever. Lowering the floor to 2 (see <a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>) eliminates the WAL roll storm.
+</p>
+
+<h3 id="hdfs-pipeline-asyncfs">9.4 AsyncFSWAL: fan-out pipeline and <code>ExcludeDatanodeManager</code></h3>
+
+<p>
+AsyncFSWAL replaces the stock client with <code>FanOutOneBlockAsyncDFSOutput</code>, in <code>hbase-asyncfs</code>. Each WAL file is bounded to exactly one HDFS block, sidestepping the entire chained pipeline construction and pipeline recovery machinery of the standard HDFS client. HBase's custom client opens one Netty channel per replica and streams packets to all DNs in parallel. There is no head/mirror/tail relationship between the DNs. The healthy-case benefit is that hflush wait drops by a small constant factor, because there is no serial-hop tail latency, and the recovery case is greatly simplified.
+</p>
+
+<p>
+AsyncFSWAL ignores <code>dfs.client.block.write.replace-datanode-on-failure.*</code>. On any DN error, all pending acks fail, and the upper layer immediately rolls the WAL. Because each WAL file is one block, this is as simple as closing the broken block-as-file, opening a fresh file with a fresh <code>addBlock</code>, and starting a fresh fan-out.
+</p>
+
+<p>
+For the roll to be productive, <code>hbase-asyncfs</code> carries its own degradation tracker. <code>StreamSlowMonitor</code> observes per-packet ack latency on each in-flight WAL writer and decides when a DN's behavior is degraded enough to act on, and <code>ExcludeDatanodeManager</code> holds the resulting per-RegionServer registry of DNs to avoid.
+</p>
+
+<p>
+The slow-packet decision in <code>StreamSlowMonitor.checkProcessTimeAndSpeed</code> uses two thresholds keyed off packet size, on the principle that small packets are bounded by per-RPC latency while large packets are bounded by throughput. Packets below <code>hbase.regionserver.async.wal.datanode.slow.check.speed.packet.data.length.min</code> (default 64 KiB) are judged against <code>hbase.regionserver.async.wal.datanode.slow.packet.process.time.millis</code> (default <strong>6 000 ms</strong>). Larger packets are judged against <code>hbase.regionserver.async.wal.datanode.slow.packet.speed.min.kbs</code> (default 20 KB/s). Either threshold being crossed contributes one observation against the DN.
+</p>
+
+<p>
+The design assumes any DN can have an occasional bad packet under GC or transient network jitter. Observations are accumulated per DN in a sliding deque whose validity window is <code>hbase.regionserver.async.wal.slow.detect.data.ttl.ms</code> (default 10 min), and only when a DN accumulates <code>hbase.regionserver.async.wal.min.slow.detect.count</code> (default 3) live observations is it promoted to the exclude registry. The result is a quorum of slow packets across a sliding window, not an instantaneous reaction to any single bad packet, a deliberate trade-off of detection latency against false-positive immunity.
+</p>
+
+<p>
+<code>ExcludeDatanodeManager</code> holds at most <code>hbase.regionserver.async.wal.max.exclude.datanode.count</code> (default <strong>3</strong>) DataNodes, each retained for <code>hbase.regionserver.async.wal.exclude.datanode.info.ttl.hour</code> (default <strong>6 hours</strong>) before automatic eviction. On each subsequent WAL roll the current registry contents are passed as the <code>excludedNodes</code> argument to the NameNode's <code>addBlock</code> call, so the placement policy is barred from returning those DNs in the new file's pipeline.
+</p>
+
+<p>
+Because <code>ExcludeDatanodeManager</code> is instantiated per RegionServer process, a bad DN is rediscovered independently by each surviving RegionServer, once the slow packet quorum has accumulated against that DN from that RS's own WAL traffic, so cluster wide convergence takes as many independent detections as there are RegionServers writing through the bad DN, with the per RS detection latency set by <code>min.slow.detect.count = 3</code> divided by that RS's per-DN slow packet rate. The NameNode graylist (&sect;9.2) is the only mechanism with true cluster wide scope.
+</p>
+
+<p>
+Also, the registry is merely a bounded cache. With <code>max.exclude.datanode.count = 3</code>, only three DataNodes can be suppressed at any moment, and a wider incident causes thrashing as newly detected bad DNs evict additional bad ones from the cache. The cap is appropriate for the steady state assumption that DN failures are uncorrelated and few at a time, but it is the wrong approach for an AZ-scoped incident. To be resilient against wider scale failures, the cap should be raised (see <a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>) so that the registry can hold the full set of concurrently degraded DNs without losing coverage.
+</p>
+
+<h3 id="hdfs-pipeline-hbase-mitigation">9.5 HBase WAL-level mitigations</h3>
+
+<p>
+Independent of the WAL provider, <code>AbstractFSWAL</code> implements three circuit breakers against a sick pipeline and one terminal watchdog. All four interact with the detection-window arithmetic of &sect;9.2: they decide what HBase does when a single sync is slow, regardless of whether the NN has yet classified the responsible DN as bad.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Mechanism</th>
+      <th>Config key</th>
+      <th>Default</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Slow-sync log/metric</td>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.ms</span></td>
+      <td>100 ms</td>
+      <td>Single sync above this threshold logs a warning and increments the slow-sync metric. No action.</td>
+    </tr>
+    <tr>
+      <td>Roll on single slow sync</td>
+      <td><span class="param-name">hbase.regionserver.wal.roll.on.sync.ms</span></td>
+      <td>10 000 ms (10 s)</td>
+      <td>A single sync exceeding this forces an immediate <code>requestLogRoll(SLOW_SYNC)</code>. Closes the current pipeline and opens a fresh one.</td>
+    </tr>
+    <tr>
+      <td>Roll on sustained slow syncs</td>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.roll.threshold</span> in <span class="param-name">hbase.regionserver.wal.slowsync.roll.interval.ms</span></td>
+      <td>100 events in 60 000 ms</td>
+      <td>Cumulative slow-sync count crossing the threshold inside the window triggers a roll.</td>
+    </tr>
+    <tr>
+      <td>Sync-timeout watchdog</td>
+      <td><span class="param-name">hbase.regionserver.wal.sync.timeout</span></td>
+      <td>300 000 ms (5 min)</td>
+      <td><code>blockOnSync</code> throws <code>WALSyncTimeoutIOException</code>; <code>HRegion.doWALAppend</code> calls <code>rsServices.abort("WAL sync timeout, forcing server shutdown", ioe)</code>. The RegionServer terminates and its regions enter recovery (&sect;&sect;1&ndash;7).</td>
+    </tr>
+    <tr>
+      <td>Low-replication roll (FSHLog only)</td>
+      <td><span class="param-name">hbase.regionserver.hlog.tolerable.lowreplication</span> / <span class="param-name">hbase.regionserver.hlog.lowreplication.rolllimit</span></td>
+      <td>=replication / 5</td>
+      <td><code>FSHLog.doCheckLogLowReplication</code> rolls when the block replication factor of the WAL file is below the floor. Disables after <code>rolllimit</code> consecutive triggers to avoid roll storms during a broad outage (see <a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The pertinent question is the time, from the moment a DN starts misbehaving, before HBase reacts. At defaults the answer is bounded by the slow-sync roll path:
+</p>
+
+$$
+T_{\text{react, single sync}} \;\leq\; \texttt{roll.on.sync.ms} \;=\; 10\,\text{s,}
+$$
+
+<p>
+and the terminal watchdog at
+</p>
+
+$$
+T_{\text{react, watchdog}} \;\leq\; \texttt{wal.sync.timeout} \;=\; 300\,\text{s.}
+$$
+
+<p>
+A 5-minute black hole on the watchdog is excessive. By then every region whose WAL is on the sick pipeline has been blocked for 5 minutes, and the RS abort triggers an SCP per &sect;&sect;1&ndash;7 anyway. The recommended settings in &sect;9.7 compress the single-sync roll to 5 seconds and the watchdog to 60 seconds, sized so that the watchdog fires only on a genuinely unrecoverable pipeline.
+</p>
+
+<h3 id="hdfs-pipeline-tune-hdfs">9.6 Recommended HDFS-side tuning</h3>
+
+<p>
+Three layers of HDFS knobs interact in a partial-failure window. The NameNode governs placement decisions and dead-DN classification, the DataNode governs the slow-peer reports that feed those decisions, and embedded client (governs in-place recovery on FSHLog).
+</p>
+
+<h4>NameNode</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.namenode.heartbeat.recheck-interval</span></td>
+      <td>300000 ms</td>
+      <td>60000 ms</td>
+      <td>Shrinks $T_{\text{dead}}$ from 10 minutes 30 seconds to 2 minutes 30 seconds. The NN sweep interval shortens proportionally.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.avoid.write.stale.datanode</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>Already enabled, listed for completeness. Activates the 30 second stale-DN window on the write path. Note that stale-DN avoidance only fires on heartbeat misses. It does not cover the degraded-but-alive case targeted by the slow peer graylist below.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.avoid.read.stale.datanode</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>Already enabled, listed for completeness. Symmetric for the read path.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.block-placement-policy.exclude-slow-nodes.enabled</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>The actual switch that makes <code>BlockPlacementPolicyDefault.isGoodDatanode</code> refuse a graylisted DN. Without this, the graylist is observed but not enforced for placement.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.avoid.read.slow.datanode</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>Symmetric on the read path. Avoids graylisted DNs in <code>sortLocatedBlocks</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.slowpeer.collect.interval</span></td>
+      <td>30 minutes</td>
+      <td>1 minute</td>
+      <td>Period of the daemon that refreshes the UUID set the placement policy reads. Shortens the second additive term in $T_{\text{graylist}}$.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.namenode.replication.min</span></td>
+      <td>1</td>
+      <td>2</td>
+      <td>Without this, <code>addBlock</code> returns successfully with one good DN and <code>complete</code> closes a half-broken WAL. Raising to 2 makes the NN refuse to allocate or close a block on a single surviving DN.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>DataNode</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.datanode.peer.stats.enabled</span></td>
+      <td>false</td>
+      <td>true</td>
+      <td>Master switch for slow-peer detection. Without it, no DN ships outlier reports and the graylist never populates.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.outliers.report.interval</span></td>
+      <td>30 minutes</td>
+      <td>1 minute</td>
+      <td>Period the DN re-runs its outlier detector and ships fresh reports. Shrinks the first additive term in $T_{\text{graylist}}$. <code>SlowPeerTracker</code> validates each report for $3\,\times$ this interval, so the staleness of the NN's view also shortens proportionally.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.min.outlier.detection.nodes</span></td>
+      <td>10</td>
+      <td>10 (keep)</td>
+      <td>Minimum peer count for the outlier detector to run at all. Lowering risks false positives on small clusters; raising disables detection in small deployments.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.slowpeer.low.threshold.ms</span></td>
+      <td>5 ms</td>
+      <td>5 ms (keep)</td>
+      <td>Noise floor: a peer with average mirror-send latency below this is never called slow. Conservative default appropriate for SSD/NVMe DataNodes.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.slow.io.warning.threshold.ms</span></td>
+      <td>300 ms</td>
+      <td>300 ms (keep, but consider monitoring)</td>
+      <td>Per-packet log-only threshold. Increments slow-write and slow-ack metrics. Treat as an early warning metric for alerting.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.datanode.max.transfer.threads</span></td>
+      <td>4096 (default)</td>
+      <td>4096 (or higher)</td>
+      <td>Hard cap on concurrent <code>DataXceiver</code> threads. Exceeding it throws on <code>accept()</code> and the pipeline-construction fails; the client treats this as a DN error and excludes it. The default is comfortable for the reference instance.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>Embedded client (set in <code>hbase-site.xml</code> on RegionServers)</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.enable</span></td>
+      <td>true</td>
+      <td>true (keep)</td>
+      <td>FSHLog-only. AsyncFSWAL ignores this key entirely.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.policy</span></td>
+      <td>DEFAULT</td>
+      <td>ALWAYS</td>
+      <td>FSHLog-only. <code>ALWAYS</code> attempts a replacement on every DN failure, not just the conditions <code>DEFAULT</code> covers. Pairs with raising <code>replication.min</code> below.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.min-replication</span></td>
+      <td>0</td>
+      <td>2</td>
+      <td>FSHLog-only. Client demands a replacement when the surviving pipeline falls below this count, instead of continuing best-effort on a thin pipeline.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.block.write.replace-datanode-on-failure.best-effort</span></td>
+      <td>false</td>
+      <td>false (keep)</td>
+      <td>FSHLog-only. With this false, the client fails the write if it cannot meet the min replication floor, which propagates upward as a <code>WAL.sync()</code> failure rather than silently continuing on a one-replica pipeline.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.write.exclude.nodes.cache.expiry.interval.millis</span></td>
+      <td>600000 ms (10 min)</td>
+      <td>600000 ms (keep)</td>
+      <td>FSHLog-only. How long a failed DN stays in the client's per-stream exclude set. Longer values trade exclusion duration for occasional unnecessary re-exclusion.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.socket-timeout</span></td>
+      <td>60000 ms (60 s)</td>
+      <td>15000 ms (15 s)</td>
+      <td>Per-hop ack-read timeout on the write pipeline and SO_TIMEOUT on the client&rarr;DN block-read socket (extended by $5\,\text{s}$ per pipeline target via <code>READ_TIMEOUT_EXTENSION</code>). Reducing to 15 s shortens the dead-silent-DN fallback by $4\times$ on both paths. Hedged reads (<a href="#hdfs-read-path">&sect;9.10</a>) cap the warm-tail case at ${\sim}150\,\text{ms}$, so this floor only matters when both replicas time out simultaneously. See <a href="#hdfs-read-path">&sect;9.10</a> for the read-side derivation and <a href="#hdfs-readpath-cross-impact">&sect;9.12</a> for the cross-section impact.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The combined effect on $T_{\text{graylist}}$ at the recommended DataNode and NameNode settings is:
+</p>
+
+$$
+T_{\text{graylist}}^{\text{(recommended)}} \;\lesssim\; 3 \cdot 60\,\text{s} \;+\; 60\,\text{s} \;=\; 4\,\text{min,}
+$$
+
+<p>
+compared to ${\sim}2\,$h at defaults. $T_{\text{dead}}$ shrinks to 2 minutes and 30 seconds, and the stale-DN write avoidance window continues to provide a 30 seconds safety valve for DNs that miss heartbeats.
+</p>
+
+<h3 id="hdfs-pipeline-tune-hbase">9.7 Recommended HBase-side tuning</h3>
+
+<h4>WAL circuit breakers (both providers)</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.ms</span></td>
+      <td>100 ms</td>
+      <td>100 ms (keep, alert)</td>
+      <td>Treat as a monitoring threshold, not a tuning lever. Alert on the slow-sync metric crossing this threshold per WAL.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.roll.on.sync.ms</span></td>
+      <td>10000 ms (10 s)</td>
+      <td>5000 ms (5 s)</td>
+      <td>Single-sync circuit breaker. A 5 second sync forces a roll, which opens a new pipeline. Tighter values risk roll churn under transient pipeline blips. 5 seconds is conservative for a healthy P99 sync of $\leq 25\,$ms.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.roll.threshold</span></td>
+      <td>100 events</td>
+      <td>25 events</td>
+      <td>Cumulative-slowness circuit breaker. Tightening to 25 events in the same 60 second window catches sustained mild degradation that never trips the single-sync threshold.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.slowsync.roll.interval.ms</span></td>
+      <td>60000 ms (60 s)</td>
+      <td>60000 ms (keep)</td>
+      <td>Window for the cumulative threshold. The pairing with the threshold above gives an effective sustained-slowness rate of $\geq 0.42\,$events/s.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.wal.sync.timeout</span></td>
+      <td>300000 ms (5 min)</td>
+      <td>60000 ms (60 s)</td>
+      <td>Watchdog. Sized to dominate the recommended single-sync roll threshold and the recommended $T_{\text{graylist}}$, so the watchdog only fires on a pipeline that is genuinely unrecoverable. Avoids a 5-minute black hole before RS abort.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>FSHLog-only</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.hlog.tolerable.lowreplication</span></td>
+      <td>= cluster replication factor (typically 3)</td>
+      <td>2</td>
+      <td>The default tracks the cluster replication factor. Pinning the floor at 2 eliminates any WAL roll storm during an AZ-loss window while preserving the safety net for in-flight degradation.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.hlog.lowreplication.rolllimit</span></td>
+      <td>5</td>
+      <td>5 (keep)</td>
+      <td>Bounds roll churn during a broad outage. After 5 consecutive low replication rolls, the path disables until a healthy pipeline is observed.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h4>AsyncFSWAL-only</h4>
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Default</th>
+      <th>Recommended</th>
+      <th>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.max.exclude.datanode.count</span></td>
+      <td>3</td>
+      <td>256</td>
+      <td>Cache size for the per-RS exclude list. Default 3 cannot represent a large blast radius incident. In the reference deployment of 500 colocated RegionServer+DataNode hosts spread over three AZs, an AZ loss removes up to $\lceil 500/3 \rceil \approx 167$ DataNodes simultaneously, all of which must be held in the registry until the NameNode-side stale and dead pathways (&sect;9.2) catch up.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.exclude.datanode.info.ttl.hour</span></td>
+      <td>6</td>
+      <td>6 (keep)</td>
+      <td>TTL of the exclude cache. Generous enough to outlast operator repair windows on a DataNode disk swap.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.datanode.slow.packet.process.time.millis</span></td>
+      <td>6000 ms</td>
+      <td>2000 ms</td>
+      <td>Threshold above which a single small packet's ack time counts as "slow" toward the exclude-list quorum.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.min.slow.detect.count</span></td>
+      <td>3</td>
+      <td>3 (keep)</td>
+      <td>Slow-packet observations a DN must accumulate before being added to the exclude list. Lower values risk false positives on transient blips.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">hbase.regionserver.async.wal.slow.detect.data.ttl.ms</span></td>
+      <td>600000 ms</td>
+      <td>600000 ms (keep)</td>
+      <td>Sliding-window length for the slow-packet counter. Longer windows accumulate more evidence but lag transient repairs.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Combining HDFS and HBase settings at the recommended values, the time-to-react on a degraded DN is bounded by two paths:
+</p>
+
+$$
+T_{\text{react}} \;\approx\; \min\!\Big(
+  \underbrace{T_{\text{roll.on.sync}}}_{5\,\text{s, per-sync}},\;\;
+  \underbrace{T_{\text{graylist}}}_{{\sim}4\,\text{min, NN-side}}
+\Big).
+$$
+
+<p>
+The per-sync path bounds the time before HBase abandons the current pipeline. The graylist path bounds the time before the NN stops handing the bad DN out for new pipelines. At HDFS and HBase defaults the corresponding numbers are <strong>10 seconds and ${\sim}2\,$hours</strong>, respectively, with no NN-side enforcement at all in the typical case.
+</p>
+
+<p>
+The values above are simple detection window arithmetic plus engineering judgement on the false positive rate at the recommended thresholds. They should be validated against production's observed sync latency P50/P99 distribution and slow-sync metric volume before broad rollout. A too-aggressive <code>roll.on.sync.ms</code> in particular can produce a roll storm that itself increases sync tail latency.
+</p>
+
+<h3 id="hdfs-pipeline-cross-impact">9.8 Cross-section impact under strict one-replica-per-AZ placement</h3>
+
+<p>
+The HDFS-side mechanics in <a href="#hdfs-pipeline-model">&sect;9.1</a>&ndash;<a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a> explain what happens to one degraded pipeline. The cluster-wide impact summarized in <a href="#az-assumptions">&sect;4</a> and used as inline callouts in <a href="#proc-store">&sect;6.6</a>, <a href="#rs-open">&sect;6.8</a>, <a href="#walsplit">&sect;6.10</a>, <a href="#pk">&sect;7.1</a>, and <a href="#nn-tune">&sect;8.3</a> follows from combining that mechanics with the strict one-replica-per-AZ placement constraint and an upper bound on the immediate WAL roll burst. This subsection derives those numbers end-to-end.
+</p>
+
+<h4>Setup</h4>
+
+<p>
+At the moment one of three AZs is lost, $N_{\text{dead}} = 167$ DataNodes vanish, and every active WAL pipeline cluster-wide instantly drops one replica. Because each pipeline started at width $r = 3$ with one replica per AZ, $N_{\text{pipelines-degraded}} = N_{\text{alive}} = 333$ &mdash; every surviving RegionServer's open WAL is affected simultaneously. AsyncFSWAL's <code>StreamSlowMonitor</code> sees the IO failure on the lost-AZ replica, the upper layer closes the current width-3 file via <a href="#hdfs-pipeline-hbase-mitigation">&sect;9.5</a>'s low-replication and slow-sync paths, opens a fresh width-2 file via <code>addBlock</code>, and resumes appending. Recommended tuning (<a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>) keeps the new pipeline acceptable to both the NameNode (<code>dfs.namenode.replication.min = 2</code>) and the low-replication-roll guard (<code>hbase.regionserver.hlog.tolerable.lowreplication = 2</code>), so the surviving cluster reaches a steady state of width-2 WAL writers within seconds of the AZ loss.
+</p>
+
+<h4>WAL roll burst at AZ loss</h4>
+
+<p>
+Detection-to-roll latency on the lost-AZ replica is bounded by <a href="#hdfs-pipeline-hbase-mitigation">&sect;9.5</a>'s AsyncFSWAL slow-packet ladder. Three consecutive packets at the slow-packet threshold trip <code>StreamSlowMonitor</code>, after which the upper layer rolls on the next sync. At the recommended <code>async.wal.datanode.slow.packet.process.time.millis = 2000</code> and <code>async.wal.min.slow.detect.count = 3</code>:
+</p>
+
+$$
+T_{\text{roll-trigger}} \;\approx\; N_{\text{min}} \cdot T_{\text{slow-packet}} \;=\; 3 \cdot 2\,\text{s} \;=\; 6\,\text{s.}
+$$
+
+<p>
+$N_{\text{pipelines-degraded}} = 333$ surviving RegionServers each issue exactly one <code>addBlock</code> RPC over that interval, giving a cluster-wide burst rate:
+</p>
+
+$$
+\lambda_{\text{addBlock}}^{\text{burst}} \;\approx\; \frac{N_{\text{alive}}}{T_{\text{roll-trigger}}} \;=\; \frac{333}{6\,\text{s}} \;\approx\; 55\,\text{addBlock/s.}
+$$
+
+<p>
+This is negligible against the tuned NameNode ceiling $C_{\text{NN}} \approx 3 \times 10^{5}\,\text{op/s}$ (<a href="#nn-tune">&sect;8.3</a>). It does, however, transition the cluster's WAL writers from width 3 to width 2 in a single bounded interval, which sets the stage for the read-load delta and abort budget below.
+</p>
+
+<h4>Bounded RS abort count</h4>
+
+<p>
+A surviving RegionServer aborts when an in-flight WAL sync fails to acknowledge within <code>hbase.regionserver.wal.sync.timeout</code> (see <a href="#hdfs-pipeline-hbase-mitigation">&sect;9.5</a>). Under AsyncWAL the bad-replica error surfaces within $T_{\text{roll-trigger}} \approx 6\,\text{s}$ and the writer rolls onto a healthy width-2 pipeline, well below the recommended <code>wal.sync.timeout</code> of 60 seconds, so the watchdog ordinarily never fires. An abort therefore requires the residual case where the slow-tail conditions persist through the roll and the new pipeline also fails to ack within the watchdog window. Bounding this by the steady state slow-sync tail probability $P_{\text{slow-sync}} \lesssim 0.01$, a generous upper bound on the recommended tuning P99:
+</p>
+
+$$
+P_{\text{at-risk}} \;\lesssim\; P_{\text{slow-sync}} \;\approx\; 0.01, \qquad
+N_{\text{abort}} \;\lesssim\; N_{\text{alive}} \cdot P_{\text{at-risk}} \;\approx\; 333 \cdot 0.01 \;\lesssim\; 3.
+$$
+
+<p>
+That is, the operator's tail-risk budget for the surviving AZs is on the order of a small constant, not a $\rho$-of-cluster fraction, provided <code>wal.sync.timeout</code> is set comfortably above $T_{\text{roll-trigger}}$ and AsyncWAL is in use. Any abort that does occur triggers an SCP for that RS and folds back into the main recovery pipeline of <a href="#unifying">&sect;10</a>; for $N_{\text{abort}} \lesssim 3$ the additional SCP load is dominated by ordinary noise and does not materially extend $T_{\text{recovery}}$.
+</p>
+
+<h4>HDFS-side load delta during the recovery window</h4>
+
+<p>
+The cluster-wide write rate from RegionServer WAL traffic is unchanged after AZ loss. The same offered $\lambda_{\text{wal}}$ now writes two replicas instead of three, and $333.\overline{3}$ surviving DataNodes carry it instead of $500$. The per-DataNode write rate therefore stays at $\lambda_{\text{wal}} \cdot 3 / 500 = \lambda_{\text{wal}} \cdot 2 / 333.\overline{3}$. Per-DataNode read rate is a different story. HFile and recovered-edit reads were striped across three replicas with locality preference, and now stripe across two with the same preference. The per-DN read rate climbs $\approx 50\%$:
+</p>
+
+$$
+\Delta \lambda_{\text{DN-read}} \;\approx\; \frac{r}{r-1} - 1 \;=\; \frac{3}{2} - 1 \;=\; 0.5.
+$$
+
+<p>
+Hflush latency on a surviving DN rises because DN disks and DN handler threads are more contended, and that latency feeds directly into $\bar{h}$ for the procedure-store WAL, into $W_{\text{open}}$ for HFile opens, and into $T_{\text{WAL}}$ for split-WAL reads. NameNode throughput is sufficient and unaffected at this scale. The addBlock burst from the WAL roll cascade ($\approx 55$/s for $\approx 6\,\text{s}$) and the heartbeat-handler load from missed-heartbeat processing on $N_{\text{dead}} = 167$ DataNodes (a one-off burst sized by <code>dfs.namenode.heartbeat.recheck-interval</code> $\approx 5\,\text{min}$ at $\approx N_{\text{dead}}/300\,\text{s} \approx 0.6$ events/s averaged, with bursts an order of magnitude higher inside the recheck window) are negligible compared to $C_{\text{NN}}$.
+</p>
+
+<h4>Cross-stage P99 impacts</h4>
+
+<p>
+Translating $\Delta \lambda_{\text{DN-read}} \approx +50\%$ into the per-stage formulas of <a href="#per-stage">&sect;6</a> and <a href="#pk">&sect;7</a> gives the derated service rates summarized in <a href="#az-derating">&sect;4.2</a>. The full derivations are:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Formula</th><th>Steady-state value</th><th>AZ-loss-window value</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Procedure-store hflush <br/>(<a href="#proc-store">&sect;6.6</a>)</td>
+      <td>$\bar{h}^{\text{AZ}} = (1 + \Delta \lambda_{\text{DN-read}}) \cdot \bar{h}$ via DN-side queue inflation</td>
+      <td>$\bar{h} \approx 10\,\text{ms}$</td>
+      <td>$\bar{h}^{\text{AZ}} \approx 15\,\text{ms}$</td>
+    </tr>
+    <tr>
+      <td>Procedure-store throughput <br/>(<a href="#proc-store">&sect;6.6</a>)</td>
+      <td>$\mu_{\text{proc}}^{\text{AZ}} = N / (w + \bar{h}^{\text{AZ}})$ at $N = 512$, $w = 10\,\text{ms}$</td>
+      <td>$\mu_{\text{proc}} \approx 25.6\,\text{K w/s}$</td>
+      <td>$\mu_{\text{proc}}^{\text{AZ}} \approx 20.5\,\text{K w/s}$</td>
+    </tr>
+    <tr>
+      <td>Procedure-store drain time <br/>(<a href="#pk">&sect;7.2</a>)</td>
+      <td>$T_{\text{proc-drain}}^{\text{AZ}} = W_{\text{total}} / \mu_{\text{proc}}^{\text{AZ}}$</td>
+      <td>$T_{\text{proc-drain}} \approx 59\,\text{s}$</td>
+      <td>$T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$</td>
+    </tr>
+    <tr>
+      <td>Service-time variance <br/>(<a href="#pk">&sect;7.1</a>)</td>
+      <td>$C_S^{2,\text{AZ}} = (\sigma_h^{\text{AZ}} / \bar{h}^{\text{AZ}})^2$ with $\sigma_h$ scaling roughly in proportion to $\bar{h}$</td>
+      <td>$C_S^{2} \approx 0.16$</td>
+      <td>$C_S^{2,\text{AZ}} \approx 0.23$</td>
+    </tr>
+    <tr>
+      <td>Sustainable utilization <br/>(<a href="#pk">&sect;7.1</a>)</td>
+      <td>$\rho_{\max}^{\text{AZ}} \approx 1/\!\left(1 + 1.33\,|C_S^{\text{AZ}}|\right)$, large-$N$ form of the bulk-cycle variance bound $N \geq \mu_A + 1.33\,\sigma_A$</td>
+      <td>$\rho_{\max} \approx 0.65$</td>
+      <td>$\rho_{\max}^{\text{AZ}} \approx 0.61$</td>
+    </tr>
+    <tr>
+      <td>RS region-open time <br/>(<a href="#rs-open">&sect;6.8</a>)</td>
+      <td>$W_{\text{open}}^{\text{AZ}} = W_{\text{open}} \cdot (1 + \Delta \lambda_{\text{DN-read}})$ via HFile read contention</td>
+      <td>$W_{\text{open}} \approx 1\,\text{s}$</td>
+      <td>$W_{\text{open}}^{\text{AZ}} \approx 1.5\,\text{s}$</td>
+    </tr>
+    <tr>
+      <td>WAL split drain <br/>(<a href="#walsplit">&sect;6.10</a>)</td>
+      <td>$T_{\text{WAL}}^{\text{AZ}} = T_{\text{WAL}} \cdot (1 + \Delta \lambda_{\text{DN-read}})$ via split-WAL read load</td>
+      <td>$T_{\text{WAL}}$ base</td>
+      <td>$T_{\text{WAL}}^{\text{AZ}} \approx 1.5 \cdot T_{\text{WAL}}$</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Composed via the <a href="#unifying">&sect;10</a> recovery-pipeline max formula, the AZ-loss-window $T_{\text{recovery}}^{\text{AZ}}$ is dominated by $T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$. The $W_{\text{open}}^{\text{AZ}}$ and $T_{\text{WAL}}^{\text{AZ}}$ inflations push $T_{\text{RS-open}}^{\text{AZ}}$ and $T_{\text{WAL-split}}^{\text{AZ}}$ up by the same $1.5\times$, but they remain below $T_{\text{proc-drain}}^{\text{AZ}}$ at the reference workload. The master procedure store remains the bottleneck stage.
+</p>
+
+<h3 id="hdfs-pipeline-limits">9.9 Limitations of the partial-failure model</h3>
+
+<p>
+Note the stale-DN write avoidance disengages when more than <code>dfs.namenode.write.stale.datanode.ratio</code> (default 0.5) of DNs is stale, and the slow-peer graylist cannot grow beyond <code>dfs.namenode.max.slowpeer.collect.nodes</code>. During an AZ-loss event the partial-failure protections are partially disabled exactly when the failure footprint is largest.
+</p>
+
+<h3 id="hdfs-read-path">9.10 Read-path tuning for fast DataNode failover</h3>
+
+<p>
+&sect;&sect;9.1&ndash;9.9 cover the writer pipeline path. The read path has its own set of detection windows and timeouts, and at HDFS defaults each region open and each WAL split is exposed to a worst case 60 second pe block stall when an embedded <code>DFSClient</code> picks a not yet classified as dead replica. The recommendations here close that gap.
+</p>
+
+<h4>Hedged reads</h4>
+
+<p>
+<code>DFSInputStream.hedgedFetchBlockByteRange</code> issues the primary block read on the chosen replica, waits up to <code>dfs.client.hedged.read.threshold.millis</code>, and on threshold expiry submits a parallel read against another replica via the JVM-wide <code>HEDGED_READ_THREAD_POOL</code>. Whichever read completes first wins. The losers are cancelled. The pool size is gated by <code>dfs.client.hedged.read.threadpool.size</code>. At the default of <strong>0</strong> the path is disabled entirely (<code>isHedgedReadsEnabled()</code> returns false).
+</p>
+
+<p>
+Effective wait under hedging is, with $F$ the per-replica latency CDF, $\theta$ the threshold, $X_1$ primary latency, and $X_2$ alt-replica latency:
+</p>
+
+$$
+E[\text{wait}_{\text{hedged}}]
+\;=\; E[X_1 \mid X_1 < \theta]\cdot F(\theta)
+\;+\; E[\min(X_1,\;\theta + X_2) \mid X_1 \ge \theta]\cdot \big(1 - F(\theta)\big).
+$$
+
+<p>
+The threshold has to sit above the healthy P99 so it does not fire in steady state and below the slow tail values that the recovery window introduces. The per replica fire rate is $1 - F(\theta)$. Each fire issues one extra read on an alternate replica, so the hedged-read load amplification on the cross-section of surviving DNs is the same fraction.
+</p>
+
+<p>
+In steady state, healthy P99 block-read latency on DataNodes sits at ${\sim}50\,\text{ms}$, comfortably below $\theta = 100\,\text{ms}$. The hedge-fire rate is $1 - F_{\text{ss}}(100\,\text{ms}) \approx 0.01$, so hedged reads add ${\lesssim}1\%$ to per-DN read load and the path is essentially dormant outside a recovery event.
+</p>
+
+<p>
+In the AZ-loss window, per-DN read load rises $\approx 50\%$ (<a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>), pushing per-DN utilization from $\rho \approx 0.5$ toward $\rho \approx 0.75$ on the surviving DataNodes. Under an M/M/1 approximation the latency tail stretches by the factor $(1-\rho_{\text{ss}})/(1-\rho_{\text{AZ}}) = 0.5/0.25 = 2$, so $P_{99}^{\text{AZ}} \approx 100\text{–}125\,\text{ms}$. The hedge-fire rate climbs to $1 - F_{\text{AZ}}(100\,\text{ms}) \approx 0.05\text{–}0.10$, and the per-DN read-load envelope settles near
+</p>
+
+$$
+\lambda_{\text{DN-read}}^{\text{AZ, hedged}}
+\;\approx\; 1.5\,\lambda_0 \cdot \big(1 + 0.05\text{–}0.10\big)
+\;\approx\; 1.58\text{–}1.65\,\lambda_0.
+$$
+
+<p>
+This sits comfortably below DataNode saturation in the reference deployment, so $\theta = 100\,\text{ms}$ is the right balance.
+</p>
+
+<h4>Per-block-read socket timeout</h4>
+
+<p>
+The client DataNode block transfer <code>SO_TIMEOUT</code> is <code>dfs.client.socket-timeout</code> (default <strong>60000 ms</strong>, sourced from <code>HdfsConstants.READ_TIMEOUT</code>). The effective wait is composed with a per-pipeline-target additive in <code>DFSClient.getDatanodeReadTimeout(numNodes)</code>:
+</p>
+
+$$
+T_{\text{block-read}} \;=\; \texttt{dfs.client.socket-timeout} \;+\; \texttt{READ\_TIMEOUT\_EXTENSION} \cdot N,
+$$
+
+<p>
+with <code>READ_TIMEOUT_EXTENSION = 5000 ms</code> (a compile-time constant, not a configuration key) and $N$ the number of DataNodes the call traverses (1 for a block read). At defaults this caps a hung-DN read at $\approx 65\,\text{s}$ before the client gives up and re-chooses a replica via <code>chooseDataNode</code>. With hedged reads enabled this floor only matters when both replicas time out simultaneously; otherwise hedging short-circuits the wait at $\theta + p_{50,\text{alt}} \approx 150\,\text{ms}$. Reducing the floor to <strong>15000 ms</strong> shortens the residual worst case by $4\times$ while leaving generous headroom above the recovery-window P99 of ${\sim}125\,\text{ms}$, so it does not introduce false positives on a healthy-but-momentarily-busy DN.
+</p>
+
+<h4>Cross-stream <code>DeadNodeDetector</code></h4>
+
+<p>
+At HDFS defaults, dead DN tracking is per-<code>DFSInputStream</code> &mdash; an in-memory <code>ConcurrentHashMap&lt;DatanodeInfo, DatanodeInfo&gt;</code> built on read failure and discarded when the stream closes. Under AZ loss this means each fresh <code>DFSInputStream</code> rediscovers the same set of dead DataNodes independently, paying the <code>dfs.client.socket-timeout</code> ghost-stall once per stream per dead DN it happens to pick.
+</p>
+
+<p>
+HDFS-13571 / HDFS-14542 introduced an opt-in <code>DeadNodeDetector</code> daemon attached to <code>ClientContext</code>, the per-JVM cache that holds the peer cache, short circuit fd cache, and located blocks refresher. With <code>dfs.client.deadnode.detection.enabled = true</code> and a single <code>dfs.client.context</code> name across all <code>DFSClient</code> instances in the JVM, the dead node set is populated exactly once on first failure and reused for every subsequent <code>DFSInputStream</code>. The detector probes asynchronously on its own pools (<code>dfs.client.deadnode.detection.probe.deadnode.threads</code> for probing dead DNs, <code>...probe.suspectnode.threads</code> for newly suspect DNs, <code>...rpc.threads</code> for the RPC fan-out) and removes a DN from the dead set when a probe succeeds.
+</p>
+
+<h4>Recommended values</h4>
+
+<table>
+  <thead>
+    <tr><th>Parameter</th><th>Default</th><th>Recommended</th><th>Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">dfs.client.hedged.read.threadpool.size</span></td>
+      <td>0 (disabled)</td>
+      <td>128</td>
+      <td>Enables hedged reads on the JVM-wide pool. Sized for $T_{\text{open}} = 32$ concurrent opens plus headroom for compaction and scan readers; pool is shared across all <code>DFSClient</code> instances in the JVM.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.hedged.read.threshold.millis</span></td>
+      <td>500</td>
+      <td>100</td>
+      <td>Sits above healthy P99 (${\sim}50\,\text{ms}$) and the recovery-window P95 (${\sim}80\,\text{ms}$). Steady-state fire rate ${\lesssim}1\%$, recovery-window fire rate $5\text{–}10\%$.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.socket-timeout</span></td>
+      <td>60000</td>
+      <td>15000</td>
+      <td>Hung-DN read fallback. Hedged reads cap the warm tail case at ${\sim}150\,\text{ms}$, so this floor only matters when both replicas time out. Halves and quarters the ghost stall residual.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.deadnode.detection.enabled</span></td>
+      <td>false</td>
+      <td>true</td>
+      <td>Master switch. Without this, every fresh <code>DFSInputStream</code> rediscovers the dead-AZ DNs independently.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.context</span></td>
+      <td>"default"</td>
+      <td>"hbase"</td>
+      <td>Pins the JVM to a single <code>ClientContext</code> so all <code>DFSClient</code> instances share one <code>DeadNodeDetector</code>, peer cache, and SC-fd cache.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.deadnode.detection.probe.connection.timeout.ms</span></td>
+      <td>20000</td>
+      <td>5000</td>
+      <td>Probe connection timeout. Tighter probes converge the dead set faster on a alrge blast radius incident.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.deadnode.detection.probe.deadnode.threads</span></td>
+      <td>10</td>
+      <td>32</td>
+      <td>Cover up to $N_{\text{dead}} \approx 167$ DataNodes without serializing the periodic re-probe.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.deadnode.detection.rpc.threads</span></td>
+      <td>20</td>
+      <td>32</td>
+      <td>RPC fan-out pool inside the probe. Sized to match the probe-thread bumps above.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.deadnode.detection.probe.deadnode.interval.ms</span></td>
+      <td>60000</td>
+      <td>60000 (keep)</td>
+      <td>A reasonable cadence for probing dead DNs.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.deadnode.detection.probe.suspectnode.interval.ms</span></td>
+      <td>300</td>
+      <td>300 (keep)</td>
+      <td>Already aggressive. Sized for fast classification of newly-failed DNs.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Hedged reads bound the per read tail at $\theta + p_{50,\text{alt}}$, the socket timeout bounds the ghost stall residual at <code>dfs.client.socket-timeout</code>, and the <code>DeadNodeDetector</code> amortizes seeding across the JVM so the residual is paid once per dead DN per process rather than once per <code>DFSInputStream</code>. The combined cross stage impact is derived in <a href="#hdfs-readpath-cross-impact">&sect;9.12</a>.
+</p>
+
+<h3 id="hdfs-nn-rpc">9.11 NameNode RPC tuning for fast HA failover</h3>
+
+<p>
+The <a href="#bounded">&sect;8.4</a> &ldquo;with NameNode failover&rdquo; bracket of $T_{\text{NN-failover}} \approx 90\text{–}180\,\text{s}$ accounts for the HDFS side wall clock time for a ZKFC-driven HA promotion. Those timers are entirely on the HDFS side and are unchanged by anything in <code>hbase-site.xml</code>.
+</p>
+
+<p>
+What <code>hbase-site.xml</code> <em>does</em> control is the <em>client-side</em> wall-clock that the embedded <code>DFSClient</code> in HBase Master and RegionServer JVMs spends stuck on a hung old-active before <code>RetryPolicies.failoverOnNetworkException</code> advances the proxy to the standby. At HDFS defaults this client-side residual can be as large as 2 minutes per stuck call. The recommendations here compress it to about 30 seconds.
+</p>
+
+<h4>Failover-proxy bridge to IPC</h4>
+
+<p>
+NameNode RPC traffic flows through a <code>FailoverProxyProvider</code> (typically <code>ConfiguredFailoverProxyProvider</code>) wrapped by <code>RetryPolicies.failoverOnNetworkException(maxFailoverAttempts, maxRetryAttempts, sleepBase, sleepMax)</code> at <code>NameNodeProxiesClient.createHAProxy</code>. The FPP&rsquo;s internal <code>AbstractNNFailoverProxyProvider</code> reads <code>dfs.client.failover.connection.retries</code> and <code>dfs.client.failover.connection.retries.on.timeouts</code> and <em>writes them back</em> into each per-NN proxy&rsquo;s <code>Configuration</code> as <code>ipc.client.connect.max.retries</code> and <code>ipc.client.connect.max.retries.on.timeouts</code>. Because both default to 0 for FPP-managed proxies, a single connect failure to one NN immediately triggers failover to the next NN, the intended fast-failover behavior. The dominant factor is the in-flight RPC timeout (<code>ipc.client.rpc-timeout.ms</code>) rather than connect retry budgets.
+</p>
+
+<h4>Layered budget</h4>
+
+<p>
+Decompose the HBase-perceived NN-unavailable wall-clock into the HDFS-side and client-side pieces:
+</p>
+
+$$
+T_{\text{NN-perceived}}
+\;\le\;
+\underbrace{T_{\text{NN-failover}}^{(\text{HDFS-side})}}_{\S\,8.4\;(90\text{--}180\,\text{s})}
+\;+\;
+\underbrace{T_{\text{client-stuck-on-hung-active}}^{(\text{client-side})}}_{\text{this subsection}}.
+$$
+
+<p>
+The first term is the HDFS HA wall-clock: ZKFC fencing + ZK session expiry (${\sim}30\,\text{s}$) + standby promotion (${\sim}10\text{–}20\,\text{s}$) + DN block-report quorum (${\sim}60\text{–}120\,\text{s}$). The second term is what the embedded <code>DFSClient</code> wastes on a hung old-active before its retry policy advances, and it splits along the failure mode of the old active. If the old active is hung but reachable (TCP handshake completes, RPC stalls), the client is bounded by <code>ipc.client.rpc-timeout.ms</code> &mdash; default $120\,\text{s}$, tuned $30\,\text{s}$. If the old active is black-holed in the lost AZ, the client is bounded by <code>ipc.client.connect.timeout</code> &mdash; default $20\,\text{s}$, tuned $5\,\text{s}$ &mdash; with no connect retries, because <code>ipc.client.connect.max.retries.on.timeouts</code> is rewritten to 0 by the FPP bridge described above.
+</p>
+
+<p>
+At HDFS defaults the client-side residual can therefore add up to ${\sim}120\,\text{s}$ to the perceived unavailability bracket. At the recommended values it adds at most ${\sim}30\,\text{s}$, so the &sect;8.4 typical-case wall-clock estimate of $\approx 2.5\text{--}4.5\,\text{min}$ does not get a hidden ${\sim}90\,\text{s}$ pad on top.
+</p>
+
+<h4>Recommended values</h4>
+
+<table>
+  <thead>
+    <tr><th>Parameter</th><th>Default</th><th>Recommended</th><th>Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="param-name">ipc.client.rpc-timeout.ms</span></td>
+      <td>120000</td>
+      <td>30000</td>
+      <td>Per-call IPC response timeout. Largest single win for the client-side residual: collapses a hung-old-active stall from $2\,\text{min}$ to $30\,\text{s}$.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">ipc.client.connect.timeout</span></td>
+      <td>20000</td>
+      <td>5000</td>
+      <td>Per-attempt TCP connect timeout. With <code>dfs.client.failover.connection.retries.on.timeouts = 0</code> already in effect, a single 5 s connect failure now triggers immediate failover to the next NN.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.failover.sleep.max.millis</span></td>
+      <td>15000</td>
+      <td>5000</td>
+      <td>Cap on exponential backoff between failover attempts during a real outage. Prevents the per-attempt budget from inflating to 15 s while the standby is mid-promotion.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.failover.sleep.base.millis</span></td>
+      <td>500</td>
+      <td>500 (keep)</td>
+      <td>Base of the exponential backoff. Already conservative for the steady-state false-failover rate.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.failover.max.attempts</span></td>
+      <td>15</td>
+      <td>15 (keep)</td>
+      <td>Number of failover attempts before the call fails. With the tighter per-attempt budget above, the total elapsed budget is already short enough.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.failover.connection.retries</span></td>
+      <td>0</td>
+      <td>0 (keep)</td>
+      <td>Already correct for fast failover. Rewritten into <code>ipc.client.connect.max.retries</code> on each per-NN proxy&rsquo;s configuration.</td>
+    </tr>
+    <tr>
+      <td><span class="param-name">dfs.client.failover.connection.retries.on.timeouts</span></td>
+      <td>0</td>
+      <td>0 (keep)</td>
+      <td>Already correct for fast failover. Rewritten into <code>ipc.client.connect.max.retries.on.timeouts</code> on each per-NN proxy&rsquo;s configuration.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+Note that <code>ipc.client.rpc-timeout.ms</code> is a global IPC setting and applies to every client-IPC call out of the JVM, not just NN traffic. The recommended value of 30 seconds sits comfortably above the per-call P99 of every HBase-internal RPC at the recommended sizing of <a href="#summary-table">&sect;8</a>.
+</p>
+
+<h3 id="hdfs-readpath-cross-impact">9.12 Cross-section impact of read-path and RPC tuning</h3>
+
+<p>
+&sect;9.8 derives the AZ-loss-window mean latency multipliers (1.5&times; on $\bar{h}$, $W_{\text{open}}$, and $T_{\text{WAL}}$) from the +50% per-DN read-load delta. Those numbers are unchanged here, because the read-path tuning of &sect;9.10 does not change how much aggregate read work the surviving DataNodes carry &mdash; the same offered $\lambda_{\text{wal}}$ is striped across $N_{\text{alive}} = 333$ DNs instead of 500, so per-DN load rises $\approx 50\%$ regardless. The mean latency component is a queueing load argument and is independent of how individual readers handle the resulting tail.
+</p>
+
+<p>
+What &sect;9.10 and &sect;9.11 <em>do</em> change is the worst case time an individual read or RPC can sit waiting on a not yet classified as dead replica. This subsection bounds that residual end-to-end and shows it stops contributing to the per-stage max in the recovery pipeline formula of &sect;10.
+</p>
+
+<h4>Tail-risk decomposition</h4>
+
+<p>
+A region open or WAL split that picks an unhealthy replica can stall in three distinct ways. The first is a <em>hung DN before timeout</em>: a lost-AZ DataNode reachable enough to complete a TCP handshake but unresponsive to the block-read RPC, in which case the client waits up to <code>dfs.client.socket-timeout</code> + <code>READ_TIMEOUT_EXTENSION</code> $\approx 65\,\text{s}$ at HDFS defaults before retrying on a different replica. The second is a <em>slow-but-alive DN</em>: a surviving DataNode whose per-block read latency has slipped into the queueing-stretched tail, where P99 can reach ${\sim}500\,\text{ms}$ to several seconds once the +50% load tips the DN toward saturation. The third is <em>black-holed NN traffic</em>: an <code>addBlock</code> or <code>getBlockLocations</code> RPC that lands on a hung old-active NameNode and waits up to <code>ipc.client.rpc-timeout.ms</code> $= 120\,\text{s}$ at HDFS defaults before <code>RetryPolicies.failoverOnNetworkException</code> advances the proxy.
+</p>
+
+<p>
+The first two are addressed by &sect;9.10, the third by &sect;9.11. Each has a per-event bound:
+</p>
+
+$$
+\begin{aligned}
+T_{\text{ghost-stall}}^{\text{(default)}}     &\;\le\; \texttt{dfs.client.socket-timeout} \;+\; 5\,\text{s} \;\approx\; 65\,\text{s,} \\
+T_{\text{ghost-stall}}^{\text{(tuned)}}       &\;\le\; \theta + p_{50,\text{alt}} \;\approx\; 150\,\text{ms} \quad \text{(hedged-read short-circuit),} \\
+T_{\text{NN-stuck}}^{\text{(default)}}        &\;\le\; \texttt{ipc.client.rpc-timeout.ms} \;=\; 120\,\text{s,}                                          \\
+T_{\text{NN-stuck}}^{\text{(tuned)}}          &\;\le\; 30\,\text{s.}
+\end{aligned}
+$$
+
+<h4>Per-RS amortized seeding cost</h4>
+
+<p>
+Without the cross-stream <code>DeadNodeDetector</code>, each <code>DFSInputStream</code> rediscovers dead DNs independently. With $N_{\text{dead}} = 167$ and a per-block-read fail probability $p_{\text{first-pick-dead}} \approx N_{\text{dead}}/N_{\text{total}} = 0.33$, the per-stream expected stall count is $0.33 \cdot k_{\text{reads/open}}$, each costing up to <code>dfs.client.socket-timeout</code>. That cost multiplies across the $M_{\text{TRSP}} = 250{,}000$ region opens during recovery, with no amortization across the streams.
+</p>
+
+<p>
+With <code>DeadNodeDetector</code> enabled and <code>dfs.client.context</code> pinned to a single name, the dead-node set is per-RS-process. Once the first stream in the JVM observes a failure on a dead DN, every subsequent stream skips that DN for free. The <em>seeding</em> cost &mdash; the wall-clock the first $N_{\text{dead}}$ stalls cost cumulatively before the detector has converged &mdash; is bounded above by
+</p>
+
+$$
+T_{\text{seed}}^{\text{(per RS)}}
+\;\le\;
+\frac{N_{\text{dead}} \cdot T_{\text{ghost-stall}}}{T_{\text{open}}}
+\quad \text{(seeding stalls served in parallel by the per-RS open executor).}
+$$
+
+<p>
+Evaluated at $N_{\text{dead}} = 167$, $T_{\text{open}} = 32$:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Tuning level</th><th>$T_{\text{ghost-stall}}$</th><th>$T_{\text{seed}}^{\text{(per RS)}}$</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>HDFS defaults</td><td>65 s</td><td>${\le}\,339\,\text{s}$ (5.6 min)</td></tr>
+    <tr><td>Socket timeout tuned alone (15 s)</td><td>20 s</td><td>${\le}\,104\,\text{s}$ (1.7 min)</td></tr>
+    <tr><td>Hedged reads layered on top</td><td>${\sim}\,150\,\text{ms}$</td><td>${\le}\,0.8\,\text{s}$</td></tr>
+  </tbody>
+</table>
+
+<p>
+The full-tuning bound (${\sim}1\,\text{s}$ of seeding cost per RS process) sits comfortably below the AZ-loss-window procedure-store drain $T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$ (<a href="#proc-store">&sect;6.6</a>, <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>), so the read-path tail no longer enters the per-stage max for $T_{\text{recovery}}$. At HDFS defaults the seeding cost dominates the recovery pipeline: 5.6 minutes per RS process is two orders of magnitude above $T_{\text{proc-drain}}$ and an order of magnitude above the slowest stressed-scenario $T_{\text{RS-open}}$ in <a href="#bounded">&sect;8.4</a>.
+</p>
+
+<h4>Composition with the &sect;9.8 mean-latency multipliers</h4>
+
+<p>
+The two analyses compose without double counting. The mean latency component of <a href="#hdfs-pipeline-cross-impact">&sect;9.8</a> &mdash; per DN read latency rising $\approx 50\%$ during recovery and inflating $\bar{h}^{\text{AZ}}$, $W_{\text{open}}^{\text{AZ}}$, and $T_{\text{WAL}}^{\text{AZ}}$ each by $\approx 1.5\times$ &mdash; is unchanged by the read path tuning of &sect;9.10 and the NN-RPC tuning of &sect;9.11, since neither alters the aggregate read work the surviving DataNodes carry. The worst case per-event stall residual collapses from ${\sim}65\,\text{s}$ (socket timeout bounded) or ${\sim}120\,\text{s}$ (rpc timeout bounded) to ${\sim}150\,\text{ms}$ on the read path and ${\sim}30\,\text{s}$ on the NN path, and the per-RS cost falls from ${\sim}5.6\,\text{min}$ at HDFS defaults to ${\sim}1\,\text{s}$.
+</p>
+
+<p>
+The first effect is what the &sect;4.2 multiplier table captures and what &sect;6.6, &sect;6.8, &sect;6.10, &sect;7.1 carry through their respective callouts. The second is what allows the &sect;8.4 <em>stressed</em> scenario to actually settle at the $T_{\text{RS-open}} \approx 70\text{–}120\,\text{s}$ figure in the table, rather than tail-extending by minutes per dead DN that has not yet been classified out of placement decisions.
+</p>
+
+<h2 id="unifying" class="page-break">10. Unifying picture</h2>
+
+<p>Recovery is a multi-stage pipeline that crosses three domains — master, RegionServer, and HDFS:</p>
+
+<div class="pipeline">┌──────────────────────────────── MASTER ─────────────────────────────────┐
+│                                                                         │
+│  SCP burst ──► serverops exec ──► procedure threads ─┬─► proc-store WAL │
+│                                                      │                  │
+│                                                      └─► remote         │
+│                                                          dispatcher     │
+│                                                            │            │
+└────────────────────────────────────────────────────────────┼────────────┘
+                                                             │
+                                                             ▼ OPEN RPC
+                              ┌──────────────── REGIONSERVER ────────────┐
+                              │                                          │
+                              │   handler.count ──► openregion exec ──┐  │
+                              │                                       │  │
+                              └───────────────────────────────────────┼──┘
+                                                                      │
+                                                                      ▼
+                                            ┌──────────── HDFS ───────────┐
+                                            │  NameNode (≤ 300K op/s)     │
+                                            │  DataNodes (block reads)    │
+                                            └─────────────────────────────┘
+                                                              │
+                                                              ▼ open complete
+                              ┌──────────────── REGIONSERVER ────────────┐
+                              │   reportRST OPEN ─────────────────────►  │
+                              └───────────────────────────────────────┼──┘
+                                                                      │
+                                                                      ▼
+┌──────────────────────────────── MASTER ─────────────────────────────────┐
+│   metahandler ──► openregion exec ──► META writes                       │
+│        │                                                                │
+│        └──► procedure threads ──► proc-store WAL (callback persist)     │
+└─────────────────────────────────────────────────────────────────────────┘</div>
+
+<p>Seven possible bottlenecks, in roughly the order they saturate under default tuning:</p>
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Capacity at default</th><th>Capacity at recommended</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>RS open executor (per-RS × $N_{\text{alive}}$)</td><td>≈ 1K–5K w/s (bottleneck)</td><td>≈ 10K–50K w/s</td></tr>
+    <tr><td>HDFS NameNode</td><td>≈ 10K opens/s at $W_{\text{open}}{=}1\text{s}$ ($C_{\text{NN}}{=}300\text{K op/s}$, $\omega{=}30$)</td><td>same (tuned at deployment time, §7.3)</td></tr>
+    <tr><td>Master procedure store</td><td>≈ 145 w/s</td><td>≈ 25.6K w/s ($N{=}512$)</td></tr>
+    <tr><td>Distributed WAL splitting (per-RS × $N_{\text{alive}}$)</td><td>$P_{\text{split}}{=}666$ slots, ${\sim}80\,$s drain at write-heavy load</td><td>$P_{\text{split}}{=}2{,}664$ slots, ${\sim}20\,$s drain at write-heavy load</td></tr>
+    <tr><td>Master serverops exec</td><td>5 (bottleneck for SCP burst)</td><td>256</td></tr>
+    <tr><td>Master metahandler</td><td>≈ 20 (bottleneck)</td><td>256</td></tr>
+    <tr><td>META row-write rate</td><td>≈ 5K w/s</td><td>same (META-bound)</td></tr>
+  </tbody>
+</table>
+
+<p>The design rule for every stage $i$ is</p>
+
+$$
+\mu_i \;\geq\; \lambda
+$$
+
+<p>
+where $\mu_i$ is the per-stage service rate from Little's Law (or a burst-concurrency lower bound for <code>serverops</code> and the dispatcher pool, or a variance-bounded service rate for the procedure store). Total recovery latency is governed by the drain time of the slowest stage:
+</p>
+
+$$
+T_{\text{recovery}} \;=\; \max_i \frac{W_{\text{total},i}}{\mu_i},
+$$
+
+<p>
+where $W_{\text{total},i}$ is the aggregate workload routed through stage $i$ during the recovery window (e.g. $W_{\text{total}}$ procedure state transitions through the procedure store, $M_{\text{TRSP}}$ region opens through the per-RS open executor). This is the fluid flow drain time, distinct from the Little's Law concurrency identity $L = \lambda W$ used in <a href="#framework">§5</a> to size individual thread pools. Minimizing $T_{\text{recovery}}$ requires balancing service rates across stages, not maximizing any single one. The three layers must be tuned together.
+</p>
+
+<p>
+During the AZ-loss window each stage's $\mu_i$ is the derated value from <a href="#hdfs-pipeline-cross-impact">§9.8</a>, summarized in the <a href="#az-derating">§4.2</a> multiplier table. At the reference workload the procedure store remains the bottlenecked stage, with $T_{\text{proc-drain}}^{\text{AZ}} \approx 73\,\text{s}$.
+</p>
+
+<p>
+The HDFS writer pipeline tuning of <a href="#hdfs-pipeline">&sect;9</a> has read and write side changes that must be applied together. The write side changes (<a href="#hdfs-pipeline-tune-hdfs">&sect;9.6</a>, <a href="#hdfs-pipeline-tune-hbase">&sect;9.7</a>) bound the cost of pipeline recovery on a sick or dead DataNode and is what keeps the WAL writer pipelines from collapsing during the AZ loss window. The read side changes (<a href="#hdfs-read-path">&sect;9.10</a>) bound the tail latency of block reads on the HFile open and WAL split paths via hedged reads + per-block-read socket timeout + JVM-shared <code>DeadNodeDetector</code>, and the NN RPC changes (<a href="#hdfs-nn-rpc">&sect;9.11</a>) bound the time the embedded <code>DFSClient</code> spends stuck on a dead NameNode during HA failover. The mean latency component (<a href="#hdfs-pipeline-cross-impact">&sect;9.8</a>) and the tail -risk component (<a href="#hdfs-readpath-cross-impact">&sect;9.12</a>) compose without double counting. The first inflates each stage's $\mu_i$ by $\approx 1.5\times$, the second prevents catastrophic per-event stalls from elevating any single stage's $T_{\text{stage}}$ above the ceiling established by procedure store drain.
+</p>
+
+<h2 id="limitations">11. Limitations of the model</h2>
+
+<p>
+The procedure store sizing accounts for service time variance via a bulk service queueing argument (<a href="#pk">§7</a>). The remaining first order simplifications:
+</p>
+
+<h4>HDFS treated as a single ops/sec ceiling</h4>
+<p>
+The NameNode is modeled as $C_{\text{NN}}$ ops/sec with no internal structure. Real NameNode behavior includes a global lock that distinguishes read paths from write paths. Under read-heavy bursts (region opens) the NN can sustain higher op rates than under mixed load. DataNode disk-read concurrency is also not modeled. HFile footer/index/bloom reads compete with normal foreground reads on the same DNs.
+</p>
+
+<h4>RS-side $W_{\text{open}}$ is a free parameter</h4>
+<p>
+Per-region open time is treated as an exogenous input ranging from 200 ms (healthy) to 5 s (stressed), but it is in fact a function of the number of HFiles per region, the number of recovered edits, NameNode latency, and DataNode block-cache state. A more complete model would derive $W_{\text{open}}$ from these inputs rather than parameterize it.
+</p>
+
+<h4>No contention modeling</h4>
+<p>
+Region locks, META row locks, and the procedure-store single-writer all serialize work; the model treats each as an ideal single-server queue. Lock contention between concurrent TRSPs sharing a parent SCP is not represented.
+</p>
+
+<h4>No retry amplification</h4>
+<p>
+Dispatcher retries on transient failures and RS-side <code>RegionAlreadyInTransitionException</code> retries are absorbed into "headroom" rather than modeled as $\lambda_{\text{eff}} = \lambda(1 + r)$ for a per-RPC retry rate $r$.
+</p>
+
+<h4>No coupling between META writes and the procedure WAL</h4>
+<p>
+Both are single-writer log-structured stores. In reality their hflush streams compete for the same NameNode and DataNode pipeline capacity but the model treats them as independent.
+</p>
+
+<h4>No feedback from queue depth back to arrival</h4>
+<p>
+Heartbeats from surviving RSs are treated as an exogenous arrival stream. In reality, master overload increases heartbeat-handling latency, which can feed back into RS-side timeouts and retries — a self-amplifying mode the linear model does not capture.
+</p>
+
+<h4>Recovered edits replay not modeled separately</h4>
+<p>
+Under AZ loss, regions inherit recovered edits from split WALs that were owned by the dead RSs. Replay during region open is its own HDFS-bound and CPU-bound workload that the per-region open-time abstraction $W_{\text{open}}$ collapses into a single number.
+</p>
+
+<h4>AsyncWAL is assumed throughout</h4>
+<p>
+The HDFS-side and cross-section derivations from <a href="#az-assumptions">§4</a> onward assume the AsyncWAL provider (<code>hbase.wal.provider = asyncfs</code>). <a href="#hdfs-pipeline-fshlog">§9.3</a> documents the FSHLog mechanics for reference but does not extend the cross-section math to that case.
+</p>
+
+<h2 id="future">12. Future work</h2>
+
+<h4>Core/overflow dynamic thread-pool sizing</h4>
+<p>
+The static thread counts in <a href="#summary-table">§8.1</a>–<a href="#summary-table">§8.2</a> are sized to absorb the worst-case AZ-loss burst, but the master pays for that capacity in stack memory, scheduler bookkeeping, and JVM working-set pressure proportional to the static cap. A core/overflow pool model would let the cluster run at a lower idle thread footprint while still hitting the same recovery bounds during a storm. Under this model the values in <a href="#summary-table">§8.1</a> become the upper bound of the overflow tier rather than the always-on thread count. The procedure executor pool is the highest leverage candidate ($N_{\text{proc}} = 512$ at static sizing). The burst-driven master executors (serverops, openregion, closeregion, metahandler) are next, since their utilization outside a recovery storm is near zero.
+</p>
+
+<h4>Procedure-store / META coupling</h4>
+<p>
+Both the procedure store WAL and the META region are single-writer log structured stores whose hflush streams compete for the same NameNode and DataNode pipeline capacity (<a href="#limitations">§11</a>). Folding the coupling in would let the procedure store / META interaction on $\bar{h}$ become a first class prediction rather than an independence assumption.
+</p>
+
+</body>
+</html>
